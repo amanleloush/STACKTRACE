@@ -1,0 +1,150 @@
+# 04 — REST vs gRPC vs GraphQL
+
+> Phase 1 • Foundations • Topic 4/74
+
+## Definition (interview-ready)
+
+**REST** is an architectural style over HTTP using resource-oriented URLs and standard verbs, typically with JSON payloads. **gRPC** is an RPC framework using Protocol Buffers over HTTP/2 with strongly typed contracts and code generation. **GraphQL** is a query language and runtime where clients describe exactly the data shape they want, executed against a single endpoint.
+
+## Why it matters
+
+The choice between these shapes API ergonomics, mobile bandwidth, internal-service performance, and team coupling for years. "Use REST" is rarely the full answer — most modern systems mix all three (REST/GraphQL at the edge, gRPC internally).
+
+## Core concepts
+
+### REST
+
+- Resources identified by URLs: `/users/42/orders/7`.
+- Verbs map to actions: `GET`, `POST`, `PUT`, `PATCH`, `DELETE`.
+- Statelessness on the server (no per-client session in the protocol).
+- Self-descriptive messages — uses standard HTTP semantics (status codes, caching headers, content negotiation).
+- **HATEOAS**: responses include links to related resources. Theoretically pure REST; almost no one does this in practice.
+- Payload: typically JSON, sometimes XML.
+
+### gRPC
+
+- Schema-first: define services and messages in **`.proto`** files.
+- Code generation: client + server stubs in many languages.
+- **Protocol Buffers**: compact binary encoding (much smaller than JSON).
+- Runs over **HTTP/2**: multiplexed streams, header compression, server push.
+- Four call types: unary, server streaming, client streaming, bidirectional streaming.
+- Built-in: deadlines, cancellation, metadata (headers), interceptors, mTLS.
+
+### GraphQL
+
+- One endpoint (`/graphql`), POST queries.
+- Client specifies the exact fields it needs:
+  ```graphql
+  query { user(id: 42) { name orders(last: 5) { total } } }
+  ```
+- Strongly typed schema — server publishes types, queries, mutations, subscriptions.
+- Solves "over-fetching" (REST returns too much) and "under-fetching" (REST needs N round-trips).
+- Tradeoff: server runs an interpreter, complex caching (POST + query body, not URL).
+
+## How it works (the wire)
+
+### REST request
+```
+GET /users/42 HTTP/1.1
+Accept: application/json
+```
+```json
+{ "id": 42, "name": "Aman", "email": "...", "orders": [...] }
+```
+
+### gRPC request
+Binary protobuf frame over HTTP/2:
+```
+:method = POST
+:path = /user.UserService/GetUser
+content-type = application/grpc+proto
+grpc-encoding = gzip
+<binary protobuf body>
+```
+Trailers carry `grpc-status`.
+
+### GraphQL request
+```
+POST /graphql
+Content-Type: application/json
+
+{ "query": "{ user(id: 42) { name orders(last: 5) { total } } }" }
+```
+
+## Real-world examples
+
+- **Stripe, GitHub, Twilio**: public REST APIs (developer ergonomics, browser-friendly).
+- **GitHub also offers GraphQL** for richer queries (`api.github.com/graphql`).
+- **Google, Netflix, Square**: gRPC internally between microservices.
+- **Shopify, Meta (Facebook)**: GraphQL at the mobile/edge — clients pick exactly what they need to save bandwidth.
+- **gRPC-Web**: lets browsers talk to gRPC backends through a proxy. Used when web clients want gRPC's typing.
+
+## Common pitfalls
+
+- **REST + N+1 problem**: client loads a list, then makes N calls to enrich each item. GraphQL or batch endpoints fix this.
+- **gRPC through HTTP/1.1 proxies**: silent failure. Confirm every hop supports h2.
+- **GraphQL N+1 on the resolver side**: naive resolvers fetch one row at a time. Use **DataLoader** to batch.
+- **Versioning**: REST often uses `/v1/`. gRPC uses field numbers (additive evolution) — never reuse a field number. GraphQL is supposed to be additive forever (deprecate, don't remove).
+- **Caching**: REST GETs cache trivially (URL is the key). GraphQL is POST → custom caching layer (persisted queries, Apollo client cache).
+- **Authorization**: GraphQL exposes broad surface area — easy to leak data through field traversal. Authorize per field, not just per endpoint.
+- **gRPC errors**: use `grpc-status` codes (NOT_FOUND, INVALID_ARGUMENT, ...) — there are only 16, and they map well to HTTP if you ever need to bridge.
+
+## When to pick each
+
+| Need | Pick |
+|---|---|
+| Public API for unknown clients (browsers, curl) | REST |
+| Browser/mobile fetching exact shapes, multiple resources at once | GraphQL |
+| Internal microservices, low latency, strong typing | gRPC |
+| Streaming (server/client/bidi) | gRPC |
+| File upload | REST (multipart) |
+| Heavy mobile + bandwidth constrained + diverse client needs | GraphQL |
+| Need HTTP caching, CDNs | REST |
+
+## Interview questions
+
+### Q1 — Easy: When is gRPC better than REST?
+For internal services where both sides are under your control, you need strong typing, low latency, small payloads, and streaming. gRPC wins on schema enforcement, protobuf compactness, and HTTP/2 multiplexing.
+
+### Q2 — Easy: What problem does GraphQL solve?
+Over-fetching (REST endpoint returns more than the client needs) and under-fetching (client needs many REST calls to build one screen). GraphQL lets the client describe exactly the data shape required in one request.
+
+### Q3 — Medium: How do you version a gRPC API?
+Add fields with new field numbers (additive only). Never reuse or change a field number. For breaking changes: new service or new package (`v2`). Use proto3 conventions: optional/required have specific semantics, field deletions should `reserved` the number to prevent reuse.
+
+### Q4 — Medium: GraphQL N+1 — what is it and how do you fix it?
+A query like `users { posts { title } }` triggers one DB query for users and then one query per user for posts (N+1 total). Fix with batching: **DataLoader** collects keys requested within a tick and issues a single `IN (...)` query, returning results indexed by key.
+
+### Q5 — Medium: Why is GraphQL hard to cache?
+REST caches on URL (GET). GraphQL uses POST + body, so HTTP caching doesn't apply. Solutions: **persisted queries** (hash the query, GET it like a URL), client-side normalized caches (Apollo, Relay), or whole-response caching with cache tags.
+
+### Q6 — Hard: How would you migrate a REST API to gRPC without breaking clients?
+Run both. Use **grpc-gateway** to expose REST→gRPC reverse proxy from your `.proto` definitions — single source of truth, two transports. Gradually shift internal clients to gRPC; keep REST for external clients until you can sunset.
+
+### Q7 — Hard: A team built a GraphQL API for mobile, but p99 latency is bad. What investigations?
+(1) Resolver N+1 → audit with query tracing, add DataLoader. (2) Query complexity attacks → add max depth, query cost limits. (3) Joins behind multiple resolvers fanning out to many services → consider stitching, federation, or pre-computed views. (4) Cold persisted-query cache → preload. (5) Expensive fields on every query → mark them as deferrable or move to a separate query.
+
+### Q8 — Hard: Compare gRPC and GraphQL streaming.
+gRPC streaming is at the transport level (HTTP/2 streams) — strict typing, bi-directional, persistent connection, well-suited for server-to-server and bidi RPC. GraphQL subscriptions are typically WebSockets — designed for client (often browser) subscribing to server-pushed events. Different audiences: gRPC for internal control planes, GraphQL subscriptions for UI live updates.
+
+## TL;DR cheat sheet
+
+| | REST | gRPC | GraphQL |
+|---|---|---|---|
+| Transport | HTTP/1.1 or 2 | HTTP/2 (required) | HTTP (POST) or WS |
+| Payload | JSON | Protobuf binary | JSON |
+| Typed contract | Optional (OpenAPI) | Required (`.proto`) | Required (SDL) |
+| Streaming | Limited (SSE, WS) | First-class, 4 modes | Subscriptions over WS |
+| Browser-native | Yes | No (grpc-web needed) | Yes |
+| Discoverable | URLs + docs | reflection + proto | introspection |
+| HTTP caching | Easy (GET) | No | Hard (POST) |
+| Best for | Public APIs | Internal microservices | Client-driven shape |
+
+## Go deeper
+
+- **gRPC docs**: [grpc.io](https://grpc.io/docs/) — start with "What is gRPC?", then language guide.
+- **GraphQL spec**: [graphql.org/learn](https://graphql.org/learn/) — official tutorial is excellent.
+- **Apollo blog**: GraphQL best practices, persisted queries, federation.
+- **Roy Fielding's REST dissertation** (skim Chapter 5) — origin of REST.
+- **ByteByteGo**: ["REST vs gRPC vs GraphQL"](https://www.youtube.com/results?search_query=bytebytego+rest+grpc+graphql).
+- **Google API Design Guide**: [aip.dev](https://aip.dev/) — how to design proper REST + gRPC APIs.

@@ -1,0 +1,202 @@
+# 14 — Cache Patterns: Aside, Through, Back, Around
+
+> Phase 3 • Caching (Redis) • Topic 14/74
+
+## Definition (interview-ready)
+
+A **cache** is a fast read store kept in front of a slow store of truth. **Cache patterns** describe *who* talks to the cache and DB, and *when*: **cache-aside** (app fills cache on miss), **read-through** (cache lib fetches on miss), **write-through** (write to cache and DB together), **write-back** (write to cache, async flush to DB), **write-around** (write skips cache).
+
+## Why it matters
+
+Cache bugs cause more outages than people admit: stale data, inconsistent invalidation, thundering herds. Picking the right pattern up front (and knowing the failure modes of each) is the first lever for both performance and correctness in any system with a meaningful read load.
+
+## Core concepts
+
+### Cache-aside (lazy loading)
+
+The default and most common pattern.
+
+```
+read:  app → cache.get(k)
+              if hit: return
+              if miss: db.get(k); cache.set(k, val, ttl); return
+write: app → db.write(k, val); cache.delete(k)   (or update)
+```
+
+Pros: simple; only cached data is what's actually requested; cache failure doesn't break writes.
+Cons: cold start is slow (every miss is a DB hit); race condition between read and invalidation can re-poison stale values.
+
+### Read-through
+
+Same logic as cache-aside, but the *cache library* (not the app) does the fetch.
+
+```
+read: app → cache.get(k) // library transparently fills from DB on miss
+```
+
+Used by some Hibernate caches, AWS DAX. Pros: app code is simpler. Cons: library must understand your DB; harder to debug.
+
+### Write-through
+
+On write, update cache **and** DB synchronously.
+
+```
+write: app → cache.set(k, val); db.write(k, val)
+```
+
+Pros: cache and DB always in sync (no staleness).
+Cons: every write pays cache+DB latency; cache holds data that may never be read (waste).
+
+### Write-behind / write-back
+
+On write, update cache; flush to DB asynchronously (batched).
+
+```
+write: app → cache.set(k, val); enqueue(k)
+flusher: batch-flush enqueued keys to DB periodically
+```
+
+Pros: dramatic write absorption (think bursts).
+Cons: complex; data loss window if cache crashes before flush; ordering and idempotency get hard. Only used with explicit durability planning.
+
+### Write-around
+
+On write, write to DB; **don't** populate cache. Cache fills only on subsequent reads (cache-aside read path).
+
+```
+write: app → db.write(k, val)
+read:  cache-aside as usual
+```
+
+Pros: avoids polluting cache with one-off writes (logs, audit data).
+Cons: read-after-write always misses; not great for read-your-writes workloads.
+
+### Refresh-ahead
+
+Proactively refresh cache before TTL expires (predict next access). Reduces tail latency but adds complexity; rarely the first tool you reach for.
+
+## Comparison: when each fits
+
+| Pattern | Read-heavy | Write-heavy | Read-after-write |
+|---|---|---|---|
+| Cache-aside | ✓ | OK | OK (with invalidation) |
+| Read-through | ✓ | OK | OK |
+| Write-through | ✓ | poor (latency) | strong consistency |
+| Write-back | ✓ | ✓ (absorbs bursts) | strong if same cache |
+| Write-around | ✓ for stable data | ✓ for cold writes | stale on first read |
+
+## Cache invalidation (the hard part)
+
+Phil Karlton: *"There are only two hard things in Computer Science: cache invalidation and naming things."*
+
+Strategies in order of complexity:
+
+1. **TTL only**: simplest. Tolerate staleness up to TTL. Good for hit-counters, leaderboards, prices that change slowly.
+2. **TTL + write-time invalidation**: write path deletes (or updates) the affected keys. Most production caches.
+3. **Versioned keys**: include a version in the key (`user:42:v3`). Bump the version on write. Old key just expires.
+4. **Pub-sub invalidation**: write publishes "key X changed"; cache nodes/clients listen and evict. Used in multi-region or multi-tier caches.
+5. **CDC-driven**: change-data-capture from the DB (Debezium) drives cache invalidation. Eventual but rarely stale.
+
+### Delete vs update on write
+
+- **Delete** is safer — next reader pulls fresh from DB.
+- **Update** is faster — no DB roundtrip for the next reader — but introduces races (two updaters can interleave and leave a stale value).
+
+Default to **delete**; only update on writes when contention is high and you have a tight CAS-style pattern.
+
+## How it works (cache-aside trace)
+
+```
+read /user/42:
+  cache.get("user:42") -> miss
+  db.select("SELECT * FROM users WHERE id=42") -> row
+  cache.set("user:42", row, ttl=300)
+  return row
+
+write /user/42:
+  db.update(...)
+  cache.delete("user:42")
+
+next read /user/42:
+  cache.get("user:42") -> miss (just deleted)
+  db -> fresh row
+  cache.set with TTL
+```
+
+## Real-world examples
+
+- **Facebook TAO**: cache-aside with smart invalidation, geographically replicated. The blueprint paper for social-graph caching.
+- **Instagram**: Memcached (cache-aside) in front of Postgres for feed assembly.
+- **Stripe**: aggressive cache-aside on read paths; writes invalidate via Kafka + listeners.
+- **DAX (AWS)**: write-through + read-through on top of DynamoDB.
+- **Hibernate 2nd-level cache**: read-through; tons of subtle gotchas.
+
+## Common pitfalls
+
+- **Race between read-miss and write**: T1 reads (miss), starts DB lookup; T2 writes new value and invalidates; T1 finishes its old read and stores the **stale value** in cache. Mitigations: re-check version after fetch, use a single-flight lock, set short TTL.
+- **Forgetting to invalidate on every write path** — direct DB writes, batch jobs, admin tools — they all need to invalidate, or you get stale forever.
+- **Write-through latency blow-up**: every write to slow DB blocks the user.
+- **Write-back data loss**: cache crash before flush.
+- **Cache as truth**: somebody reads from cache, writes back to it. After invalidation, the new write is gone. Cache is never the source of truth.
+- **Different TTLs for the same key in different services**: causes flapping; centralize TTL policy.
+- **Cache the wrong thing**: derived/aggregated data is fine; per-user permissions data has correctness implications and usually deserves either no cache or aggressive invalidation.
+
+## Interview questions
+
+### Q1 — Easy: Difference between cache-aside and read-through?
+In cache-aside, the **application** checks the cache, fetches from DB on miss, fills the cache. In read-through, the **cache library** does that transparently — the app just asks the cache and the library handles the fallback.
+
+### Q2 — Easy: Why is "delete on write" safer than "update on write"?
+Update-on-write has races: two concurrent updates can both write to the cache in non-DB order, leaving a stale value visible. Delete-on-write forces the next reader to refresh from DB, eliminating that class of bugs.
+
+### Q3 — Medium: How would you implement read-after-write consistency with cache-aside?
+Several options: (a) Write-through so the cache is updated synchronously. (b) After writing the DB, write the new value to cache (not just delete). (c) Route the user's next read to the leader DB for a short window after their write. (d) Use a versioned key — write bumps the version; reads see the new version immediately.
+
+### Q4 — Medium: When would you use write-around?
+When write data isn't immediately read again (logs, audit records, low-value writes). Polluting the cache with one-shot writes wastes memory and evicts useful data. Combined with cache-aside on reads, write-around is great for "cold writes, occasional reads."
+
+### Q5 — Medium: A stale entry sometimes appears in the cache for hours despite TTL=5min. How?
+- Race between read-miss and write — a slow read fills the cache with old data right after invalidation.
+- Some service path doesn't invalidate (batch job, scheduled task, admin tool).
+- Cache is multi-region and the invalidation message is lost.
+- TTL accidentally set to a different value somewhere (defaults).
+- Refresh-ahead misconfigured, refreshing with stale data.
+
+### Q6 — Hard: Design caching for a price-sensitive product page (~1B reads/day, prices change every few minutes).
+- **Tiered cache**: CDN (5s TTL, edge cache control) + Redis (60s TTL) + DB.
+- **Invalidation on price change**: publish event to Kafka → invalidate Redis + purge CDN.
+- **Stampede protection**: single-flight on miss (only one process loads on miss; others wait), or `EX NX` lock pattern in Redis.
+- **Graceful staleness**: serve last-known value if DB is slow, with a "max-stale" budget (say 10 minutes).
+- **Cache key**: include locale, currency, A/B variant — careful explosion.
+
+### Q7 — Hard: Walk through a race condition in cache-aside and how to fix it.
+T1 reads, misses, queries DB → gets `v1` (slow query). T2 writes `v2`, invalidates cache. T1 finishes, sets cache to `v1` — stale forever (until TTL).
+
+Fix: write-time version tracking. The cache layer stores `(value, version)`. On read-miss fill, only set if no newer version exists. Or use a probabilistic early-expiration (XFetch / probabilistic refresh) + single-flight to serialize loads. Or accept short TTL as your safety net.
+
+### Q8 — Hard: Compare write-through and write-back for a session cache.
+Write-through: every session update goes to cache + DB. Safe; durability matches DB; but DB takes write load proportional to user activity. Write-back: writes only hit cache; periodic flush. Massive throughput win, but session loss is possible on cache crash → may be acceptable for "user lost their cart" but not for "lost a payment."
+
+## TL;DR cheat sheet
+
+| Pattern | Read | Write | Notes |
+|---|---|---|---|
+| Cache-aside | app fills on miss | invalidate or update | most common |
+| Read-through | lib fills on miss | (no opinion) | hides DB |
+| Write-through | (no opinion) | cache + DB synchronously | sync, slow writes |
+| Write-back | (no opinion) | cache, async to DB | fast writes, risky |
+| Write-around | (no opinion) | DB only, no cache fill | cold-write workloads |
+
+- Prefer **cache-aside + delete on write + short TTL** as default.
+- **Cache invalidation** is the #1 source of cache bugs.
+- Don't cache the wrong thing: derived data ≫ permissions/auth.
+- Single-flight or distributed locks to prevent races on miss.
+
+## Go deeper
+
+- **AWS Whitepaper**: ["Caching Best Practices"](https://aws.amazon.com/caching/best-practices/).
+- **ByteByteGo**: ["A Guide to Top Caching Strategies"](https://blog.bytebytego.com/p/a-guide-to-top-caching-strategies).
+- **Facebook TAO paper**: ["TAO: Facebook's Distributed Data Store for the Social Graph"](https://www.usenix.org/system/files/conference/atc13/atc13-bronson.pdf).
+- **Memcached Wiki** and Brad Fitzpatrick's original posts.
+- **Caching at Netflix** engineering blog (EVCache).
+- **DDIA Chapter 5** — replication and caching overlap.

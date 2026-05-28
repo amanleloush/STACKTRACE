@@ -1,0 +1,171 @@
+# 12 — Cassandra / ScyllaDB: Wide-Column, Partition Keys, Gossip
+
+> Phase 2 • Databases • Topic 12/74
+
+## Definition (interview-ready)
+
+**Cassandra** is a leaderless, eventually consistent, wide-column distributed database optimized for very high write throughput. Data is partitioned by a **partition key** (hashed onto a token ring), ordered within partitions by **clustering keys**, replicated to N nodes, and queried with tunable consistency. **ScyllaDB** is a high-performance reimplementation in C++ with the same data model (Cassandra-compatible CQL) and dramatically better latency/throughput per node.
+
+## Why it matters
+
+When write rates dwarf any single Postgres or MySQL machine, when you need linear horizontal scale, when you can model around the access pattern (no joins, denormalize for reads), Cassandra/Scylla is the canonical choice. Time-series, event logs, IoT data, messaging history, recommendation features — all classic fits.
+
+## Core concepts
+
+### Wide-column data model
+
+- **Keyspace** → **Table** → **Rows** keyed by `(partition_key, clustering_key)`.
+- A **partition** is the unit of locality — all rows with the same partition key live on the same nodes.
+- Within a partition, rows are stored sorted by clustering key.
+- "Wide" = a single partition can hold many rows (millions, even).
+
+```cql
+CREATE TABLE messages (
+  channel_id uuid,
+  message_id timeuuid,
+  user_id uuid,
+  body text,
+  PRIMARY KEY ((channel_id), message_id)
+) WITH CLUSTERING ORDER BY (message_id DESC);
+```
+- `channel_id` is the partition key — all messages for a channel live together.
+- `message_id` is the clustering key, sorted descending — newest first, fast `LIMIT 50` queries.
+
+### Storage: LSM trees
+
+- Writes append to a **commit log** (durability) and **memtable** (in-memory sorted structure).
+- Memtable flushes to **SSTable** (immutable sorted file on disk).
+- Background **compaction** merges SSTables — choices: STCS (size-tiered), LCS (leveled), TWCS (time-window). Critical tuning for performance.
+- Writes are very fast; reads must check multiple SSTables + memtable, with **bloom filters** + **partition index** to prune.
+
+### Token ring & consistent hashing
+
+- Hash the partition key → token (Murmur3, 64-bit).
+- Each node owns a range of tokens (or many small ranges via vnodes).
+- Default: ~256 vnodes per physical node for even distribution.
+
+### Replication
+
+- **Replication factor (RF)**: how many copies. Common: 3.
+- Replication topology: **NetworkTopologyStrategy** specifies replicas per DC for multi-DC clusters.
+- Every node knows the ring; clients can be **token-aware** to send writes directly to a replica (skip an extra hop).
+
+### Tunable consistency (CL — consistency level)
+
+For each read or write, choose how many replicas must respond:
+- `ONE`, `TWO`, `THREE`, `QUORUM`, `ALL`, `LOCAL_QUORUM` (just this DC), `EACH_QUORUM` (quorum in every DC).
+
+**Quorum**: `floor(RF/2) + 1`. With RF=3, QUORUM = 2.
+
+**Strong consistency rule of thumb**: `R + W > RF`. So with RF=3, W=2 and R=2 means writes and reads overlap on at least one node → you'll see your write.
+
+### Hinted handoff & read repair
+
+When a write target is down, the coordinator stores a **hint** and replays it when the target returns. **Read repair** detects divergence at read time and reconciles. Background **anti-entropy** repair (`nodetool repair`) merges differences periodically.
+
+### Gossip
+
+Nodes exchange state with a few peers each second, propagating cluster membership and node health epidemically. No central master. Within seconds the whole cluster converges on a consistent view.
+
+### Tombstones
+
+Deletes are **tombstones** (markers, not in-place removals). Compaction physically removes them after `gc_grace_seconds` (default 10 days, so anti-entropy can converge). Heavy delete + read patterns can pile tombstones and slow scans dramatically.
+
+### Lightweight Transactions (LWT)
+
+Cassandra `IF` clauses (`UPDATE ... IF status = 'OPEN'`) use **Paxos**. Strong consistency for single partition, but **4× slower** than normal writes. Use only when you must.
+
+### Scylla differences
+
+- C++, shard-per-core architecture (no shared state across cores) — saturates modern hardware.
+- Same CQL protocol and data model.
+- Often 5–10× throughput of Cassandra on the same hardware.
+- Better tail latency.
+- Drop-in for Cassandra clients in most cases.
+
+## How it works (a write at QUORUM, RF=3)
+
+```
+Client → Coordinator (any node, ideally token-aware)
+  Coordinator forwards write to all 3 replicas
+  Each replica: commit log + memtable
+  When 2 of 3 ack → write returns to client
+  3rd may lag; hinted handoff if it was down
+```
+
+## Real-world examples
+
+- **Instagram**: feed timeline storage (huge write throughput).
+- **Discord**: messages — migrated from MongoDB → Cassandra → **ScyllaDB**. Wrote a great blog on why.
+- **Netflix**: countless services on Cassandra (watch history, customer events).
+- **Apple**: famously runs huge Cassandra clusters (100K+ nodes total).
+- **eBay, Uber, Spotify**: heavy Cassandra users for various workloads.
+
+## Common pitfalls
+
+- **Unbounded partition growth**: `PARTITION KEY = user_id` and a user with 100M events → one node carrying 50 GB of one partition → GC pauses, slow reads. Bucket the partition (`(user_id, day)`).
+- **`ALLOW FILTERING`**: forces scatter-gather across all nodes — production-killer. Treat it as a code-review red flag.
+- **Tombstone-heavy reads**: deleting many rows then querying the same partition → query scans tombstones. Reshape to TTL or time-bucket partitions.
+- **Read-modify-write**: at default consistency, lost updates. Use LWT (slow) or CRDT-style commutative writes (counter, set).
+- **Joining at the application layer**: bad fit for Cassandra. Denormalize at write time.
+- **Choosing Cassandra for low-write OLTP**: massive operational overhead vs Postgres.
+
+## Interview questions
+
+### Q1 — Easy: What's a partition key vs clustering key?
+Partition key determines which node stores the row (via hashing onto the ring). Clustering key determines the order within a partition. Together they form the primary key.
+
+### Q2 — Easy: Why is Cassandra eventually consistent?
+Writes go to multiple replicas asynchronously; replicas can diverge. With sufficient quorum on reads and writes (`R + W > RF`), you get strong consistency for those operations, but the default is tunable and often eventual.
+
+### Q3 — Medium: Explain `R + W > RF`.
+With replication factor RF, if your write hits W replicas and read consults R replicas, you're guaranteed the read overlaps with at least one node that has the write. RF=3, W=2, R=2 — quorum-style — gives strong consistency.
+
+### Q4 — Medium: How does Cassandra detect and repair divergence?
+Three mechanisms: (1) **Hinted handoff** — coordinator stores writes for down nodes and replays them. (2) **Read repair** — if read responses disagree, the coordinator picks the latest and propagates to others. (3) **Anti-entropy repair** (`nodetool repair`) — periodic Merkle-tree comparison across replicas, sync up the diffs. Must run before `gc_grace_seconds` to avoid resurrected tombstones.
+
+### Q5 — Medium: Why do tombstones cause problems?
+Deletes don't physically remove data — they write a marker (tombstone). Reads must skip them. Heavy delete + range scan = scanning thousands of tombstones for every query → slow + memory pressure. Mitigate with TTL-only deletes, time-windowed partitions, or compaction tuning (TWCS).
+
+### Q6 — Hard: Design a Cassandra schema for a chat app — users, channels, messages.
+```cql
+CREATE TABLE messages_by_channel (
+  channel_id uuid,
+  bucket_day text,           -- e.g., '2026-05-29' for partition bounding
+  message_id timeuuid,
+  user_id uuid,
+  body text,
+  PRIMARY KEY ((channel_id, bucket_day), message_id)
+) WITH CLUSTERING ORDER BY (message_id DESC);
+```
+Bucket by day to bound partition size. Newest-first ordering for fast tail reads. For "all messages by user," create a second denormalized table keyed by `user_id`.
+
+### Q7 — Hard: A Cassandra cluster has one node with 3× the load. Why?
+- **Hot partition**: one celebrity user's data pinned to that node's range. Mitigate with bucketing.
+- **Token ranges uneven**: insufficient vnodes per node, or a node was bootstrapped with wrong tokens.
+- **Hardware variance** (older box, slow disks).
+- **Long compaction backlog** monopolizing CPU/IO. Check `nodetool compactionstats`.
+
+### Q8 — Hard: Why did Discord migrate to ScyllaDB?
+Cassandra's JVM GC pauses caused p99 spikes; their messaging service needed predictable latency at huge scale. Scylla's shard-per-core C++ design eliminated GC, gave them 5–10× throughput per node, and dropped p99 dramatically. The CQL compatibility meant minimal application changes.
+
+## TL;DR cheat sheet
+
+- Wide-column data model: `((partition), clustering)` primary key.
+- LSM tree storage: memtable → SSTables → compaction.
+- Token ring + consistent hashing + vnodes. RF copies per partition.
+- Tunable consistency per operation. `R + W > RF` for strong.
+- Reads: bloom filters + partition index + SSTable scan + merge.
+- Tombstones live `gc_grace_seconds` (10 days default). Repair before that.
+- Avoid: unbounded partitions, `ALLOW FILTERING`, read-modify-write at low consistency, joins.
+- Scylla: same model, C++ + shard-per-core → much higher throughput.
+
+## Go deeper
+
+- **DataStax Academy**: [datastax.com/learn](https://www.datastax.com/learn) (free Cassandra courses).
+- **Scylla University**: [university.scylladb.com](https://university.scylladb.com/) (free, equivalent to DataStax for Scylla).
+- **DDIA Chapters 2 and 5**.
+- **Discord engineering blog**: [How Discord Stores Trillions of Messages](https://discord.com/blog/how-discord-stores-trillions-of-messages) (Cassandra → Scylla).
+- **Cassandra docs**: [cassandra.apache.org/doc](https://cassandra.apache.org/doc/latest/) — especially data modeling and operations.
+- **Talk**: "Cassandra Data Modeling for Beginners and Experts" — search the DataStax Accelerate playlists.
+- **Book**: *Cassandra: The Definitive Guide* (Carpenter & Hewitt).
