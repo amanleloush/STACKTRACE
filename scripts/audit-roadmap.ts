@@ -35,7 +35,7 @@ async function listMdx(dir: string): Promise<string[]> {
 }
 
 async function main(): Promise<void> {
-  const index = await readFile(path.join(DIST, 'index.html'));
+  const index = await readFile(path.join(DIST, 'roadmap', 'index.html'));
 
   const sysFiles = (await listMdx(path.join(REPO, 'src/content/notes'))).length;
   const dsaFiles = (await listMdx(path.join(REPO, 'src/content/dsa'))).length;
