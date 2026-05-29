@@ -1,0 +1,193 @@
+---
+title: "Kafka: Topics, Partitions, Consumer Groups, ISR"
+phase: "04-messaging-kafka"
+order: 18
+tags: ["messaging"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 8
+prerequisites: []
+---
+
+## Definition (interview-ready)
+
+**Apache Kafka** is a distributed, append-only commit log treated as a durable publish-subscribe system. Producers write to **topics** which are split into ordered **partitions** stored across brokers and replicated for HA. Consumers belong to **consumer groups** which load-balance partitions and track per-partition offsets. The **In-Sync Replica (ISR)** set is the subset of replicas caught up to the leader — Kafka acks writes against this set.
+
+## Why it matters
+
+Kafka is the de facto event backbone for most modern data systems — a stream of business events that powers analytics, CDC, ML feature pipelines, eventual-consistency between microservices. Understanding partitions, ordering, ISR, and consumer offsets is the difference between "we have Kafka" and "we know what Kafka guarantees."
+
+<Anim id="kafka" />
+
+## Core concepts
+
+### Topic, partition, offset
+
+- **Topic**: a named stream (e.g., `orders.created`).
+- **Partition**: an ordered, immutable sequence of records inside a topic. Number of partitions = unit of parallelism. Fixed at topic creation (can grow, can't easily shrink).
+- **Offset**: monotonic integer per partition identifying a record. Consumers commit offsets to remember where they left off.
+
+```
+Topic: orders.created  (3 partitions)
+
+Partition 0: [m0][m1][m2][m3]...
+Partition 1: [m0][m1][m2]...
+Partition 2: [m0][m1][m2][m3][m4]...
+```
+
+**Ordering** is per partition only — never across the whole topic. So **partition key** matters: choose it to keep related events together (e.g., `order_id`).
+
+### Brokers
+
+- A broker is one Kafka server. A cluster has many.
+- Each partition has one **leader** and N-1 **followers** (replicas). All reads/writes go through the leader.
+- Followers continuously fetch from the leader. The set caught up within `replica.lag.time.max.ms` = **In-Sync Replicas (ISR)**.
+
+### Producer
+
+- Sends records to a broker; the broker forwards to the partition leader (or producer can target directly if it knows the partition).
+- Partition selection:
+  - Explicit `key` → `hash(key) % numPartitions`.
+  - No key → round-robin / sticky partitioner (avoids tiny batches).
+- Acks: `acks=0` (fire-and-forget), `acks=1` (leader only), `acks=all` (all ISR — strongest, recommended).
+- **Idempotent producer** (`enable.idempotence=true`): producer dedupes retries within a session via producer ID + sequence number.
+
+### Consumer & consumer groups
+
+- A consumer group is a set of consumers sharing the work of consuming a topic.
+- Each partition is assigned to **exactly one** consumer within the group (others are idle for that partition).
+- Adding consumers ≤ partitions scales throughput; beyond that, they sit idle.
+- Each consumer commits offsets per partition; group state stored in the internal `__consumer_offsets` topic.
+
+```
+Topic with 3 partitions:
+  Group A (2 consumers): C1 gets partitions 0,1; C2 gets partition 2.
+  Group A (4 consumers): C1=0, C2=1, C3=2, C4=idle.
+  Group B (1 consumer):  consumes all 3 partitions independently of A.
+```
+
+### Replication & ISR
+
+- `replication.factor=3` → each partition replicated on 3 brokers.
+- **ISR** = leader + followers caught up. Min ISR (`min.insync.replicas=2` typical) sets the durability floor.
+- Producer with `acks=all` waits until min ISR ack the write. If ISR drops below min, producer gets error → either retry or give up (depending on idempotence and retries config).
+- On leader failure, a new leader is elected from the ISR.
+- **Unclean leader election** (off by default): if no ISR left, allow an out-of-sync replica to become leader → potential data loss. Off in production.
+
+### Retention
+
+- Time-based: keep records for N days (e.g., 7).
+- Size-based: keep up to N GB per partition.
+- **Compacted topics**: retain only the latest value per key (used for state, e.g., CDC change topics, Kafka Streams state).
+- Records past retention are deleted (or compacted away).
+
+### Why Kafka is fast
+
+- Append-only sequential writes to disk → SSDs love this.
+- Zero-copy `sendfile` from disk to socket — no userspace copy.
+- Page cache for reads (OS-managed). Consumers reading recent data hit RAM.
+- Batched producers, batched compression.
+- No per-message broker work (no fanout to N consumers — each consumer pulls).
+
+### Kafka without ZooKeeper: KRaft
+
+- Until Kafka 3.x, Kafka used ZooKeeper for metadata.
+- **KRaft** (Kafka Raft) mode — Kafka manages its own metadata via internal Raft consensus. ZooKeeper-free since 3.3 (production-ready) and default in newer setups.
+
+## How it works (a write/read)
+
+```
+Write:
+  Producer P → calls send(topic, key, value)
+  P picks partition: hash(key) % N
+  P sends to leader broker B0
+  B0 appends to log file, replicates to ISR
+  When acks=all and min.insync.replicas met → ack to producer
+
+Read (consumer group G):
+  G's coordinator assigns partitions to G's consumers
+  Each consumer fetches from its partition's leader, in offset order
+  Consumer processes records, periodically commits offset
+  On rebalance (consumer joins/leaves), partitions re-assigned
+```
+
+## Real-world examples
+
+- **LinkedIn**: birthplace of Kafka; activity events, change capture, metrics.
+- **Uber**: 4+ trillion messages/day; trip events, surge pricing, ETA recalc.
+- **Netflix**: keystone pipeline — events ingested via Kafka, fed to S3 / data warehouses.
+- **Robinhood, Pinterest, Shopify**: core event bus.
+- **Confluent**: company started by Kafka creators; offers managed Kafka.
+
+## Common pitfalls
+
+- **Wrong partition key**: causes hotspots (one partition gets all writes for the celebrity user).
+- **Too few partitions**: caps consumer parallelism. Increase upfront if growth expected.
+- **Too many partitions**: per-partition overhead (file handles, fetcher threads). Best practice: < 4000 per broker.
+- **`acks=1` + leader failover** = data loss. Use `acks=all`.
+- **Min.insync.replicas=1**: defeats `acks=all` durability. Use ≥ 2.
+- **Long-running consumer callbacks**: blocks the poll loop; consumer kicked out of group. Decouple work from poll.
+- **Auto-commit offsets**: commits before message processed → message loss on crash. Use manual commit after processing.
+- **No DLQ for poison messages**: a single un-deserializable message stalls the consumer forever.
+- **Ordering relied upon across the topic**: only within a partition. If you need global order, you need 1 partition (no scaling).
+- **Producer not idempotent + retries**: duplicate records on transient errors. Always enable idempotence (default in newer clients).
+
+## Interview questions
+
+### Q1 — Easy: Why do Kafka topics have partitions?
+Partitions are the unit of parallelism. Producers can write in parallel to different partitions; consumers in a group can each own different partitions. Without partitions, throughput would be capped at one consumer/producer's rate.
+
+### Q2 — Easy: What is ISR?
+**In-Sync Replicas** — the set of replicas (including leader) that are caught up with the leader within `replica.lag.time.max.ms`. Producers with `acks=all` wait until min ISR ack the write. ISR is the durability boundary.
+
+### Q3 — Medium: How does Kafka guarantee ordering?
+Within a partition, records are strictly ordered by offset. Across partitions, no order guarantee. To preserve order for related records, **send them with the same key** so they go to the same partition.
+
+### Q4 — Medium: What's the difference between a consumer group and a regular subscriber?
+A consumer group is one logical consumer made of multiple processes, sharing the work — each partition consumed by exactly one process. Different consumer groups see the same messages independently. Use one group per application; different applications = different groups.
+
+### Q5 — Medium: How does Kafka achieve high throughput?
+Sequential append-only disk writes (cheap on SSD/HDD). Zero-copy reads via `sendfile`. Batching of producer requests and compression. OS page cache for warm reads. No per-message broker fanout — consumers pull.
+
+### Q6 — Hard: Producer is configured `acks=all`, `min.insync.replicas=2`, `replication.factor=3`. A broker dies. What happens to a write?
+If the dead broker was a follower (and ISR still ≥ 2), no problem — write acks. If the leader died, broker controller elects a new leader from ISR; producer retries; write acks once new leader replicates to ≥ 2 ISR (including itself). If only 1 ISR remains (below min.insync.replicas), producer gets a `NotEnoughReplicasException`. With idempotent producer, retries are safe.
+
+### Q7 — Hard: A consumer is slow processing messages and falls behind. How would you debug and fix?
+- Check **consumer lag** (`kafka-consumer-groups.sh`).
+- Look at processing time per message — is downstream the bottleneck (DB, API)?
+- Increase parallelism inside the consumer (worker pool per partition).
+- Add more consumers to the group (up to # of partitions).
+- Increase # of partitions if you've hit the ceiling.
+- Make sure poll loop isn't blocked by message processing (decouple via in-memory queue).
+- If the bottleneck is downstream, fix downstream — adding consumers won't help.
+
+### Q8 — Hard: Design a Kafka topic for clickstream events at 1M events/sec, kept for 7 days.
+- **Partitions**: ~100–200 — gives consumer parallelism and per-partition rate ~10K msgs/sec, comfortable for a single consumer.
+- **Partition key**: user_id (to maintain per-user order while spreading load).
+- **Replication factor**: 3.
+- **Retention**: 7 days.
+- **Compression**: zstd or lz4 — clickstream is repetitive.
+- **Storage**: 1M × ~500 bytes × 86400s × 7 = ~300 TB. With RF=3 = ~900 TB. Plan disk accordingly, or use tiered storage (Kafka 3.6+).
+- **Producers**: idempotent, batched, `acks=all`, `min.insync.replicas=2`.
+- **Watch**: skew on hot users → consider sub-keying or downsampling.
+
+## TL;DR cheat sheet
+
+- Topic = ordered, immutable log split into partitions across brokers.
+- Ordering only within a partition. Same key → same partition.
+- Producer: choose `acks=all`, idempotence on, sensible batch size.
+- Consumer group: each partition consumed by one consumer in the group. Add consumers ≤ partitions to scale.
+- ISR: caught-up replicas. `min.insync.replicas` is your durability floor.
+- Replication factor 3, `acks=all`, `min.insync.replicas=2` = standard production setting.
+- Retention by time or size; compacted topics keep latest per key.
+- Speed: sequential I/O, zero-copy, OS page cache, batching, compression.
+- KRaft replaces ZooKeeper since Kafka 3.x.
+
+## Go deeper
+
+- **ByteByteGo**: ["Kafka deep dive"](https://www.youtube.com/watch?v=UNUz1-msbOM), ["Kafka 101"](https://blog.bytebytego.com/p/ep126-the-ultimate-kafka-101-you).
+- **Confluent**: [docs.confluent.io](https://docs.confluent.io/) — the canonical reference.
+- **Hussein Nasser**: Kafka internals on YouTube.
+- **Book**: *Kafka: The Definitive Guide* (Narkhede, Shapira, Palino) — by Confluent founders.
+- **Jay Kreps**: ["The Log: What every software engineer should know about real-time data's unifying abstraction"](https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying) — foundational.
+- **Martin Kleppmann**: ["Turning the database inside-out"](https://www.youtube.com/watch?v=fU9hR3kiOK0) (Strange Loop).
