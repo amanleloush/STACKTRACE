@@ -47,11 +47,23 @@ export interface OverrideRecord {
 
 export async function getEntitlement(db: Db, userId: string | null): Promise<Tier> {
   if (!userId) return 'free';
-  const row = await db.first<{ tier: string }>(
-    'SELECT tier FROM subscriptions WHERE user_id = ?',
+  const row = await db.first<{
+    tier: string;
+    status: string;
+    current_period_end: number | null;
+  }>(
+    'SELECT tier, status, current_period_end FROM subscriptions WHERE user_id = ?',
     [userId],
   );
-  return row?.tier === 'pro' ? 'pro' : 'free';
+  if (!row || row.tier !== 'pro') return 'free';
+  // cancelled_at_period_end keeps access until current_period_end elapses
+  // (plan §14d). After that, the user's tier is effectively free even
+  // though the row still says 'pro' — webhook would normally flip it
+  // when subscription.completed fires, but we handle the lapse defensively.
+  if (row.status === 'cancelled_at_period_end' && row.current_period_end != null) {
+    if (row.current_period_end < Math.floor(Date.now() / 1000)) return 'free';
+  }
+  return 'pro';
 }
 
 async function getOverride(db: Db, kind: EntityKind, id: string): Promise<OverrideRow | null> {
