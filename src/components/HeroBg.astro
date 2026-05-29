@@ -1,0 +1,159 @@
+---
+// Minimalist background animation for the landing hero.
+// Six nodes around a ring, sparse edges between them, three slow pulses
+// constantly traveling along random edges. Theme-aware, paused when the
+// hero scrolls off-screen, fully respects prefers-reduced-motion.
+//
+// SSR renders the static graph (so the page is never blank); a tiny
+// script animates the pulse positions client-side.
+---
+<div class="hero-bg" aria-hidden="true">
+  <svg
+    class="hero-bg__svg"
+    viewBox="0 0 800 400"
+    preserveAspectRatio="xMidYMid slice"
+  >
+    <!-- Six nodes around a ring (positions hand-picked, deterministic). -->
+    <g class="hero-bg__edges" data-edges>
+      <line x1="200" y1="120" x2="400" y2="80"  data-edge="0-1" />
+      <line x1="400" y1="80"  x2="600" y2="120" data-edge="1-2" />
+      <line x1="600" y1="120" x2="600" y2="280" data-edge="2-3" />
+      <line x1="600" y1="280" x2="400" y2="320" data-edge="3-4" />
+      <line x1="400" y1="320" x2="200" y2="280" data-edge="4-5" />
+      <line x1="200" y1="280" x2="200" y2="120" data-edge="5-0" />
+      <line x1="200" y1="120" x2="600" y2="280" data-edge="0-3" />
+      <line x1="600" y1="120" x2="200" y2="280" data-edge="2-5" />
+      <line x1="400" y1="80"  x2="400" y2="320" data-edge="1-4" />
+    </g>
+    <g class="hero-bg__nodes" data-nodes>
+      <circle cx="200" cy="120" r="8" data-node="0" />
+      <circle cx="400" cy="80"  r="8" data-node="1" />
+      <circle cx="600" cy="120" r="8" data-node="2" />
+      <circle cx="600" cy="280" r="8" data-node="3" />
+      <circle cx="400" cy="320" r="8" data-node="4" />
+      <circle cx="200" cy="280" r="8" data-node="5" />
+    </g>
+    <g class="hero-bg__pulses" data-pulses>
+      <circle r="5" cx="200" cy="120" data-pulse="0" />
+      <circle r="5" cx="600" cy="120" data-pulse="1" />
+      <circle r="5" cx="400" cy="320" data-pulse="2" />
+    </g>
+  </svg>
+</div>
+
+<style>
+  .hero-bg {
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    overflow: hidden;
+  }
+  .hero-bg__svg {
+    width: 100%;
+    height: 100%;
+    opacity: 0.55;
+  }
+  .hero-bg__edges line {
+    stroke: var(--primary-light);
+    stroke-width: 1;
+    opacity: 0.18;
+  }
+  .hero-bg__nodes circle {
+    fill: var(--primary-light);
+    opacity: 0.35;
+  }
+  .hero-bg__pulses circle {
+    fill: var(--accent);
+    filter: drop-shadow(0 0 8px var(--accent));
+    opacity: 0.85;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .hero-bg__pulses circle { display: none; }
+  }
+</style>
+
+<script>
+  // Six-node ring, same coordinates as the SSR markup above. Pulses
+  // travel from one node to another, then pick a new neighbor and
+  // continue. Three pulses run in parallel, offset in time.
+  const NODES: Array<[number, number]> = [
+    [200, 120], [400, 80], [600, 120],
+    [600, 280], [400, 320], [200, 280],
+  ];
+  const ADJ: number[][] = [
+    [1, 5, 3],    // 0
+    [0, 2, 4],    // 1
+    [1, 3, 5],    // 2
+    [2, 4, 0],    // 3
+    [3, 5, 1],    // 4
+    [4, 0, 2],    // 5
+  ];
+
+  for (const hero of document.querySelectorAll<HTMLElement>('.hero-bg')) {
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) continue;
+    const pulses = Array.from(hero.querySelectorAll<SVGCircleElement>('[data-pulse]'));
+
+    interface PulseState { from: number; to: number; start: number; offset: number }
+    const state: PulseState[] = pulses.map((_, i) => ({
+      from: i * 2 % NODES.length,
+      to: (i * 2 + 1) % NODES.length,
+      start: performance.now(),
+      offset: i * 750,
+    }));
+
+    let paused = false;
+    let rafId: number | null = null;
+
+    function nextHop(s: PulseState): void {
+      const neighbors = ADJ[s.to]!;
+      // Pick a neighbor that isn't the one we just came from.
+      const choices = neighbors.filter((n) => n !== s.from);
+      const next = choices[Math.floor(Math.random() * choices.length)] ?? neighbors[0]!;
+      s.from = s.to;
+      s.to = next;
+      s.start = performance.now();
+    }
+
+    const DURATION = 2200;
+    function tick(now: number): void {
+      if (paused) {
+        rafId = null;
+        return;
+      }
+      for (let i = 0; i < pulses.length; i++) {
+        const s = state[i]!;
+        const t = now - s.start - s.offset;
+        if (t < 0) continue;
+        const u = Math.min(1, t / DURATION);
+        const [x1, y1] = NODES[s.from]!;
+        const [x2, y2] = NODES[s.to]!;
+        pulses[i]!.setAttribute('cx', String(x1 + (x2 - x1) * u));
+        pulses[i]!.setAttribute('cy', String(y1 + (y2 - y1) * u));
+        if (u >= 1) {
+          s.offset = 0;
+          nextHop(s);
+        }
+      }
+      rafId = requestAnimationFrame(tick);
+    }
+    rafId = requestAnimationFrame(tick);
+
+    // Pause when the hero scrolls off-screen.
+    const io = new IntersectionObserver(
+      (entries) => {
+        for (const e of entries) {
+          paused = !e.isIntersecting;
+          if (!paused && rafId === null) {
+            rafId = requestAnimationFrame(tick);
+          } else if (paused && rafId !== null) {
+            cancelAnimationFrame(rafId);
+            rafId = null;
+          }
+        }
+      },
+      { threshold: 0.01 },
+    );
+    io.observe(hero);
+  }
+</script>
