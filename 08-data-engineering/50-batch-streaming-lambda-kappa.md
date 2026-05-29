@@ -38,6 +38,10 @@ flowchart LR
 
 Use when: latency in hours is acceptable, large aggregations, business intelligence, historical reports, ML training.
 
+The canonical batch model is **MapReduce** (Dean & Ghemawat, 2004). Input is sharded across cluster nodes; each shard goes through a `map` function that emits `(key, value)` pairs; the framework **shuffles** all values for the same key onto the same reducer; reducers fold each group into the final output. Every batch engine you use today — Spark, Flink batch mode, Hive on Tez — is some descendant of this shape, just with more in-memory tricks and smarter DAG planning.
+
+<div class="sde-anim" data-anim="mapreduce"></div>
+
 ### Stream processing
 
 - Data continuously processed event-by-event.

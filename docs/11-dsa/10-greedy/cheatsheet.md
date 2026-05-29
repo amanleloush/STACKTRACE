@@ -1,0 +1,88 @@
+---
+title: Greedy — cheatsheet
+---
+
+# Greedy · Cheatsheet
+
+> One-page recall. Print, paste in Notion, glance before the interview.
+
+## Trigger
+**You see in the problem:** "intervals — merge / non-overlap / minimum rooms", "jump / reach", "schedule activities", "gas station / circular", "minimum coins (canonical coins)", "Huffman coding".
+
+**Reach for this pattern when:**
+- You can prove that **picking the locally optimal choice at each step yields a global optimum** (exchange argument).
+- There's an obvious **sort order** that makes the right choice trivial — by end time, by start time, by ratio, by deadline.
+- DP would work but feels overkill; the problem has a slick one-pass solution.
+
+**Don't reach for it when:**
+- You can't justify why greedy works — try a small counterexample. If it fails, you need DP.
+- "Min coins" with arbitrary denominations (not canonical) — greedy fails; use DP.
+- The problem has lots of constraints interacting — greedy rarely handles coupled constraints.
+
+## The mental model
+**Sort** by the right key. **Sweep** through items once, maintaining minimal state, **commit** to a choice each step. Correctness comes from an **exchange argument**: swapping greedy's pick for any alternative can't improve the result. If you can't sketch that argument, you don't have a greedy problem.
+
+## Skeleton
+
+```python
+# Activity selection — pick non-overlapping intervals to maximize count
+def activity_selection(intervals):
+    intervals.sort(key=lambda x: x[1])     # sort by END time
+    count, last_end = 0, float('-inf')
+    for s, e in intervals:
+        if s >= last_end:
+            count += 1
+            last_end = e
+    return count
+
+# Merge intervals
+def merge(intervals):
+    intervals.sort()                       # by start
+    out = [intervals[0]]
+    for s, e in intervals[1:]:
+        if s <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e])
+    return out
+
+# Jump game — track farthest reachable
+def can_jump(nums):
+    far = 0
+    for i, v in enumerate(nums):
+        if i > far: return False
+        far = max(far, i + v)
+    return True
+```
+
+## Complexity
+- Time: **O(n log n)** (the sort dominates) or **O(n)** if no sort needed.
+- Space: **O(1)** to **O(n)** depending on output.
+
+## Variants in this pattern
+1. **Interval scheduling** — sort by end time, pick greedily.
+2. **Merge / insert intervals** — sort by start, sweep, extend the current window.
+3. **Greedy reachability** — track farthest index reachable (jump game I/II).
+4. **Resource scheduling** — heap + greedy (meeting rooms, task scheduler).
+5. **Two-pointer greedy** — gas station, candy distribution.
+6. **Huffman / coding** — repeatedly merge two smallest using min-heap.
+
+## Top problems
+- [LC 435 — Non-overlapping Intervals](https://leetcode.com/problems/non-overlapping-intervals/) (Med) — sort by end, count keepers.
+- [LC 56 — Merge Intervals](https://leetcode.com/problems/merge-intervals/) (Med) — sort by start, fold.
+- [LC 252 — Meeting Rooms](https://leetcode.com/problems/meeting-rooms/) (Easy) — sort + check overlap.
+- [LC 253 — Meeting Rooms II](https://leetcode.com/problems/meeting-rooms-ii/) (Med) — min-heap of end times, count active.
+- [LC 55 — Jump Game](https://leetcode.com/problems/jump-game/) (Med) — running farthest.
+- [LC 45 — Jump Game II](https://leetcode.com/problems/jump-game-ii/) (Med) — BFS-like greedy on jump frontier.
+- [LC 134 — Gas Station](https://leetcode.com/problems/gas-station/) (Med) — running tank; if negative, restart from `i+1`.
+
+## Common bugs / pitfalls
+- **Wrong sort key** — for interval scheduling, sort by **end** time (not start, not length).
+- **Strict vs non-strict overlap**: does `[1,2]` and `[2,3]` overlap? Read the problem carefully — `s >= last_end` vs `s > last_end`.
+- **Greedy that "feels right" but isn't** — coin change with `{1, 3, 4}` and target 6: greedy picks `4+1+1`, optimal is `3+3`. Always sanity check.
+- **Forgetting tiebreaks** — when multiple intervals end at the same time, the order may matter for downstream constraints.
+- **Off-by-one in jump game** — once `i > far`, you're stuck; check *before* updating.
+- **Gas station — sum-check shortcut**: total gas < total cost → impossible; otherwise, exactly one valid start exists.
+
+## In 30 seconds
+Sort by the right key, sweep, commit. If you can't prove (or strongly believe) the exchange argument, switch to DP. Interval problems almost always live here.

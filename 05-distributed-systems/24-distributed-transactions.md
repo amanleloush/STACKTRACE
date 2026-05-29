@@ -57,6 +57,10 @@ Coordinator + N participants.
 - If any NO: coordinator tells all participants "abort."
 - Participants commit/abort locally and release locks.
 
+Step through the protocol below. Toggle the "force-NO from P2" button to flip the happy-path commit into a unanimous abort — the entire transaction is undone, even though P1 and P3 voted YES.
+
+<div class="sde-anim" data-anim="2pc"></div>
+
 **Pros**: atomic across participants when it works.
 
 **Cons**:

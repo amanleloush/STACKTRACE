@@ -115,6 +115,12 @@ Combine: active health checks for binary up/down, passive outlier detection for 
 - **Gossip**: instances exchange membership state P2P (Consul, Cassandra). No central registry to fail.
 - **DNS service discovery**: registry exposes DNS records (`service-x.consul`). Clients use DNS as usual but with low TTL or DNS push.
 
+#### Gossip protocols
+
+Gossip (a.k.a. epidemic) protocols spread state — membership, failure detection, configuration — by having each node periodically pick a random peer and exchange information. There's no central authority, no leader, no single point of failure. The fraction of "infected" (informed) nodes grows roughly logistically; the entire cluster converges in `O(log N)` rounds. SWIM (used by Consul, HashiCorp Serf, Memberlist) is the dominant production variant; Cassandra and DynamoDB use gossip for ring membership.
+
+<div class="sde-anim" data-anim="gossip"></div>
+
 ### Avoiding flapping
 
 A node that "barely" passes/fails health check oscillates → traffic redirects every poll → bad UX.

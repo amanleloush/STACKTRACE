@@ -2385,7 +2385,11 @@
   }
 
   // ---------- registry & mount ------------------------------------------
-  const REG = {
+  const REG = {};
+  // Expose for external extensions (animations-extra.js etc.) — call before boot().
+  window.__SDE_REG = REG;
+  window.__SDE_HELPERS = { $svg, $el, frame, btn, modeGroup: typeof modeGroup === "function" ? modeGroup : null, injectDefs, hash32, PALETTE };
+  Object.assign(REG, {
     "consistent-hash": animConsistentHash,
     "raft": animRaft,
     "bucket": animBuckets,
@@ -2406,7 +2410,7 @@
     "quorum": animQuorum,
     "hll": animHLL,
     "tcp-cwnd": animTcpCwnd,
-  };
+  });
 
   function mountAll() {
     document.querySelectorAll(".sde-anim[data-anim]").forEach(host => {

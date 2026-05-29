@@ -1,0 +1,102 @@
+---
+title: Dynamic Programming — cheatsheet
+---
+
+# Dynamic Programming · Cheatsheet
+
+> One-page recall. Print, paste in Notion, glance before the interview.
+
+## Trigger
+**You see in the problem:** "maximum / minimum / count of ways", "can you reach X", "longest / shortest / smallest of …", "optimize a sequence of decisions", "overlapping subproblems", small constraints (n ≤ 200/1000) hinting O(n²)/O(n³).
+
+**Reach for this pattern when:**
+- The problem has **optimal substructure** — the answer to size n is built from answers to smaller sizes.
+- Brute force / recursion shows **overlapping subproblems**.
+- Greedy doesn't work (you tried and found a counterexample).
+- State can be encoded as a tuple of indices / flags small enough to tabulate.
+
+**Don't reach for it when:**
+- Greedy demonstrably works (intervals, activity selection, etc.).
+- State space is too large to memoize (e.g., n=10^6 with O(n²) DP).
+- It's just a search/traversal — DFS/BFS without overlap.
+
+## The mental model
+**Define the state.** Then write the **transition** (how does dp[i] follow from previous states?). Then the **base case** and **iteration order** (top-down memo or bottom-up tabulation). The art is finding the smallest state that captures everything you need — index? two indices? bitmask of used items?
+
+## Skeleton
+
+```python
+# Top-down memoization (great default)
+from functools import cache
+
+@cache
+def f(state):
+    if base(state): return base_val
+    return best(f(next_state) for next_state in transitions(state))
+
+# Bottom-up tabulation (when you need O(1) space rolling, or recursion is slow)
+def dp_1d(arr):
+    n = len(arr)
+    dp = [0] * (n + 1)
+    dp[0] = base
+    for i in range(1, n + 1):
+        dp[i] = combine(dp[i-1], dp[i-2], arr[i-1])  # transition
+    return dp[n]
+
+# 2D DP (LCS / edit distance shape)
+def lcs(a, b):
+    m, n = len(a), len(b)
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            if a[i-1] == b[j-1]: dp[i][j] = dp[i-1][j-1] + 1
+            else:                 dp[i][j] = max(dp[i-1][j], dp[i][j-1])
+    return dp[m][n]
+
+# 0/1 knapsack (rolling 1D, iterate weight DESCENDING)
+def knapsack(weights, values, W):
+    dp = [0] * (W + 1)
+    for w, v in zip(weights, values):
+        for c in range(W, w - 1, -1):     # descending — each item once
+            dp[c] = max(dp[c], dp[c - w] + v)
+    return dp[W]
+```
+
+## Complexity
+- Time: **O(states × transitions_per_state)**. Common: O(n), O(n²), O(n·W), O(n²·m), O(2^n · n).
+- Space: same as states, often reducible to O(1) or O(n) by rolling.
+
+## Variants in this pattern
+1. **1D linear DP** — `dp[i]` depends on `dp[i-1], dp[i-2]`. Climbing stairs, house robber, Fibonacci, LIS (O(n²)), max-subarray.
+2. **2D grid / pair DP** — `dp[i][j]` from `dp[i-1][j], dp[i][j-1], dp[i-1][j-1]`. Unique paths, min path sum, LCS, edit distance.
+3. **Knapsack family** — 0/1 (iterate W descending), unbounded (iterate W ascending), bounded, multi-dimensional.
+4. **LCS / sequence-alignment** — two strings, match/skip; edit distance, distinct subsequences, regex match.
+5. **Interval DP** — `dp[i][j]` = best on subarray `[i..j]`; iterate by length. Matrix chain, burst balloons, palindrome partition (min cuts).
+6. **Bitmask DP** — state = subset of items; useful when n ≤ ~20. TSP, assignment, subset sum with structure.
+7. **Tree DP** — post-order accumulation: `f(node)` from `f(child)`. House robber III, diameter, distributing coins.
+8. **Digit DP** — counting numbers with property in [L, R]; state = (position, tight, leading_zero, carry).
+
+## Top problems
+- [LC 70 — Climbing Stairs](https://leetcode.com/problems/climbing-stairs/) (Easy) — the Fibonacci shape; baseline 1D DP.
+- [LC 198 — House Robber](https://leetcode.com/problems/house-robber/) (Med) — pick/skip, O(1) space.
+- [LC 322 — Coin Change](https://leetcode.com/problems/coin-change/) (Med) — unbounded knapsack on min coins.
+- [LC 300 — Longest Increasing Subsequence](https://leetcode.com/problems/longest-increasing-subsequence/) (Med) — O(n²) DP, O(n log n) patience sort.
+- [LC 1143 — Longest Common Subsequence](https://leetcode.com/problems/longest-common-subsequence/) (Med) — classic 2D.
+- [LC 72 — Edit Distance](https://leetcode.com/problems/edit-distance/) (Med) — insert/delete/replace transitions.
+- [LC 416 — Partition Equal Subset Sum](https://leetcode.com/problems/partition-equal-subset-sum/) (Med) — 0/1 knapsack on boolean.
+- [LC 312 — Burst Balloons](https://leetcode.com/problems/burst-balloons/) (Hard) — interval DP; iterate by length, pick the *last* balloon to burst.
+- [LC 139 — Word Break](https://leetcode.com/problems/word-break/) (Med) — `dp[i] = any(dp[j] and s[j:i] in dict)`.
+- [LC 132 — Palindrome Partitioning II](https://leetcode.com/problems/palindrome-partitioning-ii/) (Hard) — min cuts; precompute palindrome table.
+
+## Common bugs / pitfalls
+- **Wrong state** — too small (can't represent enough info) or too large (TLE). Sketch the transition first; the state pops out.
+- **0/1 knapsack with ascending weight loop** → item used multiple times (becomes unbounded). Iterate weight **descending**.
+- **Iteration order for 2D DP** — make sure all dependencies are filled first. Fill row by row, column by column, by length, etc.
+- **Off-by-one between 1-indexed DP table and 0-indexed input** — `dp[i][j]` uses `a[i-1]`, `b[j-1]`.
+- **Base case omitted** — `dp[0][0] = 0` (or 1, depending) is load-bearing in 2D tables.
+- **Memoization key isn't hashable** — use tuples, not lists; `@cache` requires hashability.
+- **Forgetting to reconstruct the path** when asked "what is the actual subsequence", not just length — store choices or backtrack from the table.
+- **Interval DP wrong direction** — iterate by **increasing length**, not increasing `i`.
+
+## In 30 seconds
+State + transition + base case + iteration order. If recursion repeats the same subproblem, slap `@cache` on it; convert to tabulation only when you need O(1) space rolling or recursion is too slow.

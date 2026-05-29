@@ -83,6 +83,10 @@ Each node is one of: **Follower**, **Candidate**, **Leader**.
 
 Logs grow unboundedly. Periodically take a snapshot of state and discard log entries before the snapshot index. New followers receive snapshot + log tail to catch up.
 
+Without snapshots, restart cost grows linearly with cluster lifetime — replay every operation since genesis. With snapshots, restart cost is `O(snapshot size + |tail|)`. The same idea shows up in Kafka log compaction, RocksDB SST files, and Redis RDB persistence. The animation below shows ops appending to a log, then a periodic snapshot freezing state and discarding the prefix.
+
+<div class="sde-anim" data-anim="snapshot"></div>
+
 #### Cluster membership changes
 
 Done in two steps via **joint consensus** to avoid two majority cliques: old config + new config briefly both active until the transition commits.
@@ -96,6 +100,10 @@ Done in two steps via **joint consensus** to avoid two majority cliques: old con
 
 Paxos is **algorithmically equivalent in safety/availability to Raft** but harder to understand and implement. Hence Raft's popularity.
 
+The animation below walks through single-decree Paxos one step at a time. The proposer picks a ballot number `n`, sends `Prepare(n)`; a quorum of acceptors promises not to entertain ballots `< n` and reports anything they've already accepted; the proposer then sends `Accept(n, v)`; a quorum accepts; learners learn. The "highest-numbered prior value wins" rule is what guarantees safety across proposer crashes.
+
+<div class="sde-anim" data-anim="paxos"></div>
+
 ### Variants and alternatives
 
 - **Multi-Paxos**: Paxos for a log of decisions.
@@ -108,6 +116,12 @@ Paxos is **algorithmically equivalent in safety/availability to Raft** but harde
 
 - **Safety**: nothing bad happens (no two leaders, no committed-then-lost entry). Always preserved by Raft/Paxos.
 - **Liveness**: progress eventually. Depends on timely networks; can stall during long partitions or split votes.
+
+### Leader election (Bully algorithm)
+
+Raft uses randomized timeouts; the older **Bully algorithm** picks the highest-numbered alive node as leader deterministically. When a lower-ID node notices the leader is gone, it sends `ELECTION` to all higher IDs. Anyone alive replies `OK` and starts their own election. The highest ID with no one above it broadcasts `COORDINATOR`. The animation visualizes the cascade — crash the leader and watch the election ripple upward.
+
+<div class="sde-anim" data-anim="leader-election"></div>
 
 ## How it works (Raft log replication)
 

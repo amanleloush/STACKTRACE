@@ -1,0 +1,94 @@
+---
+title: BFS — cheatsheet
+---
+
+# BFS · Cheatsheet
+
+> One-page recall. Print, paste in Notion, glance before the interview.
+
+## Trigger
+**You see in the problem:** "shortest path in **unweighted** graph", "minimum steps / minimum moves", "level order of a tree", "shortest mutation/transformation sequence", "rot all oranges / flood from multiple sources".
+
+**Reach for this pattern when:**
+- Edges are **unweighted** (or all edges have equal weight) and you need shortest path.
+- The problem asks for "minimum number of steps" in a grid/state space.
+- You need a **level-by-level** traversal (binary tree level order, layered processing).
+- Multiple starting points need to spread simultaneously (multi-source BFS).
+
+**Don't reach for it when:**
+- Edges are weighted (different costs) → use Dijkstra.
+- You need to enumerate all paths or do a constraint search → DFS / backtracking.
+- Memory is tight and the graph is huge — BFS queue can balloon.
+
+## The mental model
+A queue + a `visited` set. Pop a node, push its unseen neighbors with `dist + 1`. BFS layers expand outward from the source like a wavefront — the first time you reach a node, you've reached it in the **fewest steps**. That's the whole invariant.
+
+## Skeleton
+
+```python
+from collections import deque
+
+def bfs_shortest(start, target, neighbors):
+    q = deque([(start, 0)])
+    seen = {start}
+    while q:
+        node, dist = q.popleft()
+        if node == target: return dist
+        for nxt in neighbors(node):
+            if nxt not in seen:
+                seen.add(nxt)
+                q.append((nxt, dist + 1))
+    return -1
+
+# Level-order traversal (tree)
+def level_order(root):
+    if not root: return []
+    q, levels = deque([root]), []
+    while q:
+        level = []
+        for _ in range(len(q)):       # snapshot size = this level
+            node = q.popleft()
+            level.append(node.val)
+            if node.left:  q.append(node.left)
+            if node.right: q.append(node.right)
+        levels.append(level)
+    return levels
+
+# Multi-source BFS (e.g., rotting oranges)
+def multi_source(grid, sources):
+    q = deque((r, c, 0) for r, c in sources)
+    seen = set(sources)
+    # ... same loop, just multiple starting points
+```
+
+## Complexity
+- Time: **O(V + E)** for graphs; **O(rows × cols)** for grids.
+- Space: **O(V)** for queue + visited set.
+
+## Variants in this pattern
+1. **Single-source shortest path (unweighted)** — the canonical BFS.
+2. **Grid BFS** — 4- or 8-directional movement, `visited` matrix.
+3. **Level-order tree traversal** — process one level at a time using queue snapshots.
+4. **Multi-source BFS** — seed the queue with all sources at distance 0.
+5. **0-1 BFS** — deque, push-front for 0-weight edges, push-back for 1-weight. O(V+E).
+6. **Bidirectional BFS** — search from both ends, meet in middle (word ladder).
+
+## Top problems
+- [LC 102 — Binary Tree Level Order Traversal](https://leetcode.com/problems/binary-tree-level-order-traversal/) (Med) — canonical level loop.
+- [LC 200 — Number of Islands](https://leetcode.com/problems/number-of-islands/) (Med) — flood fill (BFS or DFS).
+- [LC 994 — Rotting Oranges](https://leetcode.com/problems/rotting-oranges/) (Med) — multi-source, time = max distance.
+- [LC 127 — Word Ladder](https://leetcode.com/problems/word-ladder/) (Hard) — shortest transformation in word graph; bidirectional speeds it up.
+- [LC 542 — 01 Matrix](https://leetcode.com/problems/01-matrix/) (Med) — multi-source from all zeros.
+- [LC 1091 — Shortest Path in Binary Matrix](https://leetcode.com/problems/shortest-path-in-binary-matrix/) (Med) — grid BFS, 8 directions.
+- [LC 752 — Open the Lock](https://leetcode.com/problems/open-the-lock/) (Med) — state-space BFS.
+
+## Common bugs / pitfalls
+- **Marking visited on pop instead of push** — same node enters queue many times, blows memory and re-processes.
+- **Forgetting visited on the source** — adds source's neighbors, re-adds source, infinite-ish loop.
+- **Using `list.pop(0)`** instead of `deque.popleft` — O(n) per pop turns BFS into O(n²).
+- **Wrong direction set for grids** — `[(-1,0),(1,0),(0,-1),(0,1)]` for 4-way; don't typo signs.
+- **Returning distance after the loop ends without checking** — return -1 explicitly if target unreachable.
+- **Level-order trick**: capture `len(q)` *before* the for-loop, not inside; the size changes as you push children.
+
+## In 30 seconds
+Queue + visited, expand level by level. First time you reach a node = shortest path (when edges have equal weight). For weighted edges, escalate to Dijkstra.
