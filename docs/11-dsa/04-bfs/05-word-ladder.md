@@ -1,0 +1,84 @@
+# 05 — Word Ladder
+
+> BFS • Position 5/5
+
+## Problem
+LC 127: given `beginWord`, `endWord`, and a `wordList`, return the length of the shortest transformation sequence from `beginWord` to `endWord` where each step changes exactly one letter and every intermediate word must be in `wordList`. Return 0 if no transformation exists.
+
+## Intuition
+Model each word as a graph node and connect two words with an edge if they differ by exactly one letter. The answer is the shortest path from `beginWord` to `endWord` in that graph — pure BFS. The trick that makes it efficient: don't build the full adjacency list (that's O(N² · L)). Instead, generate neighbours on the fly by trying every single-letter swap and checking against a hash set of valid words. Or pre-index by "patterns" like `h*t`, `*ot`, `ho*` so each word has 26·L → L lookups.
+
+## Algorithm
+1. Put `wordList` in a hash set `S`. If `endWord` not in `S`, return 0.
+2. BFS from `beginWord` with distance 1.
+3. For each popped word, generate every single-letter variant. If a variant is in `S` and unvisited, enqueue with `dist + 1` and remove it from `S` (visited marker).
+4. If the variant equals `endWord`, return `dist + 1`. If the queue drains, return 0.
+
+```python
+from collections import deque
+
+def ladder_length(begin, end, word_list):
+    S = set(word_list)
+    if end not in S:
+        return 0
+    q = deque([(begin, 1)])
+    while q:
+        word, d = q.popleft()
+        if word == end:
+            return d
+        for i in range(len(word)):
+            for ch in 'abcdefghijklmnopqrstuvwxyz':
+                if ch == word[i]:
+                    continue
+                nxt = word[:i] + ch + word[i+1:]
+                if nxt in S:
+                    S.remove(nxt)         # visited marker
+                    q.append((nxt, d + 1))
+    return 0
+```
+
+## Walkthrough
+`begin = "hit"`, `end = "cog"`, `wordList = ["hot","dot","dog","lot","log","cog"]`:
+
+1. Init `S = {hot, dot, dog, lot, log, cog}`. `q = [("hit", 1)]`.
+2. Pop `("hit", 1)`. Try variants: `*it`, `h*t`, `hi*`. Only `hot` is in `S`. Enqueue `("hot", 2)`, remove from `S`.
+3. Pop `("hot", 2)`. Variants find `dot` and `lot`. Enqueue both at dist 3.
+4. Pop `("dot", 3)` → finds `dog`, enqueue at dist 4.
+5. Pop `("lot", 3)` → finds `log`, enqueue at dist 4.
+6. Pop `("dog", 4)` → finds `cog`, enqueue at dist 5.
+7. Pop `("log", 4)` → `cog` already removed, skip.
+8. Pop `("cog", 5)` — matches `end`. Return 5.
+
+<div class="dsa-viz" data-algo="word-ladder"></div>
+
+## Complexity
+
+<div class="dsa-bigO">
+  <span>time <strong>O(N · L · 26)</strong></span>
+  <span>space <strong>O(N · L)</strong></span>
+</div>
+
+`N` is the word-list size, `L` is the word length. Pattern indexing reduces to O(N · L²) but with a much smaller constant.
+
+## Pitfalls
+- **Removing from the set as visited marker** is fine for LC 127, but if you need to enumerate *all* shortest paths (LC 126), you must defer removal until the level is complete — otherwise you cut off parallel paths.
+- **Always check `endWord in S` upfront** — if it's not in the list, the answer is immediately 0.
+- The branching factor is `26 · L`, not just `L`. State this in interviews when estimating cost.
+- **Bidirectional BFS** halves the effective depth: expand from `begin` and `end` simultaneously, swap to whichever frontier is smaller each step.
+- For very long words, **pattern indexing** (`h*t` → `[hot, hit, ...]`) wins decisively over the brute character swap.
+
+<div class="dsa-practice">
+  <h4>Practice — LeetCode</h4>
+  <ul>
+    <li><a href="https://leetcode.com/problems/word-ladder/">127. Word Ladder (Hard)</a> — the canonical problem.</li>
+    <li><a href="https://leetcode.com/problems/word-ladder-ii/">126. Word Ladder II (Hard)</a> — enumerate all shortest paths.</li>
+    <li><a href="https://leetcode.com/problems/open-the-lock/">752. Open the Lock (Medium)</a> — BFS on lock-combination graph.</li>
+    <li><a href="https://leetcode.com/problems/minimum-genetic-mutation/">433. Minimum Genetic Mutation (Medium)</a> — Word Ladder twin on DNA.</li>
+    <li><a href="https://leetcode.com/problems/k-similar-strings/">854. K-Similar Strings (Hard)</a> — BFS on string swaps.</li>
+    <li><a href="https://leetcode.com/problems/bus-routes/">815. Bus Routes (Hard)</a> — BFS on bus-route-as-node abstraction.</li>
+    <li><a href="https://leetcode.com/problems/sliding-puzzle/">773. Sliding Puzzle (Hard)</a> — BFS on 3×2 puzzle state.</li>
+    <li><a href="https://leetcode.com/problems/snakes-and-ladders/">909. Snakes and Ladders (Medium)</a> — BFS on board state.</li>
+    <li><a href="https://leetcode.com/problems/open-the-lock/">752. Open the Lock (Medium)</a> — bidirectional BFS variant.</li>
+    <li><a href="https://leetcode.com/problems/jump-game-iv/">1345. Jump Game IV (Hard)</a> — BFS with equal-value group teleports.</li>
+  </ul>
+</div>

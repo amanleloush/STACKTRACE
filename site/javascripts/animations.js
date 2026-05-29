@@ -54,11 +54,64 @@
     host.appendChild(readout);
     return { stage, controls, readout };
   }
+  // Shared SVG defs injected into every animation's SVG so we can reference them
+  // by id (url(#bda-soft-glow), url(#bda-aurora) etc.) for cheap polish.
+  function injectDefs(svg) {
+    if (svg.querySelector("defs[data-bda='shared']")) return;
+    const defs = $svg("defs", { "data-bda": "shared" });
+    defs.innerHTML = `
+      <linearGradient id="bda-aurora" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0%"  stop-color="#6366f1"/>
+        <stop offset="55%" stop-color="#06b6d4"/>
+        <stop offset="100%" stop-color="#34d399"/>
+      </linearGradient>
+      <linearGradient id="bda-warm" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0%"  stop-color="#fbbf24"/>
+        <stop offset="100%" stop-color="#fb7185"/>
+      </linearGradient>
+      <radialGradient id="bda-spot" cx="50%" cy="50%" r="50%">
+        <stop offset="0%"  stop-color="#a78bfa" stop-opacity="0.6"/>
+        <stop offset="100%" stop-color="#a78bfa" stop-opacity="0"/>
+      </radialGradient>
+      <filter id="bda-soft-glow" x="-50%" y="-50%" width="200%" height="200%">
+        <feGaussianBlur stdDeviation="3" result="b"/>
+        <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+      </filter>
+      <filter id="bda-shadow" x="-50%" y="-50%" width="200%" height="200%">
+        <feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#000" flood-opacity="0.3"/>
+      </filter>
+    `;
+    svg.insertBefore(defs, svg.firstChild);
+  }
   function btn(label, kind, onClick) {
     const b = $el("button", "sde-anim__btn" + (kind ? " sde-anim__btn--" + kind : ""), label);
     b.type = "button";
     b.addEventListener("click", onClick);
     return b;
+  }
+  // Segmented control: keeps the active button highlighted when clicked.
+  // items = [{label, value}], getActive returns current value, onSelect(value)
+  function modeGroup(parent, items, getActive, onSelect) {
+    const wrap = $el("div", "sde-anim__mode");
+    items.forEach(it => {
+      const b = $el("button", "sde-anim__btn", it.label);
+      b.type = "button";
+      b.dataset.value = it.value;
+      b.addEventListener("click", () => {
+        onSelect(it.value);
+        refresh();
+      });
+      wrap.appendChild(b);
+    });
+    function refresh() {
+      const active = getActive();
+      [...wrap.children].forEach(b => {
+        b.classList.toggle("sde-anim__btn--primary", b.dataset.value === active);
+      });
+    }
+    refresh();
+    parent.appendChild(wrap);
+    return refresh;
   }
 
   // =====================================================================
@@ -836,9 +889,16 @@
       });
     }
 
-    ["aside", "through", "back", "around"].forEach(m => {
-      controls.appendChild(btn(m, mode === m ? "primary" : null, () => { mode = m; draw(); }));
-    });
+    modeGroup(controls,
+      [
+        { label: "aside", value: "aside" },
+        { label: "through", value: "through" },
+        { label: "back", value: "back" },
+        { label: "around", value: "around" },
+      ],
+      () => mode,
+      (v) => { mode = v; draw(); }
+    );
     controls.appendChild(btn("▶ play flow", "primary", flow));
 
     draw();
@@ -910,8 +970,11 @@
     controls.appendChild(btn("drop network", "danger", () => { linkUp = false; replicaValue = primaryValue; draw(); }));
     controls.appendChild(btn("heal network", null, () => { linkUp = true; replicaValue = primaryValue; draw(); }));
     controls.appendChild(btn("write to primary", "primary", () => { primaryValue = Math.floor(Math.random() * 100); if (linkUp) replicaValue = primaryValue; draw(); }));
-    controls.appendChild(btn("CP mode", mode === "CP" ? "primary" : null, () => { mode = "CP"; draw(); }));
-    controls.appendChild(btn("AP mode", mode === "AP" ? "primary" : null, () => { mode = "AP"; draw(); }));
+    modeGroup(controls,
+      [{ label: "CP mode", value: "CP" }, { label: "AP mode", value: "AP" }],
+      () => mode,
+      (v) => { mode = v; draw(); }
+    );
 
     draw();
   }
@@ -1068,8 +1131,11 @@
       }
     }
 
-    controls.appendChild(btn("saga", mode === "saga" ? "primary" : null, () => { mode = "saga"; draw(mode); }));
-    controls.appendChild(btn("2PC", mode === "2pc" ? "primary" : null, () => { mode = "2pc"; draw(mode); }));
+    modeGroup(controls,
+      [{ label: "saga", value: "saga" }, { label: "2PC", value: "2pc" }],
+      () => mode,
+      (v) => { mode = v; draw(mode); }
+    );
     controls.appendChild(btn("▶ play scenario", "primary", play));
 
     draw(mode);
@@ -1240,9 +1306,1080 @@
       readout.appendChild($el("span", null, `skew: <strong>${(max - min)}</strong>`));
     }
 
-    ["range", "hash", "geo"].forEach(s => {
-      controls.appendChild(btn(s, strategy === s ? "primary" : null, () => { strategy = s; draw(); }));
+    modeGroup(controls,
+      [{ label: "range", value: "range" }, { label: "hash", value: "hash" }, { label: "geo", value: "geo" }],
+      () => strategy,
+      (v) => { strategy = v; draw(); }
+    );
+
+    draw();
+  }
+
+  // =====================================================================
+  // 12) BLOOM FILTER — bit array, k hashes, FP demo
+  // =====================================================================
+  function animBloom(host) {
+    const { stage, controls, readout } = frame(host, {
+      title: "Bloom filter — set membership with k hashes",
+      caption: "Insert items: each sets k bits (k=3 here). Query an item: if any of its k bits is 0 it is definitely absent; if all are 1, it might be present (false positive possible).",
     });
+    const M = 32; // bits
+    const K = 3;
+    const bits = new Array(M).fill(0);
+    const inserted = new Set();
+    let lastQuery = null;
+
+    const svg = $svg("svg", { viewBox: "0 0 480 200", width: 480, style: "max-width:100%;height:auto;" });
+    stage.appendChild(svg);
+
+    function hashes(s) {
+      const h1 = hash32(s);
+      const h2 = hash32(s + "::salt");
+      return [0, 1, 2].map(i => (h1 + i * h2) % M);
+    }
+
+    function draw() {
+      svg.innerHTML = "";
+      const cw = 13, ch = 26, padX = 16, padY = 60;
+      // bit grid
+      for (let i = 0; i < M; i++) {
+        const x = padX + i * cw, y = padY;
+        const set = bits[i] === 1;
+        svg.appendChild($svg("rect", {
+          x, y, width: cw - 2, height: ch, rx: 2,
+          fill: set ? "#34d399" : "rgba(167,139,250,0.12)",
+          stroke: set ? "#10b981" : "rgba(167,139,250,0.3)",
+        }));
+        const t = $svg("text", {
+          x: x + (cw - 2) / 2, y: y + ch / 2 + 4,
+          "text-anchor": "middle", class: "anim-label--mono",
+          fill: set ? "#0b0d18" : "var(--md-default-fg-color--light)",
+        });
+        t.textContent = set ? "1" : "0";
+        svg.appendChild(t);
+        const idx = $svg("text", {
+          x: x + (cw - 2) / 2, y: padY - 6,
+          "text-anchor": "middle", class: "anim-label--mono",
+          "font-size": "8",
+        });
+        idx.textContent = i;
+        svg.appendChild(idx);
+      }
+      // query highlight
+      if (lastQuery) {
+        const positions = hashes(lastQuery.s);
+        positions.forEach(p => {
+          const x = padX + p * cw, y = padY;
+          const isSet = bits[p] === 1;
+          svg.appendChild($svg("rect", {
+            x: x - 1, y: y - 1, width: cw, height: ch + 2, rx: 2,
+            fill: "none",
+            stroke: isSet ? "#fbbf24" : "#ef4444",
+            "stroke-width": 2,
+          }));
+        });
+        const verdict = $svg("text", {
+          x: 240, y: 150, "text-anchor": "middle", class: "anim-label--big",
+          fill: lastQuery.verdict === "in" ? "#34d399" : (lastQuery.verdict === "absent" ? "#ef4444" : "#fbbf24"),
+        });
+        verdict.textContent =
+          lastQuery.verdict === "in"        ? `'${lastQuery.s}' — maybe present`
+          : lastQuery.verdict === "absent"  ? `'${lastQuery.s}' — definitely NOT present`
+          :                                   `'${lastQuery.s}' — false positive!`;
+        svg.appendChild(verdict);
+        const subs = $svg("text", {
+          x: 240, y: 175, "text-anchor": "middle", class: "anim-label--mono",
+        });
+        subs.textContent = `hashes → bits [${positions.join(", ")}]`;
+        svg.appendChild(subs);
+      }
+      // header text
+      const ht = $svg("text", { x: 240, y: 30, "text-anchor": "middle", class: "anim-label--big" });
+      ht.textContent = `${M}-bit Bloom filter · k=${K} hash funcs`;
+      svg.appendChild(ht);
+
+      readout.innerHTML = "";
+      const setBits = bits.filter(b => b === 1).length;
+      const fpRate = Math.pow(1 - Math.exp(-K * inserted.size / M), K) * 100;
+      readout.appendChild($el("span", null, `inserted: <strong>${inserted.size}</strong>`));
+      readout.appendChild($el("span", null, `bits set: <strong>${setBits}/${M}</strong>`));
+      readout.appendChild($el("span", null, `theoretical FP rate: ~<strong>${fpRate.toFixed(1)}%</strong>`));
+    }
+
+    let pool = ["alice", "bob", "carol", "dave", "eve", "frank", "grace", "henry"];
+    function add() {
+      if (!pool.length) return;
+      const s = pool.shift();
+      inserted.add(s);
+      hashes(s).forEach(p => bits[p] = 1);
+      lastQuery = { s, verdict: "in" };
+      draw();
+    }
+    function query(s) {
+      const positions = hashes(s);
+      const allSet = positions.every(p => bits[p] === 1);
+      const verdict = !allSet ? "absent" : (inserted.has(s) ? "in" : "fp");
+      lastQuery = { s, verdict };
+      draw();
+    }
+
+    controls.appendChild(btn("insert next item", "primary", add));
+    controls.appendChild(btn("query inserted item", null, () => {
+      const arr = [...inserted];
+      if (arr.length) query(arr[Math.floor(Math.random() * arr.length)]);
+    }));
+    controls.appendChild(btn("query random item", null, () => query("rnd:" + Math.floor(Math.random() * 9999))));
+    controls.appendChild(btn("reset", "danger", () => {
+      bits.fill(0); inserted.clear(); lastQuery = null;
+      pool = ["alice", "bob", "carol", "dave", "eve", "frank", "grace", "henry"];
+      draw();
+    }));
+
+    draw();
+  }
+
+  // =====================================================================
+  // 13) CIRCUIT BREAKER — state machine
+  // =====================================================================
+  function animCircuit(host) {
+    const { stage, controls, readout } = frame(host, {
+      title: "Circuit breaker — closed / open / half-open",
+      caption: "Send requests; observe how a slow/failing downstream trips the breaker open (fast-fails), and how a probe in half-open decides whether to recover.",
+    });
+    const svg = $svg("svg", { viewBox: "0 0 480 220", width: 480, style: "max-width:100%;height:auto;" });
+    stage.appendChild(svg);
+
+    let state = "closed";        // closed / open / half-open
+    let consecFails = 0;
+    let consecOK = 0;
+    let downstreamHealthy = true;
+    const THRESH_FAIL = 3;
+    const THRESH_OK = 2;
+    let totalAttempts = 0, served = 0, fastFailed = 0;
+    let openSince = 0;
+    const COOLDOWN_MS = 6000;
+
+    function draw() {
+      svg.innerHTML = "";
+      const states = [
+        { name: "closed", x: 80, color: "#10b981", desc: "pass through" },
+        { name: "open", x: 240, color: "#ef4444", desc: "fast-fail" },
+        { name: "half-open", x: 400, color: "#f59e0b", desc: "probe" },
+      ];
+      states.forEach(s => {
+        const active = s.name === state;
+        svg.appendChild($svg("circle", {
+          cx: s.x, cy: 100, r: active ? 42 : 32,
+          fill: active ? s.color : "rgba(255,255,255,0.05)",
+          stroke: s.color, "stroke-width": active ? 3 : 1.5,
+          opacity: active ? 1 : 0.55,
+        }));
+        const t = $svg("text", {
+          x: s.x, y: 102, "text-anchor": "middle",
+          class: "anim-label", "font-weight": 700,
+          fill: active ? "#fff" : s.color,
+        });
+        t.textContent = s.name;
+        svg.appendChild(t);
+        const d = $svg("text", {
+          x: s.x, y: 155, "text-anchor": "middle", class: "anim-label--mono",
+        });
+        d.textContent = s.desc;
+        svg.appendChild(d);
+      });
+      // arrows
+      function arrow(x1, x2, label, y = 60) {
+        const mid = (x1 + x2) / 2;
+        svg.appendChild($svg("path", {
+          d: `M${x1 + 36} ${y + 10} Q ${mid} ${y - 10} ${x2 - 36} ${y + 10}`,
+          stroke: "rgba(167,139,250,0.5)", fill: "none", "stroke-width": 1.5,
+          "marker-end": "url(#cb-arr)",
+        }));
+        const t = $svg("text", {
+          x: mid, y: y, "text-anchor": "middle", class: "anim-label--mono",
+        });
+        t.textContent = label;
+        svg.appendChild(t);
+      }
+      const defs = $svg("defs", {});
+      const marker = $svg("marker", { id: "cb-arr", viewBox: "0 0 10 10", refX: 8, refY: 5, markerWidth: 6, markerHeight: 6, orient: "auto" });
+      marker.appendChild($svg("path", { d: "M0 0 L10 5 L0 10 z", fill: "rgba(167,139,250,0.8)" }));
+      defs.appendChild(marker);
+      svg.appendChild(defs);
+      arrow(80, 240, `${THRESH_FAIL} fails`);
+      arrow(240, 400, "cooldown elapsed");
+      arrow(400, 80, "probe ok", 180);
+
+      // status
+      const dh = $svg("text", { x: 240, y: 30, "text-anchor": "middle", class: "anim-label--big" });
+      dh.textContent = `downstream: ${downstreamHealthy ? "healthy ✓" : "failing ✗"}`;
+      dh.setAttribute("fill", downstreamHealthy ? "#10b981" : "#ef4444");
+      svg.appendChild(dh);
+
+      readout.innerHTML = "";
+      readout.appendChild($el("span", null, `state: <strong>${state}</strong>`));
+      readout.appendChild($el("span", null, `attempts: <strong>${totalAttempts}</strong>`));
+      readout.appendChild($el("span", null, `served: <strong>${served}</strong>`));
+      readout.appendChild($el("span", null, `fast-failed: <strong>${fastFailed}</strong>`));
+      if (state === "open") {
+        const remaining = Math.max(0, COOLDOWN_MS - (Date.now() - openSince));
+        readout.appendChild($el("span", null, `cooldown: <strong>${Math.ceil(remaining / 1000)}s</strong>`));
+      }
+    }
+
+    function attempt() {
+      totalAttempts++;
+      if (state === "open") {
+        fastFailed++;
+        // check cooldown elapsed
+        if (Date.now() - openSince >= COOLDOWN_MS) { state = "half-open"; consecOK = 0; }
+        draw();
+        return;
+      }
+      // closed or half-open → really call downstream
+      if (downstreamHealthy) {
+        served++;
+        consecFails = 0;
+        if (state === "half-open") {
+          consecOK++;
+          if (consecOK >= THRESH_OK) { state = "closed"; consecOK = 0; }
+        }
+      } else {
+        consecFails++;
+        if (state === "half-open") { state = "open"; openSince = Date.now(); consecFails = 0; }
+        else if (consecFails >= THRESH_FAIL) { state = "open"; openSince = Date.now(); consecFails = 0; }
+      }
+      draw();
+    }
+
+    controls.appendChild(btn("send request", "primary", attempt));
+    controls.appendChild(btn("send 5", null, () => { for (let i = 0; i < 5; i++) setTimeout(attempt, i * 350); }));
+    controls.appendChild(btn("toggle downstream", "danger", () => { downstreamHealthy = !downstreamHealthy; draw(); }));
+    controls.appendChild(btn("force cooldown end", null, () => { if (state === "open") { openSince -= COOLDOWN_MS; attempt(); } }));
+    controls.appendChild(btn("reset", null, () => {
+      state = "closed"; consecFails = 0; consecOK = 0;
+      totalAttempts = served = fastFailed = 0; downstreamHealthy = true;
+      draw();
+    }));
+    // tick remaining cooldown display
+    setInterval(() => { if (state === "open") draw(); }, 1000);
+    draw();
+  }
+
+  // =====================================================================
+  // 14) LOAD BALANCING ALGORITHMS — round-robin / least-conn / random / IP-hash
+  // =====================================================================
+  function animLoadBalancer(host) {
+    const { stage, controls, readout } = frame(host, {
+      title: "Load balancer — algorithm comparison",
+      caption: "Same 20 requests, different algorithms. Watch how each distributes load and what happens when one backend slows down.",
+    });
+    const svg = $svg("svg", { viewBox: "0 0 480 240", width: 480, style: "max-width:100%;height:auto;" });
+    stage.appendChild(svg);
+
+    const N = 4;
+    let mode = "rr";
+    let rrIdx = 0;
+    let counts = [0, 0, 0, 0];
+    let inflight = [0, 0, 0, 0];
+    let slowOne = false;
+    let totalReqs = 0;
+
+    function pickRR() { const r = rrIdx; rrIdx = (rrIdx + 1) % N; return r; }
+    function pickLC() {
+      let best = 0;
+      for (let i = 1; i < N; i++) if (inflight[i] < inflight[best]) best = i;
+      return best;
+    }
+    function pickRand() { return Math.floor(Math.random() * N); }
+    function pickHash(reqIdx) { return hash32("client:" + (reqIdx % 8)) % N; }
+
+    function pickBackend(reqIdx) {
+      if (mode === "rr") return pickRR();
+      if (mode === "lc") return pickLC();
+      if (mode === "rand") return pickRand();
+      if (mode === "hash") return pickHash(reqIdx);
+      return 0;
+    }
+
+    function draw(highlight) {
+      svg.innerHTML = "";
+      // LB box
+      svg.appendChild($svg("rect", { x: 20, y: 100, width: 90, height: 40, rx: 8, fill: "#7c3aed" }));
+      const lbt = $svg("text", { x: 65, y: 125, "text-anchor": "middle", class: "anim-label", fill: "#fff", "font-weight": 700 });
+      lbt.textContent = "LB";
+      svg.appendChild(lbt);
+      const lbm = $svg("text", { x: 65, y: 158, "text-anchor": "middle", class: "anim-label--mono" });
+      lbm.textContent = ({ rr: "round-robin", lc: "least-conn", rand: "random", hash: "IP hash" })[mode];
+      svg.appendChild(lbm);
+
+      // backends
+      for (let i = 0; i < N; i++) {
+        const y = 30 + i * 50;
+        const isSlow = slowOne && i === 0;
+        svg.appendChild($svg("rect", { x: 320, y, width: 120, height: 38, rx: 6,
+          fill: isSlow ? "rgba(239,68,68,0.18)" : "rgba(99,102,241,0.10)",
+          stroke: isSlow ? "#ef4444" : "rgba(99,102,241,0.4)" }));
+        const lbl = $svg("text", { x: 332, y: y + 22, class: "anim-label" });
+        lbl.textContent = `backend ${i}` + (isSlow ? " (slow)" : "");
+        svg.appendChild(lbl);
+        // count badge
+        const c = $svg("rect", { x: 405, y: y + 4, width: 32, height: 16, rx: 4,
+          fill: highlight === i ? "#fbbf24" : "rgba(255,255,255,0.06)" });
+        svg.appendChild(c);
+        const ct = $svg("text", { x: 421, y: y + 16, "text-anchor": "middle", class: "anim-label--mono",
+          "font-weight": 700, fill: highlight === i ? "#0b0d18" : null });
+        ct.textContent = counts[i];
+        svg.appendChild(ct);
+        // link
+        const ln = $svg("line", { x1: 110, y1: 120, x2: 320, y2: y + 19,
+          stroke: highlight === i ? "#fbbf24" : "rgba(167,139,250,0.2)",
+          "stroke-width": highlight === i ? 2 : 1 });
+        svg.appendChild(ln);
+      }
+
+      readout.innerHTML = "";
+      readout.appendChild($el("span", null, `total reqs: <strong>${totalReqs}</strong>`));
+      const max = Math.max(...counts), min = Math.min(...counts);
+      readout.appendChild($el("span", null, `max load: <strong>${max}</strong>`));
+      readout.appendChild($el("span", null, `imbalance: <strong>${max - min}</strong>`));
+      readout.appendChild($el("span", null, `slow node: <strong>${slowOne ? "on (backend 0)" : "off"}</strong>`));
+    }
+
+    function send() {
+      totalReqs++;
+      const b = pickBackend(totalReqs);
+      counts[b]++;
+      inflight[b]++;
+      draw(b);
+      const slow = slowOne && b === 0 ? 1500 : 350;
+      setTimeout(() => { inflight[b] = Math.max(0, inflight[b] - 1); draw(); }, slow);
+    }
+
+    modeGroup(controls, [
+      { label: "round-robin", value: "rr" },
+      { label: "least-conn", value: "lc" },
+      { label: "random", value: "rand" },
+      { label: "IP hash", value: "hash" },
+    ], () => mode, (v) => { mode = v; draw(); });
+    controls.appendChild(btn("send request", "primary", send));
+    controls.appendChild(btn("send 20", null, () => { for (let i = 0; i < 20; i++) setTimeout(send, i * 110); }));
+    controls.appendChild(btn("toggle slow backend", "danger", () => { slowOne = !slowOne; draw(); }));
+    controls.appendChild(btn("reset", null, () => {
+      counts = [0, 0, 0, 0]; inflight = [0, 0, 0, 0]; rrIdx = 0; totalReqs = 0;
+      draw();
+    }));
+    draw();
+  }
+
+  // =====================================================================
+  // 15) STREAM WINDOWING — tumbling / sliding / session + watermark
+  // =====================================================================
+  function animWindowing(host) {
+    const { stage, controls, readout } = frame(host, {
+      title: "Stream windowing & watermarks",
+      caption: "Events have event-time. Tumbling, sliding, and session windows group them differently. Watermark fires window emission once 'no more late events' is promised.",
+    });
+    const svg = $svg("svg", { viewBox: "0 0 480 240", width: 480, style: "max-width:100%;height:auto;" });
+    stage.appendChild(svg);
+
+    let mode = "tumbling";
+    let events = [
+      { t: 1 }, { t: 3 }, { t: 4 }, { t: 7 }, { t: 9 }, { t: 12 }, { t: 15 }, { t: 16 }, { t: 19 }
+    ];
+    let watermark = 0;
+
+    function windows() {
+      if (mode === "tumbling") {
+        return [[0, 5], [5, 10], [10, 15], [15, 20]];
+      } else if (mode === "sliding") {
+        // size 5, step 3
+        return [[0, 5], [3, 8], [6, 11], [9, 14], [12, 17], [15, 20]];
+      } else {
+        // session: gap 4
+        const sorted = [...events].sort((a, b) => a.t - b.t);
+        const wins = [];
+        let cur = null;
+        sorted.forEach(e => {
+          if (!cur || e.t - cur[1] > 4) { if (cur) wins.push(cur); cur = [e.t, e.t]; }
+          else cur[1] = e.t;
+        });
+        if (cur) wins.push(cur);
+        return wins.map(w => [w[0] - 0.5, w[1] + 0.5]);
+      }
+    }
+
+    function draw() {
+      svg.innerHTML = "";
+      const x0 = 30, x1 = 450, span = 21;
+      function tx(t) { return x0 + (t / span) * (x1 - x0); }
+      // axis
+      svg.appendChild($svg("line", { x1: x0, y1: 180, x2: x1, y2: 180, stroke: "rgba(255,255,255,0.25)" }));
+      for (let i = 0; i <= 20; i += 5) {
+        const x = tx(i);
+        svg.appendChild($svg("line", { x1: x, y1: 178, x2: x, y2: 184, stroke: "rgba(255,255,255,0.3)" }));
+        const t = $svg("text", { x, y: 200, "text-anchor": "middle", class: "anim-label--mono" });
+        t.textContent = "t=" + i;
+        svg.appendChild(t);
+      }
+      // windows
+      const wins = windows();
+      wins.forEach((w, i) => {
+        const x = tx(w[0]), wd = tx(w[1]) - tx(w[0]);
+        const closed = w[1] <= watermark;
+        const fill = closed ? "rgba(52,211,153,0.18)" : "rgba(99,102,241,0.10)";
+        const stroke = closed ? "#10b981" : "rgba(99,102,241,0.4)";
+        svg.appendChild($svg("rect", { x, y: 70, width: wd, height: 100, fill, stroke, "stroke-width": 1, rx: 6 }));
+        const lbl = $svg("text", { x: x + wd / 2, y: 60, "text-anchor": "middle", class: "anim-label--mono" });
+        lbl.textContent = `[${w[0]}, ${w[1]})`;
+        if (closed) lbl.setAttribute("fill", "#34d399");
+        svg.appendChild(lbl);
+      });
+      // events
+      events.forEach(e => {
+        const x = tx(e.t);
+        const inWindow = wins.some(w => e.t >= w[0] && e.t < w[1]);
+        svg.appendChild($svg("circle", { cx: x, cy: 130, r: 7, fill: inWindow ? "#fbbf24" : "#94a3b8",
+          filter: "drop-shadow(0 0 4px rgba(251,191,36,0.7))" }));
+        const t = $svg("text", { x, y: 110, "text-anchor": "middle", class: "anim-label--mono" });
+        t.textContent = "t=" + e.t;
+        svg.appendChild(t);
+      });
+      // watermark
+      const wx = tx(watermark);
+      svg.appendChild($svg("line", { x1: wx, y1: 40, x2: wx, y2: 180,
+        stroke: "#ef4899", "stroke-width": 2, "stroke-dasharray": "4 4" }));
+      const wt = $svg("text", { x: wx, y: 36, "text-anchor": "middle", class: "anim-label" });
+      wt.textContent = `watermark ${watermark.toFixed(0)}`;
+      wt.setAttribute("fill", "#ec4899");
+      svg.appendChild(wt);
+
+      readout.innerHTML = "";
+      readout.appendChild($el("span", null, `mode: <strong>${mode}</strong>`));
+      readout.appendChild($el("span", null, `events: <strong>${events.length}</strong>`));
+      readout.appendChild($el("span", null, `watermark: <strong>${watermark}</strong>`));
+      readout.appendChild($el("span", null, `closed windows: <strong>${wins.filter(w => w[1] <= watermark).length}</strong>`));
+    }
+
+    modeGroup(controls, [
+      { label: "tumbling", value: "tumbling" },
+      { label: "sliding", value: "sliding" },
+      { label: "session", value: "session" },
+    ], () => mode, (v) => { mode = v; draw(); });
+    controls.appendChild(btn("+ event (late?)", "primary", () => {
+      const lateT = Math.max(0, watermark - Math.floor(Math.random() * 5));
+      events.push({ t: lateT });
+      draw();
+    }));
+    controls.appendChild(btn("advance watermark", null, () => { watermark = Math.min(21, watermark + 3); draw(); }));
+    controls.appendChild(btn("reset", "danger", () => {
+      events = [{ t: 1 }, { t: 3 }, { t: 4 }, { t: 7 }, { t: 9 }, { t: 12 }, { t: 15 }, { t: 16 }, { t: 19 }];
+      watermark = 0; draw();
+    }));
+
+    draw();
+  }
+
+  // =====================================================================
+  // 16) LRU vs LFU EVICTION — same workload, different survivors
+  // =====================================================================
+  function animEviction(host) {
+    const { stage, controls, readout } = frame(host, {
+      title: "LRU vs LFU eviction — same workload, different survivors",
+      caption: "A 5-slot cache, two policies, the same stream of accesses. LRU evicts the least-recently-used; LFU evicts the least-frequently-used. Watch which keys live and die in each.",
+    });
+    const svg = $svg("svg", { viewBox: "0 0 480 230", width: 480, style: "max-width:100%;height:auto;" });
+    stage.appendChild(svg);
+
+    const CAP = 5;
+    let lru = []; // array of {k, recency}
+    let lfu = []; // array of {k, freq}
+    let tickCount = 0;
+    let lruHits = 0, lruMiss = 0, lfuHits = 0, lfuMiss = 0;
+    let lastKey = null;
+
+    function access(k) {
+      tickCount++;
+      // LRU
+      const lruIdx = lru.findIndex(e => e.k === k);
+      if (lruIdx >= 0) { lru[lruIdx].recency = tickCount; lruHits++; }
+      else {
+        lruMiss++;
+        if (lru.length >= CAP) {
+          let worst = 0;
+          for (let i = 1; i < lru.length; i++) if (lru[i].recency < lru[worst].recency) worst = i;
+          lru.splice(worst, 1);
+        }
+        lru.push({ k, recency: tickCount });
+      }
+      // LFU
+      const lfuIdx = lfu.findIndex(e => e.k === k);
+      if (lfuIdx >= 0) { lfu[lfuIdx].freq++; lfu[lfuIdx].lastSeen = tickCount; lfuHits++; }
+      else {
+        lfuMiss++;
+        if (lfu.length >= CAP) {
+          let worst = 0;
+          for (let i = 1; i < lfu.length; i++) {
+            if (lfu[i].freq < lfu[worst].freq ||
+              (lfu[i].freq === lfu[worst].freq && lfu[i].lastSeen < lfu[worst].lastSeen)) worst = i;
+          }
+          lfu.splice(worst, 1);
+        }
+        lfu.push({ k, freq: 1, lastSeen: tickCount });
+      }
+      lastKey = k;
+      draw();
+    }
+
+    function colorFor(k) {
+      const palette = ["#a78bfa", "#06b6d4", "#34d399", "#fbbf24", "#fb7185", "#22d3ee", "#84cc16", "#f97316"];
+      return palette[hash32(k) % palette.length];
+    }
+
+    function draw() {
+      svg.innerHTML = "";
+      // LRU row
+      const ht1 = $svg("text", { x: 30, y: 30, class: "anim-label--big" }); ht1.textContent = "LRU"; svg.appendChild(ht1);
+      const ht1s = $svg("text", { x: 70, y: 30, class: "anim-label--mono" });
+      ht1s.textContent = `(hit ${lruHits}/${lruHits + lruMiss})`; svg.appendChild(ht1s);
+      const sorted1 = [...lru].sort((a, b) => b.recency - a.recency); // most recent first
+      for (let i = 0; i < CAP; i++) {
+        const x = 30 + i * 86, y = 50;
+        const e = sorted1[i];
+        svg.appendChild($svg("rect", {
+          x, y, width: 72, height: 50, rx: 8,
+          fill: e ? colorFor(e.k) : "rgba(255,255,255,0.04)",
+          stroke: e && e.k === lastKey ? "#fbbf24" : "rgba(167,139,250,0.2)",
+          "stroke-width": e && e.k === lastKey ? 2.5 : 1,
+        }));
+        if (e) {
+          const t = $svg("text", { x: x + 36, y: y + 25, "text-anchor": "middle", class: "anim-label", fill: "#0b0d18", "font-weight": 700 });
+          t.textContent = e.k; svg.appendChild(t);
+          const r = $svg("text", { x: x + 36, y: y + 42, "text-anchor": "middle", class: "anim-label--mono" });
+          r.textContent = `last @ ${e.recency}`; svg.appendChild(r);
+        }
+      }
+      // LFU row
+      const ht2 = $svg("text", { x: 30, y: 135, class: "anim-label--big" }); ht2.textContent = "LFU"; svg.appendChild(ht2);
+      const ht2s = $svg("text", { x: 70, y: 135, class: "anim-label--mono" });
+      ht2s.textContent = `(hit ${lfuHits}/${lfuHits + lfuMiss})`; svg.appendChild(ht2s);
+      const sorted2 = [...lfu].sort((a, b) => b.freq - a.freq);
+      for (let i = 0; i < CAP; i++) {
+        const x = 30 + i * 86, y = 155;
+        const e = sorted2[i];
+        svg.appendChild($svg("rect", {
+          x, y, width: 72, height: 50, rx: 8,
+          fill: e ? colorFor(e.k) : "rgba(255,255,255,0.04)",
+          stroke: e && e.k === lastKey ? "#fbbf24" : "rgba(167,139,250,0.2)",
+          "stroke-width": e && e.k === lastKey ? 2.5 : 1,
+        }));
+        if (e) {
+          const t = $svg("text", { x: x + 36, y: y + 25, "text-anchor": "middle", class: "anim-label", fill: "#0b0d18", "font-weight": 700 });
+          t.textContent = e.k; svg.appendChild(t);
+          const r = $svg("text", { x: x + 36, y: y + 42, "text-anchor": "middle", class: "anim-label--mono" });
+          r.textContent = `freq ${e.freq}`; svg.appendChild(r);
+        }
+      }
+      readout.innerHTML = "";
+      readout.appendChild($el("span", null, `accesses: <strong>${tickCount}</strong>`));
+      readout.appendChild($el("span", null, `last key: <strong>${lastKey ?? "—"}</strong>`));
+      readout.appendChild($el("span", null, `LRU hit rate: <strong>${tickCount ? Math.round(100 * lruHits / tickCount) : 0}%</strong>`));
+      readout.appendChild($el("span", null, `LFU hit rate: <strong>${tickCount ? Math.round(100 * lfuHits / tickCount) : 0}%</strong>`));
+    }
+
+    function workload(name) {
+      lru = []; lfu = []; tickCount = 0; lruHits = lruMiss = lfuHits = lfuMiss = 0; lastKey = null;
+      let seq;
+      if (name === "trending") {
+        // 'A' very popular early then forgotten; LFU keeps it long after, LRU evicts it
+        seq = "AAAAAAAA B C D E F G H I J K L M N O P".split(" ");
+      } else if (name === "rare-but-recent") {
+        // 'Z' shown once at the very end → LRU keeps it, LFU evicts it next
+        seq = "A A A A B B B B C C C C D D D D E E E E Z".split(" ");
+      } else if (name === "hot-set") {
+        // 5 keys cycling forever, no eviction
+        seq = "A B C D E A B C D E A B C D E A B C".split(" ");
+      } else { // random
+        seq = [];
+        for (let i = 0; i < 24; i++) seq.push(String.fromCharCode(65 + Math.floor(Math.random() * 8)));
+      }
+      let i = 0;
+      function step() { if (i >= seq.length) return; access(seq[i++]); setTimeout(step, 320); }
+      step();
+    }
+
+    controls.appendChild(btn("workload: trending", "primary", () => workload("trending")));
+    controls.appendChild(btn("rare-but-recent", null, () => workload("rare-but-recent")));
+    controls.appendChild(btn("hot working set", null, () => workload("hot-set")));
+    controls.appendChild(btn("random", null, () => workload("random")));
+    controls.appendChild(btn("reset", "danger", () => { lru = []; lfu = []; tickCount = 0; lruHits = lruMiss = lfuHits = lfuMiss = 0; lastKey = null; draw(); }));
+
+    draw();
+  }
+
+  // =====================================================================
+  // 17) MVCC — version chain + reader snapshot isolation
+  // =====================================================================
+  function animMvcc(host) {
+    const { stage, controls, readout } = frame(host, {
+      title: "MVCC — version chain, snapshots, and bloat",
+      caption: "Each row holds a chain of versions. Long-running readers pin old versions; vacuum can only reclaim versions older than the oldest active snapshot. Try opening a long reader — watch the chain grow.",
+    });
+    const svg = $svg("svg", { viewBox: "0 0 480 240", width: 480, style: "max-width:100%;height:auto;" });
+    stage.appendChild(svg);
+
+    let txid = 1;
+    let versions = [{ v: 1, xmin: 1, xmax: null, val: "alice@x.com" }];
+    let readers = []; // {id, snapshotXid}
+    let nextReaderId = 1;
+
+    function commit(newVal) {
+      txid++;
+      const last = versions[versions.length - 1];
+      last.xmax = txid;
+      versions.push({ v: versions.length + 1, xmin: txid, xmax: null, val: newVal });
+      draw();
+    }
+    function newReader() {
+      txid++;
+      readers.push({ id: nextReaderId++, snapshotXid: txid });
+      draw();
+    }
+    function closeReader() {
+      readers.shift();
+      draw();
+    }
+    function vacuum() {
+      if (!readers.length) return; // safe to vacuum nothing if no readers
+      const oldest = Math.min(...readers.map(r => r.snapshotXid));
+      versions = versions.filter(v => v.xmax === null || v.xmax >= oldest);
+      draw();
+    }
+    function vacuumAll() {
+      // no readers → reclaim all but current
+      if (readers.length) return vacuum();
+      versions = versions.filter(v => v.xmax === null);
+      draw();
+    }
+
+    function draw() {
+      svg.innerHTML = "";
+      const ht = $svg("text", { x: 30, y: 28, class: "anim-label--big" });
+      ht.textContent = `row=user(42)  ·  current txid=${txid}`;
+      svg.appendChild(ht);
+
+      // versions row
+      versions.forEach((v, i) => {
+        const x = 30 + i * 100, y = 60;
+        const alive = v.xmax === null;
+        svg.appendChild($svg("rect", {
+          x, y, width: 85, height: 56, rx: 8,
+          fill: alive ? "rgba(52,211,153,0.18)" : "rgba(239,68,68,0.10)",
+          stroke: alive ? "#10b981" : "#ef4444",
+        }));
+        const t = $svg("text", { x: x + 4, y: y + 20, class: "anim-label", "font-weight": 700 });
+        t.textContent = `v${v.v}`; svg.appendChild(t);
+        const xm = $svg("text", { x: x + 4, y: y + 35, class: "anim-label--mono" });
+        xm.textContent = `xmin=${v.xmin}`; svg.appendChild(xm);
+        const xx = $svg("text", { x: x + 4, y: y + 48, class: "anim-label--mono" });
+        xx.textContent = `xmax=${v.xmax ?? "∞"}`; svg.appendChild(xx);
+        // arrow to next
+        if (i < versions.length - 1) {
+          svg.appendChild($svg("line", { x1: x + 85, y1: y + 28, x2: x + 100, y2: y + 28,
+            stroke: "rgba(167,139,250,0.6)", "stroke-width": 1.5 }));
+        }
+      });
+
+      // readers row
+      const rl = $svg("text", { x: 30, y: 150, class: "anim-label--big" });
+      rl.textContent = `active readers (${readers.length})`; svg.appendChild(rl);
+      readers.forEach((r, i) => {
+        const x = 30 + i * 100, y = 165;
+        svg.appendChild($svg("rect", { x, y, width: 85, height: 40, rx: 6,
+          fill: "rgba(99,102,241,0.18)", stroke: "#6366f1" }));
+        const t = $svg("text", { x: x + 4, y: y + 18, class: "anim-label", "font-weight": 700 });
+        t.textContent = `R${r.id}`; svg.appendChild(t);
+        const sn = $svg("text", { x: x + 4, y: y + 33, class: "anim-label--mono" });
+        sn.textContent = `snap=${r.snapshotXid}`; svg.appendChild(sn);
+        // which version this reader sees
+        const visible = [...versions].reverse().find(v => v.xmin <= r.snapshotXid && (v.xmax === null || v.xmax > r.snapshotXid));
+        if (visible) {
+          const vIdx = versions.indexOf(visible);
+          const vx = 30 + vIdx * 100 + 42;
+          svg.appendChild($svg("line", { x1: x + 42, y1: y, x2: vx, y2: 116,
+            stroke: "#a78bfa", "stroke-width": 1.5, "stroke-dasharray": "3 3", opacity: 0.7 }));
+        }
+      });
+
+      readout.innerHTML = "";
+      readout.appendChild($el("span", null, `versions: <strong>${versions.length}</strong>`));
+      readout.appendChild($el("span", null, `readers: <strong>${readers.length}</strong>`));
+      const oldest = readers.length ? Math.min(...readers.map(r => r.snapshotXid)) : "—";
+      readout.appendChild($el("span", null, `oldest snap: <strong>${oldest}</strong>`));
+      const reclaimable = versions.filter(v => v.xmax !== null && (!readers.length || v.xmax < (oldest === "—" ? Infinity : oldest))).length;
+      readout.appendChild($el("span", null, `reclaimable: <strong>${reclaimable}</strong>`));
+    }
+
+    let nv = 0;
+    const newVals = ["bob@x.com", "carol@x.com", "dave@x.com", "eve@x.com", "frank@x.com", "grace@x.com"];
+    controls.appendChild(btn("UPDATE row", "primary", () => { commit(newVals[nv++ % newVals.length]); }));
+    controls.appendChild(btn("open reader", null, newReader));
+    controls.appendChild(btn("close oldest reader", null, closeReader));
+    controls.appendChild(btn("VACUUM", null, vacuumAll));
+    controls.appendChild(btn("reset", "danger", () => {
+      txid = 1; nv = 0; nextReaderId = 1; readers = [];
+      versions = [{ v: 1, xmin: 1, xmax: null, val: "alice@x.com" }];
+      draw();
+    }));
+
+    draw();
+  }
+
+  // =====================================================================
+  // 18) QUORUM (W + R) — Dynamo-style read/write
+  // =====================================================================
+  function animQuorum(host) {
+    const { stage, controls, readout } = frame(host, {
+      title: "Quorum (W + R) — strong vs eventual",
+      caption: "5 replicas. Pick W and R. The classic Dynamo invariant: W + R > N gives strong consistency on reads. Lower it for higher availability / latency. Press WRITE then READ to see what each replica returns.",
+    });
+    const svg = $svg("svg", { viewBox: "0 0 480 240", width: 480, style: "max-width:100%;height:auto;" });
+    stage.appendChild(svg);
+
+    const N = 5;
+    let W = 3, R = 3;
+    let nodes = []; // { value, version, lastTouch }
+    for (let i = 0; i < N; i++) nodes.push({ value: 0, version: 0, lastTouch: null });
+    let nextVersion = 1;
+    let lastOp = null; // { kind, indices, value? , latest? }
+
+    function write() {
+      const indices = pickRandomSubset(N, W);
+      const v = nextVersion++;
+      const val = Math.floor(Math.random() * 100);
+      indices.forEach(i => { nodes[i] = { value: val, version: v, lastTouch: "W" }; });
+      lastOp = { kind: "write", indices, value: val, version: v };
+      // simulate replica lag: 1-2 replicas not in W don't sync yet
+      draw();
+    }
+    function read() {
+      const indices = pickRandomSubset(N, R);
+      const responses = indices.map(i => ({ i, ...nodes[i] }));
+      const best = responses.reduce((a, b) => (a.version >= b.version ? a : b));
+      lastOp = { kind: "read", indices, value: best.value, version: best.version, responses };
+      // mark touched
+      indices.forEach(i => nodes[i].lastTouch = "R");
+      draw();
+    }
+    function pickRandomSubset(n, k) {
+      const arr = [...Array(n).keys()];
+      for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [arr[i], arr[j]] = [arr[j], arr[i]];
+      }
+      return arr.slice(0, k).sort((a, b) => a - b);
+    }
+
+    function draw() {
+      svg.innerHTML = "";
+      // top: invariant status
+      const strong = (W + R) > N;
+      const inv = $svg("text", { x: 240, y: 24, "text-anchor": "middle", class: "anim-label--big",
+        fill: strong ? "#10b981" : "#f59e0b" });
+      inv.textContent = strong ? `W(${W}) + R(${R}) > N(${N}) — strong reads` : `W(${W}) + R(${R}) ≤ N(${N}) — possibly stale`;
+      svg.appendChild(inv);
+
+      // nodes
+      for (let i = 0; i < N; i++) {
+        const x = 30 + i * 88, y = 70;
+        const involved = lastOp && lastOp.indices.includes(i);
+        const isLatest = lastOp && lastOp.kind === "read" && involved && nodes[i].version === lastOp.version;
+        const stroke = involved
+          ? (lastOp.kind === "write" ? "#10b981" : (isLatest ? "#fbbf24" : "#ef4444"))
+          : "rgba(167,139,250,0.3)";
+        svg.appendChild($svg("rect", { x, y, width: 80, height: 80, rx: 12,
+          fill: "rgba(99,102,241,0.10)", stroke, "stroke-width": involved ? 3 : 1 }));
+        const t = $svg("text", { x: x + 40, y: y + 28, "text-anchor": "middle", class: "anim-label", "font-weight": 700 });
+        t.textContent = `n${i}`;
+        svg.appendChild(t);
+        const vt = $svg("text", { x: x + 40, y: y + 50, "text-anchor": "middle", class: "anim-label--mono" });
+        vt.textContent = `val=${nodes[i].value}`; svg.appendChild(vt);
+        const vv = $svg("text", { x: x + 40, y: y + 68, "text-anchor": "middle", class: "anim-label--mono" });
+        vv.textContent = `v${nodes[i].version}`; svg.appendChild(vv);
+        if (involved) {
+          const lbl = $svg("text", { x: x + 40, y: y - 6, "text-anchor": "middle", class: "anim-label--mono",
+            fill: lastOp.kind === "write" ? "#10b981" : "#fbbf24" });
+          lbl.textContent = lastOp.kind === "write" ? "✓ written" : "← read"; svg.appendChild(lbl);
+        }
+      }
+
+      // verdict
+      if (lastOp) {
+        const v = $svg("text", { x: 240, y: 175, "text-anchor": "middle", class: "anim-label--big" });
+        if (lastOp.kind === "write") {
+          v.textContent = `WRITE val=${lastOp.value} (v${lastOp.version}) to nodes ${lastOp.indices.join(",")}`;
+          v.setAttribute("fill", "#10b981");
+        } else {
+          const seen = lastOp.responses.map(r => `n${r.i}:v${r.version}`).join("  ");
+          const t = $svg("text", { x: 240, y: 175, "text-anchor": "middle", class: "anim-label" });
+          t.textContent = `READ from ${lastOp.indices.join(",")} → return val=${lastOp.value} (v${lastOp.version})`;
+          t.setAttribute("fill", "#fbbf24");
+          svg.appendChild(t);
+          const sub = $svg("text", { x: 240, y: 195, "text-anchor": "middle", class: "anim-label--mono" });
+          sub.textContent = seen; svg.appendChild(sub);
+          return;
+        }
+        svg.appendChild(v);
+      }
+
+      readout.innerHTML = "";
+      readout.appendChild($el("span", null, `N=<strong>${N}</strong>  W=<strong>${W}</strong>  R=<strong>${R}</strong>`));
+      readout.appendChild($el("span", null, strong ? `<strong style="color:#10b981">strong</strong>` : `<strong style="color:#f59e0b">eventual</strong>`));
+      const latest = Math.max(...nodes.map(n => n.version));
+      const lagging = nodes.filter(n => n.version < latest).length;
+      readout.appendChild($el("span", null, `nodes lagging: <strong>${lagging}/${N}</strong>`));
+    }
+
+    controls.appendChild(btn("WRITE", "primary", write));
+    controls.appendChild(btn("READ", null, read));
+    modeGroup(controls, [
+      { label: "W=1", value: "1" },
+      { label: "W=2", value: "2" },
+      { label: "W=3", value: "3" },
+      { label: "W=5", value: "5" },
+    ], () => String(W), v => { W = +v; draw(); });
+    modeGroup(controls, [
+      { label: "R=1", value: "1" },
+      { label: "R=2", value: "2" },
+      { label: "R=3", value: "3" },
+      { label: "R=5", value: "5" },
+    ], () => String(R), v => { R = +v; draw(); });
+
+    draw();
+  }
+
+  // =====================================================================
+  // 19) HYPERLOGLOG — register array + estimate
+  // =====================================================================
+  function animHLL(host) {
+    const { stage, controls, readout } = frame(host, {
+      title: "HyperLogLog — cardinality from leading zeros",
+      caption: "Each item gets hashed. The top bits choose a bucket (0..15 here); the trailing bits' leading-zero count is stored if larger than what's there. Estimate = harmonic-mean trick on 2^register.",
+    });
+    const svg = $svg("svg", { viewBox: "0 0 480 200", width: 480, style: "max-width:100%;height:auto;" });
+    stage.appendChild(svg);
+
+    const M = 16;
+    let regs = new Array(M).fill(0);
+    const seen = new Set();
+    let lastInsert = null;
+
+    function leadingZeros(n, bits) {
+      let z = 0;
+      for (let i = bits - 1; i >= 0; i--) {
+        if ((n >>> i) & 1) break;
+        z++;
+      }
+      return z + 1; // HLL stores leading-zeros + 1
+    }
+    function alphaM(m) {
+      if (m === 16) return 0.673;
+      if (m === 32) return 0.697;
+      if (m === 64) return 0.709;
+      return 0.7213 / (1 + 1.079 / m);
+    }
+    function estimate() {
+      // raw estimate; small-range correction skipped for visual simplicity
+      const sum = regs.reduce((a, r) => a + Math.pow(2, -r), 0);
+      const e = alphaM(M) * M * M / sum;
+      return Math.round(e);
+    }
+
+    function add(s) {
+      const h = hash32(s);
+      const bucket = h & (M - 1); // low 4 bits = bucket idx
+      const rest = h >>> 4;
+      const lz = leadingZeros(rest, 28);
+      const prev = regs[bucket];
+      regs[bucket] = Math.max(prev, lz);
+      seen.add(s);
+      lastInsert = { s, bucket, lz, changed: regs[bucket] !== prev };
+      draw();
+    }
+
+    function draw() {
+      svg.innerHTML = "";
+      // header
+      const ht = $svg("text", { x: 240, y: 22, "text-anchor": "middle", class: "anim-label--big" });
+      ht.textContent = `${M} registers · estimate ≈ ${estimate()} · true distincts = ${seen.size}`;
+      svg.appendChild(ht);
+
+      // registers — 8 cols × 2 rows
+      const cols = 8;
+      for (let i = 0; i < M; i++) {
+        const col = i % cols, row = Math.floor(i / cols);
+        const x = 30 + col * 55, y = 50 + row * 56;
+        const active = lastInsert && lastInsert.bucket === i;
+        svg.appendChild($svg("rect", { x, y, width: 50, height: 46, rx: 7,
+          fill: active ? "#fbbf24" : "rgba(99,102,241,0.15)",
+          stroke: active ? "#f59e0b" : "rgba(99,102,241,0.4)",
+          "stroke-width": active ? 2.5 : 1 }));
+        const it = $svg("text", { x: x + 25, y: y + 18, "text-anchor": "middle", class: "anim-label--mono",
+          fill: active ? "#0b0d18" : null });
+        it.textContent = `b${i}`; svg.appendChild(it);
+        const vt = $svg("text", { x: x + 25, y: y + 38, "text-anchor": "middle", class: "anim-label",
+          "font-weight": 700, fill: active ? "#0b0d18" : null });
+        vt.textContent = regs[i];
+        svg.appendChild(vt);
+      }
+
+      // last insert info
+      if (lastInsert) {
+        const lt = $svg("text", { x: 240, y: 180, "text-anchor": "middle", class: "anim-label--mono" });
+        lt.textContent = `last: '${lastInsert.s}' → bucket ${lastInsert.bucket}, lz+1=${lastInsert.lz}` +
+          (lastInsert.changed ? " ✓ updated" : " — no change");
+        svg.appendChild(lt);
+      }
+
+      readout.innerHTML = "";
+      readout.appendChild($el("span", null, `inserted: <strong>${seen.size}</strong>`));
+      readout.appendChild($el("span", null, `estimate: <strong>${estimate()}</strong>`));
+      const err = seen.size === 0 ? 0 : Math.abs(estimate() - seen.size) / seen.size * 100;
+      readout.appendChild($el("span", null, `error: <strong>${err.toFixed(1)}%</strong>`));
+      readout.appendChild($el("span", null, `memory: <strong>${M} bytes</strong>`));
+    }
+
+    controls.appendChild(btn("add 1 item", "primary", () => add("u" + Math.floor(Math.random() * 1e9))));
+    controls.appendChild(btn("add 100", null, () => { for (let i = 0; i < 100; i++) setTimeout(() => add("u" + Math.floor(Math.random() * 1e9)), i * 25); }));
+    controls.appendChild(btn("add 1000 (fast)", null, () => { for (let i = 0; i < 1000; i++) add("u" + Math.floor(Math.random() * 1e9)); }));
+    controls.appendChild(btn("add same item ×50", null, () => { for (let i = 0; i < 50; i++) add("samekey"); }));
+    controls.appendChild(btn("reset", "danger", () => { regs.fill(0); seen.clear(); lastInsert = null; draw(); }));
+
+    draw();
+  }
+
+  // =====================================================================
+  // 20) TCP CONGESTION CONTROL — slow start + AIMD sawtooth
+  // =====================================================================
+  function animTcpCwnd(host) {
+    const { stage, controls, readout } = frame(host, {
+      title: "TCP congestion control — slow start + AIMD sawtooth",
+      caption: "cwnd doubles per RTT in slow-start, then grows linearly. On packet loss, cwnd halves (multiplicative decrease) and restarts linear growth (additive increase). The sawtooth is why p99 latency spikes.",
+    });
+    const svg = $svg("svg", { viewBox: "0 0 480 240", width: 480, style: "max-width:100%;height:auto;" });
+    stage.appendChild(svg);
+
+    const MAX_PTS = 80;
+    let pts = []; // {rtt, cwnd, state} where state ∈ ss/ca/loss
+    let cwnd = 1;
+    let ssthresh = 32;
+    let rttCount = 0;
+    let state = "ss";
+    let running = false;
+    let timer = null;
+
+    function step() {
+      rttCount++;
+      // loss probability climbs as cwnd approaches link capacity (= 40)
+      const lossP = Math.min(0.6, Math.max(0, (cwnd - 28) / 28));
+      const loss = Math.random() < lossP;
+      let nextState = state;
+      if (loss) {
+        ssthresh = Math.max(2, Math.floor(cwnd / 2));
+        cwnd = ssthresh;
+        nextState = "ca";
+        pts.push({ rtt: rttCount, cwnd, state: "loss" });
+      } else {
+        if (state === "ss") {
+          cwnd *= 2;
+          if (cwnd >= ssthresh) { cwnd = ssthresh; nextState = "ca"; }
+        } else {
+          cwnd += 1;
+        }
+        pts.push({ rtt: rttCount, cwnd, state: nextState });
+      }
+      state = nextState;
+      if (pts.length > MAX_PTS) pts.shift();
+      draw();
+    }
+
+    function start() { if (running) return; running = true; timer = setInterval(step, 220); }
+    function stop() { running = false; if (timer) clearInterval(timer); }
+
+    function draw() {
+      svg.innerHTML = "";
+      // axes
+      svg.appendChild($svg("line", { x1: 40, y1: 200, x2: 460, y2: 200, stroke: "rgba(255,255,255,0.25)" }));
+      svg.appendChild($svg("line", { x1: 40, y1: 30, x2: 40, y2: 200, stroke: "rgba(255,255,255,0.25)" }));
+      const xat = $svg("text", { x: 250, y: 220, "text-anchor": "middle", class: "anim-label--mono" });
+      xat.textContent = "RTTs →"; svg.appendChild(xat);
+      const yat = $svg("text", { x: 14, y: 110, "text-anchor": "middle", class: "anim-label--mono", transform: "rotate(-90 14 110)" });
+      yat.textContent = "cwnd"; svg.appendChild(yat);
+      // grid
+      for (let v of [10, 20, 30, 40]) {
+        const y = 200 - (v / 40) * 165;
+        svg.appendChild($svg("line", { x1: 40, y1: y, x2: 460, y2: y, stroke: "rgba(167,139,250,0.1)", "stroke-dasharray": "2 3" }));
+        const tt = $svg("text", { x: 36, y: y + 4, "text-anchor": "end", class: "anim-label--mono" });
+        tt.textContent = v; svg.appendChild(tt);
+      }
+      // ssthresh line
+      const sty = 200 - (ssthresh / 40) * 165;
+      svg.appendChild($svg("line", { x1: 40, y1: sty, x2: 460, y2: sty, stroke: "#fbbf24", "stroke-dasharray": "5 3", opacity: 0.5 }));
+      const ssl = $svg("text", { x: 458, y: sty - 4, "text-anchor": "end", class: "anim-label--mono", fill: "#fbbf24" });
+      ssl.textContent = `ssthresh = ${ssthresh}`; svg.appendChild(ssl);
+      // capacity line
+      const cy = 200 - (40 / 40) * 165;
+      svg.appendChild($svg("line", { x1: 40, y1: cy, x2: 460, y2: cy, stroke: "#ef4444", "stroke-dasharray": "5 3", opacity: 0.4 }));
+      const cl = $svg("text", { x: 458, y: cy - 4, "text-anchor": "end", class: "anim-label--mono", fill: "#ef4444" });
+      cl.textContent = "capacity ≈ 40"; svg.appendChild(cl);
+
+      // line
+      const path = $svg("path", { fill: "none", stroke: "#a78bfa", "stroke-width": 2 });
+      let d = "";
+      pts.forEach((p, i) => {
+        const x = 40 + (i / MAX_PTS) * 420;
+        const y = 200 - (Math.min(p.cwnd, 45) / 40) * 165;
+        d += (i === 0 ? "M" : "L") + ` ${x} ${y} `;
+      });
+      path.setAttribute("d", d);
+      svg.appendChild(path);
+
+      // mark loss points
+      pts.forEach((p, i) => {
+        if (p.state === "loss") {
+          const x = 40 + (i / MAX_PTS) * 420;
+          const y = 200 - (Math.min(p.cwnd, 45) / 40) * 165;
+          svg.appendChild($svg("circle", { cx: x, cy: y, r: 5, fill: "#ef4444",
+            filter: "drop-shadow(0 0 6px rgba(239,68,68,0.7))" }));
+        }
+      });
+      // current cwnd dot
+      if (pts.length) {
+        const last = pts[pts.length - 1];
+        const x = 40 + ((pts.length - 1) / MAX_PTS) * 420;
+        const y = 200 - (Math.min(last.cwnd, 45) / 40) * 165;
+        svg.appendChild($svg("circle", { cx: x, cy: y, r: 4, fill: "#fbbf24" }));
+      }
+
+      readout.innerHTML = "";
+      readout.appendChild($el("span", null, `phase: <strong>${state === "ss" ? "slow start" : "congestion avoidance"}</strong>`));
+      readout.appendChild($el("span", null, `cwnd: <strong>${cwnd.toFixed(1)}</strong>`));
+      readout.appendChild($el("span", null, `ssthresh: <strong>${ssthresh}</strong>`));
+      readout.appendChild($el("span", null, `RTT: <strong>${rttCount}</strong>`));
+    }
+
+    controls.appendChild(btn("▶ run", "primary", start));
+    controls.appendChild(btn("⏸ pause", null, stop));
+    controls.appendChild(btn("step 1 RTT", null, step));
+    controls.appendChild(btn("inject loss", "danger", () => {
+      ssthresh = Math.max(2, Math.floor(cwnd / 2));
+      cwnd = ssthresh;
+      pts.push({ rtt: ++rttCount, cwnd, state: "loss" });
+      state = "ca";
+      if (pts.length > MAX_PTS) pts.shift();
+      draw();
+    }));
+    controls.appendChild(btn("reset", null, () => { stop(); pts = []; cwnd = 1; ssthresh = 32; rttCount = 0; state = "ss"; draw(); }));
 
     draw();
   }
@@ -1260,6 +2397,15 @@
     "saga": animSaga,
     "vector-clock": animVectorClock,
     "sharding": animSharding,
+    "bloom": animBloom,
+    "circuit-breaker": animCircuit,
+    "load-balancer": animLoadBalancer,
+    "windowing": animWindowing,
+    "eviction": animEviction,
+    "mvcc": animMvcc,
+    "quorum": animQuorum,
+    "hll": animHLL,
+    "tcp-cwnd": animTcpCwnd,
   };
 
   function mountAll() {

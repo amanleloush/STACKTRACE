@@ -1,0 +1,74 @@
+# 04 — Coin Change (min coins for amount)
+
+> Dynamic Programming • Position 4/11
+
+## Problem
+Given coin denominations `coins` and a target `amount`, return the **fewest** coins needed to make up that amount. If it cannot be made, return `-1`. Each coin denomination may be used an unlimited number of times.
+
+## Intuition
+For every amount `a`, the optimum is one more than the optimum of `a - c` for some coin `c`. We try every coin and take the smallest result. Because coins are reusable we sweep amounts in increasing order — by the time we evaluate `dp[a]`, every `dp[a - c]` already reflects the best (possibly multi-coin) solution. The sentinel value `amount + 1` (or `inf`) marks "unreachable" so `min` works without special-casing.
+
+## State & recurrence
+- State: `dp[a]` = minimum coins needed to make amount `a`.
+- Transition: `dp[a] = 1 + min(dp[a - c] for c in coins if a - c >= 0)`.
+- Base case: `dp[0] = 0` (zero coins make amount 0). All other `dp[a]` start at `inf`.
+
+## Algorithm
+```python
+def coinChange(coins: list[int], amount: int) -> int:
+    INF = amount + 1  # safe sentinel; any real answer is at most `amount`
+    dp = [0] + [INF] * amount
+    for a in range(1, amount + 1):
+        for c in coins:
+            if c <= a:
+                dp[a] = min(dp[a], dp[a - c] + 1)
+    return dp[amount] if dp[amount] != INF else -1
+
+# Top-down equivalent with memoization is also fine:
+# @cache
+# def best(a):
+#     if a == 0: return 0
+#     if a < 0:  return INF
+#     return 1 + min(best(a - c) for c in coins)
+```
+
+## Walkthrough
+For `coins = [1, 2, 5]`, `amount = 11`:
+
+1. `dp[0] = 0`; everything else starts at `12`.
+2. `dp[1] = dp[0] + 1 = 1` (one `1`).
+3. `dp[2] = min(dp[1] + 1, dp[0] + 1) = 1` (one `2`).
+4. Sweep up: `dp[5] = 1`, `dp[6] = 2`, ..., `dp[10] = 2` (two `5`s).
+5. `dp[11] = min(dp[10] + 1, dp[9] + 1, dp[6] + 1) = 3` (5 + 5 + 1). Return `3`.
+
+<div class="dsa-viz" data-algo="coin-change"></div>
+
+## Complexity
+
+<div class="dsa-bigO">
+  <span>time <strong>O(amount · len(coins))</strong></span>
+  <span>space <strong>O(amount)</strong></span>
+</div>
+
+## Pitfalls
+- Using a greedy "always take the largest coin" — wrong for arbitrary denominations (e.g. `[1, 3, 4]` with amount `6`).
+- Initializing `dp` with `0` everywhere — `min` then locks in `0` for unreachable amounts.
+- Confusing 322 (min count) with 518 (number of ways) — different recurrences and loop orders.
+- Forgetting the `-1` return when `dp[amount]` stays at the sentinel.
+- For permutation-counting variants (377), the outer/inner loop order flips — capacity outside, coins inside.
+
+<div class="dsa-practice">
+  <h4>Practice — LeetCode</h4>
+  <ul>
+    <li><a href="https://leetcode.com/problems/coin-change/">322. Coin Change (Medium)</a> — the canonical min-coins problem.</li>
+    <li><a href="https://leetcode.com/problems/coin-change-ii/">518. Coin Change 2 (Medium)</a> — count distinct combinations.</li>
+    <li><a href="https://leetcode.com/problems/combination-sum-iv/">377. Combination Sum IV (Medium)</a> — count permutations; flip loop order.</li>
+    <li><a href="https://leetcode.com/problems/partition-equal-subset-sum/">416. Partition Equal Subset Sum (Medium)</a> — 0/1 knapsack as a yes/no DP.</li>
+    <li><a href="https://leetcode.com/problems/target-sum/">494. Target Sum (Medium)</a> — reformulate as subset-sum.</li>
+    <li><a href="https://leetcode.com/problems/profitable-schemes/">879. Profitable Schemes (Hard)</a> — two-dimension knapsack.</li>
+    <li><a href="https://leetcode.com/problems/minimum-cost-for-tickets/">983. Minimum Cost For Tickets (Medium)</a> — DP over days with multiple ticket types.</li>
+    <li><a href="https://leetcode.com/problems/painting-the-walls/">2742. Painting the Walls (Hard)</a> — 0/1 knapsack reframed.</li>
+    <li><a href="https://leetcode.com/problems/perfect-squares/">279. Perfect Squares (Medium)</a> — coins are square numbers.</li>
+    <li><a href="https://leetcode.com/problems/form-largest-integer-with-digits-that-add-up-to-target/">1449. Form Largest Integer With Digits That Add up to Target (Hard)</a> — string-valued knapsack.</li>
+  </ul>
+</div>

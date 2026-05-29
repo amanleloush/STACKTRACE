@@ -1,0 +1,72 @@
+# 03 — Bellman-Ford
+
+> Graph Algorithms • Position 3/8
+
+## Problem
+Single-source shortest paths in a weighted graph that **may contain negative edges**. Also detect negative cycles reachable from the source.
+
+## Intuition
+A shortest path in a graph with V nodes uses at most V−1 edges (otherwise it revisits a node and you can shortcut). So **relax every edge V−1 times** and every shortest distance will settle. The invariant: **after k full passes, `dist[v]` equals the shortest path from source to v using at most k edges.** A V-th pass that still improves any distance proves a negative cycle is reachable.
+
+## Algorithm
+Init `dist[source] = 0`, infinity elsewhere. Loop V−1 times: for every edge `(u, v, w)`, if `dist[u] + w < dist[v]`, set `dist[v] = dist[u] + w`. Run one more pass; any further improvement signals a negative cycle.
+
+```python
+def bellman_ford(n, edges, src):
+    dist = [float('inf')] * n
+    dist[src] = 0
+    for _ in range(n - 1):
+        updated = False
+        for u, v, w in edges:
+            if dist[u] + w < dist[v]:
+                dist[v] = dist[u] + w
+                updated = True
+        if not updated:
+            break                       # early exit when stable
+    # negative-cycle check
+    for u, v, w in edges:
+        if dist[u] + w < dist[v]:
+            return None                 # neg cycle reachable from src
+    return dist
+```
+
+## Walkthrough
+Example: 5 nodes `S, A, B, C, D`; directed edges `S→A(6), S→B(7), A→B(8), A→C(5), B→C(-3), B→D(9), C→D(2)`. Source = S.
+
+1. **Init.** `dist = [S:0, A:∞, B:∞, C:∞, D:∞]`.
+2. **Pass 1.** Relax in edge order: `S→A` sets `A=6`, `S→B` sets `B=7`, `A→B` keeps `B=7` (6+8≥7), `A→C` sets `C=11`, `B→C` sets `C=4` (7−3), `B→D` sets `D=16`, `C→D` sets `D=6` (4+2). Result: `[0, 6, 7, 4, 6]`.
+3. **Pass 2.** No edge improves — algorithm converged early (the second pass will skip ahead to the cycle-check sweep).
+4. **Cycle-check pass.** Run every edge once more; nothing relaxes, so **no negative cycle reachable from S**.
+5. **End.** Final shortest paths: `S=0, A=6, B=7, C=4, D=6`.
+
+<div class="dsa-viz" data-algo="bellman-ford"></div>
+
+## Complexity
+
+<div class="dsa-bigO">
+  <span>time <strong>O(V · E)</strong></span>
+  <span>space <strong>O(V)</strong></span>
+</div>
+
+## Pitfalls
+- **Early exit** when a full pass changes nothing — common test cases settle long before V−1.
+- **Negative cycle detection** is a *separate* V-th pass; don't claim cycles from intermediate passes.
+- **Watch for overflow** — `dist[u] + w` with `dist[u] = inf` should be guarded.
+- **SPFA** (Shortest Path Faster Algorithm) is a queue-based Bellman-Ford that's fast in practice but worst-case identical.
+- **K-edge variant** (problem 787) — run exactly K+1 passes; cap path edges and snapshot `dist` between passes to avoid relaxing twice in one pass.
+
+<div class="dsa-practice">
+  <h4>Practice — LeetCode</h4>
+  <ul>
+    <li><a href="https://leetcode.com/problems/cheapest-flights-within-k-stops/">787 Cheapest Flights Within K Stops (Med)</a> — Bellman-Ford with K+1 passes is the cleanest solve.</li>
+    <li><a href="https://leetcode.com/problems/network-delay-time/">743 Network Delay Time (Med)</a> — works here too (no negatives).</li>
+    <li><a href="https://leetcode.com/problems/number-of-ways-to-arrive-at-destination/">1976 Number of Ways to Arrive at Destination (Med)</a> — Dijkstra preferred, BF as comparison.</li>
+    <li><a href="https://leetcode.com/problems/reachable-nodes-in-subdivided-graph/">882 Reachable Nodes In Subdivided Graph (Hard)</a> — practice graph modeling.</li>
+    <li><a href="https://leetcode.com/problems/number-of-restricted-paths-from-first-to-last-node/">1786 Number of Restricted Paths (Med)</a> — Dijkstra-then-DP, BF alternative.</li>
+    <li><a href="https://leetcode.com/problems/minimum-cost-to-reach-destination-in-time/">1928 Minimum Cost to Reach Destination (Hard)</a> — time-constrained relaxation.</li>
+    <li><a href="https://leetcode.com/problems/course-schedule-iv/">1462 Course Schedule IV (Med)</a> — transitive closure (BF-flavored).</li>
+    <li><a href="https://leetcode.com/problems/path-with-minimum-effort/">1631 Path With Minimum Effort (Med)</a> — BF variant on max-along-path.</li>
+    <li><a href="https://leetcode.com/problems/path-with-maximum-probability/">1514 Path with Maximum Probability (Med)</a> — relax on product.</li>
+    <li><a href="https://leetcode.com/problems/find-the-city-with-the-smallest-number-of-neighbors-at-a-threshold-distance/">1334 Find the City (Med)</a> — small V favors Floyd or BF-per-source.</li>
+  </ul>
+</div>

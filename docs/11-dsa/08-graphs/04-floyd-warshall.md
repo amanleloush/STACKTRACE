@@ -1,0 +1,69 @@
+# 04 — Floyd-Warshall
+
+> Graph Algorithms • Position 4/8
+
+## Problem
+Compute the shortest distance between **every pair** of nodes in a weighted graph (no negative cycles).
+
+## Intuition
+For every pair `(i, j)`, consider routes that may pass through an intermediate node `k`. If `dist[i][k] + dist[k][j] < dist[i][j]`, the route through `k` wins. Iterate `k` from 0 to V−1; after `k` is processed, **`dist[i][j]` is the shortest path using intermediates from `{0..k}` only**. After the full loop, you've allowed every node as an intermediate — done. That's the loop invariant.
+
+## Algorithm
+Init the distance matrix from the edge list (`dist[i][i] = 0`, edges fill in, rest infinity). Triple-loop: `k` outermost, then `i`, then `j`. Update on improvement.
+
+```python
+def floyd_warshall(n, edges):
+    INF = float('inf')
+    dist = [[INF] * n for _ in range(n)]
+    for i in range(n):
+        dist[i][i] = 0
+    for u, v, w in edges:
+        dist[u][v] = min(dist[u][v], w)
+    for k in range(n):
+        for i in range(n):
+            for j in range(n):
+                if dist[i][k] + dist[k][j] < dist[i][j]:
+                    dist[i][j] = dist[i][k] + dist[k][j]
+    return dist
+```
+
+## Walkthrough
+Example: 4 nodes; edges `0→1(3), 0→3(7), 1→0(8), 1→2(2), 2→0(5), 2→3(1), 3→0(2)`.
+
+1. **Init.** Diagonals = 0; direct edges filled; rest ∞.
+2. **k=0.** Try every `(i,j)` via node 0: `1→0→3 = 8+7 = 15` updates `dist[1][3]` (was ∞); `2→0→1 = 5+3 = 8` updates `dist[2][1]`; `2→0→3 = 5+7 = 12` updates `dist[2][3]`; `3→0→1 = 2+3 = 5` updates `dist[3][1]`.
+3. **k=1.** Routes via node 1: `0→1→2 = 3+2 = 5` updates `dist[0][2]`; `3→1→2 = 5+2 = 7` updates `dist[3][2]`.
+4. **k=2.** Routes via node 2: `0→2→3 = 5+1 = 6` beats `dist[0][3]=7`; `1→2→3 = 2+1 = 3` beats `dist[1][3]=15`.
+5. **k=3 → done.** Routes via node 3 close the loop (e.g. `1→3→0 = 3+2 = 5` beats `dist[1][0]=8`); after the k=3 sweep, the matrix holds all-pairs shortest paths.
+
+<div class="dsa-viz" data-algo="floyd-warshall"></div>
+
+## Complexity
+
+<div class="dsa-bigO">
+  <span>time <strong>O(V³)</strong></span>
+  <span>space <strong>O(V²)</strong></span>
+</div>
+
+## Pitfalls
+- **`k` is the outer loop** — getting the loop order wrong silently produces wrong answers. Memorize: k, i, j.
+- **Negative cycles** — check `dist[i][i] < 0` after the loop; any negative diagonal means a negative cycle is reachable through `i`.
+- **V³ is brutal** for V > ~500 — fall back to Dijkstra-per-source (O(V · (E + V) log V)) for sparse graphs.
+- **Transitive closure** — replace `+`/`min` with `OR`/`AND` to compute reachability in the same loop shape.
+- **Path reconstruction** — store `next[i][j] = j` (initially) and update `next[i][j] = next[i][k]` on relaxation; walk `next` to rebuild.
+
+<div class="dsa-practice">
+  <h4>Practice — LeetCode</h4>
+  <ul>
+    <li><a href="https://leetcode.com/problems/find-the-city-with-the-smallest-number-of-neighbors-at-a-threshold-distance/">1334 Find the City (Med)</a> — the canonical Floyd-Warshall problem.</li>
+    <li><a href="https://leetcode.com/problems/course-schedule-iv/">1462 Course Schedule IV (Med)</a> — transitive closure flavor.</li>
+    <li><a href="https://leetcode.com/problems/number-of-ways-to-arrive-at-destination/">1976 Number of Ways to Arrive at Destination (Med)</a> — Dijkstra preferred; FW reference.</li>
+    <li><a href="https://leetcode.com/problems/network-delay-time/">743 Network Delay Time (Med)</a> — FW on small graphs.</li>
+    <li><a href="https://leetcode.com/problems/cheapest-flights-within-k-stops/">787 Cheapest Flights Within K Stops (Med)</a> — FW with hop limit is awkward; BF cleaner.</li>
+    <li><a href="https://leetcode.com/problems/detonate-the-maximum-bombs/">2101 Detonate the Maximum Bombs (Med)</a> — reachability via FW.</li>
+    <li><a href="https://leetcode.com/problems/find-if-path-exists-in-graph/">1971 Find if Path Exists (Easy)</a> — reachability warm-up.</li>
+    <li><a href="https://leetcode.com/problems/shortest-path-with-alternating-colors/">1129 Shortest Path with Alternating Colors (Med)</a> — BFS, but FW also works.</li>
+    <li><a href="https://leetcode.com/problems/count-servers-that-communicate/">1267 Count Servers that Communicate (Med)</a> — row/col reachability counting.</li>
+    <li><a href="https://leetcode.com/problems/validate-binary-tree-nodes/">1361 Validate Binary Tree Nodes (Med)</a> — reachability + structural checks.</li>
+  </ul>
+</div>
