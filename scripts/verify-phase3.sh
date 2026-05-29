@@ -48,12 +48,14 @@ assert() {
   fi
 }
 
-# Fresh local DB so the verify run is repeatable.
-rm -f .local.db .local.db-* >/dev/null 2>&1 || true
-npm run migrate >/dev/null
+# Use a separate DB file so the verify run never disturbs the main
+# `.local.db` (where the user's interactive session lives).
+VERIFY_DB="${VERIFY_DB:-.local-verify.db}"
+rm -f "${VERIFY_DB}" "${VERIFY_DB}"-* >/dev/null 2>&1 || true
+LOCAL_DB_PATH="${VERIFY_DB}" npm run migrate >/dev/null
 
 echo "[verify] booting astro dev on :${PORT}…"
-DEV_AUTH_BACKDOOR=1 ADMIN_EMAILS="${ADMIN_EMAIL}" \
+DEV_AUTH_BACKDOOR=1 ADMIN_EMAILS="${ADMIN_EMAIL}" LOCAL_DB_PATH="${VERIFY_DB}" \
   npx astro dev --port "${PORT}" >"${DEV_LOG}" 2>&1 &
 DEV_PID=$!
 

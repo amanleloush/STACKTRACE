@@ -79,5 +79,11 @@ export async function getDb(opts: GetDbOptions = {}): Promise<Db> {
     return makeD1Db(opts.env.DB);
   }
   const { makeDevDb } = await import('./db.dev');
-  return makeDevDb(opts.localPath);
+  // Explicit `opts.localPath` wins. Otherwise honor LOCAL_DB_PATH so test
+  // runs can target an isolated file without disturbing the main `.local.db`.
+  const localPath =
+    opts.localPath ??
+    (typeof process !== 'undefined' ? process.env.LOCAL_DB_PATH : undefined) ??
+    '.local.db';
+  return makeDevDb(localPath);
 }

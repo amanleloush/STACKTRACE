@@ -15,7 +15,7 @@ function readFlag(name: string, fallback: string): string {
   return hit ? hit.slice(prefix.length) : fallback;
 }
 
-const dbPath = readFlag('db', '.local.db');
+const dbPath = readFlag('db', process.env.LOCAL_DB_PATH ?? '.local.db');
 const migrationsDir = readFlag('dir', path.resolve(process.cwd(), 'migrations'));
 
 const db = makeDevDb(dbPath);

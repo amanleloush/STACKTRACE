@@ -40,6 +40,7 @@ export const onRequest = defineMiddleware(async (context, next) => {
   }
 
   const token = readSessionCookie(context.cookies);
+  let staleToken = false;
   if (token) {
     try {
       const env = context.locals.runtime?.env;
@@ -47,6 +48,10 @@ export const onRequest = defineMiddleware(async (context, next) => {
       const { user, session } = await validateSession(db, token);
       context.locals.user = user;
       context.locals.session = session;
+      // Cookie present but no row → the user record was deleted (e.g. a
+      // verify-phase3 run wiped .local.db) or the session expired. Mark
+      // it so we can clear the stale cookie.
+      if (!user) staleToken = true;
     } catch (e) {
       console.error('[middleware] session resolve failed:', e);
     }
@@ -54,6 +59,31 @@ export const onRequest = defineMiddleware(async (context, next) => {
 
   const isAdminRoute = path.startsWith('/admin') || path.startsWith('/api/admin');
   if (isAdminRoute && context.locals.user?.role !== 'admin') {
+    // Dev-mode diagnostic: include a small body explaining *why* (signed
+    // out, stale, or just non-admin). Prod still gets a bare 404 so the
+    // admin surface isn't telegraphed (§14h).
+    if (import.meta.env.DEV) {
+      const reason = staleToken
+        ? 'session cookie is stale (user record missing — local DB was likely wiped). Sign in again at /login/.'
+        : context.locals.user
+          ? `signed in as ${context.locals.user.email} (role=${context.locals.user.role}). Admin routes require role=admin — add ${context.locals.user.email} to ADMIN_EMAILS in .env.local and sign in again.`
+          : 'not signed in. Visit /login/.';
+      const response = new Response(
+        `Not found.\n\n[dev-mode hint] /admin/* — ${reason}\n`,
+        { status: 404, headers: { 'Content-Type': 'text/plain; charset=utf-8' } },
+      );
+      if (staleToken) {
+        response.headers.append(
+          'Set-Cookie',
+          'sysviz_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax',
+        );
+        response.headers.append(
+          'Set-Cookie',
+          'sysviz_signed_in=; Path=/; Max-Age=0; SameSite=Lax',
+        );
+      }
+      return response;
+    }
     return new Response('Not found', { status: 404 });
   }
 
