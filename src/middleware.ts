@@ -33,11 +33,11 @@ export const onRequest = defineMiddleware(async (context, next) => {
     }
   }
 
-  // Admin gate. Path-based check so it covers both pages and API routes.
-  if (context.url.pathname.startsWith('/admin')) {
-    if (context.locals.user?.role !== 'admin') {
-      return new Response('Not found', { status: 404 });
-    }
+  // Admin gate. Covers both /admin/* pages and /api/admin/* write endpoints.
+  const path = context.url.pathname;
+  const isAdminRoute = path.startsWith('/admin') || path.startsWith('/api/admin');
+  if (isAdminRoute && context.locals.user?.role !== 'admin') {
+    return new Response('Not found', { status: 404 });
   }
 
   return next();

@@ -1,0 +1,200 @@
+---
+import BaseLayout from '~/layouts/BaseLayout.astro';
+import { getCollection } from 'astro:content';
+import { listAnimMetas } from '~/lib/anim/registry';
+import { getDb } from '~/lib/db';
+import { listOverrides, type EntityKind } from '~/lib/billing/entitlement';
+
+export const prerender = false;
+
+interface Row {
+  kind: EntityKind;
+  id: string;
+  title: string;
+  defaultPremium: boolean;
+  previewParagraphs: number | null;
+  effectivePremium: boolean;
+  hasOverride: boolean;
+  overrideAt: number | null;
+}
+
+const env = Astro.locals.runtime?.env;
+const db = await getDb({ env });
+const overrides = await listOverrides(db);
+const overrideMap = new Map(overrides.map((o) => [`${o.entityKind}:${o.entityId}`, o]));
+
+const notes = await getCollection('notes', (n) => !n.data.draft);
+const dsaEntries = await getCollection('dsa', (n) => !n.data.draft);
+const anims = listAnimMetas();
+
+function rowFor(kind: EntityKind, id: string, title: string, defaultPremium: boolean, previewParagraphs?: number): Row {
+  const o = overrideMap.get(`${kind}:${id}`);
+  return {
+    kind,
+    id,
+    title,
+    defaultPremium,
+    previewParagraphs: previewParagraphs ?? null,
+    effectivePremium: o ? o.premium : defaultPremium,
+    hasOverride: !!o,
+    overrideAt: o?.updatedAt ?? null,
+  };
+}
+
+const rows: Row[] = [
+  ...notes.map((n) => rowFor('note', n.id, n.data.title, n.data.premium, n.data.previewParagraphs)),
+  ...dsaEntries.map((n) => rowFor('note', n.id, n.data.title, n.data.premium, n.data.previewParagraphs)),
+  ...anims.map((a) => rowFor('anim', a.id, a.title, a.premium ?? false)),
+];
+
+const flash = Astro.url.searchParams.get('flash');
+
+// Quick summary stats.
+const counts = rows.reduce(
+  (acc, r) => {
+    acc.total++;
+    if (r.effectivePremium) acc.gated++;
+    if (r.hasOverride) acc.overrides++;
+    return acc;
+  },
+  { total: 0, gated: 0, overrides: 0 },
+);
+---
+<BaseLayout title="Admin — Content gating">
+  <section class="admin-content">
+    <header class="admin-content__head">
+      <div>
+        <h1>Content gating</h1>
+        <p class="admin-content__sub">
+          <strong>{counts.total}</strong> entities · <strong>{counts.gated}</strong> currently gated ·
+          <strong>{counts.overrides}</strong> with an override.
+          Defaults come from frontmatter / AnimMeta; overrides live in
+          <code>entitlement_overrides</code>.
+        </p>
+      </div>
+      <a class="anim__btn" href="/admin/">← Back</a>
+    </header>
+
+    {flash && (
+      <div class="admin-content__flash" role="status">{flash}</div>
+    )}
+
+    <table class="admin-content__table">
+      <thead>
+        <tr>
+          <th>Kind</th>
+          <th>Title / id</th>
+          <th>Default</th>
+          <th>Effective</th>
+          <th>Override</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((r) => (
+          <tr>
+            <td><code>{r.kind}</code></td>
+            <td>
+              <div class="admin-content__title">{r.title}</div>
+              <code class="admin-content__id">{r.id}</code>
+            </td>
+            <td>{r.defaultPremium ? '🔒' : '—'}</td>
+            <td class={r.effectivePremium ? 'is-gated' : 'is-free'}>
+              {r.effectivePremium ? '🔒 gated' : '— free'}
+            </td>
+            <td>
+              {r.hasOverride
+                ? <span class="admin-content__override">override</span>
+                : <span class="admin-content__default">default</span>}
+            </td>
+            <td class="admin-content__actions">
+              <form method="post" action="/api/admin/content/override">
+                <input type="hidden" name="kind" value={r.kind} />
+                <input type="hidden" name="id" value={r.id} />
+                <input type="hidden" name="premium" value={r.effectivePremium ? '0' : '1'} />
+                <button type="submit" class="anim__btn">
+                  {r.effectivePremium ? '→ Make free' : '→ Make premium'}
+                </button>
+              </form>
+              {r.hasOverride && (
+                <form method="post" action="/api/admin/content/override" style="display:inline">
+                  <input type="hidden" name="kind" value={r.kind} />
+                  <input type="hidden" name="id" value={r.id} />
+                  <input type="hidden" name="action" value="clear" />
+                  <button type="submit" class="anim__btn admin-content__reset">Reset</button>
+                </form>
+              )}
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  </section>
+</BaseLayout>
+
+<style>
+  .admin-content { max-width: 78rem; margin: 1.5rem auto; }
+  .admin-content__head {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+  }
+  .admin-content__sub {
+    color: var(--fg-muted);
+    max-width: 50rem;
+    margin: 0.5rem 0 0;
+    line-height: 1.5;
+    font-size: 0.92rem;
+  }
+  .admin-content__sub code { background: var(--code-bg); padding: 0.1em 0.4em; border-radius: 4px; }
+  .admin-content__flash {
+    padding: 0.65rem 1rem;
+    margin-bottom: 1rem;
+    background: color-mix(in srgb, var(--anim-success) 14%, transparent);
+    border: 1px solid var(--anim-success);
+    border-radius: 8px;
+    color: var(--fg);
+    font-size: 0.9rem;
+  }
+  .admin-content__table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.85rem;
+  }
+  .admin-content__table th,
+  .admin-content__table td {
+    padding: 0.55rem 0.6rem;
+    text-align: left;
+    border-bottom: 1px solid var(--card-border);
+    vertical-align: middle;
+  }
+  .admin-content__table th {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--fg-muted);
+  }
+  .admin-content__title { font-weight: 500; }
+  .admin-content__id {
+    display: block;
+    font-size: 0.72rem;
+    color: var(--fg-faint);
+  }
+  .admin-content__override {
+    font-size: 0.7rem;
+    padding: 0.15rem 0.55rem;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--anim-highlight) 18%, transparent);
+    color: var(--anim-highlight);
+    font-weight: 600;
+  }
+  .admin-content__default { color: var(--fg-faint); font-size: 0.78rem; }
+  .is-gated { color: var(--anim-highlight); font-weight: 600; }
+  .is-free { color: var(--fg-muted); }
+  .admin-content__actions { display: flex; gap: 0.4rem; align-items: center; }
+  .admin-content__actions form { display: inline; }
+  .admin-content__reset { font-size: 0.7rem; padding: 0.2rem 0.55rem; }
+</style>
