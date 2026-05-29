@@ -6,6 +6,21 @@
 
 Design a real-time messaging system supporting 1-to-1 and group chats, with delivery, read receipts, presence, and message history.
 
+```mermaid
+flowchart LR
+    A([Client A]) <-->|WebSocket| GW1[Gateway 1]
+    B([Client B]) <-->|WebSocket| GW2[Gateway 2]
+    GW1 --> R[Routing / fan-out]
+    GW2 --> R
+    R <--> P[(Presence — Redis)]
+    R --> K[[Kafka: chat.messages]]
+    K --> S[Message store writer]
+    S --> DB[(Cassandra<br/>partition by chat_id)]
+    K --> PUSH[Push worker]
+    PUSH --> APNS[(APNs / FCM)]
+    R --> SEEN[[Kafka: read.receipts]]
+```
+
 ## Requirements
 
 ### Functional

@@ -10,6 +10,17 @@
 
 CDC is how modern systems propagate the source of truth (a database) to caches, search indexes, data warehouses, ML feature stores, downstream services, and audit logs — without dual writes (which would be race-prone) and without rewriting the app. It powers the "event-driven architecture" most teams talk about.
 
+```mermaid
+flowchart LR
+    APP[App] -->|writes| DB[(Postgres / MySQL)]
+    DB -.->|WAL / binlog tail| DBZ[Debezium connector]
+    DBZ --> K[[Kafka: cdc.orders]]
+    K --> S1[Search indexer] --> ES[(Elasticsearch)]
+    K --> S2[Cache invalidator] --> R[(Redis)]
+    K --> S3[Warehouse sink] --> WH[(Snowflake)]
+    K --> S4[Feature pipeline] --> FS[(Feature store)]
+```
+
 ## Core concepts
 
 ### Why not just dual-write?

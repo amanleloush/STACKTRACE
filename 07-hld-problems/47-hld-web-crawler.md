@@ -6,6 +6,19 @@
 
 Design a distributed web crawler: fetch billions of pages from the public web, parse and index them, respect robots.txt and politeness, while scaling efficiently.
 
+```mermaid
+flowchart LR
+    SEED[Seed URLs] --> FRO[URL frontier<br/>priority queue per host]
+    FRO --> POL[Politeness gate<br/>robots.txt + delay]
+    POL --> FET[Fetcher pool]
+    FET --> PAR[Parser]
+    PAR -->|new URLs| DEDUP[Bloom + URL store]
+    DEDUP --> FRO
+    PAR --> STORE[(Page store — S3)]
+    STORE --> IDX[Indexer] --> ES[(Search index)]
+    FET -.->|503 / slow| BACK[Backoff]
+```
+
 ## Requirements
 
 ### Functional

@@ -10,6 +10,27 @@ A **monolith** is a single deployable unit holding all functionality. **Microser
 
 The microservices-first instinct of the 2010s burned many teams: distributed transactions, observability complexity, deployment overhead. The current consensus: **start with a modular monolith; extract services when you have a real, measured reason.**
 
+```mermaid
+flowchart LR
+    subgraph M["Monolith"]
+        M1[orders] --- M2[users] --- M3[catalog] --- M4[payments]
+    end
+    subgraph MM["Modular monolith"]
+        MM1[orders] -.module bdry.-> MM2[users]
+        MM2 -.-> MM3[catalog]
+        MM3 -.-> MM4[payments]
+    end
+    subgraph MS["Microservices"]
+        MS1[orders] -->|HTTP/gRPC| MS2[users]
+        MS2 --> MS3[catalog]
+        MS3 -->|event| MS4[payments]
+    end
+    M -->|extract module| MM -->|extract service| MS
+    style M fill:#475569,color:#fff
+    style MM fill:#6366f1,color:#fff
+    style MS fill:#34d399,color:#0b0d18
+```
+
 ## Core concepts
 
 ### Monolith

@@ -10,6 +10,24 @@
 
 Every backend that handles more than one request at a time deals with concurrency: thread pools, connection pools, async I/O, locks, atomics, queues. Bugs here are non-deterministic, expensive in production, and brutal to debug. Interviews use locks/deadlock/race-condition questions as proxies for "have you actually written a multi-threaded service."
 
+```mermaid
+flowchart LR
+    subgraph DEAD["Deadlock — two locks, two threads, opposite order"]
+        T1[Thread A] -->|holds| L1[(Lock 1)]
+        T1 -->|wants| L2[(Lock 2)]
+        T2[Thread B] -->|holds| L2
+        T2 -->|wants| L1
+    end
+    subgraph FIX["Fix — global lock order"]
+        TX[Thread A] -->|acquire| LO1[(Lock 1)] -->|then| LO2[(Lock 2)]
+        TY[Thread B] -->|acquire| LO1
+    end
+    style L1 fill:#ef4444,color:#fff
+    style L2 fill:#ef4444,color:#fff
+    style LO1 fill:#10b981,color:#fff
+    style LO2 fill:#10b981,color:#fff
+```
+
 ## Core concepts
 
 ### Process vs thread

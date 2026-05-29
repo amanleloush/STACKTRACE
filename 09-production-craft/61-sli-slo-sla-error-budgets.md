@@ -9,6 +9,25 @@
 - **SLA (Service Level Agreement)**: an external contract with consequences (refunds, penalties) if SLO is missed.
 - **Error budget**: 1 - SLO. The amount of unreliability you can "spend" — on risky deploys, experiments, or just unlucky incidents — before missing the SLO.
 
+```mermaid
+flowchart LR
+    SLO["SLO: 99.9% successful<br/>over 30d window"] --> BUDGET["Error budget = 0.1%<br/>≈ 43.2 min/30d"]
+    BUDGET --> BURN["Track burn rate<br/>(actual errors / budget)"]
+    BURN -->|burn × 14 over 1h| FAST[FAST burn page]
+    BURN -->|burn × 6 over 6h| SLOW[SLOW burn ticket]
+    BURN -->|under| OK[ship more risky things]
+    style FAST fill:#ef4444,color:#fff
+    style SLOW fill:#f59e0b,color:#0b0d18
+    style OK fill:#10b981,color:#fff
+```
+
+| Term | Audience | Teeth |
+|---|---|---|
+| **SLI** | engineers | what you measure |
+| **SLO** | internal | what you target |
+| **SLA** | customers | contractually owed (refunds, etc.) |
+| **Error budget** | leadership + eng | how much risk you can spend |
+
 ## Why it matters
 
 Without SLOs, "reliability" is debated forever. With SLOs, you have a concrete target everyone agrees on, alerts you only when it matters, and an error budget that turns reliability into a quantitative resource you can spend. This is the foundation of Google-style SRE.

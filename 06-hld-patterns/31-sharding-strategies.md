@@ -10,6 +10,10 @@
 
 The sharding decision is the single most consequential one in a distributed data system. It dictates which queries are fast (single-shard) and which are slow (scatter-gather), how rebalancing works, what kinds of transactions are possible, and how operational pain scales.
 
+<div class="sde-anim" data-anim="sharding"></div>
+
+<div class="sde-anim" data-anim="consistent-hash"></div>
+
 ## Core concepts
 
 ### Range partitioning

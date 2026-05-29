@@ -10,6 +10,28 @@
 
 Every codebase accumulates debt; what differs is how teams respond. Teams that ignore debt slow down progressively until they can't ship. Teams that refactor continuously keep velocity high for years. Refactoring is the practical skill; debt management is the discipline.
 
+```mermaid
+flowchart LR
+    subgraph S0["Today — legacy monolith"]
+        L1[old code]
+    end
+    subgraph S1["Wrap with interface"]
+        L1b[old code] --> IF1[adapter]
+    end
+    subgraph S2["Send some traffic to new"]
+        IF2[adapter] --> NEW1[new impl 10%]
+        IF2 --> L1c[old code 90%]
+    end
+    subgraph S3["Cut over"]
+        IF3[adapter] --> NEW2[new impl 100%]
+        OLD3[old code · dead] -. delete .-> X((removed))
+    end
+    S0 --> S1 --> S2 --> S3
+    style L1 fill:#475569,color:#fff
+    style NEW2 fill:#10b981,color:#fff
+    style X fill:#ef4444,color:#fff
+```
+
 ## Core concepts
 
 ### Refactoring (Fowler's definition)

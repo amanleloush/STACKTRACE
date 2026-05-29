@@ -10,6 +10,8 @@
 
 Almost every database brochure overpromises. CAP/PACELC + the consistency hierarchy give you the vocabulary to evaluate claims and to reason about what your system actually guarantees — which matters when correctness bugs appear under failure or contention.
 
+<div class="sde-anim" data-anim="cap"></div>
+
 ## Core concepts
 
 ### CAP theorem (Brewer 2000, proven 2002)

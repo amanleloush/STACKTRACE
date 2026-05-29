@@ -6,6 +6,23 @@
 
 Design a ride-sharing platform: riders request a trip, the system finds nearby drivers, matches optimally, tracks the ride, and processes payment.
 
+```mermaid
+flowchart LR
+    R([Rider app]) -->|request| LB
+    D([Driver app]) -->|loc updates| LB
+    LB --> LOC[Location ingestor]
+    LOC --> GEO[(Geo-index<br/>S2 cells / Redis geo)]
+    LB --> DISP[Dispatch service]
+    DISP --> GEO
+    DISP --> MATCH[Matcher<br/>hungarian / greedy]
+    MATCH --> TRIP[Trip state machine]
+    TRIP --> DB[(Trips DB)]
+    TRIP --> K[[trip events]]
+    K --> SURGE[Surge pricer]
+    K --> PAY[Payment]
+    K --> ETA[ETA service]
+```
+
 ## Requirements
 
 ### Functional

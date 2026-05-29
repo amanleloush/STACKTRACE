@@ -10,6 +10,25 @@
 
 The choice between these shapes API ergonomics, mobile bandwidth, internal-service performance, and team coupling for years. "Use REST" is rarely the full answer — most modern systems mix all three (REST/GraphQL at the edge, gRPC internally).
 
+```mermaid
+flowchart TB
+    subgraph REST["REST — N round-trips, JSON over HTTP/1.1"]
+        C1[Client] -->|GET /user/42| S1[Service]
+        C1 -->|GET /user/42/posts| S1
+        C1 -->|GET /post/9/comments| S1
+    end
+    subgraph GQL["GraphQL — 1 query, exact shape"]
+        C2[Client] -->|POST /graphql<br/>{user{posts{comments}}}| S2[Resolver]
+        S2 --> R1[(user)]
+        S2 --> R2[(posts)]
+        S2 --> R3[(comments)]
+    end
+    subgraph GRPC["gRPC — proto over HTTP/2, streaming"]
+        C3[Client] <-->|bidi stream| S3[Service]
+        S3 -.codegen.-> ST[(.proto stub)]
+    end
+```
+
 ## Core concepts
 
 ### REST

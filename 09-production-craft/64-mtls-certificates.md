@@ -10,6 +10,31 @@
 
 Service-to-service identity at scale demands stronger auth than shared secrets or bearer tokens. mTLS gives you encryption + cryptographic identity in one step, with no central token issuer to fail. The hard part isn't TLS itself — it's the lifecycle: rotation, revocation, expiry monitoring.
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client (svc-A)
+    participant S as Server (svc-B)
+    C->>S: ClientHello
+    S->>C: ServerHello + cert (signed by org CA)
+    C->>C: verify server cert chain → CA root
+    S->>C: CertificateRequest
+    C->>S: client cert (signed by org CA)
+    S->>S: verify client cert chain → CA root
+    Note over C,S: both sides authenticated · symmetric session key
+    C->>S: encrypted application data
+```
+
+```mermaid
+flowchart LR
+    CA[(Root CA<br/>offline, hardware-protected)] --> ICA[(Intermediate CA)]
+    ICA --> CM[cert-manager / Vault PKI]
+    CM -->|SPIFFE ID| POD1[Pod svc-A]
+    CM -->|SPIFFE ID| POD2[Pod svc-B]
+    CM -. rotate every 24h .-> POD1
+    POD1 <-->|mTLS handshake| POD2
+```
+
 ## Core concepts
 
 ### Regular TLS recap

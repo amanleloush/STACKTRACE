@@ -10,6 +10,8 @@
 
 Kafka is the de facto event backbone for most modern data systems — a stream of business events that powers analytics, CDC, ML feature pipelines, eventual-consistency between microservices. Understanding partitions, ordering, ISR, and consumer offsets is the difference between "we have Kafka" and "we know what Kafka guarantees."
 
+<div class="sde-anim" data-anim="kafka"></div>
+
 ## Core concepts
 
 ### Topic, partition, offset

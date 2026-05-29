@@ -10,6 +10,24 @@
 
 Almost every backend conversation — load balancing, gRPC, Kafka, WebSockets, HTTP/3, mTLS — pulls on these four primitives: 3-way handshake, congestion control, TLS handshake, datagrams. If you can't explain what happens between `connect()` and the first byte of payload, you can't reason about p99 latency, head-of-line blocking, or connection pooling.
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant S as Server
+    Note over C,S: TCP 3-way handshake (~1 RTT)
+    C->>S: SYN (seq=x)
+    S->>C: SYN-ACK (seq=y, ack=x+1)
+    C->>S: ACK (ack=y+1)
+    Note over C,S: TLS 1.3 handshake (1 RTT)
+    C->>S: ClientHello + key share
+    S->>C: ServerHello + cert + Finished
+    C->>S: Finished
+    Note over C,S: Application data (encrypted)
+    C->>S: GET /api HTTP/1.1
+    S->>C: 200 OK + body
+```
+
 ## Core concepts
 
 ### TCP — what guarantees you get

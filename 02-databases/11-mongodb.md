@@ -10,6 +10,25 @@
 
 MongoDB shows up everywhere — early-stage products, content platforms, mobile backends. Knowing when to pick it (flexible schemas, hierarchical data, fast iteration) and when not to (multi-document transactions across collections, heavy joins, strict relational integrity) is a baseline backend skill.
 
+```mermaid
+flowchart LR
+    C([Client]) --> R[mongos router]
+    R --> CFG[(Config servers<br/>shard map)]
+    R --> S1
+    R --> S2
+    R --> S3
+    subgraph S1["Shard 1 — replica set"]
+        P1[(Primary)] -.async.-> SC1[(Secondary)]
+        P1 -.async.-> SC2[(Secondary)]
+    end
+    subgraph S2["Shard 2 — replica set"]
+        P2[(Primary)] -.-> SD1[(Secondary)]
+    end
+    subgraph S3["Shard 3 — replica set"]
+        P3[(Primary)] -.-> SE1[(Secondary)]
+    end
+```
+
 ## Core concepts
 
 ### Documents and collections

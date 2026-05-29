@@ -6,6 +6,24 @@
 
 Design a video streaming platform: users upload videos, the system transcodes to multiple bitrates, stores them, and streams to viewers globally with low buffering and minimal cost.
 
+```mermaid
+flowchart LR
+    UP([Creator]) -->|raw mp4| INGEST[Ingest API]
+    INGEST --> RAW[(Raw object store)]
+    RAW --> Q[[Transcode queue]]
+    Q --> W1[Worker — 240p]
+    Q --> W2[Worker — 720p]
+    Q --> W3[Worker — 1080p]
+    Q --> W4[Worker — 4K]
+    W1 --> SEG[Segmented<br/>HLS/DASH]
+    W2 --> SEG
+    W3 --> SEG
+    W4 --> SEG
+    SEG --> CDN[Edge CDN]
+    V([Viewer]) -->|manifest| CDN
+    V -->|ABR feedback| PLAYER[Player switches rendition]
+```
+
 ## Requirements
 
 ### Functional

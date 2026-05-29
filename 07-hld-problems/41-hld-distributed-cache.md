@@ -6,6 +6,8 @@
 
 Design a distributed cache cluster (Redis-style) for sub-ms reads of hot keyed data, horizontally scalable, with replication for HA and consistent hashing for sharding.
 
+<div class="sde-anim" data-anim="consistent-hash"></div>
+
 ## Requirements
 
 ### Functional

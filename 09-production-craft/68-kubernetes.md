@@ -10,6 +10,22 @@
 
 K8s is the de facto standard for running containerized workloads at scale. Whether you love or hate it, large-scale deployments converge on k8s patterns (or work around its complexity). Knowing the primitives lets you reason about modern infra without getting lost in YAML.
 
+```mermaid
+flowchart LR
+    USER([kubectl apply]) --> API[API server]
+    API --> ETCD[(etcd)]
+    API <--> SCHED[Scheduler]
+    API <--> CM[Controller manager]
+    CM --> RS[ReplicaSet ctrl]
+    CM --> DEPL[Deployment ctrl]
+    SCHED -.assign.-> NODE
+    subgraph NODE["Worker node"]
+        KUBELET[kubelet] -->|run pod| CRI[(containerd)]
+        KUBEPROXY[kube-proxy]
+    end
+    KUBELET -->|status| API
+```
+
 ## Core concepts
 
 ### Pod

@@ -10,6 +10,38 @@ A **lakehouse** is a data architecture that adds warehouse-grade features (ACID 
 
 Lakehouses replace the messy two-tier "data lake + warehouse" architecture. You get warehouse semantics at lake price and open-format flexibility. Modern data stacks at Netflix, Apple, Uber, Stripe, and most large teams are converging on lakehouse table formats.
 
+```mermaid
+flowchart TB
+    subgraph QE["Query engines (read open formats)"]
+        SPARK[Spark]
+        TRINO[Trino]
+        FLINK[Flink]
+        SNOW[Snowflake / DBX / BQ]
+    end
+    subgraph META["Open table format — metadata layer"]
+        ICE[Iceberg metadata.json] --> SNAP[snapshots · manifests]
+        DEL[Delta _delta_log] --> SNAP
+        HUDI[Hudi timeline] --> SNAP
+    end
+    subgraph FILES["Open file format"]
+        PQ[(Parquet / ORC files in S3 / GCS / ADLS)]
+    end
+    QE --> META --> FILES
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Q1 as Query A (reader)
+    participant T as Iceberg table
+    participant Q2 as Query B (writer — UPDATE)
+    Q1->>T: snapshot v3 (consistent read)
+    Q2->>T: UPDATE rows → writes new files
+    Q2->>T: commit snapshot v4 (atomic)
+    Note over Q1: still reading v3 — time travel works
+    Q1->>T: SELECT FROM t AS OF v3
+```
+
 ## Core concepts
 
 ### The old two-tier problem

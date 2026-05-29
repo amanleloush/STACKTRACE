@@ -10,6 +10,8 @@ A **cache** is a fast read store kept in front of a slow store of truth. **Cache
 
 Cache bugs cause more outages than people admit: stale data, inconsistent invalidation, thundering herds. Picking the right pattern up front (and knowing the failure modes of each) is the first lever for both performance and correctness in any system with a meaningful read load.
 
+<div class="sde-anim" data-anim="cache-patterns"></div>
+
 ## Core concepts
 
 ### Cache-aside (lazy loading)

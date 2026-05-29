@@ -10,6 +10,28 @@
 
 The biggest cause of production incidents is "this deploy broke something." Feature flags + canary + dark launch separate the **risk of deploying code** from the **risk of releasing a feature**. Top-tier teams ship many times a day because of these patterns; teams without them ship cautiously and slowly.
 
+```mermaid
+flowchart LR
+    DEPLOY[Deploy code with flag OFF] --> SHADOW[Dark launch<br/>run new path, discard output, compare]
+    SHADOW -->|matches old?| INTERNAL[Enable for internal users]
+    INTERNAL --> CANARY[Canary 1% → 5% → 25% → 100%]
+    CANARY -. SLO breach .-> KILL[kill switch — flag OFF]
+    CANARY --> FULL[100% release]
+    FULL --> REMOVE[Remove flag from code]
+    style KILL fill:#ef4444,color:#fff
+    style REMOVE fill:#10b981,color:#fff
+```
+
+```mermaid
+flowchart LR
+    USER([request]) --> LB[LB / proxy]
+    LB --> EVAL[Flag evaluation<br/>user_id, region, percentage]
+    EVAL -->|flag.enabled| NEW[New code path]
+    EVAL -->|else| OLD[Old code path]
+    EVAL --> SDK[(Flag SDK · LaunchDarkly / Unleash / GrowthBook)]
+    SDK --> METRICS[Emit exposure events] --> ANL[Analytics — was the variant safer?]
+```
+
 ## Core concepts
 
 ### Feature flags

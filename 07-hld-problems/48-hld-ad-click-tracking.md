@@ -6,6 +6,20 @@
 
 Design a system that ingests billions of ad-click events per day, deduplicates, attributes, aggregates in real time and offline, and provides dashboards + APIs for advertisers and internal systems.
 
+```mermaid
+flowchart LR
+    CLICK([Click pixel]) --> ING[Ingest API]
+    ING --> K[[Kafka: ad.clicks]]
+    K --> DEDUP[Dedup<br/>click_id Bloom]
+    DEDUP --> FRAUD[Fraud filter]
+    FRAUD --> RT[Realtime agg<br/>Flink] --> RTSTORE[(Druid / Pinot)]
+    FRAUD --> RAW[(Raw landing<br/>S3 / Iceberg)]
+    RAW --> BATCH[Spark daily] --> WH[(Warehouse)]
+    RTSTORE --> DASH[Dashboards]
+    WH --> DASH
+    WH --> BILL[Billing]
+```
+
 ## Requirements
 
 ### Functional

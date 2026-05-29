@@ -10,6 +10,18 @@
 
 Hand-managed infra drifts, can't be audited, and is the #1 cause of "it works in staging but not prod." IaC turns infra into code: review, test, version, repeat. Every modern team needs IaC.
 
+```mermaid
+flowchart LR
+    DEV[Engineer edits .tf] --> PR[Pull request]
+    PR --> CI[CI runs<br/>terraform plan]
+    CI --> REVIEW[Review diff]
+    REVIEW -->|approve| MERGE[merge to main]
+    MERGE --> APPLY[terraform apply<br/>in CD pipeline]
+    APPLY --> STATE[(Remote state<br/>S3 + DynamoDB lock)]
+    APPLY --> CLOUD[(AWS / GCP API)]
+    CLOUD --> DRIFT[drift detection nightly] --> CI
+```
+
 ## Core concepts
 
 ### Terraform basics

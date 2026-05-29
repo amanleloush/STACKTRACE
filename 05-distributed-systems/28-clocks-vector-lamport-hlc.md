@@ -13,6 +13,8 @@ In a distributed system, **wall-clock time can't be trusted** because clocks dri
 
 Wall-clock ordering breaks: replicas with skewed clocks make wrong decisions ("which write won?"). Distributed systems use logical or hybrid clocks for consistency, replication conflict resolution, version vectors, and tracing. Understanding the model determines correctness, not just performance.
 
+<div class="sde-anim" data-anim="vector-clock"></div>
+
 ## Core concepts
 
 ### The clock problem

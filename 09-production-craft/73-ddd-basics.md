@@ -11,6 +11,32 @@
 - **Entity / Value object**: things with identity vs things defined by their values.
 - **Domain event**: something significant that happened in the domain.
 
+```mermaid
+flowchart TB
+    subgraph BC1["Bounded context: Sales"]
+        S1[Order]
+        S2[Cart]
+        S3[Pricing]
+        S1 --> S2
+        S1 --> S3
+    end
+    subgraph BC2["Bounded context: Fulfilment"]
+        F1[Shipment]
+        F2[Pick list]
+        F1 --> F2
+    end
+    subgraph BC3["Bounded context: Billing"]
+        B1[Invoice]
+        B2[Tax calc]
+        B1 --> B2
+    end
+    S1 -.OrderPlaced event.-> F1
+    S1 -.OrderPlaced event.-> B1
+    style BC1 fill:#6366f1,color:#fff
+    style BC2 fill:#06b6d4,color:#fff
+    style BC3 fill:#34d399,color:#0b0d18
+```
+
 ## Why it matters
 
 DDD's tactical patterns (aggregates, entities, repositories) clarify code structure; its strategic patterns (bounded contexts, ubiquitous language) drive microservice boundaries, team boundaries, and API design. Most "microservices but everything's coupled" problems trace to ignoring DDD's strategic principles.

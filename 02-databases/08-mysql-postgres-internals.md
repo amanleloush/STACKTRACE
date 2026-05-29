@@ -10,6 +10,8 @@ Relational databases like MySQL (InnoDB) and Postgres store rows in **B+ tree** 
 
 Most production performance issues in OLTP systems trace back to a missing index, a stale stats table, or a planner choosing a sequential scan when a seek would be 100× faster. If you can read an `EXPLAIN ANALYZE`, you can fix 80% of slow queries on day one of any new team.
 
+<div class="sde-anim" data-anim="lsm-btree"></div>
+
 ## Core concepts
 
 ### B+ tree storage

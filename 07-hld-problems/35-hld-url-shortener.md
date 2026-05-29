@@ -6,6 +6,21 @@
 
 Build a service that converts long URLs to short ones (`bit.ly/xY3qZ`) and redirects users back to the original URL on access. Track click counts.
 
+```mermaid
+flowchart LR
+    U([User]) --> CDN
+    CDN --> LB[L7 Load balancer]
+    LB --> API[Shortener API]
+    API -->|writes| KGEN[Key generator<br/>base62 / range]
+    API -->|cache then DB| C[(Redis<br/>code → long_url)]
+    C -->|miss| DB[(Postgres / Cassandra<br/>shorts table)]
+    LB --> R[Redirect service]
+    R --> C
+    R -->|async| Q[[Click events queue]]
+    Q --> A[Analytics consumer]
+    A --> WH[(Warehouse)]
+```
+
 ## Requirements
 
 ### Functional

@@ -6,6 +6,18 @@
 
 Design a typeahead service that suggests the most likely completions for a user's prefix in real time, ranked by popularity and relevance.
 
+```mermaid
+flowchart LR
+    U([User types 'sys']) --> EDGE[Edge / CDN]
+    EDGE --> API[Suggest API]
+    API --> CACHE[(Redis<br/>prefix → top-K)]
+    CACHE -.miss.-> TRIE[Trie service<br/>in-memory]
+    TRIE --> STORE[(Suggestion store)]
+    LOGS[[Query log stream]] --> AGG[Hourly aggregator]
+    AGG --> RANK[Rank model] --> STORE
+    AGG --> CACHE
+```
+
 ## Requirements
 
 ### Functional

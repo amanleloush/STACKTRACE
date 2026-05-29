@@ -6,6 +6,24 @@
 
 Design a social news feed: users post (tweets/status), follow each other, and see a personalized timeline of their followees' recent activity, ranked or chronological.
 
+```mermaid
+flowchart TB
+    subgraph Write["Write path"]
+        AUTH([Author]) -->|POST /post| PS[Post service]
+        PS --> DB[(Posts DB)]
+        PS --> FAN[Fan-out worker]
+        FAN -->|push to followers| TL[(Timeline cache<br/>Redis sorted-set)]
+        FAN -->|skip celebs| MARK[mark celeb]
+    end
+    subgraph Read["Read path"]
+        READER([Reader]) -->|GET /feed| FS[Feed service]
+        FS --> TL
+        FS -->|pull recent celeb posts| CDB[(Celeb posts)]
+        FS --> RANK[Ranking model]
+        RANK --> READER
+    end
+```
+
 ## Requirements
 
 ### Functional

@@ -10,6 +10,10 @@
 
 Rate limiting is the front line for: API abuse protection, DoS mitigation, fair resource sharing, cost control on expensive operations, defending downstream services. Done wrong, it punishes good users; done right, it's invisible.
 
+<div class="sde-anim" data-anim="bucket"></div>
+
+<div class="sde-anim" data-anim="rate-window"></div>
+
 ## Core concepts
 
 ### Token bucket

@@ -10,6 +10,25 @@
 
 Choosing sync vs async per interaction is the most consequential design decision in modern systems. Sync everywhere → fragile, slow, hard to scale, cascading failures. Async everywhere → eventual consistency surprises, debugging hell. The mature answer is **sync where you need an answer right now, async everywhere else.**
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as User
+    participant A as Order svc
+    participant P as Payment
+    participant I as Inventory
+    participant E as Email worker
+    Note over U,E: Mature shape — sync where the user waits, async everywhere else
+    U->>A: POST /order
+    A->>P: charge (sync)
+    P-->>A: success
+    A->>I: reserve (sync)
+    I-->>A: ok
+    A-->>U: 200 created
+    A--)E: order.created event
+    E->>E: send confirmation email
+```
+
 ## Core concepts
 
 ### Sync (request-response)

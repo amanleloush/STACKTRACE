@@ -6,6 +6,8 @@
 
 Design a payment system that processes money movement (debit A, credit B) with strict correctness — no double charges, no lost transfers, full auditability, even under retries and partial failures.
 
+<div class="sde-anim" data-anim="saga"></div>
+
 ## Requirements
 
 ### Functional

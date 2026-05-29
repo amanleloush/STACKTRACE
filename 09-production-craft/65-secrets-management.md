@@ -10,6 +10,33 @@
 
 Leaked secrets are responsible for many of the largest production incidents (data breaches, crypto thefts, abused cloud accounts). Done right, secrets are short-lived, dynamically issued, audited per access, and never reach a developer's laptop in plaintext.
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as App
+    participant W as Workload identity<br/>(k8s SA / IAM role)
+    participant V as Vault / Secrets Manager
+    participant DB as Database
+    A->>W: I am pod-orders-7
+    W-->>A: signed JWT (workload identity)
+    A->>V: request DB creds (with JWT)
+    V->>V: authorize, mint short-lived role
+    V->>DB: CREATE ROLE temp_xyz VALID 15m
+    V-->>A: user/pwd (TTL 15m)
+    A->>DB: connect with creds
+    Note over V: auto-revokes after TTL
+```
+
+```mermaid
+flowchart LR
+    DEV[Developer] -->|never sees plaintext| GIT[Git repo]
+    GIT --> SOPS[SOPS-encrypted YAML<br/>or sealed secrets]
+    SOPS -->|decrypt with KMS| K8S[k8s secret]
+    K8S --> APP[Pod env]
+    APP -. avoid .-> ENV[.env on laptop]
+    style ENV fill:#ef4444,color:#fff
+```
+
 ## Core concepts
 
 ### What's a secret?

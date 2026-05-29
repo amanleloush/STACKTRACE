@@ -10,6 +10,22 @@
 
 Almost every data team faces "do we need real-time?" The wrong answer (real-time everywhere) burns money; the wrong answer (batch everything) ships stale data. Knowing the latency/cost/complexity tradeoffs of each architecture is core to data engineering.
 
+```mermaid
+flowchart LR
+    SRC[Sources<br/>apps · logs · CDC] --> K[[Kafka]]
+    subgraph Lambda
+        K --> SP[Speed layer<br/>Flink] --> SV[(Serving — Redis)]
+        K --> RAW[(Raw landing)]
+        RAW --> BP[Batch — Spark<br/>nightly] --> SV2[(Batch view)]
+    end
+    subgraph Kappa
+        K -. replay .-> SP2[Stream job] --> SV3[(Serving)]
+    end
+    SV --> Q[Query API]
+    SV2 --> Q
+    SV3 --> Q
+```
+
 ## Core concepts
 
 ### Batch processing

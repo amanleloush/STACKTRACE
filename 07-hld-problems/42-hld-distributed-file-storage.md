@@ -6,6 +6,23 @@
 
 Design an object storage system: users can upload, download, and delete files of any size, with durability, availability, and a global namespace.
 
+```mermaid
+flowchart LR
+    C([Client]) --> GW[API gateway]
+    GW --> AUTH[Auth + ACL]
+    GW --> META[(Metadata DB<br/>bucket/key → chunks)]
+    GW -->|multipart upload| CHUNK[Chunker]
+    CHUNK --> DEDUP[Content-hash dedup]
+    DEDUP --> EC[Erasure code<br/>k+m]
+    EC --> N1[(Storage node A)]
+    EC --> N2[(Storage node B)]
+    EC --> N3[(Storage node C)]
+    GW --> CDN[CDN edge]
+    REPAIR[Background repair] --> N1
+    REPAIR --> N2
+    REPAIR --> N3
+```
+
 ## Requirements
 
 ### Functional

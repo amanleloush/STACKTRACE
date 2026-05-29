@@ -10,6 +10,32 @@ The **testing pyramid** (Mike Cohn) prescribes more **unit** tests, fewer **inte
 
 Without a coherent test strategy, you either ship bugs (too few tests) or move at the speed of glaciers (too many flaky, slow E2E tests). Knowing the pyramid prevents the most common anti-pattern in test suites: bloated, slow, fragile, and (worst) ignored.
 
+```mermaid
+flowchart TB
+    E2E["E2E (5%) — full system, browser/UI"] --> INT
+    INT["Integration (15%) — multiple components, real I/O"] --> CONT
+    CONT["Contract (10%) — verify producer/consumer agreement"] --> UNIT
+    UNIT["Unit (70%) — pure functions, mocked I/O"]
+    style E2E fill:#ef4444,color:#fff
+    style INT fill:#f59e0b,color:#0b0d18
+    style CONT fill:#6366f1,color:#fff
+    style UNIT fill:#10b981,color:#fff
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant CO as Consumer test
+    participant CT as Contract (pact file)
+    participant PR as Producer test
+    CO->>CT: 'when I call GET /user/42, expect {id, name}'
+    CT-->>CO: store expectation
+    Note over CO,PR: published to broker
+    PR->>CT: load expectations from consumers
+    PR->>PR: replay each against producer
+    PR-->>CT: pass/fail per consumer
+```
+
 ## Core concepts
 
 ### The pyramid

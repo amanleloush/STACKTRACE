@@ -10,6 +10,23 @@ An **API gateway** is a single entry point in front of multiple backend services
 
 Once you have more than 3 services, putting clients (web, mobile, third parties) directly in front of them is a mess: every client needs to know every service, authenticate to each, handle retries, parse different formats. A gateway centralizes this. The BFF pattern then takes it further: mobile and web have *different* needs (data shapes, payload sizes, auth flows) — one BFF each.
 
+```mermaid
+flowchart LR
+    WEB([Web app]) --> BW[Web BFF]
+    MOB([Mobile app]) --> BM[Mobile BFF]
+    PRT([Partners]) --> GW[Public API gateway]
+    BW --> SVC
+    BM --> SVC
+    GW --> SVC
+    subgraph SVC["Internal services"]
+        S1[user-svc]
+        S2[order-svc]
+        S3[catalog-svc]
+        S4[inventory-svc]
+    end
+    GW --> AUTH[(Auth)] & RL[(Rate limit)] & WAF[(WAF)]
+```
+
 ## Core concepts
 
 ### API gateway responsibilities

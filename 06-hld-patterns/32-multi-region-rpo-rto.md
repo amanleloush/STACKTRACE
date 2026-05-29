@@ -10,6 +10,22 @@
 
 A region-wide cloud outage (AWS us-east-1 has had several) takes down anything single-region. Multi-AZ is table stakes for serious systems; multi-region is the next level — much more expensive and complex but essential for finance, healthcare, global apps. RPO/RTO are how you quantify what "available" actually means in dollars and minutes.
 
+```mermaid
+flowchart LR
+    DNS[Geo DNS / Anycast] --> R1
+    DNS --> R2
+    subgraph R1["Region us-east-1 (active)"]
+        LB1[LB] --> APP1[App] --> DB1[(Primary DB)]
+        APP1 --> S1[Object store]
+    end
+    subgraph R2["Region eu-west-1 (standby / active)"]
+        LB2[LB] --> APP2[App] --> DB2[(Replica DB)]
+        APP2 --> S2[Object store]
+    end
+    DB1 -.async repl.-> DB2
+    S1 -.cross-region repl.-> S2
+```
+
 ## Core concepts
 
 ### Region vs AZ vs edge

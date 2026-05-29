@@ -10,6 +10,23 @@
 
 Every request begins with DNS and ends at a load balancer. If you can't explain the path from `api.example.com` to a specific pod, you can't debug latency, blue-green deploys, sticky sessions, or "why is one shard hot." Consistent hashing is the algorithm behind caches, sharded databases, and DHTs.
 
+```mermaid
+flowchart LR
+    A[Browser] -->|cache miss| B[OS resolver]
+    B -->|miss| C[Recursive resolver<br/>1.1.1.1]
+    C -->|. ?| D[Root NS]
+    C -->|.com ?| E[TLD NS]
+    C -->|example.com ?| F[Authoritative NS]
+    F -->|A record| C
+    C -->|IP| B
+    B -->|IP| A
+    A -->|TCP/TLS| G[L4 LB<br/>anycast IP]
+    G --> H[L7 LB / Envoy]
+    H --> I[(Service pod 1)]
+    H --> J[(Service pod 2)]
+    H --> K[(Service pod 3)]
+```
+
 ## Core concepts
 
 ### DNS — the journey of a lookup

@@ -9,6 +9,29 @@ Three complementary frameworks for what to monitor:
 - **USE** (Brendan Gregg): **U**tilization, **S**aturation, **E**rrors — for **resources** (CPU, disk, network).
 - **Golden Signals** (Google SRE): **Latency, Traffic, Errors, Saturation** — for user-facing services.
 
+```mermaid
+flowchart TB
+    subgraph RED["RED — for services"]
+        R1[Rate<br/>req/s]
+        R2[Errors<br/>5xx %]
+        R3[Duration<br/>p50/p99]
+    end
+    subgraph USE["USE — for resources"]
+        U1[Utilization<br/>CPU %, RAM %]
+        U2[Saturation<br/>queue depth, swap]
+        U3[Errors<br/>disk failures]
+    end
+    subgraph GOLD["Golden signals — Google SRE"]
+        G1[Latency]
+        G2[Traffic]
+        G3[Errors]
+        G4[Saturation]
+    end
+    style RED fill:#6366f1,color:#fff
+    style USE fill:#06b6d4,color:#fff
+    style GOLD fill:#34d399,color:#0b0d18
+```
+
 ## Why it matters
 
 Without a model, dashboards become "everything we could measure," and the signal gets lost. These frameworks give you a small, consistent set of metrics per service / per resource that catches most problems.

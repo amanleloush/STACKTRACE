@@ -10,6 +10,34 @@ In dimensional modeling, **fact tables** store metrics (sales, clicks, sessions)
 
 Dimensional modeling is the backbone of every analytics warehouse — it's the language analysts use, the schema BI tools assume, and the structure that makes queries simple and fast. Understanding SCDs avoids "historical reports that change every day" type bugs.
 
+```mermaid
+flowchart LR
+    subgraph STAR["Star schema (denormalized dims)"]
+        F1[Fact: sales] --- D1[Dim: date]
+        F1 --- D2[Dim: customer<br/>name, city, country]
+        F1 --- D3[Dim: product<br/>name, category, brand]
+        F1 --- D4[Dim: store]
+    end
+    subgraph SNOW["Snowflake (normalized dims)"]
+        F2[Fact: sales] --- E1[Dim: customer]
+        E1 --- E1a[Dim: city] --- E1b[Dim: country]
+        F2 --- E2[Dim: product]
+        E2 --- E2a[Dim: category] --- E2b[Dim: dept]
+    end
+```
+
+```mermaid
+flowchart TB
+    subgraph T1["SCD Type 1 — overwrite"]
+        A1["row before: city='NYC'"] --> A2["row after: city='LA'"]
+        A3[no history, simple, fast]
+    end
+    subgraph T2["SCD Type 2 — historical"]
+        B1["row v1: city='NYC', valid 2024-01-01..2025-03-15, current=0"]
+        B2["row v2: city='LA', valid 2025-03-16..∞, current=1"]
+    end
+```
+
 ## Core concepts
 
 ### Fact tables

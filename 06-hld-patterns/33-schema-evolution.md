@@ -10,6 +10,16 @@
 
 In a system with N services, M deploys per day, and a Kafka topic carrying 6 months of history, every schema change is a potential outage if you don't manage compatibility. Schema evolution discipline is what separates teams that can deploy 100 times a day from those that can deploy weekly.
 
+```mermaid
+flowchart LR
+    A[Old schema] -->|expand| B[Both columns / fields]
+    B -->|migrate consumers| C[Switch readers to new]
+    C -->|migrate producers| D[Switch writers to new]
+    D -->|contract| E[Drop old column / field]
+    style A fill:#475569,color:#fff
+    style E fill:#10b981,color:#fff
+```
+
 ## Core concepts
 
 ### Why schema changes are hard in distributed systems

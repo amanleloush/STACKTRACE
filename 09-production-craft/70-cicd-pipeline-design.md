@@ -10,6 +10,20 @@
 
 The deployment pipeline is where engineering velocity and operational quality intersect. Slow, manual, or unreliable CI/CD = slow shipping, late discovery of issues, dangerous rollbacks. Fast, automated, observable CI/CD = teams that ship 10× a day with confidence.
 
+```mermaid
+flowchart LR
+    PR[PR opened] --> LINT[lint + format]
+    LINT --> UNIT[unit tests]
+    UNIT --> BUILD[build artifact]
+    BUILD --> SCAN[SCA + SAST<br/>secrets scan]
+    SCAN --> INT[integration tests]
+    INT --> STG[deploy → staging]
+    STG --> E2E[E2E smoke]
+    E2E --> CANARY[canary — 5%]
+    CANARY -->|SLO ok| ROLL[rollout 100%]
+    CANARY -. SLO breach .-> RB[auto rollback]
+```
+
 ## Core concepts
 
 ### CI vs CD

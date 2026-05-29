@@ -10,6 +10,20 @@
 
 Trino/Presto fill the niche between "interactive query" (Redshift, BigQuery, Snowflake) and "batch ETL" (Spark): SQL over data lakes (Parquet/ORC in S3), federating multiple sources, no copy required. Used by Facebook (origin), Netflix, Airbnb, Lyft, Pinterest, Slack — anywhere people need fast SQL over warehouses or lakehouses.
 
+```mermaid
+flowchart LR
+    USER([analyst]) --> CLI[Trino CLI / JDBC]
+    CLI --> COORD[Coordinator<br/>parser + planner]
+    COORD --> W1[Worker 1]
+    COORD --> W2[Worker 2]
+    COORD --> W3[Worker N]
+    W1 --> C1[(S3 / Iceberg<br/>connector)]
+    W2 --> C2[(Postgres<br/>connector)]
+    W3 --> C3[(Kafka<br/>connector)]
+    W1 -. shuffle .-> W2
+    W2 -. shuffle .-> W3
+```
+
 ## Core concepts
 
 ### Architecture

@@ -10,6 +10,39 @@
 
 Whenever the question is "fast text search," "log search," "faceted product search," "autocomplete," or "log/metric aggregation," Elasticsearch (or its fork OpenSearch) is almost always in the answer. It's also a misused tool: people put primary data in it, then learn the hard way that it isn't an ACID database.
 
+```mermaid
+flowchart LR
+    subgraph DOCS["3 documents"]
+        D1["doc1: 'the quick brown fox'"]
+        D2["doc2: 'quick foxes jump'"]
+        D3["doc3: 'the lazy dog'"]
+    end
+    subgraph IDX["Inverted index"]
+        T1["'the' → [d1, d3]"]
+        T2["'quick' → [d1, d2]"]
+        T3["'fox' → [d1, d2]"]
+        T4["'jump' → [d2]"]
+        T5["'lazy' → [d3]"]
+        T6["'dog' → [d3]"]
+    end
+    DOCS -.analyzer<br/>tokenize+stem.-> IDX
+```
+
+```mermaid
+flowchart TB
+    Q([query 'quick fox']) --> CO[Coordinator node]
+    CO --> N1[Node 1<br/>shard 0 primary]
+    CO --> N2[Node 2<br/>shard 1 primary]
+    CO --> N3[Node 3<br/>shard 2 primary]
+    N1 --> R1[(replica)]
+    N2 --> R2[(replica)]
+    N3 --> R3[(replica)]
+    N1 -. BM25 scores .-> CO
+    N2 -. BM25 scores .-> CO
+    N3 -. BM25 scores .-> CO
+    CO --> RES[merged top-K]
+```
+
 ## Core concepts
 
 ### Document, index, mapping

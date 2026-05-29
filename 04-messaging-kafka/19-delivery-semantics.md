@@ -15,6 +15,26 @@
 
 Distributed systems lose, duplicate, or reorder messages. Pretending otherwise is the #1 source of duplicate charges, double-shipped orders, lost notifications. The right answer in 95% of production designs: **at-least-once delivery + idempotent consumers + DLQs for poison messages.**
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as Producer
+    participant B as Broker
+    participant C as Consumer
+    participant DB as DB (idempotency table)
+    P->>B: publish msg (id=42, key=order:7)
+    B-->>P: ack (offset=120)
+    B->>C: deliver msg (offset=120)
+    C->>DB: INSERT id=42 ... ON CONFLICT DO NOTHING
+    DB-->>C: 1 row (first time)
+    C->>B: commit offset 120
+    Note over P,DB: replay (network blip) — duplicate delivery
+    B->>C: redeliver msg (offset=120)
+    C->>DB: INSERT id=42 ON CONFLICT DO NOTHING
+    DB-->>C: 0 rows (already processed)
+    C->>B: commit offset 120 (no-op)
+```
+
 ## Core concepts
 
 ### The three semantics

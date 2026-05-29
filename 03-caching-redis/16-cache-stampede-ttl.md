@@ -10,6 +10,29 @@ A **cache stampede** (a.k.a. **thundering herd**) is when many concurrent reques
 
 Stampedes are a top cause of cache-fronted service outages. The DB is sized assuming the cache absorbs 99% of reads — when a key expires and 10K requests miss simultaneously, the DB sees a 10K-instant spike and falls over. Real production incident class; every senior engineer should know the fixes.
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant R as 10k requests
+    participant C as Cache
+    participant L as Single-flight lock
+    participant D as DB
+    Note over R,D: Naive — stampede
+    R->>C: GET key (expired)
+    C-->>R: miss
+    R->>D: 10k parallel SELECTs
+    D-->>R: 💥
+    Note over R,D: Fix — single-flight
+    R->>C: GET key (expired)
+    C-->>R: miss
+    R->>L: try acquire lock(key)
+    L-->>R: only 1 wins
+    R->>D: SELECT (just one)
+    D-->>R: row
+    R->>C: SET key
+    R-->>R: others read fresh value
+```
+
 ## Core concepts
 
 ### What triggers a stampede

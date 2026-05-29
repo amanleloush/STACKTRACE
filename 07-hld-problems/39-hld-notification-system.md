@@ -6,6 +6,24 @@
 
 Design a system that delivers notifications (email, SMS, push, in-app) to users at scale, respecting preferences, deduplication, rate limits, and delivery retries.
 
+```mermaid
+flowchart LR
+    SRC[Source service] -->|POST /notify| API[Notification API]
+    API --> PREF[(User prefs DB)]
+    API --> DEDUP[(Redis dedup<br/>idempotency_key)]
+    API --> Q[[Kafka: notifications.queued]]
+    Q --> ROUT[Router / templater]
+    ROUT --> QE[[email queue]]
+    ROUT --> QS[[sms queue]]
+    ROUT --> QP[[push queue]]
+    QE --> WE[Email worker] --> SES[(SES / SendGrid)]
+    QS --> WS[SMS worker] --> TW[(Twilio)]
+    QP --> WP[Push worker] --> APNS[(APNs / FCM)]
+    WE -. fail .-> DLQ[[DLQ]]
+    WS -. fail .-> DLQ
+    WP -. fail .-> DLQ
+```
+
 ## Requirements
 
 ### Functional

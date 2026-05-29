@@ -10,6 +10,21 @@
 
 PII handling is the most common compliance pitfall and a major legal risk. Fines: GDPR up to 4% of global revenue; DPDP up to ₹250 crore. Beyond legal, it's a trust issue — leaks make front pages. Engineers who can design with privacy in mind are unusually valuable.
 
+```mermaid
+flowchart LR
+    APP[App writes user] --> ENC{PII fields}
+    ENC -->|email| MSK[mask: a***@g.com]
+    ENC -->|phone| TOK[tokenize → tok_4f9a]
+    ENC -->|aadhaar| KMS[envelope-encrypt<br/>with KMS DEK]
+    TOK --> VAULT[(Token vault)]
+    KMS --> COL[(column-level encrypted)]
+    MSK --> COL2[(non-sensitive col)]
+    COL --> DLP[Warehouse — restricted views]
+    COL2 --> DLP
+    DLP -. policy .-> ANALYST[Analyst sees masked only]
+    DLP -. with KMS access .-> PRIV[Privileged role decrypts]
+```
+
 ## Core concepts
 
 ### Categories of personal data

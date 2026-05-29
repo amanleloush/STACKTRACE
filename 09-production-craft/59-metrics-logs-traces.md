@@ -11,6 +11,18 @@ The "three pillars" of observability:
 
 **OpenTelemetry (OTel)** is the emerging unified standard for instrumenting and exporting all three.
 
+```mermaid
+flowchart LR
+    APP[App with OTel SDK] --> COL[OTel collector]
+    COL --> MET[(Prometheus / Mimir)]
+    COL --> LOG[(Loki / ELK)]
+    COL --> TR[(Tempo / Jaeger)]
+    MET --> GRAF[Grafana]
+    LOG --> GRAF
+    TR --> GRAF
+    GRAF --> ALERT[Alertmanager / PagerDuty]
+```
+
 ## Why it matters
 
 You can't operate what you can't observe. The difference between "the site is slow" and "the auth service has a p99 spike from DB connection pool exhaustion" is exactly the difference between a long incident and a fast one. Building observability is engineering's primary defense against production unknown unknowns.

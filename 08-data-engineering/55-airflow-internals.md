@@ -10,6 +10,18 @@
 
 Most data teams orchestrate with Airflow. The same patterns (idempotency, backfills, deferrable ops, retries) apply to any modern orchestrator (Prefect, Dagster, Temporal). Knowing these well is what separates data engineers who can ship reliable pipelines from those whose jobs run nightly and break weekly.
 
+```mermaid
+flowchart LR
+    EXTRACT[extract from API] --> LAND[(land raw)]
+    LAND --> CLEAN[clean]
+    CLEAN --> JOIN[join dim tables]
+    JOIN --> AGG[daily agg]
+    AGG --> PUB[publish to warehouse]
+    CLEAN --> QC[quality checks]
+    QC -. fail .-> ALERT[alert + pause]
+    QC -. pass .-> AGG
+```
+
 ## Core concepts
 
 ### DAG

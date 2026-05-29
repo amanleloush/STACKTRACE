@@ -10,6 +10,38 @@
 
 Every database, message queue, and log system is designed around storage hierarchy: how it lays out data on disk, when it flushes, how it leverages OS caches. Choices like "B+ tree vs LSM tree" trace back to whether you optimize for HDD sequential, SSD random, or random/sequential mix. Knowing the page cache and fsync lets you reason about durability, performance, and crash recovery — the difference between "data lost" and "data safe."
 
+```mermaid
+flowchart LR
+    CPU[CPU register<br/>~0.3 ns] --> L1[L1 cache<br/>~1 ns]
+    L1 --> L2[L2 cache<br/>~3 ns]
+    L2 --> L3[L3 cache<br/>~10 ns]
+    L3 --> RAM[RAM<br/>~100 ns]
+    RAM --> SSD[NVMe SSD<br/>~150 µs]
+    SSD --> HDD[HDD seek<br/>~10 ms]
+    HDD --> NET[Cross-region net<br/>~150 ms]
+    style CPU fill:#10b981,color:#fff
+    style RAM fill:#06b6d4,color:#fff
+    style SSD fill:#6366f1,color:#fff
+    style HDD fill:#f59e0b,color:#fff
+    style NET fill:#ef4444,color:#fff
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as App
+    participant PC as Page cache (RAM)
+    participant D as Disk
+    A->>PC: write(buf)
+    PC-->>A: ok (still volatile!)
+    Note over PC,D: crash here → data lost
+    A->>PC: fsync()
+    PC->>D: flush pages
+    D-->>PC: durable
+    PC-->>A: fsync returns
+    Note over PC,D: crash here → data safe
+```
+
 ## Core concepts
 
 ### HDD vs SSD vs NVMe

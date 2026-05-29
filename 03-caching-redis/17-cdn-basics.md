@@ -10,6 +10,26 @@ A **CDN** (Content Delivery Network) is a globally distributed cache of edge ser
 
 Once your app has users in more than one country, the speed of light becomes the bottleneck. A CDN drops first-byte latency from 200ms to 20ms, absorbs traffic spikes (the origin sees a tiny fraction of requests), and absorbs DDoS. Every modern app — web, mobile API, video — uses a CDN.
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as User (Mumbai)
+    participant DNS as Anycast DNS
+    participant POP as Edge PoP (Mumbai)
+    participant ORG as Origin (us-east-1)
+    U->>DNS: resolve cdn.example.com
+    DNS-->>U: nearest PoP IP (Mumbai)
+    U->>POP: GET /img/hero.jpg
+    alt cache hit
+        POP-->>U: 200 (5 ms first byte)
+    else cache miss
+        POP->>ORG: GET /img/hero.jpg
+        ORG-->>POP: 200 + Cache-Control
+        POP-->>U: 200 (200 ms first byte)
+        Note over POP: store for next user
+    end
+```
+
 ## Core concepts
 
 ### Why a CDN

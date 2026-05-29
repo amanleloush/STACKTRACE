@@ -10,6 +10,21 @@
 
 "Garbage in, garbage out" — every analytics team that scales hits the data quality wall. Bad data leads to bad business decisions and broken trust. Lineage answers "if I change this table, what breaks?" — essential for safe evolution at scale.
 
+```mermaid
+flowchart LR
+    SRC1[(orders DB)] --> RAW1[raw.orders]
+    SRC2[(payments DB)] --> RAW2[raw.payments]
+    RAW1 --> CLEAN1[stg.orders<br/>quality: not_null·unique·ranges]
+    RAW2 --> CLEAN2[stg.payments]
+    CLEAN1 --> JOIN[mart.order_facts]
+    CLEAN2 --> JOIN
+    JOIN --> BI[Tableau dashboard<br/>'revenue / region']
+    JOIN --> ML[ML feature: avg_order_value]
+    CLEAN1 -. fail .-> ALERT[circuit breaker<br/>halt downstream]
+    style ALERT fill:#ef4444,color:#fff
+    style JOIN fill:#10b981,color:#fff
+```
+
 ## Core concepts
 
 ### What is data quality

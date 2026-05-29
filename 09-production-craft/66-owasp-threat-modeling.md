@@ -10,6 +10,25 @@
 
 Almost every production breach maps to an OWASP Top 10 category. Threat modeling early in design surfaces vulnerabilities cheaply — before code, before users, before compliance audits. Engineers who internalize OWASP + STRIDE write meaningfully more secure code by default.
 
+```mermaid
+flowchart LR
+    subgraph TRUST["Trust boundaries"]
+        U([User]) -.untrusted.-> CDN
+        CDN -. trust gate 1 .-> APP[App service]
+        APP -. trust gate 2 .-> DB[(DB)]
+        APP -. trust gate 3 .-> EXT[3rd-party API]
+    end
+    APP --> STRIDE
+    subgraph STRIDE["Apply STRIDE per boundary"]
+        S[Spoofing → strong auth, mTLS]
+        T[Tampering → input validation, signing]
+        R[Repudiation → audit logs, signatures]
+        I[Info disclosure → encryption, redaction]
+        D[DoS → rate limit, quotas]
+        E[Elevation → least-privilege, RBAC]
+    end
+```
+
 ## Core concepts
 
 ### OWASP Top 10 (2021 edition; current as of 2026)

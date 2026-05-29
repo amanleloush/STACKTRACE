@@ -10,6 +10,25 @@
 
 Static config + DNS works until your service auto-scales, deploys frequently, or runs containers — then instances change every few minutes. Service discovery + health checks are how Kubernetes, Consul, Eureka, and modern service meshes route correctly through that churn.
 
+```mermaid
+flowchart LR
+    subgraph CSD["Client-side discovery"]
+        CC[Client] -->|"lookup 'orders'"| REG1[(Registry<br/>Consul / Eureka)]
+        REG1 -->|list of IPs| CC
+        CC -->|direct call + LB| I1[Instance 1]
+        CC --> I2[Instance 2]
+        I1 -.heartbeat.-> REG1
+        I2 -.heartbeat.-> REG1
+    end
+    subgraph SSD["Server-side discovery"]
+        CS[Client] -->|orders.svc.cluster| LB2[LB / mesh proxy]
+        LB2 --> REG2[(Registry)]
+        LB2 --> J1[Instance 1]
+        LB2 --> J2[Instance 2]
+        J1 -.heartbeat.-> REG2
+    end
+```
+
 ## Core concepts
 
 ### Why DNS alone isn't enough

@@ -6,6 +6,10 @@
 
 Design a rate limiter that enforces request quotas per user/API key across many app servers and regions, returning `429 Too Many Requests` when exceeded, with low latency.
 
+<div class="sde-anim" data-anim="bucket"></div>
+
+<div class="sde-anim" data-anim="rate-window"></div>
+
 ## Requirements
 
 ### Functional

@@ -10,6 +10,32 @@
 
 Picking the right messaging system is a long-term commitment — operationally, architecturally, and culturally. Knowing the trade-offs avoids spending six months later migrating off the wrong choice.
 
+```mermaid
+flowchart TB
+    subgraph RABBIT["RabbitMQ — smart broker"]
+        P1[Producer] --> EX[Exchange<br/>direct/topic/fanout]
+        EX --> Q1[Queue 1] --> C1[Consumer]
+        EX --> Q2[Queue 2] --> C2[Consumer]
+    end
+    subgraph PULSAR["Pulsar — compute/storage split"]
+        P2[Producer] --> B[Broker<br/>stateless]
+        B --> BK[(BookKeeper<br/>distributed log)]
+        B --> CS[Subscriber]
+    end
+    subgraph SQS["SQS — managed queue"]
+        P3[Producer] --> SQ[(SQS queue<br/>standard / FIFO)]
+        SQ -.poll.-> C3[Consumer]
+    end
+```
+
+| | RabbitMQ | Kafka | Pulsar | SQS |
+|---|---|---|---|---|
+| Model | smart broker | log | broker + log | managed queue |
+| Order | per-queue | per-partition | per-partition | FIFO mode only |
+| Retention | drain | configurable | tiered | 14 d max |
+| Throughput | 10s K/s | 1M+/s | 1M+/s | unlimited (managed) |
+| Ops cost | medium | high | high | none (AWS-managed) |
+
 ## Core concepts
 
 ### RabbitMQ

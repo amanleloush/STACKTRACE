@@ -10,6 +10,22 @@
 
 Spark powers most modern big-data pipelines (ETL, ML, Kafka-stream-to-warehouse). Understanding shuffle, partitioning, and skew is the difference between "10 min job" and "10 hour job that fails."
 
+```mermaid
+flowchart LR
+    subgraph S1["Stage 1 — narrow"]
+        R1[read parquet] --> F1[filter]
+        F1 --> M1[map]
+    end
+    subgraph S2["Stage 2 — wide (after shuffle)"]
+        G1[groupBy key] --> A1[agg sum]
+    end
+    subgraph S3["Stage 3"]
+        J1[join broadcast] --> W1[write iceberg]
+    end
+    M1 -.->|shuffle write| G1
+    A1 -.->|shuffle write| J1
+```
+
 ## Core concepts
 
 ### Lazy evaluation + DAG

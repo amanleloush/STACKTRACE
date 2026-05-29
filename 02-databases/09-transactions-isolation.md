@@ -10,6 +10,30 @@ A **transaction** is a unit of work that is **A**tomic, **C**onsistent, **I**sol
 
 Subtle bugs from isolation level choices have caused real outages (lost updates in inventory systems, double-spend in payments). If you can name the anomaly each level prevents and what's still possible, you can read existing code defensively and reason about new transactional logic.
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant T1 as Txn A
+    participant DB as Postgres
+    participant T2 as Txn B
+    Note over T1,T2: Lost update at Read Committed
+    T1->>DB: BEGIN; SELECT balance FROM acct WHERE id=1 (=100)
+    T2->>DB: BEGIN; SELECT balance FROM acct WHERE id=1 (=100)
+    T1->>DB: UPDATE balance=90 WHERE id=1
+    T1->>DB: COMMIT
+    T2->>DB: UPDATE balance=80 WHERE id=1
+    T2->>DB: COMMIT
+    Note over T1,T2: A's -10 lost. Fix: SELECT ... FOR UPDATE,<br/>or SERIALIZABLE, or compare-and-set
+```
+
+| Level | Dirty read | Non-repeatable | Phantom | Write skew |
+|---|---|---|---|---|
+| Read Uncommitted | ✗ | ✗ | ✗ | ✗ |
+| Read Committed | ✓ | ✗ | ✗ | ✗ |
+| Repeatable Read | ✓ | ✓ | ~ (snapshot) | ✗ |
+| Snapshot (MVCC) | ✓ | ✓ | ✓ | ✗ |
+| Serializable | ✓ | ✓ | ✓ | ✓ |
+
 ## Core concepts
 
 ### ACID

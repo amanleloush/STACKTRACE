@@ -10,6 +10,8 @@
 
 You hit replication when reads outgrow one machine (most apps); you hit sharding when writes or storage outgrow one machine (fewer, but harder). Choosing replication topology and shard key sets the upper bound on your scale and most of your operational pain.
 
+<div class="sde-anim" data-anim="sharding"></div>
+
 ## Core concepts
 
 ### Replication topologies

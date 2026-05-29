@@ -8,6 +8,22 @@
 
 Alert fatigue (too many pages, mostly noise) is the #1 killer of on-call quality and the leading indicator of incident response problems. Every senior engineer needs to know how to design alerts that pass the "would I get out of bed at 3 AM for this?" test.
 
+```mermaid
+flowchart LR
+    METRIC[Prometheus metric] --> RULE[Alerting rule<br/>'error_rate > 0.5% for 5m']
+    RULE --> AM[Alertmanager]
+    AM --> GRP[Group by service+severity]
+    GRP --> ROUTE{Route}
+    ROUTE -->|sev=page| PD[PagerDuty / on-call]
+    ROUTE -->|sev=ticket| JIRA[Jira / ticket]
+    ROUTE -->|sev=warn| SLACK[Slack channel]
+    AM -. inhibit .-> SUPP[suppress dependent alerts]
+    AM -. silence .-> MUT[during deploys]
+    style PD fill:#ef4444,color:#fff
+    style JIRA fill:#f59e0b,color:#0b0d18
+    style SLACK fill:#6366f1,color:#fff
+```
+
 ## Core concepts
 
 ### Symptom vs cause

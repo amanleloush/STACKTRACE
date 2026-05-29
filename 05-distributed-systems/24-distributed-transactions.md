@@ -10,6 +10,31 @@ A **distributed transaction** is a unit of work spanning multiple services or da
 
 In microservices, every meaningful operation tends to cross service boundaries. ACID across services is expensive or impossible. The choice between 2PC, sagas, and outbox shapes failure modes, latency, and observability of every cross-service flow.
 
+<div class="sde-anim" data-anim="saga"></div>
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Coordinator
+    participant A as Service A
+    participant B as Service B
+    participant D as Service C
+    Note over C,D: 2PC — prepare phase
+    C->>A: prepare
+    C->>B: prepare
+    C->>D: prepare
+    A-->>C: yes (locks held)
+    B-->>C: yes (locks held)
+    D-->>C: yes (locks held)
+    Note over C,D: 2PC — commit phase
+    C->>A: commit
+    C->>B: commit
+    C->>D: commit
+    A-->>C: done
+    B-->>C: done
+    D-->>C: done
+```
+
 ## Core concepts
 
 ### Why traditional ACID doesn't extend across services

@@ -10,6 +10,19 @@
 
 Every system that needs leader election, distributed locks, atomic config updates, or replicated state machines uses consensus under the hood. Knowing what consensus guarantees (and the cost of providing it) lets you decide when to lean on Raft/Paxos vs softer designs (gossip, CRDTs, last-write-wins).
 
+<div class="sde-anim" data-anim="raft"></div>
+
+```mermaid
+stateDiagram-v2
+    [*] --> Follower
+    Follower --> Candidate: election timeout
+    Candidate --> Leader: majority of votes
+    Candidate --> Follower: discovers higher term
+    Candidate --> Candidate: split vote → new election
+    Leader --> Follower: discovers higher term
+    Leader --> [*]: crash
+```
+
 ## Core concepts
 
 ### What consensus solves

@@ -10,6 +10,8 @@
 
 When write rates dwarf any single Postgres or MySQL machine, when you need linear horizontal scale, when you can model around the access pattern (no joins, denormalize for reads), Cassandra/Scylla is the canonical choice. Time-series, event logs, IoT data, messaging history, recommendation features — all classic fits.
 
+<div class="sde-anim" data-anim="lsm-btree"></div>
+
 ## Core concepts
 
 ### Wide-column data model

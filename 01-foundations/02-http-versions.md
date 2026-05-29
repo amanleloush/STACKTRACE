@@ -13,6 +13,28 @@ A backend dev needs to understand:
 - Why HTTP/2 didn't really fix the latency problem under loss
 - Why HTTP/3 / QUIC is showing up in load balancers, CDNs, and gRPC
 - Why gRPC requires HTTP/2 and what that means for proxies
+
+```mermaid
+flowchart TB
+    subgraph H1["HTTP/1.1 — 1 req/conn at a time"]
+        C1[Client] -- conn 1 --> S1[Server]
+        C1 -- conn 2 --> S1
+        C1 -- conn 3 --> S1
+        C1 -- conn 4 --> S1
+    end
+    subgraph H2["HTTP/2 — many streams, 1 TCP conn"]
+        C2[Client] -- TCP+TLS --> S2[Server]
+        S2 -.->|stream 1| C2
+        S2 -.->|stream 3| C2
+        S2 -.->|stream 5| C2
+    end
+    subgraph H3["HTTP/3 — QUIC over UDP, no HOL"]
+        C3[Client] -- QUIC+TLS in 1-RTT --> S3[Server]
+        S3 -.->|stream a| C3
+        S3 -.->|stream b| C3
+        S3 -.->|stream c — packet loss only blocks this stream| C3
+    end
+```
 - When SSE / long-polling / WebSockets break under HTTP/2 multiplexing
 
 ## Core concepts

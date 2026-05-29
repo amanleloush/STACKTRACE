@@ -10,6 +10,24 @@
 
 Auth is in every system; getting it wrong is a security incident. The patterns here are universal across SaaS, mobile apps, internal systems, microservices. Knowing the difference between OAuth and OIDC, and what JWTs actually guarantee (and don't), is foundational.
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as User
+    participant A as App (client)
+    participant I as Identity provider
+    participant R as Resource API
+    U->>A: click "log in"
+    A->>I: redirect /authorize (PKCE challenge)
+    U->>I: enter credentials + consent
+    I->>A: redirect with auth code
+    A->>I: POST /token (code + PKCE verifier)
+    I-->>A: access_token + id_token (OIDC) + refresh_token
+    A->>R: GET /me  (Authorization: Bearer access_token)
+    R->>R: verify JWT signature + claims
+    R-->>A: 200 user data
+```
+
 ## Core concepts
 
 ### AuthN vs AuthZ

@@ -6,6 +6,20 @@
 
 Design a system that sells limited-quantity items (a "flash sale") at high concurrency without overselling. Example: 10K units released; in the first second, 1M users try to buy.
 
+```mermaid
+flowchart LR
+    U([1M users]) --> WAIT[Waiting room<br/>queue / lottery]
+    WAIT --> CDN
+    CDN --> LB
+    LB --> API[Buy API]
+    API --> RL[Rate limit]
+    RL --> R[(Redis hot key<br/>Lua script:<br/>DECR if &gt; 0)]
+    R -->|ok| Q[[Order queue]]
+    R -->|sold out| FAIL[respond 410]
+    Q --> W[Order worker] --> DB[(Orders DB)]
+    Q --> PAY[Payment service]
+```
+
 ## Requirements
 
 ### Functional

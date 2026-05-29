@@ -10,6 +10,30 @@
 
 The file format decision affects every downstream query's performance and cost. Storing analytics data in JSON or CSV instead of Parquet typically multiplies your S3 + query costs by 5-50× and slows queries by 10-100×.
 
+```mermaid
+flowchart TB
+    subgraph ROW["Row layout (Avro / CSV)"]
+        R1["[id=1, name='a', age=30] · [id=2, name='b', age=25] · [id=3, name='c', age=40]"]
+    end
+    subgraph COL["Columnar layout (Parquet / ORC)"]
+        C1["id  : [1, 2, 3]"]
+        C2["name: ['a','b','c']"]
+        C3["age : [30, 25, 40]"]
+    end
+    Q[["SELECT AVG(age) ..."]] -.scans.-> COL
+    Q -.scans.-> ROW
+    style COL fill:#10b981,color:#fff
+    style ROW fill:#f59e0b,color:#0b0d18
+```
+
+| | Parquet | ORC | Avro |
+|---|---|---|---|
+| Layout | columnar | columnar | row |
+| Best for | analytics (Spark/Trino) | analytics (Hive) | streaming, RPC payloads |
+| Compression | strong (per-column) | strong (stripe-level) | good |
+| Schema evolution | yes (loose) | yes | strongest |
+| Predicate pushdown | yes (stats per page) | yes (indexes per stripe) | no |
+
 ## Core concepts
 
 ### Columnar vs row-based

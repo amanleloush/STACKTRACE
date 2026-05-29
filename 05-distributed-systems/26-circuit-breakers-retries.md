@@ -10,6 +10,19 @@
 
 Cascading failures — one slow downstream taking down the whole system — are the most common production outage pattern. Circuit breakers, bulkheads, and disciplined retries are the resilience pattern stack every senior engineer needs to apply by default.
 
+```mermaid
+stateDiagram-v2
+    [*] --> Closed
+    Closed --> Open: error rate > threshold
+    Open --> HalfOpen: cooldown elapsed
+    HalfOpen --> Closed: probe succeeds
+    HalfOpen --> Open: probe fails
+    note right of Open
+        Fast-fail without
+        calling downstream
+    end note
+```
+
 ## Core concepts
 
 ### Circuit breaker states

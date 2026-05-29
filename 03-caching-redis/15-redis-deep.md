@@ -10,6 +10,36 @@
 
 Redis is the default cache, rate limiter, leaderboard, distributed lock, ephemeral queue, pub/sub bus, and "low-latency sidecar store" in production systems. Knowing its data structures and operational levers (persistence, eviction, cluster) is one of the highest-leverage skills in backend engineering.
 
+```mermaid
+flowchart LR
+    C([Client]) --> P1
+    C --> P2
+    C --> P3
+    subgraph CLUSTER["Redis Cluster — 16384 hash slots"]
+        subgraph M1["Shard A (slots 0-5460)"]
+            P1[(Primary)] -.async.-> R1[(Replica)]
+        end
+        subgraph M2["Shard B (slots 5461-10922)"]
+            P2[(Primary)] -.-> R2[(Replica)]
+        end
+        subgraph M3["Shard C (slots 10923-16383)"]
+            P3[(Primary)] -.-> R3[(Replica)]
+        end
+    end
+    P1 <-.gossip.-> P2
+    P2 <-.gossip.-> P3
+    P1 <-.gossip.-> P3
+```
+
+```mermaid
+flowchart LR
+    subgraph PERS["Persistence — pick your trade"]
+        RDB[RDB snapshot<br/>every N min<br/>fast restart] -. crash window .-> LOSS1[lose last interval]
+        AOF[AOF append-only<br/>fsync every cmd / sec] -. larger file .-> LOSS2[lose 0-1 sec]
+        BOTH[Both = belt + suspenders]
+    end
+```
+
 ## Core concepts
 
 ### Data structures (each is a Redis "type")

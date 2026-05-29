@@ -10,6 +10,37 @@ A working mental map of the most-used cloud services from AWS and GCP, grouped b
 
 Cloud is the default deployment target. Knowing what services exist (and their tradeoffs) lets you design correctly without inventing what already exists. Interviews often ask "what AWS service would you use for X?" — you need the map.
 
+```mermaid
+flowchart TB
+    subgraph CAT["Category"]
+        C1[Compute]
+        C2[Storage]
+        C3[Database]
+        C4[Messaging]
+        C5[Networking]
+        C6[Identity]
+        C7[Observability]
+    end
+    subgraph AWS["AWS"]
+        C1 -. EC2 · Fargate · Lambda .-> AC1[ ]
+        C2 -. S3 · EBS · EFS .-> AC2[ ]
+        C3 -. RDS · DynamoDB · Aurora .-> AC3[ ]
+        C4 -. SQS · SNS · Kinesis · MSK .-> AC4[ ]
+        C5 -. VPC · ALB · CloudFront · R53 .-> AC5[ ]
+        C6 -. IAM · STS · Cognito .-> AC6[ ]
+        C7 -. CloudWatch · X-Ray .-> AC7[ ]
+    end
+    subgraph GCP["GCP"]
+        C1 -. GCE · Cloud Run · Functions .-> GC1[ ]
+        C2 -. GCS · Persistent Disk .-> GC2[ ]
+        C3 -. Cloud SQL · Spanner · Firestore .-> GC3[ ]
+        C4 -. Pub/Sub · Tasks .-> GC4[ ]
+        C5 -. VPC · GLB · Cloud CDN · Cloud DNS .-> GC5[ ]
+        C6 -. IAM · Workload Identity .-> GC6[ ]
+        C7 -. Cloud Logging · Trace .-> GC7[ ]
+    end
+```
+
 ## Core mapping (AWS ↔ GCP)
 
 ### Compute

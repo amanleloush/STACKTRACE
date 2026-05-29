@@ -6,6 +6,21 @@
 
 Design a distributed scheduler that runs millions of jobs on time (cron-like) and dependency-driven (DAGs), with retries, failure handling, and observability.
 
+```mermaid
+flowchart LR
+    DEF[DAG definitions] --> META[(Metadata DB)]
+    SCHED[Scheduler<br/>leader-elected] --> META
+    SCHED --> Q[[Task queue]]
+    Q --> W1[Worker 1]
+    Q --> W2[Worker 2]
+    Q --> W3[Worker N]
+    W1 --> LOCK[(Distributed lock<br/>idempotency)]
+    W1 --> EXEC[Execute task]
+    EXEC --> RES[(Result store)]
+    EXEC -. retry .-> Q
+    EXEC -. exhausted .-> DLQ[[DLQ]]
+```
+
 ## Requirements
 
 ### Functional
