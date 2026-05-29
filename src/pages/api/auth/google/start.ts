@@ -28,7 +28,15 @@ export const GET: APIRoute = async ({ cookies, url }) => {
   try {
     const authUrl = getGoogleClient().createAuthorizationURL(state, codeVerifier, SCOPES);
     return new Response(null, { status: 302, headers: { Location: authUrl.toString() } });
-  } catch (e) {
-    return new Response(`OAuth misconfig: ${String(e)}`, { status: 500 });
+  } catch {
+    // Misconfig is a setup-time mistake, not a server fault. Send the user
+    // back to /login with a friendly error chip + instructions instead of
+    // a 500 wall of text.
+    return new Response(null, {
+      status: 302,
+      headers: {
+        Location: `/login/?error=oauth-misconfig&next=${encodeURIComponent(next)}`,
+      },
+    });
   }
 };
