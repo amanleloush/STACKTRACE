@@ -56,19 +56,37 @@ async function main(): Promise<void> {
   }
   console.log('[roadmap] ✓ both pillar containers present');
 
+  // Pre-collect slugs for SSR routes — those don't emit static HTML.
+  const noteSlugs = new Set((await listMdx(path.join(REPO, 'src/content/notes'))).map(
+    (p) => path.basename(p, path.extname(p)),
+  ));
+  const dsaSlugs = new Set((await listMdx(path.join(REPO, 'src/content/dsa'))).map(
+    (p) => path.basename(p, path.extname(p)),
+  ));
+
   const hrefs = [...index.matchAll(/class="roadmap__chip"\s+href="([^"]+)"/g)].map((m) => m[1]!);
   let bad = 0;
   for (const href of hrefs) {
-    const file = path.join(DIST, href.replace(/\/$/, ''), 'index.html');
-    try {
-      await fs.access(file);
-    } catch {
-      console.error(`[roadmap] ✗ chip href has no built page: ${href}`);
+    let resolved = false;
+    if (href.startsWith('/learn/notes/')) {
+      const slug = href.slice('/learn/notes/'.length).replace(/\/$/, '');
+      resolved = noteSlugs.has(slug);
+    } else if (href.startsWith('/learn/dsa/')) {
+      const slug = href.slice('/learn/dsa/'.length).replace(/\/$/, '');
+      resolved = dsaSlugs.has(slug);
+    } else {
+      try {
+        await fs.access(path.join(DIST, href.replace(/\/$/, ''), 'index.html'));
+        resolved = true;
+      } catch { /* static target missing */ }
+    }
+    if (!resolved) {
+      console.error(`[roadmap] ✗ chip href has no built page or source: ${href}`);
       bad++;
     }
   }
   if (bad > 0) process.exit(1);
-  console.log(`[roadmap] ✓ all ${hrefs.length} chip hrefs resolve to built pages`);
+  console.log(`[roadmap] ✓ all ${hrefs.length} chip hrefs resolve`);
 }
 
 main().catch((e: unknown) => {

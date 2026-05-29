@@ -1,31 +1,54 @@
 ---
-import { getCollection, render, type CollectionEntry } from 'astro:content';
+import { getEntry, render } from 'astro:content';
 import BaseLayout from '~/layouts/BaseLayout.astro';
 import NoteLayout from '~/components/NoteLayout.astro';
 import Anim from '~/components/Anim.astro';
 import Premium from '~/components/Premium.astro';
+import Paywall from '~/components/Paywall.astro';
+import { getDb } from '~/lib/db';
+import { canAccess } from '~/lib/billing/entitlement';
 
-export const prerender = true;
+export const prerender = false;
 
-export async function getStaticPaths() {
-  const entries = await getCollection('dsa', (n) => !n.data.draft);
-  return entries.map((entry) => ({
-    params: { slug: entry.id },
-    props: { entry },
-  }));
+const slug = Astro.params.slug;
+if (!slug) return new Response('Not found', { status: 404 });
+
+const entry = await getEntry('dsa', slug);
+if (!entry || entry.data.draft) return new Response('Not found', { status: 404 });
+
+const env = Astro.locals.runtime?.env;
+const db = await getDb({ env });
+Astro.locals.entry = entry;
+
+const access = await canAccess(
+  db,
+  {
+    kind: 'note',
+    id: entry.id,
+    defaultPremium: entry.data.premium,
+    defaultPreviewParagraphs: entry.data.previewParagraphs,
+  },
+  Astro.locals.user,
+);
+
+Astro.response.headers.set('Vary', 'Cookie');
+if (Astro.locals.user) {
+  Astro.response.headers.set('Cache-Control', 'private, no-store');
+} else {
+  Astro.response.headers.set('Cache-Control', 'public, max-age=60, s-maxage=300');
 }
 
-interface Props {
-  entry: CollectionEntry<'dsa'>;
-}
-const { entry } = Astro.props;
-const { Content } = await render(entry);
+const { Content } = access.allowed
+  ? await render(entry)
+  : { Content: null };
 ---
 <BaseLayout
   title={`${entry.data.title} — sysviz`}
   description={entry.data.summary ?? entry.data.title}
 >
-  <NoteLayout entry={entry} collectionLabel="DSA">
-    <Content components={{ Anim, Premium }} />
+  <NoteLayout entry={entry} collectionLabel="DSA" effectivePremium={!access.allowed || entry.data.premium}>
+    {access.allowed && Content
+      ? <Content components={{ Anim, Premium }} />
+      : <Paywall reason="note" />}
   </NoteLayout>
 </BaseLayout>
