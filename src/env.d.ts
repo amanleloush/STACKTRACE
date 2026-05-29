@@ -27,6 +27,10 @@ interface ImportMetaEnv {
   readonly ADMIN_EMAILS?: string;
   readonly DEV_AUTH_BACKDOOR?: string;
   readonly SITE_SLUG?: string;
+  readonly RAZORPAY_KEY_ID?: string;
+  readonly RAZORPAY_KEY_SECRET?: string;
+  readonly RAZORPAY_PLAN_ID?: string;
+  readonly RAZORPAY_WEBHOOK_SECRET?: string;
 }
 
 interface ImportMeta {
