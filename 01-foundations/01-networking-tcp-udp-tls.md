@@ -28,6 +28,8 @@ sequenceDiagram
     S->>C: 200 OK + body
 ```
 
+<div class="sde-anim" data-anim="tcp-cwnd"></div>
+
 ## Core concepts
 
 ### TCP — what guarantees you get

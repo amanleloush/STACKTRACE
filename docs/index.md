@@ -17,8 +17,8 @@ hide:
   <div class="bda-hero__meta">
     <span><strong>77</strong> topics</span>
     <span><strong>10</strong> phases</span>
-    <span><strong>11</strong> interactive demos</span>
-    <span><strong>50+</strong> diagrams</span>
+    <span><strong>20</strong> interactive demos</span>
+    <span><strong>55+</strong> diagrams</span>
   </div>
 </section>
 
@@ -126,7 +126,7 @@ hide:
 <div class="bda-section-head">
   <div>
     <div class="bda-section-eyebrow">Try one now</div>
-    <h2>11 interactive animations</h2>
+    <h2>20 interactive animations</h2>
   </div>
   <div class="bda-section-head__hint">Built-in, not screenshots — click, poke, break them</div>
 </div>
@@ -144,6 +144,15 @@ hide:
 | **Saga vs 2PC** — step through both | [Distributed transactions](05-distributed-systems/24-distributed-transactions.md) · [Payment HLD](07-hld-problems/43-hld-payment-system.md) |
 | **Vector clocks** — causality and concurrency | [Clocks](05-distributed-systems/28-clocks-vector-lamport-hlc.md) |
 | **Sharding** — range / hash / geo with hot-key visualization | [Sharding](06-hld-patterns/31-sharding-strategies.md) · [Replication & sharding](02-databases/10-replication-sharding.md) |
+| **Bloom filter** — bit array with k hashes, watch false positives appear | [Probabilistic DS](10-modern-additions/76-probabilistic-data-structures.md) |
+| **Circuit breaker** — closed / open / half-open state machine with cooldown | [Circuit breakers & retries](05-distributed-systems/26-circuit-breakers-retries.md) |
+| **Load balancer algorithms** — round-robin / least-conn / random / IP-hash, with a slow backend | [DNS & load balancing](01-foundations/03-dns-load-balancing.md) |
+| **Stream windowing** — tumbling / sliding / session + watermark progression | [Stream processing](10-modern-additions/77-stream-processing-flink-kstreams.md) |
+| **LRU vs LFU eviction** — same workload, watch which keys live and die in each | [Cache patterns](03-caching-redis/14-cache-patterns.md) |
+| **MVCC version chain** — long-running reader blocks vacuum, bloat grows | [Transactions & isolation](02-databases/09-transactions-isolation.md) |
+| **Quorum (W+R) reads/writes** — see exactly when reads go stale | [Replication & sharding](02-databases/10-replication-sharding.md) |
+| **HyperLogLog** — 16 registers update as items hash in; estimate converges | [Probabilistic DS](10-modern-additions/76-probabilistic-data-structures.md) |
+| **TCP congestion (cwnd sawtooth)** — slow-start → AIMD → packet loss → halve | [Networking — TCP/UDP/TLS](01-foundations/01-networking-tcp-udp-tls.md) |
 
 !!! tip "How to use this site"
     Read each topic top-to-bottom once for intuition. Come back the day before an interview and read only the **TL;DR cheat sheet** at the bottom. The middle exists to build the model the first time, not to be re-read.

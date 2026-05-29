@@ -12,6 +12,8 @@ You hit replication when reads outgrow one machine (most apps); you hit sharding
 
 <div class="sde-anim" data-anim="sharding"></div>
 
+<div class="sde-anim" data-anim="quorum"></div>
+
 ## Core concepts
 
 ### Replication topologies

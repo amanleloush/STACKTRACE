@@ -34,6 +34,8 @@ sequenceDiagram
 | Snapshot (MVCC) | ✓ | ✓ | ✓ | ✗ |
 | Serializable | ✓ | ✓ | ✓ | ✓ |
 
+<div class="sde-anim" data-anim="mvcc"></div>
+
 ## Core concepts
 
 ### ACID

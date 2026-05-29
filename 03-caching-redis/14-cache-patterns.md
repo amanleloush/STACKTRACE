@@ -12,6 +12,8 @@ Cache bugs cause more outages than people admit: stale data, inconsistent invali
 
 <div class="sde-anim" data-anim="cache-patterns"></div>
 
+<div class="sde-anim" data-anim="eviction"></div>
+
 ## Core concepts
 
 ### Cache-aside (lazy loading)

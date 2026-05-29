@@ -23,6 +23,8 @@ stateDiagram-v2
     end note
 ```
 
+<div class="sde-anim" data-anim="circuit-breaker"></div>
+
 ## Core concepts
 
 ### Circuit breaker states

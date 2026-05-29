@@ -74,6 +74,8 @@ flowchart LR
     end
 ```
 
+<div class="sde-anim" data-anim="windowing"></div>
+
 ### State
 
 A stream job's state is keyed state (per-key counters, dictionaries) and operator state (broadcast configs, source offsets). Sources of correctness pain:

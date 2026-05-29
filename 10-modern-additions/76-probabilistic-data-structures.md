@@ -19,6 +19,10 @@ flowchart LR
     style MAYBE fill:#f59e0b,color:#0b0d18
 ```
 
+<div class="sde-anim" data-anim="bloom"></div>
+
+<div class="sde-anim" data-anim="hll"></div>
+
 ## Core concepts
 
 ### Bloom filter

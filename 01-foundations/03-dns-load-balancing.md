@@ -27,6 +27,8 @@ flowchart LR
     H --> K[(Service pod 3)]
 ```
 
+<div class="sde-anim" data-anim="load-balancer"></div>
+
 ## Core concepts
 
 ### DNS — the journey of a lookup
