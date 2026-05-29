@@ -6,17 +6,38 @@ import { readSessionCookie } from '~/lib/auth/cookies';
 /**
  * Per-request auth resolver + admin route guard.
  *
- * Reads the sysviz_session cookie, looks the row up in `sessions` + `users`,
- * and stamps Astro.locals.user / .session for every downstream page or API
- * route. Cookie missing or invalid → user/session are null (anonymous).
+ * Only resolves the session for routes that actually need it. Prerendered
+ * routes (everything outside `SSR_PATH_PREFIXES`) skip the cookie read so
+ * Astro's static analyzer doesn't fire the "Astro.request.headers was used"
+ * warning at build/prerender time — and so the CDN can cache them with
+ * a single representation across all visitors (plan §14e).
  *
- * /admin/* is guarded here, server-side: anonymous + non-admin requests get
- * 404 (not 403) so the panel's existence isn't telegraphed to anyone who
- * isn't already entitled to it (§14h).
+ * /admin/* + /api/admin/* are guarded server-side: anon or non-admin gets
+ * 404 (not 403) so the panel's existence isn't telegraphed (§14h).
  */
+const SSR_PATH_PREFIXES = [
+  '/api/',
+  '/admin',
+  '/account',
+  '/login',
+  '/learn/',
+] as const;
+
+function needsAuthResolution(pathname: string): boolean {
+  for (const p of SSR_PATH_PREFIXES) {
+    if (pathname === p.replace(/\/$/, '') || pathname.startsWith(p)) return true;
+  }
+  return false;
+}
+
 export const onRequest = defineMiddleware(async (context, next) => {
   context.locals.user = null;
   context.locals.session = null;
+
+  const path = context.url.pathname;
+  if (!needsAuthResolution(path)) {
+    return next();
+  }
 
   const token = readSessionCookie(context.cookies);
   if (token) {
@@ -27,14 +48,10 @@ export const onRequest = defineMiddleware(async (context, next) => {
       context.locals.user = user;
       context.locals.session = session;
     } catch (e) {
-      // Don't fail the whole request if the DB is briefly unreachable —
-      // surface as anonymous and let the route decide what to do.
       console.error('[middleware] session resolve failed:', e);
     }
   }
 
-  // Admin gate. Covers both /admin/* pages and /api/admin/* write endpoints.
-  const path = context.url.pathname;
   const isAdminRoute = path.startsWith('/admin') || path.startsWith('/api/admin');
   if (isAdminRoute && context.locals.user?.role !== 'admin') {
     return new Response('Not found', { status: 404 });

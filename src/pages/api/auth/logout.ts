@@ -1,7 +1,7 @@
 import type { APIRoute } from 'astro';
 import { getDb } from '~/lib/db';
 import { invalidateSession } from '~/lib/auth/session';
-import { readSessionCookie, clearSessionCookie } from '~/lib/auth/cookies';
+import { readSessionCookie, clearSessionCookie, clearHintCookie } from '~/lib/auth/cookies';
 
 export const prerender = false;
 
@@ -21,6 +21,7 @@ async function logoutResponse({
     await invalidateSession(db, token);
   }
   clearSessionCookie(cookies);
+  clearHintCookie(cookies);
   return new Response(null, { status: 302, headers: { Location: redirectTo } });
 }
 

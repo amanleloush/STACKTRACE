@@ -3,7 +3,7 @@ import { getDb } from '~/lib/db';
 import { getGoogleClient, fetchGoogleUserInfo } from '~/lib/auth/google';
 import { upsertUserFromGoogle } from '~/lib/auth/users';
 import { createSession, generateSessionToken } from '~/lib/auth/session';
-import { setSessionCookie } from '~/lib/auth/cookies';
+import { setSessionCookie, setHintCookie } from '~/lib/auth/cookies';
 
 export const prerender = false;
 
@@ -39,6 +39,7 @@ export const GET: APIRoute = async ({ url, cookies, locals }) => {
   const token = generateSessionToken();
   await createSession(db, token, user.id);
   setSessionCookie(cookies, token);
+  setHintCookie(cookies, user.name ?? user.email.split('@')[0] ?? 'Account', user.role);
 
   return new Response(null, { status: 302, headers: { Location: next } });
 };
