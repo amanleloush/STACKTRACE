@@ -1,5 +1,8 @@
 ---
 import BaseLayout from '~/layouts/BaseLayout.astro';
+import { getDb } from '~/lib/db';
+import { getSubscription } from '~/lib/billing/subscriptions';
+import { getEntitlement } from '~/lib/billing/entitlement';
 
 export const prerender = false;
 
@@ -7,44 +10,152 @@ const user = Astro.locals.user;
 if (!user) {
   return Astro.redirect('/login/?next=/account/');
 }
+
+const env = Astro.locals.runtime?.env;
+const db = await getDb({ env });
+const tier = await getEntitlement(db, user.id);
+const sub = await getSubscription(db, user.id);
+const justSubscribed = Astro.url.searchParams.get('just-subscribed') === '1';
+
+function fmtDate(unixSec: number | null | undefined): string {
+  if (!unixSec) return '—';
+  return new Date(unixSec * 1000).toLocaleDateString(undefined, {
+    year: 'numeric', month: 'short', day: 'numeric',
+  });
+}
+
+const statusLabel: Record<string, string> = {
+  trialing: 'Trial',
+  active: 'Active',
+  past_due: 'Past due (grace period)',
+  paused: 'Paused',
+  cancelled_at_period_end: 'Cancelling at period end',
+  cancelled: 'Cancelled',
+};
+
+Astro.response.headers.set('Cache-Control', 'private, no-store');
 ---
 <BaseLayout title="Account — sysviz">
   <section class="account">
     <h1>Account</h1>
+
+    {justSubscribed && (
+      <div class="account__flash">
+        ✓ Subscription started. Tier should flip to <strong>pro</strong> within a few seconds
+        once Razorpay's webhook fires. Reload this page if the tier still says free.
+      </div>
+    )}
+
     <div class="account__card">
       <div class="account__row"><span>Email</span><strong>{user.email}</strong></div>
       <div class="account__row"><span>Name</span><strong>{user.name ?? '—'}</strong></div>
       <div class="account__row"><span>Role</span><strong>{user.role}</strong></div>
+      <div class="account__row">
+        <span>Tier</span>
+        <strong class={tier === 'pro' ? 'account__tier--pro' : ''}>{tier}</strong>
+      </div>
     </div>
 
-    <p class="account__hint">
-      Subscriptions, progress tracking, and bookmarks land in later phases.
-      For now, sign-in is enough to flip into admin mode (if your email is on the ADMIN_EMAILS list).
-    </p>
+    <h2 class="account__h2">Subscription</h2>
+    <div class="account__card">
+      {sub ? (
+        <>
+          <div class="account__row"><span>Status</span><strong>{statusLabel[sub.status] ?? sub.status}</strong></div>
+          <div class="account__row"><span>Current period ends</span><strong>{fmtDate(sub.currentPeriodEnd)}</strong></div>
+          {sub.razorpaySubscriptionId && (
+            <div class="account__row">
+              <span>Razorpay id</span>
+              <code class="account__code">{sub.razorpaySubscriptionId}</code>
+            </div>
+          )}
+        </>
+      ) : (
+        <p class="account__muted">No subscription on file. Visit <a href="/pricing/">pricing</a> to start one.</p>
+      )}
 
+      {sub?.status === 'past_due' && (
+        <div class="account__warn">
+          The last renewal payment failed. Razorpay is retrying — your access continues during
+          the grace window. Update your payment method in the Razorpay portal to avoid lapse.
+        </div>
+      )}
+
+      <div class="account__actions">
+        {user.role !== 'admin' && tier === 'free' && (
+          <a class="anim__btn anim__btn--primary" href="/pricing/">Subscribe →</a>
+        )}
+        {sub && (sub.status === 'active' || sub.status === 'trialing') && (
+          <form action="/api/razorpay/cancel" method="post" onsubmit="return confirm('Cancel at the end of the current period? You keep access until then.')">
+            <button type="submit" class="anim__btn">Cancel at period end</button>
+          </form>
+        )}
+        {sub?.status === 'cancelled_at_period_end' && (
+          <form action="/api/razorpay/reactivate" method="post">
+            <button type="submit" class="anim__btn anim__btn--primary">Reactivate</button>
+          </form>
+        )}
+      </div>
+    </div>
+
+    <h2 class="account__h2">Session</h2>
     <form action="/api/auth/logout" method="post">
       <button type="submit" class="anim__btn">Sign out</button>
     </form>
   </section>
-</BaseLayout>
 
-<style>
-  .account { max-width: 32rem; margin: 3rem auto; }
-  .account__card {
-    background: var(--card-bg);
-    border: 1px solid var(--card-border);
-    border-radius: 12px;
-    padding: 1rem 1.25rem;
-    margin: 1.5rem 0;
-  }
-  .account__row {
-    display: flex;
-    justify-content: space-between;
-    padding: 0.55rem 0;
-    border-bottom: 1px solid var(--card-border);
-    font-size: 0.92rem;
-  }
-  .account__row:last-child { border-bottom: none; }
-  .account__row span { color: var(--fg-muted); }
-  .account__hint { color: var(--fg-muted); font-size: 0.9rem; line-height: 1.6; margin-bottom: 1.5rem; }
-</style>
+  <style>
+    .account { max-width: 38rem; margin: 3rem auto; }
+    .account__h2 { margin: 2rem 0 0.75rem; font-size: 1.05rem; color: var(--fg-muted); }
+    .account__card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 1rem 1.25rem;
+      margin-bottom: 1rem;
+    }
+    .account__row {
+      display: flex;
+      justify-content: space-between;
+      gap: 1rem;
+      padding: 0.55rem 0;
+      border-bottom: 1px solid var(--card-border);
+      font-size: 0.92rem;
+      align-items: center;
+    }
+    .account__row:last-child { border-bottom: none; }
+    .account__row span { color: var(--fg-muted); }
+    .account__tier--pro {
+      background: var(--grad-5);
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+      font-weight: 800;
+    }
+    .account__code { font-size: 0.78rem; color: var(--fg-faint); }
+    .account__muted { color: var(--fg-muted); margin: 0.25rem 0; }
+    .account__warn {
+      margin-top: 0.75rem;
+      padding: 0.7rem 0.9rem;
+      background: color-mix(in srgb, var(--anim-danger) 12%, transparent);
+      border: 1px solid var(--anim-danger);
+      border-radius: 8px;
+      font-size: 0.88rem;
+      line-height: 1.5;
+    }
+    .account__flash {
+      margin-bottom: 1.25rem;
+      padding: 0.7rem 0.9rem;
+      background: color-mix(in srgb, var(--anim-success) 14%, transparent);
+      border: 1px solid var(--anim-success);
+      border-radius: 8px;
+      font-size: 0.9rem;
+    }
+    .account__actions {
+      display: flex;
+      gap: 0.55rem;
+      flex-wrap: wrap;
+      margin-top: 1rem;
+    }
+    .account__actions form { display: inline; }
+  </style>
+</BaseLayout>
