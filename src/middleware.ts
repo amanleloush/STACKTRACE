@@ -1,7 +1,12 @@
 import { defineMiddleware } from 'astro:middleware';
 import { getDb } from '~/lib/db';
 import { validateSession } from '~/lib/auth/session';
-import { readSessionCookie } from '~/lib/auth/cookies';
+import {
+  readSessionCookie,
+  clearSessionCookie,
+  clearHintCookie,
+  HINT_COOKIE,
+} from '~/lib/auth/cookies';
 
 /**
  * Per-request auth resolver + admin route guard.
@@ -57,6 +62,15 @@ export const onRequest = defineMiddleware(async (context, next) => {
     }
   }
 
+  // Keep the two cookies in lockstep. If we couldn't resolve a real user but
+  // either cookie is still hanging around, drop both — otherwise the nav-swap
+  // script in BaseLayout will keep lying about who's signed in.
+  const hintPresent = context.cookies.has(HINT_COOKIE);
+  if (!context.locals.user && (staleToken || hintPresent)) {
+    if (staleToken) clearSessionCookie(context.cookies);
+    if (hintPresent) clearHintCookie(context.cookies);
+  }
+
   const isAdminRoute = path.startsWith('/admin') || path.startsWith('/api/admin');
   if (isAdminRoute && context.locals.user?.role !== 'admin') {
     // Dev-mode diagnostic: include a small body explaining *why* (signed
@@ -68,21 +82,13 @@ export const onRequest = defineMiddleware(async (context, next) => {
         : context.locals.user
           ? `signed in as ${context.locals.user.email} (role=${context.locals.user.role}). Admin routes require role=admin — add ${context.locals.user.email} to ADMIN_EMAILS in .env.local and sign in again.`
           : 'not signed in. Visit /login/.';
-      const response = new Response(
+      // The clearSessionCookie / clearHintCookie calls above already queued
+      // Set-Cookie headers on the cookies bag; Astro merges them onto this
+      // response automatically. Just return.
+      return new Response(
         `Not found.\n\n[dev-mode hint] /admin/* — ${reason}\n`,
         { status: 404, headers: { 'Content-Type': 'text/plain; charset=utf-8' } },
       );
-      if (staleToken) {
-        response.headers.append(
-          'Set-Cookie',
-          'sysviz_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax',
-        );
-        response.headers.append(
-          'Set-Cookie',
-          'sysviz_signed_in=; Path=/; Max-Age=0; SameSite=Lax',
-        );
-      }
-      return response;
     }
     return new Response('Not found', { status: 404 });
   }
