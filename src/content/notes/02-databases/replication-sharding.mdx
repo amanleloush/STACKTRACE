@@ -1,0 +1,167 @@
+---
+title: "Replication + Sharding"
+phase: "02-databases"
+order: 10
+tags: ["db", "sharding"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 7
+prerequisites: []
+---
+
+## Definition (interview-ready)
+
+**Replication** copies the same data to multiple nodes for read scaling, durability, and HA — synchronous (strong consistency, slower writes) or asynchronous (fast writes, possible loss). **Sharding** (a.k.a. partitioning) splits a dataset across nodes so each holds a subset — for write scaling and storage scaling.
+
+## Why it matters
+
+You hit replication when reads outgrow one machine (most apps); you hit sharding when writes or storage outgrow one machine (fewer, but harder). Choosing replication topology and shard key sets the upper bound on your scale and most of your operational pain.
+
+<Anim id="sharding" />
+
+## Core concepts
+
+### Replication topologies
+
+- **Single-leader (primary/replica)**: writes to one leader, asynchronous (or sync) replication to replicas. Reads can hit replicas for scale. Failure of leader → promote a replica (auto or manual).
+- **Multi-leader**: multiple leaders accept writes, replicate to each other. Useful across regions. Requires conflict resolution (last-write-wins, CRDTs, application logic).
+- **Leaderless**: any node accepts writes, writes go to R replicas, reads from W. Requires read-repair, anti-entropy. Used by Cassandra, DynamoDB.
+
+### Sync vs async replication
+
+- **Sync**: leader doesn't ack until N replicas confirm. Stronger durability; commit latency = slowest replica's RTT.
+- **Async**: leader acks immediately. Faster, but on crash you can lose unreplicated writes — that's your **RPO** (recovery point objective).
+- **Semi-sync** (MySQL): wait for at least one replica to receive (not apply) the write before ack — middle ground.
+
+### Replication lag
+
+Async replicas trail the leader by some time (ms to seconds, occasionally minutes under load).
+
+Consequence patterns:
+- **Read-your-writes**: user writes → reads from a replica before the write propagates → "where did my comment go?" Fixes: route to leader for read after write, sticky session, or read from "self" only via leader.
+- **Monotonic reads**: user reads from replica A (sees v1), next read from replica B (sees v0). Fix: sticky to one replica.
+- **Causal consistency**: comment B references comment A; both must be visible in order. Fix: causal tracking, or single-leader for write chains.
+
+### Failover
+
+- Detect leader failure (heartbeat).
+- Pick a new leader (the most up-to-date replica).
+- Reconfigure clients.
+- Old leader rejoins as replica (may need to discard unreplicated writes — **split-brain risk** if not handled).
+
+Tools: AWS RDS Multi-AZ, PgBouncer + repmgr/Patroni for Postgres, Orchestrator for MySQL, Cloud SQL HA.
+
+### Sharding (partitioning) strategies
+
+- **Range partitioning**: shard by key range. `users` with id 1–1M on shard A, 1M–2M on B. Easy range scans. **Hot shards** if writes are monotonic (everyone writes to "latest").
+- **Hash partitioning**: shard by `hash(key) % N`. Evenly spreads load. Loses range-scan locality. Adding nodes remaps almost everything → **consistent hashing** to mitigate.
+- **Directory-based**: a lookup service maps key → shard. Flexible, but the lookup is a new single point.
+- **Geo / locality**: shard by region. Best for user-locality apps.
+
+### Shard key choice
+
+The single most consequential database decision in a sharded system. A good shard key:
+- Is in **every query's WHERE clause** (avoid scatter-gather across shards).
+- Has **high cardinality** (millions of distinct values, not 5).
+- Has **balanced access** (no celebrity user generating 10% of traffic).
+- Lets you **localize transactions** to a single shard (no cross-shard ACID).
+
+Real-world: tenant ID, user ID, customer ID are common. Time is a frequent **anti-pattern** (recent shard becomes hot).
+
+### Cross-shard operations
+
+- **Cross-shard joins**: scatter-gather, slow.
+- **Cross-shard transactions**: need 2PC (expensive, partial-failure modes) or sagas (eventual).
+- **Aggregations**: each shard computes locally, coordinator merges.
+- **Global secondary indexes**: index materialized across shards (DynamoDB GSI, Vitess).
+
+### Rebalancing
+
+- Adding a shard: with hash sharding and `% N`, almost all keys remap. **Use consistent hashing** or vnodes (Cassandra, Riak, Vitess).
+- Tools split shards online (Vitess Reshard, MongoDB chunk migration).
+
+## How it works (a sharded read/write)
+
+```
+Client                          Router/Proxy                Shard
+  |  SELECT ... WHERE user_id=42 |                           |
+  |---------------------------->|                           |
+  |                             | hash(42) % 8 → shard 3    |
+  |                             |-------------------------->|
+  |                             |<-- rows -----------------|
+  |<------ rows ---------------|                           |
+```
+
+## Real-world examples
+
+- **YouTube → Vitess**: sharded MySQL with online resharding, query routing, transparent to apps.
+- **Uber → Schemaless**: leaderless replicated KV on top of MySQL, sharded by trip ID.
+- **Discord**: messages sharded by channel ID over Cassandra (now ScyllaDB) — channel = unit of locality.
+- **Stripe**: payments sharded by merchant ID; reporting reads cross-shard via DBT/Trino over a warehouse copy.
+- **MongoDB / Cassandra / DynamoDB**: sharding is built-in.
+
+## Common pitfalls
+
+- **Picking a low-cardinality shard key** (e.g., `country`) → 5 countries = 5 shards forever, hot ones unmanageable.
+- **Time as shard key** → all writes to today's shard.
+- **Cross-shard joins**: slow, fragile. Denormalize or use a query layer.
+- **Forgetting to replicate the WAL**: replicas built from snapshots only → recovery gap.
+- **Replication lag during a deploy**: long-running migration backs up the replication stream. Use online schema change tools.
+- **Failover during a network partition**: two nodes both think they're leader → **split brain**, divergent data. Use fencing (STONITH), majority quorum, or hosted HA.
+- **Read-after-write surprises**: API returns 200 OK, user refresh shows old data. Route critical follow-up reads to leader.
+
+## Interview questions
+
+### Q1 — Easy: When do you replicate vs shard?
+Replicate when **reads** outgrow one node, or for HA/durability. Shard when **writes or storage** outgrow one node. They're complementary — most large systems do both.
+
+### Q2 — Easy: What is replication lag and why does it matter?
+The delay between a write committing on the leader and being applied on a replica. Matters because users who write and then read from a replica may not see their own write — "read-your-writes" violation.
+
+### Q3 — Medium: How would you pick a shard key for an e-commerce orders table?
+Likely `customer_id` (or `merchant_id` depending on access pattern). High cardinality, present in most queries, balanced (no super-customer dominating). Time-only (`created_at`) would be terrible because today's shard takes all writes.
+
+### Q4 — Medium: Compare sync and async replication tradeoffs.
+Sync: stronger durability (write isn't acked until replicas confirm), higher write latency (gated by slowest replica). Async: low latency, but on leader crash you lose unreplicated writes (RPO > 0). Many setups use semi-sync — wait for at least one replica to receive.
+
+### Q5 — Medium: How does consistent hashing help when adding shards?
+With `hash(key) % N`, adding a shard remaps ~all keys (massive data movement). Consistent hashing places nodes on a ring; adding one moves only ~1/N keys (the ones closer to the new node). Critical for online rebalancing of caches and KV stores.
+
+### Q6 — Hard: A sharded MySQL setup needs a transaction across two shards. Options?
+(1) **Two-phase commit**: slow, fragile (prepare then commit phases; coordinator failure leaves locks). (2) **Saga**: break into compensable local transactions; orchestrator or choreography. (3) **Re-shard**: pick a key that keeps the txn local (e.g., wrap both records under same tenant). (4) **Outbox + idempotent retry**: write the intention in shard A, async process picks up and applies on B. Most teams choose (3) or (4).
+
+### Q7 — Hard: Production setup: 1 leader, 3 async replicas. Leader crashes. How do you fail over safely?
+- Detect via consensus (don't fail over on a single missed heartbeat).
+- Among replicas, pick the **most up-to-date** (highest WAL position / GTID).
+- Promote it; reconfigure clients (DNS, proxy, etcd).
+- Old leader, when it returns, may have **unreplicated writes** — these must be discarded (and ideally logged) to avoid divergence. This is data loss; that's the cost of async.
+- Fence the old leader (firewall, STONITH) until you're sure it won't accept writes.
+
+### Q8 — Hard: Re-sharding a 10TB Postgres on `tenant_id` to add capacity, with zero downtime. Approach?
+- Double-write to old + new for a transition period.
+- Backfill historical data into the new shard (chunked, throttled).
+- Cut reads over once new shard is verified consistent.
+- Stop double-writing, decommission slice of old shard.
+- Tools: logical replication (Postgres pglogical), Debezium for CDC, Citus for native sharding.
+- The hardest part is **invariants that cross shards** — those need application-level handling first.
+
+## TL;DR cheat sheet
+
+- **Replication** = redundancy + read scaling. Sync (safe, slow) vs Async (fast, lossy).
+- **Replication lag** breaks read-your-writes; route critical reads to leader.
+- **Sharding** = horizontal write/storage scaling. Choose: range, hash, directory, geo.
+- **Shard key** must have high cardinality, balanced load, and appear in most queries.
+- Time as a shard key is a famous anti-pattern.
+- Cross-shard joins/transactions are expensive — prefer locality or sagas.
+- Consistent hashing minimizes data movement on rebalance.
+- Split brain: prevent with quorum + fencing.
+
+## Go deeper
+
+- **DDIA**, Chapters 5 (Replication) and 6 (Partitioning).
+- **Vitess docs**: [vitess.io](https://vitess.io/docs/) — best resource on sharded MySQL.
+- **Citus docs** for Postgres sharding.
+- **MongoDB docs**: [Sharding](https://www.mongodb.com/docs/manual/sharding/).
+- **Discord engineering**: [Storing billions of messages](https://discord.com/blog/how-discord-stores-billions-of-messages) and [trillions of messages](https://discord.com/blog/how-discord-stores-trillions-of-messages).
+- **Jepsen analyses**: real-world replication anomalies in Postgres, MySQL, MongoDB, Cassandra.
+- **ByteByteGo** YouTube on replication and sharding.
