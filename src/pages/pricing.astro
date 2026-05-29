@@ -1,0 +1,265 @@
+---
+import BaseLayout from '~/layouts/BaseLayout.astro';
+import { getDb } from '~/lib/db';
+import { getSubscription } from '~/lib/billing/subscriptions';
+import { getEntitlement } from '~/lib/billing/entitlement';
+
+export const prerender = false;
+
+const user = Astro.locals.user;
+const env = Astro.locals.runtime?.env;
+const db = await getDb({ env });
+
+const tier = user ? await getEntitlement(db, user.id) : 'free';
+const sub = user ? await getSubscription(db, user.id) : null;
+
+const nextParam = Astro.url.searchParams.get('next') ?? '/account/';
+const signInHref = `/login/?next=${encodeURIComponent(`/pricing/?next=${encodeURIComponent(nextParam)}`)}`;
+
+Astro.response.headers.set('Cache-Control', 'private, no-store');
+---
+<BaseLayout title="Pricing — sysviz" description="One subscription unlocks every premium note, every interactive animation, every cheat-sheet.">
+  <section class="pricing">
+    <header class="pricing__head">
+      <h1>One plan. Everything.</h1>
+      <p>Every premium note + every interactive animation + every cheat-sheet — across the systems and DSA tracks.</p>
+    </header>
+
+    <article class="pricing__card">
+      <div class="pricing__chip">🔒 Premium</div>
+      <div class="pricing__price">
+        ₹499<span class="pricing__per">/month</span>
+      </div>
+      <ul class="pricing__features">
+        <li>All premium notes across all 10 phases</li>
+        <li>All 16+ interactive animations</li>
+        <li>DSA pillar (sorting, graphs, more coming)</li>
+        <li>Cancel anytime — access continues until period end</li>
+      </ul>
+
+      {!user && (
+        <a class="anim__btn anim__btn--primary pricing__cta" href={signInHref}>
+          Sign in to subscribe →
+        </a>
+      )}
+
+      {user && user.role === 'admin' && (
+        <div class="pricing__notice">
+          You're signed in as admin — you bypass the gate on every premium note. No subscription needed.
+        </div>
+      )}
+
+      {user && user.role !== 'admin' && tier === 'pro' && (
+        <>
+          <div class="pricing__notice pricing__notice--ok">
+            ✓ You're already on <strong>pro</strong>.
+            {sub?.status === 'cancelled_at_period_end' && sub.currentPeriodEnd && (
+              <> Access continues until {new Date(sub.currentPeriodEnd * 1000).toLocaleDateString()}.</>
+            )}
+          </div>
+          <a class="anim__btn pricing__cta" href="/account/">Manage subscription →</a>
+        </>
+      )}
+
+      {user && user.role !== 'admin' && tier === 'free' && (
+        <button id="pricing-subscribe" type="button" class="anim__btn anim__btn--primary pricing__cta" data-user-id={user.id}>
+          Subscribe (test mode)
+        </button>
+      )}
+
+      <p id="pricing-status" class="pricing__status" hidden></p>
+    </article>
+
+    <p class="pricing__fine">
+      Phase 4a is wired against Razorpay's <strong>test mode</strong>. No real card will be charged.
+      For full local iteration without provisioning a Razorpay account, admins can use the
+      <code>/api/admin/dev/fake-razorpay-event</code> simulator instead.
+    </p>
+  </section>
+
+  <script>
+    // Razorpay Checkout flow — only fires when the user clicks Subscribe.
+    // 1. POST /api/razorpay/checkout → backend creates a subscription and
+    //    returns { subscription_id, key_id }.
+    // 2. Load checkout.razorpay.com/v1/checkout.js, open modal with those.
+    // 3. The modal handles payment; the webhook posts subscription.activated
+    //    to our backend, applyEvent flips tier→pro.
+    // 4. On modal "success", redirect to /account/ which reflects the new tier.
+    const btn = document.getElementById('pricing-subscribe') as HTMLButtonElement | null;
+    const status = document.getElementById('pricing-status') as HTMLParagraphElement | null;
+
+    function setStatus(msg: string, tone: 'info' | 'error' = 'info') {
+      if (!status) return;
+      status.hidden = false;
+      status.textContent = msg;
+      status.dataset.tone = tone;
+    }
+
+    async function loadCheckout(): Promise<void> {
+      return new Promise((resolve, reject) => {
+        if ((window as unknown as { Razorpay?: unknown }).Razorpay) return resolve();
+        const s = document.createElement('script');
+        s.src = 'https://checkout.razorpay.com/v1/checkout.js';
+        s.async = true;
+        s.onload = () => resolve();
+        s.onerror = () => reject(new Error('failed to load checkout.js'));
+        document.head.appendChild(s);
+      });
+    }
+
+    btn?.addEventListener('click', async () => {
+      btn.disabled = true;
+      setStatus('Creating subscription…');
+      try {
+        const resp = await fetch('/api/razorpay/checkout', { method: 'POST' });
+        if (!resp.ok) {
+          const t = await resp.text();
+          throw new Error(t || `HTTP ${resp.status}`);
+        }
+        const { subscription_id, key_id } = await resp.json();
+        await loadCheckout();
+        setStatus('Opening Razorpay checkout…');
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const rzp = new (window as any).Razorpay({
+          key: key_id,
+          subscription_id,
+          name: 'sysviz',
+          description: 'Premium subscription',
+          theme: { color: '#818cf8' },
+          handler: () => {
+            // Subscription activation comes via webhook, not the modal handler.
+            // Bounce the user to /account/ where they'll see tier=pro once the
+            // webhook lands (a second or two).
+            window.location.href = '/account/?just-subscribed=1';
+          },
+          modal: {
+            ondismiss: () => {
+              btn.disabled = false;
+              setStatus('Checkout closed without completing.', 'info');
+            },
+          },
+        });
+        rzp.open();
+      } catch (e) {
+        btn.disabled = false;
+        setStatus(`Couldn't start checkout: ${String((e as Error).message ?? e)}`, 'error');
+      }
+    });
+  </script>
+
+  <style>
+    .pricing { max-width: 38rem; margin: 3rem auto; }
+    .pricing__head { text-align: center; margin-bottom: 2rem; }
+    .pricing__head h1 { margin: 0 0 0.5rem; font-size: clamp(1.8rem, 4vw, 2.4rem); }
+    .pricing__head p { color: var(--fg-muted); margin: 0; }
+
+    .pricing__card {
+      position: relative;
+      padding: 2rem 1.75rem 1.75rem;
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 14px;
+      overflow: hidden;
+    }
+    .pricing__card::before {
+      content: "";
+      position: absolute;
+      top: -50px; right: -50px;
+      width: 200px; height: 200px;
+      background: var(--grad-2);
+      filter: blur(80px);
+      opacity: 0.2;
+      z-index: 0;
+    }
+    .pricing__card > * { position: relative; z-index: 1; }
+
+    .pricing__chip {
+      display: inline-block;
+      padding: 0.2rem 0.65rem;
+      border-radius: 999px;
+      background: var(--grad-5);
+      color: white;
+      font-size: 0.7rem;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      margin-bottom: 1rem;
+    }
+    .pricing__price {
+      font-size: 2.4rem;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      margin-bottom: 1rem;
+    }
+    .pricing__per { font-size: 1rem; font-weight: 400; color: var(--fg-muted); margin-left: 0.25rem; }
+
+    .pricing__features {
+      list-style: none;
+      padding: 0;
+      margin: 0 0 1.5rem;
+      display: grid;
+      gap: 0.4rem;
+    }
+    .pricing__features li {
+      padding-left: 1.5rem;
+      position: relative;
+      color: var(--fg);
+      font-size: 0.92rem;
+    }
+    .pricing__features li::before {
+      content: "✓";
+      position: absolute;
+      left: 0;
+      color: var(--anim-success);
+      font-weight: 700;
+    }
+    .pricing__cta {
+      width: 100%;
+      padding: 0.8rem 1.5rem;
+      font-size: 0.95rem;
+      text-align: center;
+      display: block;
+    }
+    .pricing__notice {
+      padding: 0.75rem 1rem;
+      background: color-mix(in srgb, var(--primary) 10%, transparent);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      font-size: 0.88rem;
+      color: var(--fg-muted);
+      margin-bottom: 1rem;
+    }
+    .pricing__notice--ok {
+      background: color-mix(in srgb, var(--anim-success) 14%, transparent);
+      border-color: var(--anim-success);
+      color: var(--fg);
+    }
+    .pricing__notice strong { color: var(--fg); }
+
+    .pricing__status {
+      margin-top: 1rem;
+      padding: 0.55rem 0.8rem;
+      border-radius: 8px;
+      font-size: 0.85rem;
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+    }
+    .pricing__status[data-tone="error"] {
+      background: color-mix(in srgb, var(--anim-danger) 12%, transparent);
+      border-color: var(--anim-danger);
+    }
+
+    .pricing__fine {
+      text-align: center;
+      margin-top: 2rem;
+      color: var(--fg-faint);
+      font-size: 0.78rem;
+      line-height: 1.55;
+    }
+    .pricing__fine code {
+      background: var(--code-bg);
+      padding: 0.1em 0.4em;
+      border-radius: 4px;
+    }
+  </style>
+</BaseLayout>
