@@ -1,6 +1,6 @@
 ---
-import { listAnims } from '~/lib/anim/registry';
-const anims = listAnims();
+import { listAnimMetas } from '~/lib/anim/registry';
+const anims = listAnimMetas();
 const allTags = [...new Set(anims.flatMap((a) => a.tags))].sort();
 ---
 <section class="gallery">
@@ -106,29 +106,51 @@ const allTags = [...new Set(anims.flatMap((a) => a.tags))].sort();
 </style>
 
 <script>
-  import Fuse from 'fuse.js';
+  // Fuse.js is ~16 KB gzipped. Only the search box uses it, and most
+  // visitors filter by tag (or don't filter at all). Lazy-import on first
+  // search focus so the gallery's initial payload stays tiny.
+  type FuseModule = typeof import('fuse.js');
+  type FuseInstance = InstanceType<FuseModule['default']>;
 
-  type Card = HTMLElement;
   const grid = document.getElementById('gallery-grid');
   const input = document.getElementById('gallery-search') as HTMLInputElement | null;
   const tagBtns = document.querySelectorAll<HTMLButtonElement>('.tag-btn');
-  if (!grid || !input) {
-    // hydration noop
-  } else {
-    const cards = Array.from(grid.querySelectorAll<Card>('.gallery__card'));
+
+  if (grid && input) {
+    const cards = Array.from(grid.querySelectorAll<HTMLElement>('.gallery__card'));
     const data = cards.map((c) => ({
       title: c.dataset.title ?? '',
       tags: (c.dataset.tags ?? '').split(' '),
       el: c,
     }));
-    const fuse = new Fuse(data, { keys: ['title', 'tags'], threshold: 0.4 });
 
     let activeTag = 'all';
     let query = '';
+    let filterGen = 0;
 
-    function applyFilter(): void {
+    let fuseInstance: FuseInstance | null = null;
+    let fuseLoading: Promise<FuseInstance> | null = null;
+    function getFuse(): Promise<FuseInstance> {
+      if (fuseInstance) return Promise.resolve(fuseInstance);
+      if (!fuseLoading) {
+        fuseLoading = import('fuse.js').then((mod) => {
+          fuseInstance = new mod.default(data, { keys: ['title', 'tags'], threshold: 0.4 });
+          return fuseInstance;
+        });
+      }
+      return fuseLoading;
+    }
+
+    async function applyFilter(): Promise<void> {
+      const gen = ++filterGen;
       const q = query.trim().toLowerCase();
-      const matched = q ? new Set(fuse.search(q).map((r) => r.item.el)) : null;
+      let matched: Set<HTMLElement> | null = null;
+      if (q) {
+        const fuse = await getFuse();
+        // A newer keystroke superseded us; abandon this run.
+        if (gen !== filterGen) return;
+        matched = new Set(fuse.search(q).map((r) => (r as { item: { el: HTMLElement } }).item.el));
+      }
       data.forEach(({ el, tags }) => {
         const tagOk = activeTag === 'all' || tags.includes(activeTag);
         const queryOk = !matched || matched.has(el);
@@ -136,16 +158,19 @@ const allTags = [...new Set(anims.flatMap((a) => a.tags))].sort();
       });
     }
 
+    // Preload Fuse the moment the user touches the input — head-start on the import.
+    input.addEventListener('focus', () => { void getFuse(); }, { once: true });
+
     input.addEventListener('input', () => {
       query = input.value;
-      applyFilter();
+      void applyFilter();
     });
     tagBtns.forEach((btn) => {
       btn.addEventListener('click', () => {
         tagBtns.forEach((b) => b.setAttribute('aria-pressed', 'false'));
         btn.setAttribute('aria-pressed', 'true');
         activeTag = btn.dataset.tag ?? 'all';
-        applyFilter();
+        void applyFilter();
       });
     });
   }

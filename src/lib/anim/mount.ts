@@ -1,4 +1,6 @@
-import { getAnim } from './registry';
+// @client-only — this module touches document / window / IntersectionObserver
+// at module scope (guarded). Do not import it from SSR-only code paths.
+import { getAnimLoader, getMeta } from './registry';
 import type { AnimHandle } from './types';
 
 interface MountedAnim {
@@ -9,6 +11,7 @@ interface MountedAnim {
 }
 
 const MOUNTED = new WeakMap<HTMLElement, MountedAnim>();
+const PENDING = new WeakSet<HTMLElement>();
 let observer: IntersectionObserver | null = null;
 
 function ensureObserver(): IntersectionObserver {
@@ -34,20 +37,40 @@ function ensureObserver(): IntersectionObserver {
 
 /**
  * Mount one animation host. Safe to call multiple times — re-mount is a no-op
- * if the same id is already mounted on the same node.
+ * if the same id is already mounted on the same node. The actual anim module
+ * is lazy-imported, so the gallery page never ships per-anim code unless the
+ * user opens a card.
  */
-export function mountOne(host: HTMLElement): void {
+export async function mountOne(host: HTMLElement): Promise<void> {
   const id = host.dataset['anim'];
   if (!id) return;
   const existing = MOUNTED.get(host);
   if (existing && existing.id === id) return;
+  if (PENDING.has(host)) return;
   if (existing) existing.handle.destroy();
 
-  const mod = getAnim(id);
-  if (!mod) {
+  if (!getMeta(id)) {
     host.innerHTML = `<div class="anim__caption" style="color:var(--anim-danger)">Unknown animation: ${id}</div>`;
     return;
   }
+
+  const loader = getAnimLoader(id);
+  if (!loader) {
+    host.innerHTML = `<div class="anim__caption" style="color:var(--anim-danger)">Anim "${id}" has no module</div>`;
+    return;
+  }
+
+  PENDING.add(host);
+  let mod;
+  try {
+    mod = await loader();
+  } finally {
+    PENDING.delete(host);
+  }
+
+  // Host could have been swapped out during the dynamic import (Astro view-transition).
+  if (!host.isConnected) return;
+
   const handle = mod.mount(host, readOpts(host));
   const mounted: MountedAnim = { id, host, handle, visible: true };
   MOUNTED.set(host, mounted);
@@ -56,7 +79,9 @@ export function mountOne(host: HTMLElement): void {
 
 /** Mount every `[data-anim]` element currently in the DOM. */
 export function mountAll(root: ParentNode = document): void {
-  root.querySelectorAll<HTMLElement>('[data-anim]').forEach(mountOne);
+  root.querySelectorAll<HTMLElement>('[data-anim]').forEach((host) => {
+    void mountOne(host);
+  });
 }
 
 /** Tear down all mounted anims (used on Astro view-transitions). */
@@ -84,7 +109,7 @@ function readOpts(host: HTMLElement): Record<string, unknown> {
 
 // Boot on initial load + on Astro client-side navigation.
 if (typeof document !== 'undefined') {
-  const boot = () => mountAll();
+  const boot = (): void => mountAll();
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', boot, { once: true });
   } else {

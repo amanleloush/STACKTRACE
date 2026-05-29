@@ -1,19 +1,14 @@
 import type { AnimModule, AnimHandle } from '~/lib/anim/types';
 import { buildFrame, svgEl, htmlEl, makeBtn } from '~/lib/anim/svg';
 import { token, onThemeChange } from '~/lib/anim/theme';
+import meta from './meta';
 
 /**
  * Raft — leader election + log replication.
- * Ported from Brain-Detox-Arc/docs/javascripts/animations.js:240-404
- * (now uses theme tokens instead of hardcoded #a78bfa, etc.)
+ * Ported from Brain-Detox-Arc/docs/javascripts/animations.js:240-404.
  */
 const raft: AnimModule = {
-  id: 'raft',
-  title: 'Raft — leader election & log replication',
-  caption:
-    'Five-node cluster. Kill the leader to trigger an election; partition the network to see Raft refuse progress without a quorum.',
-  tags: ['distsys', 'consensus'],
-  pillar: 'systems',
+  ...meta,
 
   mount(host): AnimHandle {
     const { stage, controls, readout } = buildFrame(host, {

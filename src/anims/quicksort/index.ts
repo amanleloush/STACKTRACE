@@ -3,6 +3,7 @@ import { buildFrame, svgEl, htmlEl, makeBtn, makeSlider } from '~/lib/anim/svg';
 import { token, onThemeChange } from '~/lib/anim/theme';
 import { mulberry32, shuffled } from '~/lib/anim/rng';
 import { prefersReducedMotion } from '~/lib/anim/a11y';
+import meta from './meta';
 
 /**
  * Quicksort — Lomuto partition.
@@ -13,13 +14,7 @@ import { prefersReducedMotion } from '~/lib/anim/a11y';
  * Subsequent sorting anims (merge, heap, etc.) should follow this shape.
  */
 const quicksort: AnimModule = {
-  id: 'quicksort',
-  title: 'Quicksort — Lomuto partition',
-  caption:
-    'Pivot moves to its final position, then the array splits around it. Watch comparisons, swaps, and the boundary advance.',
-  tags: ['sorting'],
-  pillar: 'dsa',
-  defaults: { n: 16, seed: 7 },
+  ...meta,
 
   mount(host, opts = {}): AnimHandle {
     const { stage, controls, readout } = buildFrame(host, {
