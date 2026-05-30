@@ -1,5 +1,12 @@
 import type { AnimModule, AnimHandle } from '~/lib/anim/types';
-import { buildFrame, svgEl, htmlEl, makeBtn } from '~/lib/anim/svg';
+import {
+  buildFrame,
+  svgEl,
+  htmlEl,
+  makeBtn,
+  attachCodePanel,
+  attachStepRunner,
+} from '~/lib/anim/svg';
 import { token, onThemeChange } from '~/lib/anim/theme';
 import { prefersReducedMotion } from '~/lib/anim/a11y';
 import meta from './meta';
@@ -31,17 +38,31 @@ interface Step {
   current: number;
   visited: number[];
   note: string;
+  /** Index into the pseudocode `CODE` array — drives the line-highlight. */
+  codeLine: number;
 }
+
+const CODE = [
+  'stack = [start]',
+  'visited = {start}',
+  'while stack:',
+  '    u = stack.pop()',
+  '    for v in adj(u):',
+  '        if v not in visited:',
+  '            visited.add(v)',
+  '            stack.append(v)',
+];
 
 const dfs: AnimModule = {
   ...meta,
 
   mount(host): AnimHandle {
-    const { stage, controls, readout } = buildFrame(host, {
+    const frame = buildFrame(host, {
       title: meta.title,
       caption: meta.caption,
-      badge: 'Interactive',
+      badge: 'Step-by-step',
     });
+    const { stage, controls, readout } = frame;
 
     const SIZE_W = 480;
     const SIZE_H = 260;
@@ -52,19 +73,10 @@ const dfs: AnimModule = {
     });
     stage.appendChild(svg);
 
+    const codePanel = attachCodePanel(frame, { lines: CODE });
+
     let start = 0;
-    let speed = 1;
-    let paused = false;
-    let runToken = 0;
     let steps: Step[] = [];
-    let cursor = 0;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    function clearTimer(): void {
-      if (timer) {
-        clearTimeout(timer);
-        timer = null;
-      }
-    }
 
     function adj(i: number): number[] {
       const out: number[] = [];
@@ -82,36 +94,40 @@ const dfs: AnimModule = {
       const seen = new Set<number>([start]);
       states[start] = 'stacked';
       steps = [];
-      const push = (current: number, note: string): void => {
+      const push = (current: number, note: string, codeLine: number): void => {
         steps.push({
           states: [...states],
           stack: [...stack],
           current,
           visited: [...visited],
           note,
+          codeLine,
         });
       };
-      push(-1, `init: push start ${start} onto stack`);
+      push(-1, `init: push start ${start} onto stack`, 0);
       while (stack.length > 0) {
+        push(-1, 'loop condition', 2);
         const u = stack.pop()!;
         if (states[u] === 'visited') continue;
         states[u] = 'current';
-        push(u, `pop ${u}`);
+        push(u, `pop ${u}`, 3);
         // Push neighbors in reverse sorted order so we visit smallest first.
         const neigh = adj(u).slice().reverse();
         for (const v of neigh) {
+          push(u, `check neighbor ${v}`, 4);
           if (!seen.has(v)) {
+            push(u, `not visited — push ${v}`, 5);
             seen.add(v);
             stack.push(v);
             states[v] = 'stacked';
-            push(u, `push neighbor ${v}`);
+            push(u, `push neighbor ${v}`, 7);
           }
         }
         states[u] = 'visited';
         visited.push(u);
-        push(-1, `mark ${u} visited`);
+        push(-1, `mark ${u} visited`, 2);
       }
-      push(-1, 'done');
+      push(-1, 'done', 2);
     }
 
     function colorFor(state: NodeState): string {
@@ -123,7 +139,7 @@ const dfs: AnimModule = {
       }
     }
 
-    function draw(): void {
+    function draw(cursor: number): void {
       svg.innerHTML = '';
       const s = steps[cursor];
       if (!s) return;
@@ -176,78 +192,37 @@ const dfs: AnimModule = {
       readout.appendChild(htmlEl('span', {}, `stack: [${s.stack.join(', ')}]`));
       readout.appendChild(htmlEl('span', {}, `visited: [${s.visited.join(', ')}]`));
       readout.appendChild(htmlEl('span', {}, `start: ${start}`));
+
+      codePanel.highlight(s.codeLine);
     }
 
-    function tick(): void {
-      if (paused) return;
-      if (cursor >= steps.length - 1) {
-        clearTimer();
-        return;
-      }
-      cursor++;
-      draw();
-      timer = setTimeout(tick, Math.max(60, 360 / speed));
-    }
-
-    function play(): void {
-      const myRun = ++runToken;
-      paused = false;
-      clearTimer();
-      if (prefersReducedMotion()) {
-        cursor = steps.length - 1;
-        draw();
-        return;
-      }
-      const loop = (): void => {
-        if (myRun !== runToken) return;
-        tick();
-      };
-      loop();
-    }
-
-    function stepOne(): void {
-      paused = true;
-      clearTimer();
-      if (cursor < steps.length - 1) cursor++;
-      draw();
-    }
-
-    function reset(): void {
-      runToken++;
-      paused = true;
-      clearTimer();
-      genSteps();
-      cursor = 0;
-      draw();
-    }
-
-    function cycleStart(): void {
-      start = (start + 1) % NODES.length;
-      reset();
-    }
-
-    controls.appendChild(makeBtn('play', play, { primary: true }));
-    controls.appendChild(makeBtn('step', stepOne));
-    controls.appendChild(makeBtn('reset', reset));
-    controls.appendChild(makeBtn('cycle start', cycleStart));
-
-    const offTheme = onThemeChange(() => draw());
     genSteps();
-    cursor = 0;
-    draw();
+
+    const runner = attachStepRunner({
+      controls,
+      totalSteps: () => steps.length,
+      onStep: draw,
+      onReset: () => genSteps(),
+      prefersReducedMotion: prefersReducedMotion(),
+    });
+
+    // Extra: "cycle start" — pick a different starting node and replay.
+    controls.appendChild(
+      makeBtn('Cycle start', () => {
+        start = (start + 1) % NODES.length;
+        genSteps();
+        runner.reset();
+      }),
+    );
+
+    const offTheme = onThemeChange(() => draw(runner.getCursor()));
 
     return {
-      pause(): void {
-        paused = true;
-        clearTimer();
-      },
-      resume(): void {
-        /* user clicks play */
-      },
-      reset,
+      pause(): void { runner.pause(); },
+      resume(): void { /* user clicks play */ },
+      reset(): void { runner.reset(); },
       destroy(): void {
-        runToken++;
-        clearTimer();
+        runner.destroy();
         offTheme();
         host.innerHTML = '';
       },

@@ -1,0 +1,563 @@
+---
+/**
+ * "Mark as completed" widget rendered at the end of every note.
+ *
+ * On click → fires a confetti burst from the CTA, the button morphs into
+ * a green success state, and a toast slides in with a link to the roadmap.
+ * Click again (or "Undo") to revert.
+ *
+ * State lives in localStorage keyed by `<pillar>:<slug>`. Dispatches a
+ * `stacktrace:progress` window event on toggle so the roadmap (or any
+ * future view) can react without polling.
+ */
+interface Props {
+  pillar: 'notes' | 'dsa';
+  slug: string;
+  title: string;
+  /** Next note in this pillar/phase, if any — surfaces a "Next topic →"
+   *  CTA after the user marks this one done. */
+  nextHref?: string | null;
+  nextTitle?: string | null;
+}
+const { pillar, slug, title: _title, nextHref = null, nextTitle = null } = Astro.props;
+const storageKey = `${pillar}:${slug}`;
+const pillarLabel = pillar === 'dsa' ? 'DSA' : 'systems';
+const hasNext = !!nextHref && !!nextTitle;
+---
+<aside class="note-done" data-storage-key={storageKey}>
+  <hr class="note-done__rule" />
+  <div class="note-done__inner">
+    <h3 class="note-done__heading">
+      <span class="note-done__heading-default">Finished reading?</span>
+      <span class="note-done__heading-done">Nice — one down!</span>
+    </h3>
+    <p class="note-done__sub">
+      <span class="note-done__sub-default">
+        Tick it off your roadmap so next time you visit, you'll know exactly where you left off.
+      </span>
+      <span class="note-done__sub-done">
+        Logged to your {pillarLabel} journey. Keep the streak going.
+      </span>
+    </p>
+
+    <div class="note-done__cta-wrap">
+      <canvas class="note-done__burst" aria-hidden="true" width="320" height="320"></canvas>
+      <button type="button" class="note-done__cta" aria-pressed="false">
+        <span class="note-done__cta-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="9" class="note-done__icon-circle" />
+            <path d="m7.5 12.5 3 3 6-7" class="note-done__icon-check" />
+          </svg>
+        </span>
+        <span class="note-done__cta-text">
+          <span class="note-done__cta-default">Mark as completed</span>
+          <span class="note-done__cta-done">Completed</span>
+        </span>
+      </button>
+    </div>
+
+    {hasNext && (
+      <a class="note-done__next" href={nextHref!}>
+        <span class="note-done__next-label">Next topic</span>
+        <span class="note-done__next-title">{nextTitle}</span>
+        <span class="note-done__next-arrow" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M5 12h14M13 5l7 7-7 7" />
+          </svg>
+        </span>
+      </a>
+    )}
+
+    <button type="button" class="note-done__undo" aria-label="Undo completion">
+      Undo
+    </button>
+  </div>
+
+  <!-- Toast (slides in from bottom-right; auto-dismisses) -->
+  <div class="note-done__toast" role="status" aria-live="polite" hidden>
+    <span class="note-done__toast-icon" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="m5 12 5 5L20 7" />
+      </svg>
+    </span>
+    <div class="note-done__toast-body">
+      <strong>Added to your journey</strong>
+      <div class="note-done__toast-links">
+        <a href="/roadmap/" class="note-done__toast-link">View roadmap</a>
+        {hasNext && (
+          <>
+            <span class="note-done__toast-sep" aria-hidden="true">·</span>
+            <a href={nextHref!} class="note-done__toast-link note-done__toast-link--next">Next topic →</a>
+          </>
+        )}
+      </div>
+    </div>
+  </div>
+</aside>
+
+<script>
+  type Detail = { key: string; value: boolean };
+
+  function readSet(): Set<string> {
+    try {
+      return new Set(JSON.parse(localStorage.getItem('stacktrace:completed') ?? '[]'));
+    } catch {
+      return new Set();
+    }
+  }
+  function writeSet(s: Set<string>): void {
+    localStorage.setItem('stacktrace:completed', JSON.stringify([...s]));
+  }
+
+  // Tiny confetti — radial burst of colored squares + circles. Triggered
+  // only on a true unchecked → checked transition (not on undo, not on load).
+  type Particle = {
+    x: number; y: number; vx: number; vy: number;
+    r: number; color: string; shape: 'square' | 'circle';
+    angVel: number; ang: number; life: number;
+  };
+  const PALETTE = ['#4f46e5', '#06b6d4', '#22d3ee', '#34d399', '#f59e0b', '#ec4899', '#ef4444'];
+
+  function fireBurst(canvas: HTMLCanvasElement, originX: number, originY: number): void {
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth;
+    const h = canvas.clientHeight;
+    canvas.width = Math.floor(w * dpr);
+    canvas.height = Math.floor(h * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (reduceMotion) return;
+
+    const N = 36;
+    const particles: Particle[] = [];
+    for (let i = 0; i < N; i++) {
+      const angle = (i / N) * Math.PI * 2 + (Math.random() - 0.5) * 0.3;
+      const speed = 140 + Math.random() * 220;
+      particles.push({
+        x: originX,
+        y: originY,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed - 60,
+        r: 4 + Math.random() * 4,
+        color: PALETTE[i % PALETTE.length]!,
+        shape: Math.random() < 0.55 ? 'square' : 'circle',
+        angVel: (Math.random() - 0.5) * 12,
+        ang: Math.random() * Math.PI * 2,
+        life: 1,
+      });
+    }
+
+    const GRAVITY = 540;     // px/s²
+    const DRAG = 0.96;       // velocity multiplier per frame
+    const FADE_AFTER = 0.45; // seconds before fading begins
+    const DURATION = 1.4;    // seconds total
+
+    let start = performance.now();
+    function tick(now: number): void {
+      const t = (now - start) / 1000;
+      const dt = 1 / 60;
+      ctx!.clearRect(0, 0, w, h);
+      let alive = 0;
+
+      for (const p of particles) {
+        if (p.life <= 0) continue;
+        alive++;
+        p.vy += GRAVITY * dt;
+        p.vx *= DRAG;
+        p.vy *= DRAG;
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+        p.ang += p.angVel * dt;
+        if (t > FADE_AFTER) p.life = Math.max(0, 1 - (t - FADE_AFTER) / (DURATION - FADE_AFTER));
+
+        ctx!.save();
+        ctx!.globalAlpha = p.life;
+        ctx!.translate(p.x, p.y);
+        ctx!.rotate(p.ang);
+        ctx!.fillStyle = p.color;
+        if (p.shape === 'square') {
+          ctx!.fillRect(-p.r, -p.r, p.r * 2, p.r * 2);
+        } else {
+          ctx!.beginPath();
+          ctx!.arc(0, 0, p.r, 0, Math.PI * 2);
+          ctx!.fill();
+        }
+        ctx!.restore();
+      }
+
+      if (alive > 0 && t < DURATION) {
+        requestAnimationFrame(tick);
+      } else {
+        ctx!.clearRect(0, 0, w, h);
+      }
+    }
+    requestAnimationFrame(tick);
+  }
+
+  function showToast(root: HTMLElement): void {
+    const toast = root.querySelector<HTMLElement>('.note-done__toast');
+    if (!toast) return;
+    toast.hidden = false;
+    toast.dataset.show = 'true';
+    window.clearTimeout((toast as HTMLElement & { _t?: number })._t);
+    (toast as HTMLElement & { _t?: number })._t = window.setTimeout(() => {
+      toast.dataset.show = 'false';
+      window.setTimeout(() => { toast.hidden = true; }, 250);
+    }, 3200);
+  }
+
+  function init(root: HTMLElement): void {
+    const key = root.dataset.storageKey;
+    if (!key) return;
+    const cta = root.querySelector<HTMLButtonElement>('.note-done__cta');
+    const undo = root.querySelector<HTMLButtonElement>('.note-done__undo');
+    const burst = root.querySelector<HTMLCanvasElement>('.note-done__burst');
+    if (!cta || !undo) return;
+
+    function paint(done: boolean): void {
+      root.dataset.done = done ? 'true' : 'false';
+      cta!.setAttribute('aria-pressed', done ? 'true' : 'false');
+    }
+    paint(readSet().has(key));
+
+    function toggle(force?: boolean): void {
+      const set = readSet();
+      const wasDone = set.has(key!);
+      const next = force ?? !wasDone;
+      if (next) set.add(key!); else set.delete(key!);
+      writeSet(set);
+      paint(next);
+      window.dispatchEvent(
+        new CustomEvent<Detail>('stacktrace:progress', { detail: { key: key!, value: next } }),
+      );
+      // Only celebrate on the true off→on transition.
+      if (!wasDone && next) {
+        if (burst) {
+          const w = burst.clientWidth;
+          const h = burst.clientHeight;
+          fireBurst(burst, w / 2, h / 2);
+        }
+        showToast(root);
+      }
+    }
+
+    cta.addEventListener('click', () => toggle());
+    undo.addEventListener('click', () => toggle(false));
+
+    window.addEventListener('storage', (e) => {
+      if (e.key === 'stacktrace:completed') paint(readSet().has(key));
+    });
+  }
+
+  for (const el of document.querySelectorAll<HTMLElement>('.note-done')) init(el);
+</script>
+
+<style>
+  /* ============================================================
+     "Mark as completed" widget — educative-style hero CTA, with a
+     confetti burst rendered on the canvas overlay and a slide-in
+     toast linking to the roadmap.
+     ============================================================ */
+  .note-done {
+    margin: 4rem auto 1rem;
+    max-width: 36rem;
+    position: relative;
+  }
+
+  .note-done__rule {
+    border: none;
+    height: 1px;
+    background: linear-gradient(
+      90deg,
+      transparent,
+      color-mix(in srgb, var(--card-border) 80%, transparent),
+      transparent
+    );
+    margin: 0 0 1.75rem;
+  }
+
+  .note-done__inner {
+    text-align: center;
+    padding: 1.75rem 1.5rem 2rem;
+    background: var(--card-bg);
+    border: 1px solid var(--card-border);
+    border-radius: 16px;
+    box-shadow: var(--card-shadow);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    transition: border-color 0.25s ease, background 0.25s ease;
+  }
+  .note-done[data-done='true'] .note-done__inner {
+    border-color: color-mix(in srgb, var(--anim-success, var(--accent)) 50%, var(--card-border));
+    background: color-mix(in srgb, var(--anim-success, var(--accent)) 6%, var(--card-bg));
+  }
+
+  .note-done__heading {
+    margin: 0 0 0.4rem;
+    font-size: 1.15rem;
+    font-weight: 700;
+    color: var(--fg);
+  }
+  .note-done__heading-default,
+  .note-done__heading-done { display: none; }
+  .note-done[data-done='false'] .note-done__heading-default,
+  .note-done:not([data-done]) .note-done__heading-default { display: inline; }
+  .note-done[data-done='true'] .note-done__heading-done {
+    display: inline;
+    background: linear-gradient(135deg, var(--anim-success, var(--accent)), var(--accent));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  .note-done__sub {
+    margin: 0 auto 1.4rem;
+    max-width: 30rem;
+    color: var(--fg-muted);
+    font-size: 0.92rem;
+    line-height: 1.55;
+  }
+  .note-done__sub-default,
+  .note-done__sub-done { display: none; }
+  .note-done[data-done='false'] .note-done__sub-default,
+  .note-done:not([data-done]) .note-done__sub-default { display: inline; }
+  .note-done[data-done='true'] .note-done__sub-done { display: inline; }
+
+  /* CTA + canvas overlay positioned in a wrapper so the burst can
+     paint freely above/around the button without affecting layout. */
+  .note-done__cta-wrap {
+    position: relative;
+    display: inline-block;
+  }
+  .note-done__burst {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 320px;
+    height: 320px;
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+    z-index: 1;
+  }
+
+  .note-done__cta {
+    appearance: none;
+    position: relative;
+    z-index: 2;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.9rem 1.7rem;
+    border-radius: 999px;
+    border: 0;
+    background: linear-gradient(135deg, var(--primary-dark, var(--primary)) 0%, var(--primary) 100%);
+    color: white;
+    font: inherit;
+    font-size: 0.98rem;
+    font-weight: 700;
+    cursor: pointer;
+    text-shadow: 0 1px 0 rgba(0, 0, 0, 0.12);
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.12),
+      0 8px 22px color-mix(in srgb, var(--primary) 40%, transparent);
+    transition: transform 0.2s cubic-bezier(0.34, 1.56, 0.64, 1), box-shadow 0.25s ease, background 0.35s ease, filter 0.15s ease;
+    min-width: 240px;
+    justify-content: center;
+  }
+  .note-done__cta:hover {
+    filter: brightness(1.08);
+    transform: translateY(-1px);
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.15),
+      0 10px 28px color-mix(in srgb, var(--primary) 50%, transparent);
+  }
+  .note-done__cta:active { transform: scale(0.97); }
+  .note-done__cta:focus-visible {
+    outline: 3px solid color-mix(in srgb, var(--primary) 50%, transparent);
+    outline-offset: 3px;
+  }
+  [data-theme='light'] .note-done__cta {
+    box-shadow:
+      0 1px 2px rgba(15, 23, 42, 0.1),
+      0 4px 14px rgba(67, 56, 202, 0.3);
+  }
+
+  .note-done[data-done='true'] .note-done__cta {
+    background: linear-gradient(135deg, var(--anim-success, var(--accent)) 0%, var(--accent) 100%);
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.12),
+      0 6px 18px color-mix(in srgb, var(--anim-success, var(--accent)) 40%, transparent);
+    animation: note-done-pop 0.45s cubic-bezier(0.34, 1.56, 0.64, 1);
+  }
+  @keyframes note-done-pop {
+    0%   { transform: scale(1); }
+    50%  { transform: scale(1.08); }
+    100% { transform: scale(1); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .note-done[data-done='true'] .note-done__cta { animation: none; }
+  }
+  [data-theme='light'] .note-done[data-done='true'] .note-done__cta {
+    box-shadow:
+      0 1px 2px rgba(15, 23, 42, 0.1),
+      0 4px 14px color-mix(in srgb, var(--anim-success, var(--accent)) 40%, transparent);
+  }
+
+  .note-done__cta-icon { display: inline-flex; flex: 0 0 auto; }
+  .note-done__icon-check {
+    stroke-dasharray: 16;
+    stroke-dashoffset: 16;
+    transition: stroke-dashoffset 0.4s ease 0.05s;
+  }
+  .note-done[data-done='true'] .note-done__icon-check { stroke-dashoffset: 0; }
+
+  .note-done__cta-default,
+  .note-done__cta-done { display: none; }
+  .note-done[data-done='false'] .note-done__cta-default,
+  .note-done:not([data-done]) .note-done__cta-default { display: inline; }
+  .note-done[data-done='true'] .note-done__cta-done { display: inline; }
+
+  .note-done__undo {
+    appearance: none;
+    border: 0;
+    background: transparent;
+    color: var(--fg-muted);
+    font: inherit;
+    font-size: 0.82rem;
+    cursor: pointer;
+    margin-top: 1rem;
+    padding: 0.3rem 0.6rem;
+    border-radius: 6px;
+    text-decoration: underline;
+    text-decoration-color: color-mix(in srgb, var(--fg-muted) 50%, transparent);
+    text-underline-offset: 3px;
+    display: none;
+    transition: color 0.15s ease, background 0.15s ease;
+  }
+  .note-done__undo:hover {
+    color: var(--fg);
+    background: color-mix(in srgb, var(--card-border) 40%, transparent);
+  }
+  .note-done[data-done='true'] .note-done__undo { display: inline-block; }
+
+  /* Next-topic CTA — slides in after completion. Outlined, accent-bordered;
+     hover fills with accent. */
+  .note-done__next {
+    display: none;
+    margin: 1.25rem auto 0;
+    max-width: 26rem;
+    padding: 0.75rem 1rem;
+    background: var(--card-bg);
+    border: 1px solid color-mix(in srgb, var(--accent) 50%, var(--card-border));
+    border-radius: 12px;
+    text-decoration: none;
+    color: var(--fg);
+    transition: background 0.18s ease, border-color 0.18s ease, transform 0.08s ease;
+    align-items: center;
+    gap: 0.6rem;
+    text-align: left;
+  }
+  .note-done__next:hover {
+    background: color-mix(in srgb, var(--accent) 10%, var(--card-bg));
+    border-color: var(--accent);
+    transform: translateY(-1px);
+  }
+  .note-done__next:active { transform: scale(0.98); }
+  .note-done[data-done='true'] .note-done__next { display: flex; }
+  .note-done__next-label {
+    flex: 0 0 auto;
+    font-family: var(--font-code);
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-weight: 700;
+    color: var(--accent);
+    padding: 0.15rem 0.5rem;
+    border-radius: 5px;
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+  }
+  .note-done__next-title {
+    flex: 1 1 auto;
+    font-size: 0.92rem;
+    font-weight: 600;
+    color: var(--fg);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .note-done__next-arrow {
+    flex: 0 0 auto;
+    display: inline-flex;
+    color: var(--accent);
+    transition: transform 0.18s ease;
+  }
+  .note-done__next:hover .note-done__next-arrow { transform: translateX(3px); }
+
+  /* Toast — fixed, slides in from bottom-right. Auto-hides after ~3s. */
+  .note-done__toast {
+    position: fixed;
+    right: 1.25rem;
+    bottom: 1.25rem;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.7rem;
+    padding: 0.75rem 1rem;
+    background: var(--card-bg);
+    border: 1px solid color-mix(in srgb, var(--anim-success, var(--accent)) 55%, var(--card-border));
+    border-radius: 12px;
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.12),
+      0 12px 32px rgba(0, 0, 0, 0.28);
+    backdrop-filter: blur(20px) saturate(180%);
+    -webkit-backdrop-filter: blur(20px) saturate(180%);
+    z-index: 100;
+    transform: translateY(140%);
+    opacity: 0;
+    transition: transform 0.32s cubic-bezier(0.34, 1.56, 0.64, 1), opacity 0.22s ease;
+  }
+  .note-done__toast[data-show='true'] {
+    transform: translateY(0);
+    opacity: 1;
+  }
+  .note-done__toast-icon {
+    display: inline-flex;
+    width: 28px;
+    height: 28px;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    background: var(--anim-success, var(--accent));
+    color: white;
+    flex: 0 0 auto;
+  }
+  .note-done__toast-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    line-height: 1.3;
+  }
+  .note-done__toast-body strong {
+    font-size: 0.92rem;
+    color: var(--fg);
+  }
+  .note-done__toast-links {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .note-done__toast-link {
+    font-size: 0.8rem;
+    color: var(--accent);
+    text-decoration: none;
+    font-weight: 600;
+  }
+  .note-done__toast-link:hover { text-decoration: underline; }
+  .note-done__toast-link--next { color: var(--anim-success, var(--accent)); }
+  .note-done__toast-sep {
+    color: var(--fg-faint);
+    font-size: 0.78rem;
+  }
+</style>

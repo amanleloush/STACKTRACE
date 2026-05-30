@@ -1,0 +1,183 @@
+# 09 — Transactions + Isolation Levels (MVCC, WAL)
+
+> Phase 2 • Databases • Topic 9/74
+
+## Definition (interview-ready)
+
+A **transaction** is a unit of work that is **A**tomic, **C**onsistent, **I**solated, **D**urable (ACID). **Isolation levels** are tunable contracts that trade strictness for performance, defining which concurrent anomalies (dirty reads, non-repeatable reads, phantoms, write skew) a transaction can observe. **MVCC** (multi-version concurrency control) implements isolation by keeping multiple row versions, so readers and writers don't block each other. **WAL** (write-ahead log) makes atomicity + durability cheap.
+
+## Why it matters
+
+Subtle bugs from isolation level choices have caused real outages (lost updates in inventory systems, double-spend in payments). If you can name the anomaly each level prevents and what's still possible, you can read existing code defensively and reason about new transactional logic.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant T1 as Txn A
+    participant DB as Postgres
+    participant T2 as Txn B
+    Note over T1,T2: Lost update at Read Committed
+    T1->>DB: BEGIN; SELECT balance FROM acct WHERE id=1 (=100)
+    T2->>DB: BEGIN; SELECT balance FROM acct WHERE id=1 (=100)
+    T1->>DB: UPDATE balance=90 WHERE id=1
+    T1->>DB: COMMIT
+    T2->>DB: UPDATE balance=80 WHERE id=1
+    T2->>DB: COMMIT
+    Note over T1,T2: A's -10 lost. Fix: SELECT ... FOR UPDATE,<br/>or SERIALIZABLE, or compare-and-set
+```
+
+| Level | Dirty read | Non-repeatable | Phantom | Write skew |
+|---|---|---|---|---|
+| Read Uncommitted | ✗ | ✗ | ✗ | ✗ |
+| Read Committed | ✓ | ✗ | ✗ | ✗ |
+| Repeatable Read | ✓ | ✓ | ~ (snapshot) | ✗ |
+| Snapshot (MVCC) | ✓ | ✓ | ✓ | ✗ |
+| Serializable | ✓ | ✓ | ✓ | ✓ |
+
+<div class="sde-anim" data-anim="mvcc"></div>
+
+## Core concepts
+
+### ACID
+
+- **Atomic**: all-or-nothing — either all writes commit, or none. Implemented via the WAL + rollback log.
+- **Consistent**: transitions one valid DB state to another (constraints satisfied). The application's job too.
+- **Isolated**: concurrent transactions appear sequential (to varying degrees).
+- **Durable**: committed writes survive crash. Implemented via fsync of the WAL on commit.
+
+### Anomalies (what isolation prevents)
+
+- **Dirty read**: read a value another (uncommitted) transaction wrote. If that transaction rolls back, you saw a phantom write.
+- **Non-repeatable read**: same row read twice in one transaction returns different values (committed write between).
+- **Phantom read**: same range query in one transaction returns different *set* of rows.
+- **Lost update**: T1 reads X=10, T2 reads X=10, both write X=11. One increment lost.
+- **Write skew**: two transactions read overlapping data, each makes a decision based on it, and both commit a write that — taken together — violates an invariant. Famous example: two doctors going off-call simultaneously because each sees the *other* is on call.
+
+### Standard isolation levels (ANSI SQL)
+
+| Level | Dirty read | Non-repeatable | Phantom | Lost update | Write skew |
+|---|---|---|---|---|---|
+| Read uncommitted | ✘ allowed | ✘ | ✘ | ✘ | ✘ |
+| Read committed | ✓ prevented | ✘ | ✘ | ✘ | ✘ |
+| Repeatable read | ✓ | ✓ | ✘ (ANSI) / ✓ (MySQL gap locks) | ✓ (PG snapshot) | ✘ |
+| Serializable | ✓ | ✓ | ✓ | ✓ | ✓ |
+
+**Real-world defaults**:
+- Postgres: **read committed** by default.
+- MySQL InnoDB: **repeatable read** by default (with gap locks → blocks phantoms).
+- Many ORMs ship with read committed.
+
+### Snapshot isolation (Postgres "repeatable read")
+
+The transaction sees a snapshot of the DB at its start. Other commits are invisible. Implemented via MVCC. Stronger than ANSI repeatable read (no non-repeatable reads, no phantoms in the way most people mean) — but still allows **write skew**.
+
+### Serializable (SSI in Postgres)
+
+Postgres "Serializable Snapshot Isolation" detects dangerous read/write patterns at commit time and aborts one transaction (with a serialization failure — application must retry). The toughest guarantee — equivalent to running transactions one at a time — without the cost of strict 2-phase locking.
+
+### MVCC
+
+- Each row has hidden columns `xmin` (creating txn ID) and `xmax` (deleting/updating txn ID).
+- A read sees a row only if `xmin` < my snapshot and `xmax` > my snapshot (or 0).
+- **Updates create new versions**, don't overwrite. Old versions become dead tuples — cleaned up by VACUUM (Postgres) or pruned from the undo log (MySQL).
+- Readers never block writers; writers never block readers. Conflicts only at the write level — and there too they often resolve via row-level locks.
+
+### Locks
+
+Even with MVCC, writes still take row locks (`SELECT ... FOR UPDATE`). Types:
+- **Shared lock (S)**: many readers.
+- **Exclusive lock (X)**: one writer, no readers.
+- **Predicate lock**: range — needed to prevent phantoms (e.g., InnoDB gap locks).
+- **Intent locks** (table-level coarse, on top of row-level fine).
+
+### Two-phase locking (2PL)
+
+Classic serializability: each transaction acquires all locks before releasing any. Strict 2PL holds locks until commit. Strong but blocks readers and writers heavily. Most modern DBs prefer MVCC + selective locking.
+
+### WAL (write-ahead log)
+
+1. Change recorded in WAL, fsynced on commit.
+2. Buffer cache updated.
+3. Periodic checkpoint flushes dirty pages.
+4. Crash → replay WAL from last checkpoint.
+
+WAL also supports point-in-time recovery (PITR) and physical replication (Postgres' streaming replication ships WAL bytes to a replica).
+
+## How it works (transaction lifecycle)
+
+```
+BEGIN;
+   ↓
+acquire txn ID, take MVCC snapshot
+   ↓
+SELECT ...  → read consistent snapshot, no locks
+UPDATE ...  → write new row version, take row-level X lock
+INSERT ...  → append row with xmin = txn ID
+   ↓
+COMMIT;
+   ↓
+WAL flushed (fsync)
+locks released
+visible to new snapshots
+```
+
+## Real-world examples
+
+- **Postgres SSI in Stripe**: payment intent flows use serializable to catch concurrent double-charges; the retry-on-conflict pattern is wired into their data layer.
+- **MySQL repeatable read in Square**: most apps stay at default; for inventory checks where write skew matters, they upgrade to serializable or use explicit `SELECT FOR UPDATE`.
+- **Spanner**: globally distributed serializability using TrueTime — atomic clocks + uncertainty windows.
+
+## Common pitfalls
+
+- **Read-modify-write at read committed**: classic lost update. Use `SELECT FOR UPDATE`, or compare-and-swap (`UPDATE ... WHERE version = ?`).
+- **Long transactions**: hold MVCC snapshots, prevent VACUUM, bloat tables. Even an idle BEGIN can lock a table for hours.
+- **Misunderstanding "repeatable read"**: ANSI repeatable read still allows phantoms. Postgres' RR (snapshot isolation) does not — but allows write skew.
+- **DDL inside transactions**: MySQL/InnoDB historically committed implicitly; Postgres treats most DDL as transactional. Know your DB.
+- **Distributed transactions**: 2PC is slow and fragile. Prefer sagas + idempotency.
+- **Retry without idempotency**: a serialization failure is retried but the side effect (email, payment) happened twice. Make handlers idempotent.
+
+## Interview questions
+
+### Q1 — Easy: Name the four ACID properties.
+Atomicity, Consistency, Isolation, Durability.
+
+### Q2 — Easy: What is a dirty read?
+Reading a value written by an uncommitted transaction. If that transaction later rolls back, you've seen data that "never existed." Prevented by Read Committed and above.
+
+### Q3 — Medium: Explain MVCC in one paragraph.
+Multi-Version Concurrency Control: writes create new versions of rows rather than overwriting; each version is tagged with the transaction ID that created and (optionally) deleted it. Readers see only versions visible to their snapshot. Result: readers never block writers, writers never block readers. Postgres cleans up dead versions via VACUUM; MySQL keeps them in undo logs.
+
+### Q4 — Medium: What's the difference between Repeatable Read and Serializable?
+Repeatable Read prevents non-repeatable reads (same row reads same value within the transaction) and, in Postgres' snapshot isolation, phantoms — but still allows **write skew** (two txns each reading and writing different rows in a way that violates an invariant). Serializable additionally prevents write skew, behaving as if transactions ran one at a time.
+
+### Q5 — Medium: What is write skew? Give an example.
+Two transactions read overlapping data and write to non-overlapping rows in a way that — combined — violates a constraint. Example: two doctors, one is required to be on call. Each reads "the other is on call" and updates *themselves* off-call. Both commit → no one on call.
+
+### Q6 — Hard: How does WAL enable both durability and performance?
+Performance: instead of fsyncing many random pages, only the **sequential** WAL gets fsynced on commit. In-memory data pages get flushed lazily by background checkpoints. Durability: on crash, replay WAL from last checkpoint — guaranteed to restore committed transactions because they entered the WAL before commit returned.
+
+### Q7 — Hard: Implement a counter increment that's safe at Read Committed.
+Three options: (1) `UPDATE counters SET n = n + 1 WHERE id = ?` — atomic at the row, safe. (2) `SELECT ... FOR UPDATE` then update — exclusive row lock until commit. (3) Optimistic CAS: `UPDATE counters SET n = ?, version = version + 1 WHERE id = ? AND version = ?` — retry on miss. Avoid `SELECT n; UPDATE n+1` at read committed — that's the lost-update pattern.
+
+### Q8 — Hard: Compare 2PL with MVCC-based serializability.
+**2PL** acquires locks (shared/exclusive) before any access; in strict 2PL, all locks released at commit. Strong, but readers block writers and vice versa — bad for read-heavy workloads. **MVCC + SSI** (Postgres) lets readers go without locks against a consistent snapshot, then detects serialization conflicts at commit and aborts one (which retries). Higher throughput under read-heavy load, at the cost of application-visible retry handling.
+
+## TL;DR cheat sheet
+
+- ACID: Atomic, Consistent, Isolated, Durable.
+- Anomalies in order of severity: dirty read → non-repeatable → phantom → lost update → write skew.
+- Read Committed (PG default) prevents dirty reads only. Repeatable Read in PG = snapshot isolation (prevents phantoms, allows write skew). Serializable prevents all (with retry on conflict).
+- MVCC: row versions, no read locks. Postgres `xmin/xmax`. MySQL undo log.
+- WAL: sequential log, fsync on commit, lazy flush of data. Enables PITR + replication.
+- For read-modify-write: `UPDATE ... WHERE` atomic, or `SELECT FOR UPDATE`, or optimistic CAS.
+- Long transactions = MVCC snapshot held = no VACUUM = bloat.
+
+## Go deeper
+
+- **DDIA Chapter 7** — the gold standard chapter on transactions and isolation.
+- **Jepsen consistency models**: [jepsen.io/consistency](https://jepsen.io/consistency) — visual hierarchy.
+- **"A Critique of ANSI SQL Isolation Levels"** by Berenson et al — original paper showing ANSI levels are under-specified.
+- **Postgres docs**: [Transaction Isolation](https://www.postgresql.org/docs/current/transaction-iso.html).
+- **MySQL docs**: [InnoDB Transaction Model](https://dev.mysql.com/doc/refman/8.0/en/innodb-transaction-model.html).
+- **Martin Kleppmann talks** on YouTube — accessible deep dives.
+- **Postgres SSI paper** (Ports & Grittner) — short, readable.

@@ -1,0 +1,75 @@
+# 07 — Prim MST
+
+> Graph Algorithms • Position 7/8
+
+## Problem
+Given a weighted undirected graph, find a **minimum spanning tree** — same goal as Kruskal, different growth strategy.
+
+## Intuition
+Grow the MST node by node. Start from any vertex; repeatedly add the **cheapest edge that connects an in-tree node to an out-of-tree node**. A min-heap of crossing edges makes this efficient. The invariant: **the tree-so-far is always a subtree of *some* MST** (cut property again). Prim is essentially Dijkstra where the key is the edge weight to the frontier, not the cumulative distance from a source.
+
+## Algorithm
+Maintain a `in_tree` set and a min-heap of `(edge_weight, neighbor)` for edges crossing the cut. Pop the cheapest crossing edge; if its neighbor isn't in the tree yet, add it and push all of its outgoing edges.
+
+```python
+import heapq
+
+def prim(n, graph, start=0):
+    in_tree = [False] * n
+    heap = [(0, start)]
+    total, taken = 0, 0
+    while heap and taken < n:
+        w, u = heapq.heappop(heap)
+        if in_tree[u]:
+            continue
+        in_tree[u] = True
+        total += w
+        taken += 1
+        for v, weight in graph[u]:
+            if not in_tree[v]:
+                heapq.heappush(heap, (weight, v))
+    return total if taken == n else -1     # -1 if disconnected
+```
+
+## Walkthrough
+Example: 6 nodes `A–F`, edges `A-B(4), A-D(1), B-C(3), B-E(2), C-F(5), D-E(6), E-F(7), B-D(8)`. Start = A.
+
+1. **Seed.** `visited = {A}`; frontier (sorted) = `A-D(1), A-B(4)`.
+2. **Absorb D.** Pop `A-D(1)` — D not visited, accept → MST += A-D. Push D's new crossings `D-E(6), B-D(8)`. Frontier = `A-B(4), D-E(6), B-D(8)`. Total = 1.
+3. **Absorb B, then E.** Pop `A-B(4)` → accept; push `B-C(3), B-E(2), B-D(8)`. Frontier head is now `B-E(2)` — pop, accept E, push `E-F(7)`. Total = 1+4+2 = 7.
+4. **Absorb C, then F.** Pop `B-C(3)` → accept C, push `C-F(5)`. Pop `C-F(5)` → accept F. Total = 7+3+5 = 15.
+5. **End.** All 6 nodes visited; MST = `{A-D, A-B, B-E, B-C, C-F}`, weight **15**. Any later pops (`D-E`, `E-F`, `B-D`) hit already-visited endpoints and get discarded.
+
+<div class="dsa-viz" data-algo="prim"></div>
+
+## Complexity
+
+<div class="dsa-bigO">
+  <span>time <strong>O(E log V)</strong></span>
+  <span>space <strong>O(V + E)</strong></span>
+</div>
+
+With a Fibonacci heap, O(E + V log V). With an adjacency matrix and no heap, O(V²) — better for dense graphs.
+
+## Pitfalls
+- **Skip in-tree on pop** — like Dijkstra, you'll have stale heap entries. Discard if the target is already in the tree.
+- **Disconnected graphs** — Prim from one start only covers one component. Loop over un-marked starts to get the forest.
+- **Adjacency-list representation** is required — Prim works on neighbors; if you only have an edge list, Kruskal is more natural.
+- **Dense vs sparse** — Prim with a matrix is O(V²) (no heap). For E ≈ V², that beats E log V.
+- **Tie-breaking** — any choice among equal-cost crossing edges is optimal.
+
+<div class="dsa-practice">
+  <h4>Practice — LeetCode</h4>
+  <ul>
+    <li><a href="https://leetcode.com/problems/min-cost-to-connect-all-points/">1584 Min Cost to Connect All Points (Med)</a> — dense graph; Prim O(V²) shines.</li>
+    <li><a href="https://leetcode.com/problems/connecting-cities-with-minimum-cost/">1135 Connecting Cities With Minimum Cost (Med)</a> — same template as Kruskal.</li>
+    <li><a href="https://leetcode.com/problems/find-critical-and-pseudo-critical-edges-in-minimum-spanning-tree/">1489 Find Critical and Pseudo-Critical Edges in MST (Hard)</a> — Prim works but Kruskal is cleaner.</li>
+    <li><a href="https://leetcode.com/problems/optimize-water-distribution-in-a-village/">1168 Optimize Water Distribution (Hard)</a> — virtual-node + Prim.</li>
+    <li><a href="https://leetcode.com/problems/path-with-minimum-effort/">1631 Path With Minimum Effort (Med)</a> — Prim variant: minimize max edge.</li>
+    <li><a href="https://leetcode.com/problems/path-with-maximum-minimum-value/">1102 Path With Maximum Minimum Value (Med)</a> — reversed-key Prim.</li>
+    <li><a href="https://leetcode.com/problems/checking-existence-of-edge-length-limited-paths/">1697 Checking Existence of Edge Length Limited Paths (Hard)</a> — DSU is cleaner; Prim possible.</li>
+    <li><a href="https://leetcode.com/problems/swim-in-rising-water/">778 Swim in Rising Water (Hard)</a> — minimax path; Dijkstra/Prim variant.</li>
+    <li><a href="https://leetcode.com/problems/tree-diameter/">1245 Tree Diameter (Med)</a> — adjacent topic; two BFS pass.</li>
+    <li><a href="https://leetcode.com/problems/course-schedule-iv/">1462 Course Schedule IV (Med)</a> — reachability comparison.</li>
+  </ul>
+</div>

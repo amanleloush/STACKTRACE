@@ -1,0 +1,137 @@
+# 05 — Back-of-Envelope Math + Latency Numbers
+
+> Phase 1 • Foundations • Topic 5/74
+
+## Definition (interview-ready)
+
+**Back-of-envelope estimation** is the practice of using rough orders of magnitude — for throughput (QPS), storage, bandwidth, and latency — to decide whether a system design is plausible before committing to it. You memorize a small set of base numbers, then multiply/divide.
+
+## Why it matters
+
+Every system design interview opens with capacity numbers: "100M DAU, 5 posts per user, 1KB per post." If you can't translate that to QPS, GB/day, and IOPS, you can't choose a database, a sharding strategy, or a cache size. In the real world, the same skill stops you from over-engineering for traffic that won't come (or under-provisioning a launch).
+
+## Core numbers to memorize (Jeff Dean, updated)
+
+```
+L1 cache reference                 0.5 ns
+Branch mispredict                    5 ns
+L2 cache reference                   7 ns
+Mutex lock/unlock                   25 ns
+Main memory reference              100 ns           (~200× L1)
+Compress 1KB with Snappy         3,000 ns  (3 μs)
+Send 1KB over 1 Gbps network    10,000 ns  (10 μs)
+SSD random read              150,000 ns  (150 μs)
+Read 1MB sequentially from RAM  250,000 ns  (250 μs)
+Round trip within datacenter    500,000 ns  (500 μs = 0.5 ms)
+Read 1MB sequentially from SSD 1,000,000 ns  (1 ms)
+HDD seek                       10,000,000 ns  (10 ms)
+Read 1MB sequentially from HDD 20,000,000 ns  (20 ms)
+Round trip CA → Netherlands   150,000,000 ns  (150 ms)
+```
+
+### Useful conversions
+
+- **1 ns** = 10⁻⁹ s. **1 ms** = 10⁻³ s.
+- **1 byte** = 8 bits. **1 KB** = 10³ B, **1 MB** = 10⁶ B, **1 GB** = 10⁹ B (decimal — disks/networks use these).
+- **1 Gbps** = 125 MB/s.
+- **86,400 seconds in a day** — call it ~10⁵.
+- **30M seconds in a year** — call it ~3 × 10⁷.
+
+### Throughput conversions
+
+- **DAU → QPS**: `DAU × actions_per_user / 86,400`. 100M DAU × 10 actions = 1B/day ≈ 12K QPS average. Peak = ~3× average.
+- **Storage / day**: `events_per_day × bytes_per_event`.
+- **Bandwidth**: `QPS × payload_size`.
+
+## How to apply (template)
+
+For any HLD problem:
+
+1. **Users & actions**: DAU, actions per user per day → average QPS, peak QPS.
+2. **Read/write ratio**: typically 100:1 for social feeds, 1:1 for chat, 10:1 for e-commerce.
+3. **Payload sizes**: tweet 1KB, image 200KB, video clip 5MB.
+4. **Storage per day**: writes/day × payload.
+5. **Storage per 5 years**: × ~2000 days. (Useful when sizing data lakes.)
+6. **Bandwidth**: peak QPS × payload. Inbound and outbound.
+7. **Cache size**: hot fraction (often 20%) × dataset.
+8. **Connections**: with persistent conns, QPS / RPS-per-conn ≈ active conns.
+
+## Worked example: a Twitter feed
+
+- 300M DAU, each posts 2 tweets/day → 600M tweets/day → ~7K writes/sec average, ~21K peak.
+- Each reads 100 tweets/day → 30B reads/day → ~350K reads/sec average, ~1M peak.
+- 1KB per tweet → 600 GB writes/day → ~200 TB/year (raw).
+- Outbound bandwidth at peak: 1M reads/sec × 1KB = 1 GB/s.
+
+**Immediate conclusions**:
+- Reads dominate by 100×. Cache aggressively.
+- 1M QPS reads = sharded read replicas + Redis layer + CDN for media.
+- 200 TB/year + replication factor 3 → 600 TB/year actually stored. Tiered storage (hot in MySQL/Cassandra, cold in S3/parquet).
+- 1 GB/s outbound → CDN handles media; tweet text fits in low GB/s easily.
+
+## Real-world examples
+
+- **WhatsApp**: famously handled 50B messages/day with ~50 engineers — math told them per-server message handling needed to be ~1M concurrent connections. They built Erlang/FreeBSD around exactly that.
+- **Instagram**: photos uploaded ≈ 100M/day. At 200KB avg + RF=3 = ~60 TB/day new storage. Hence their tiered S3 + CDN architecture.
+- **Stripe**: ~1B requests/day at peak. With p99 latency target of <100 ms across multi-step flows, latency budgets per hop are <10 ms — drives gRPC + co-located services + tight caching.
+
+## Common pitfalls
+
+- **Mixing decimal and binary units**: disk vendors say 1 TB = 10¹² bytes; OS says 1 TiB = 2⁴⁰. Be consistent.
+- **Forgetting peak ≠ average**: real traffic is bursty. Apply 2–5× peak factor.
+- **Forgetting replication**: storage estimates need × replication factor (typically 3).
+- **Ignoring metadata**: indexes can be 20-50% of data size; logs can equal the data they describe.
+- **Conflating read latency with write latency**: writes often need fsync, replication ACKs, much slower than reads.
+- **Wishful caching**: "we'll cache it" doesn't help if access pattern has no locality.
+
+## Interview questions
+
+### Q1 — Easy: How much faster is RAM than SSD random read?
+RAM access ~100 ns, SSD random read ~150 μs → SSD is ~1,500× slower. Sequential SSD read of 1MB is ~1 ms, vs 250 μs from RAM (4× slower for big blocks).
+
+### Q2 — Easy: How much data does 100M DAU posting 1 tweet/day (1 KB) generate per year?
+100M × 1 KB/day = 100 GB/day. × 365 = ~36 TB/year. With replication factor 3, ~110 TB/year on disk.
+
+### Q3 — Medium: A service needs to serve 1M QPS. Each request is 2KB response. How much bandwidth?
+1M × 2KB = 2 GB/s = 16 Gbps. You need either fat NICs (40/100 Gbps) on the edge, or a CDN to absorb this.
+
+### Q4 — Medium: 500M users, you want to store one timestamp per user updated every login. How big is the table?
+500M × ~30 bytes (user_id 8B + timestamp 8B + indexing overhead ~14B) ≈ 15 GB. Fits in RAM on one machine. With index → ~30 GB. Still tiny — no sharding needed for this alone.
+
+### Q5 — Medium: A request fans out to 5 internal services, each with p99 = 20 ms. What's the upper bound for total p99?
+**It's not 20 ms.** Fan-out + wait-for-all → p99 of the slowest of 5 independent 20-ms p99 calls is much higher. With 5 calls, p99 of the slowest ≈ p(1-0.01^5)... actually closer to ~50–60 ms in practice. Lesson: fan-out amplifies tail latency. (Jeff Dean: "The Tail at Scale.")
+
+### Q6 — Hard: Design a write-heavy logging system at 1M events/sec, 200 bytes each. Estimate storage and bandwidth for 1 year.
+- Throughput: 1M × 200B = 200 MB/s = 1.6 Gbps ingress (× compression ~3× → 0.5 Gbps over the wire).
+- Per day: 200 MB/s × 86,400 = ~17 TB raw, ~6 TB compressed.
+- Per year: ~6 PB compressed, ~18 PB with RF=3.
+- Conclusion: tiered storage, columnar format (Parquet), partition by date + tenant, cold storage to S3 Glacier after 30 days, query via Trino/Presto.
+
+### Q7 — Hard: You're sizing a cache for a system with 10TB of warm data and 80% hit rate target. Cache budget?
+80% hit rate on Zipfian access usually requires caching ~20% of the working set. ~2 TB cache. Spread across Redis cluster nodes at 50 GB each (leaving overhead) → ~40 nodes. If 80% target is from p50 not warm working set, you might need closer to 30% → ~3 TB.
+
+### Q8 — Hard: A new feature predicts 5M extra DAU. Each session is 30 min, generates 50 API calls of 5KB response. What infra grows?
+- Sessions/sec at peak (3× avg): 5M × (30 min / 1440 min) × 3 ≈ 300K concurrent active.
+- API peak: 5M × 50 / 86400 × 3 ≈ 8.7K QPS new load.
+- Bandwidth: 8.7K × 5KB = ~45 MB/s = 350 Mbps egress.
+- Concurrent connections ≈ 300K → matters for LB/conn pools, not bandwidth.
+- DB writes/reads: depends on feature mix; back-pressure plan needed before launch.
+
+## TL;DR cheat sheet
+
+- L1 → 0.5 ns. RAM → 100 ns. SSD random → 150 μs. Datacenter RTT → 0.5 ms. Cross-continent RTT → 150 ms.
+- 1 Gbps = 125 MB/s. 1 day = 86,400 s ≈ 10⁵.
+- Peak ≈ 2–5× average.
+- Read-heavy social = ~100:1 R/W. Cache the reads.
+- Always multiply storage by replication factor (× 3 typical).
+- Fan-out amplifies tail latency. p99 of N calls » p99 of one.
+- When in doubt, compute QPS first, then storage/day, then bandwidth.
+
+## Go deeper
+
+- **Jeff Dean's latency numbers**: [gist](https://gist.github.com/jboner/2841832) and ["Numbers Everyone Should Know"](https://www.cs.cornell.edu/projects/ladis2009/talks/dean-keynote-ladis2009.pdf).
+- **Colin Scott's interactive latency**: [colin-scott.github.io/personal_website/research/interactive_latency.html](https://colin-scott.github.io/personal_website/research/interactive_latency.html) (scrubs over years).
+- **Jeff Dean, "The Tail at Scale"**: [CACM paper](https://research.google/pubs/the-tail-at-scale/) — required reading.
+- **ByteByteGo**: ["Back of the Envelope estimation"](https://blog.bytebytego.com/p/back-of-the-envelope-estimation) primer.
+- **Alex Xu, *System Design Interview Vol 1*** — Chapter 2 has a clean back-of-envelope walkthrough.
+- **Sysbench / ab / wrk** — build intuition by actually measuring on your laptop.

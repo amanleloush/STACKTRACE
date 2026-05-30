@@ -24,6 +24,15 @@ const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 const SOURCE_ROOT = '/Users/amansinghchauhan/Downloads/brain-detox-arc/docs/11-dsa';
 const TARGET_ROOT = path.join(ROOT, 'src/content/dsa');
+const ANIMS_ROOT = path.join(ROOT, 'src/anims');
+
+// Cache: every directory under src/anims/ is a valid anim id (anything else
+// would fail the registry boot assertion, so we don't need to inspect meta).
+const VALID_ANIM_IDS = new Set(
+  fs.readdirSync(ANIMS_ROOT).filter((d) =>
+    fs.statSync(path.join(ANIMS_ROOT, d)).isDirectory(),
+  ),
+);
 
 // Special-case source-stem -> target-slug renames. Stem = filename without
 // the leading "NN-" prefix and without the .md extension. Anything not in
@@ -118,25 +127,33 @@ function insertAnimTag(mdxText, animId) {
   // Idempotency: anything already containing <Anim id= ... is a no-op.
   if (/<Anim\s+id=/.test(mdxText)) return { kind: 'skipped-idempotent', text: mdxText };
 
-  // Prefer `## Complexity`, fall back to `## Pitfalls`. Match start-of-line.
-  const headingRe = /^## (Complexity|Pitfalls)\b/m;
+  // Anchor preference: Complexity > Pitfalls > Practice. Match start-of-line.
+  // `## Practice` also catches `## Practice — LeetCode` because \b matches
+  // the word boundary after "Practice".
+  const headingRe = /^## (Complexity|Pitfalls|Practice)\b/m;
   const match = mdxText.match(headingRe);
-  if (!match) return { kind: 'no-anchor', text: mdxText };
 
-  const idx = match.index;
-  const before = mdxText.slice(0, idx);
-  const after = mdxText.slice(idx);
   const insert = `<Anim id="${animId}" />\n\n`;
-  return { kind: 'inserted', text: before + insert + after };
+
+  if (match) {
+    const idx = match.index;
+    return { kind: 'inserted', text: mdxText.slice(0, idx) + insert + mdxText.slice(idx) };
+  }
+
+  // No section header to anchor to — append at end of file (after a blank
+  // line separator). Used for short notes whose only content is the body.
+  const trimmed = mdxText.replace(/\s+$/, '');
+  return { kind: 'inserted-eof', text: trimmed + '\n\n' + insert };
 }
 
 function main() {
   const tally = {
     inserted: 0,
+    'inserted-eof': 0,
     'skipped-idempotent': 0,
     'no-source-anim': 0,
     'target-missing': 0,
-    'no-anchor': 0,
+    'unknown-anim-id': 0,
   };
   const log = [];
 
@@ -147,6 +164,13 @@ function main() {
     if (!animId) {
       tally['no-source-anim'] += 1;
       continue; // not every source has an anim — index/cheatsheet/etc.
+    }
+    if (!VALID_ANIM_IDS.has(animId)) {
+      // Brain-detox source referenced an algo the engine never implemented
+      // (e.g. word-ladder). Skip — refuse to insert dangling refs.
+      tally['unknown-anim-id'] += 1;
+      log.push(`unknown-anim-id      brain-detox source ${phase}/${file}  (id="${animId}")`);
+      continue;
     }
     const slug = defaultSlug(stemOf(file));
     const targetPath = targetMdxPath(phase, slug);

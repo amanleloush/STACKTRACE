@@ -1,0 +1,122 @@
+---
+title: Foundations — cheatsheet
+---
+
+# Foundations · Cheatsheet
+
+> One-page recall. Big-O, recursion shapes, and pattern recognition — the floor under every DSA problem.
+
+## Trigger
+**You see in the problem:** any algorithm question. Foundations are what you reach for *before* picking a pattern.
+
+**Reach for this when:** you need to (a) estimate cost from constraints, (b) write or analyze a recursion, (c) pick which of the 15 patterns fits.
+
+**Don't lean only on this when:** the problem is clearly in a single pattern's wheelhouse — go to that pattern's cheatsheet.
+
+## Big-O ladder
+
+| Complexity   | Cost @ n=10^5         | Looks like                                                |
+|--------------|-----------------------|-----------------------------------------------------------|
+| O(1)         | constant              | hash lookup, math, stack push                             |
+| O(log n)     | ~17 ops               | binary search, balanced-tree op                           |
+| O(n)         | 10^5 ops              | single linear scan, two pointers, sliding window          |
+| O(n log n)   | ~1.7M ops             | sort, heap of n inserts, divide-and-conquer merging       |
+| O(n √n)      | ~3.2M ops             | Mo's algorithm, some number-theory sieves                 |
+| O(n²)        | 10^10 — too slow      | nested loops, naive DP on pairs                           |
+| O(n² log n)  | way too slow          | Floyd-Warshall on dense graph (n=10^3 ok, 10^5 no)        |
+| O(2^n)       | dies past n ≈ 25      | subset enumeration, naive recursion                       |
+| O(n!)        | dies past n ≈ 11      | permutation enumeration                                   |
+
+**Rule of thumb:** Python does ~10^7 simple ops/sec, C++/Java ~10^8. If `n × work_per_step` > 10^8, you need a better pattern.
+
+## Constraint → complexity decode
+
+| Constraint            | Likely target complexity  | Implied patterns                          |
+|-----------------------|---------------------------|-------------------------------------------|
+| n ≤ 10                | O(n!) or O(2^n)           | backtracking, bitmask DP                  |
+| n ≤ 20                | O(2^n)                    | bitmask, subset enumeration               |
+| n ≤ 100               | O(n³)                     | Floyd-Warshall, interval DP, edit-distance|
+| n ≤ 1,000             | O(n²)                     | LCS, 2D DP, naive pair scan               |
+| n ≤ 10^5              | O(n log n) or O(n)        | sort + two-pointer, heap, sliding window  |
+| n ≤ 10^6              | O(n) or O(n log n)        | linear scan, hashing, monotonic stack     |
+| n ≤ 10^9              | O(log n) or O(√n)         | binary search on answer, math             |
+
+## Recursion templates
+
+```python
+# 1. Linear recursion (Fibonacci shape)
+def f(n):
+    if n <= 1: return n
+    return f(n-1) + f(n-2)
+
+# 2. Divide and conquer (merge sort shape)
+def solve(arr):
+    if len(arr) <= 1: return arr
+    mid = len(arr) // 2
+    return merge(solve(arr[:mid]), solve(arr[mid:]))
+
+# 3. Backtracking (subset/permutation shape)
+def backtrack(path, choices):
+    if is_solution(path):
+        out.append(path[:]); return
+    for c in choices:
+        path.append(c)
+        backtrack(path, next_choices(c))
+        path.pop()  # undo
+
+# 4. Tree recursion (post-order shape)
+def dfs(node):
+    if not node: return base
+    left  = dfs(node.left)
+    right = dfs(node.right)
+    return combine(node.val, left, right)
+
+# 5. Memoized recursion (top-down DP)
+@cache
+def f(state):
+    if base(state): return base_val
+    return best(f(next_state) for next_state in transitions(state))
+```
+
+**Master theorem cheat:** `T(n) = a·T(n/b) + O(n^d)`
+- if `d > log_b(a)` → O(n^d)
+- if `d = log_b(a)` → O(n^d log n)
+- if `d < log_b(a)` → O(n^log_b(a))
+
+Merge sort: `a=2, b=2, d=1` → `d = log_2(2)` → O(n log n). ✅
+
+## 3×3 Pattern recognition matrix
+
+| Input shape →<br>Question type ↓ | **Linear (array/string)** | **Tree/graph**               | **Number/state space**           |
+|---------------------------------|---------------------------|------------------------------|----------------------------------|
+| **Search / lookup**             | Binary search, two-ptr    | BFS, DFS                     | Binary search on answer          |
+| **Optimize (max/min/count)**    | Sliding window, DP, greedy| Dijkstra, DP-on-tree         | DP, knapsack, bitmask            |
+| **Enumerate / construct**       | Backtracking, sorting     | Topological sort, DFS        | Backtracking, subsets/permutations|
+
+## Pattern triggers (one-line each)
+
+- **"sorted + pair/triplet"** → two pointers
+- **"longest/shortest contiguous … with property"** → sliding window
+- **"sorted + find target / find boundary"** → binary search
+- **"shortest path in unweighted"** → BFS
+- **"connected components / reachable"** → DFS or union-find
+- **"all combinations / permutations / subsets"** → backtracking
+- **"top K / Kth"** → heap
+- **"weighted shortest path"** → Dijkstra
+- **"overlapping subproblems"** → DP
+- **"local optimal = global optimal (provable)"** → greedy
+- **"prefix lookup / autocomplete"** → trie
+- **"XOR / count bits / power of 2"** → bit manipulation
+- **"next greater / smaller / span"** → monotonic stack
+- **"cycle / Kth-from-end in linked list"** → slow/fast pointers
+
+## Common bugs / pitfalls
+- Mixing up **base case** vs **recursive case** — always handle empty/single first.
+- Forgetting that Python recursion limit is 1000 — `sys.setrecursionlimit` or iterate.
+- Confusing **average** and **worst** case (quicksort is O(n²) worst).
+- "n ≤ 10^5 so O(n²) is fine" — it's 10^10 ops. It is not fine.
+- Ignoring constants when n is small (~50) — O(n³) often beats fancy O(n² log n).
+- Treating recursion stack as free — DFS on a 10^5-deep path will blow the stack.
+
+## In 30 seconds
+Constraints tell you the complexity; complexity tells you the pattern. Memorize the n→O() table and the trigger phrases. Everything else is mechanical.

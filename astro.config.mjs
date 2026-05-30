@@ -3,8 +3,10 @@ import mdx from '@astrojs/mdx';
 import sitemap from '@astrojs/sitemap';
 import pagefind from 'astro-pagefind';
 import cloudflare from '@astrojs/cloudflare';
+import rehypeSlug from 'rehype-slug';
+import rehypeAutolinkHeadings from 'rehype-autolink-headings';
 
-const SITE_SLUG = process.env.SITE_SLUG ?? 'sysviz-next';
+const SITE_SLUG = process.env.SITE_SLUG ?? 'stacktrace';
 const SITE_URL = process.env.SITE_URL ?? 'https://example.com';
 
 // Astro 5 dropped `output: 'hybrid'`. The equivalent is `output: 'static'`
@@ -18,7 +20,34 @@ export default defineConfig({
   adapter: cloudflare({
     imageService: 'compile',
   }),
-  integrations: [mdx(), sitemap(), pagefind()],
+  integrations: [
+    mdx({
+      // Brain-detox-style heading permalinks: every h2/h3/h4 gets an id
+      // + a clickable ¶ anchor on hover, so readers can deep-link
+      // straight to a section.
+      rehypePlugins: [
+        rehypeSlug,
+        [
+          rehypeAutolinkHeadings,
+          {
+            behavior: 'append',
+            properties: {
+              className: ['note__heading-anchor'],
+              ariaLabel: 'Link to this section',
+            },
+            content: {
+              type: 'element',
+              tagName: 'span',
+              properties: { className: ['note__heading-anchor-glyph'], ariaHidden: 'true' },
+              children: [{ type: 'text', value: '¶' }],
+            },
+          },
+        ],
+      ],
+    }),
+    sitemap(),
+    pagefind(),
+  ],
   build: {
     format: 'directory',
   },

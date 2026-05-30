@@ -1,17 +1,290 @@
 ---
 import BaseLayout from '~/layouts/BaseLayout.astro';
 import GalleryGrid from '~/components/GalleryGrid.astro';
+import Anim from '~/components/Anim.astro';
+import { listAnimMetas } from '~/lib/anim/registry';
+
+// Pick a fresh "featured" anim every server render — first-time visitors
+// always get a different live preview. The picker is purely server-side
+// (build-time on prerendered pages), but the client-side "Next" button
+// rotates locally so the user can keep cycling without a page reload.
+const allAnims = listAnimMetas();
+const featured = allAnims[Math.floor(Math.random() * allAnims.length)]!;
+// Serialize the full pool to a data attribute so the client picker can
+// pull a random next id without a fresh server round-trip.
+const animPool = allAnims.map((a) => ({ id: a.id, title: a.title, caption: a.caption }));
 ---
 <BaseLayout
-  title="Animations — sysviz"
+  title="Animations — StackTrace"
   description="Filterable gallery of interactive system-design and DSA animations."
 >
-  <header style="margin-bottom: 1rem;">
+  <header class="anim-page__head">
     <h1>Animations</h1>
-    <p style="color: var(--fg-muted); max-width: 44rem;">
-      Every animation runs in your browser. Click a card to open the standalone, deep-linkable view,
-      or embed any of them in a note with <code>&lt;Anim id="…"/&gt;</code>.
+    <p>
+      Every animation runs in your browser. Try the featured one below — or scroll down to
+      browse the full catalog by tag.
     </p>
   </header>
-  <GalleryGrid />
+
+  <!-- Featured live preview — randomized per visit, rotatable via "Next" -->
+  <section
+    class="featured"
+    data-current-id={featured.id}
+    data-pool={JSON.stringify(animPool)}
+    aria-label="Featured animation"
+  >
+    <div class="featured__head">
+      <span class="featured__eyebrow">Featured · live preview</span>
+      <h2 class="featured__title" id="featured-title">{featured.title}</h2>
+      <p class="featured__caption" id="featured-caption">{featured.caption}</p>
+    </div>
+
+    <div class="featured__stage" id="featured-stage">
+      <Anim id={featured.id} />
+    </div>
+
+    <div class="featured__actions">
+      <button type="button" class="featured__btn featured__btn--primary" id="featured-next">
+        <span>Next animation</span>
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M5 12h14M13 5l7 7-7 7" />
+        </svg>
+      </button>
+      <a class="featured__btn" id="featured-open" href={`/animations/${featured.id}/`}>
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M7 17 17 7M9 7h8v8" />
+        </svg>
+        <span>Open standalone</span>
+      </a>
+    </div>
+  </section>
+
+  <hr class="anim-page__divider" />
+
+  <section class="anim-page__browse">
+    <header class="anim-page__browse-head">
+      <h2>Or browse by topic</h2>
+      <p>All {allAnims.length} animations. Filter by tag or search to find one.</p>
+    </header>
+    <GalleryGrid />
+  </section>
 </BaseLayout>
+
+<script>
+  type PoolEntry = { id: string; title: string; caption: string };
+
+  const featured = document.querySelector<HTMLElement>('.featured');
+  if (featured) {
+    const stage = featured.querySelector<HTMLElement>('#featured-stage');
+    const titleEl = featured.querySelector<HTMLElement>('#featured-title');
+    const captionEl = featured.querySelector<HTMLElement>('#featured-caption');
+    const openLink = featured.querySelector<HTMLAnchorElement>('#featured-open');
+    const nextBtn = featured.querySelector<HTMLButtonElement>('#featured-next');
+
+    let pool: PoolEntry[] = [];
+    try {
+      pool = JSON.parse(featured.dataset.pool ?? '[]');
+    } catch {
+      pool = [];
+    }
+    let currentId = featured.dataset.currentId ?? pool[0]?.id ?? '';
+
+    function pickNext(): PoolEntry | null {
+      if (pool.length === 0) return null;
+      if (pool.length === 1) return pool[0]!;
+      let pick = pool[Math.floor(Math.random() * pool.length)]!;
+      // Avoid showing the same one twice in a row.
+      let guard = 0;
+      while (pick.id === currentId && guard < 8) {
+        pick = pool[Math.floor(Math.random() * pool.length)]!;
+        guard++;
+      }
+      return pick;
+    }
+
+    function swapTo(next: PoolEntry): void {
+      currentId = next.id;
+      if (titleEl) titleEl.textContent = next.title;
+      if (captionEl) captionEl.textContent = next.caption;
+      if (openLink) openLink.href = `/animations/${next.id}/`;
+      if (stage) {
+        // Re-mount: the anim mount runtime is idempotent on
+        // `data-anim` change, but resetting the host's HTML is the
+        // cleanest path. After we swap, the mount runtime picks up
+        // the new id on its next scheduled run (manual trigger below).
+        stage.innerHTML = `<div class="anim-host" data-anim="${next.id}"></div>`;
+        // Kick the runtime to mount the freshly-inserted host.
+        import('~/lib/anim/mount').then((m) => {
+          m.mountAll(stage);
+        }).catch(() => {
+          /* ignore — runtime always present in browser */
+        });
+      }
+    }
+
+    nextBtn?.addEventListener('click', () => {
+      const next = pickNext();
+      if (next) swapTo(next);
+    });
+  }
+</script>
+
+<style>
+  .anim-page__head {
+    margin-bottom: 1.5rem;
+    text-align: center;
+  }
+  .anim-page__head h1 {
+    margin: 0 0 0.5rem;
+    font-size: clamp(1.6rem, 4vw, 2.2rem);
+    background: var(--grad-3);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    font-weight: 800;
+  }
+  .anim-page__head p {
+    margin: 0 auto;
+    max-width: 50ch;
+    color: var(--fg-muted);
+    line-height: 1.55;
+  }
+
+  /* Featured card */
+  .featured {
+    margin: 0 auto 1rem;
+    padding: 1.5rem 1.5rem 1.65rem;
+    background: var(--card-bg);
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--card-border));
+    border-radius: 18px;
+    box-shadow: var(--card-shadow);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    position: relative;
+    overflow: hidden;
+  }
+  .featured::before {
+    content: '';
+    position: absolute;
+    top: -100px;
+    right: -80px;
+    width: 280px;
+    height: 280px;
+    background: radial-gradient(circle, color-mix(in srgb, var(--accent) 22%, transparent), transparent 70%);
+    filter: blur(40px);
+    z-index: 0;
+    pointer-events: none;
+  }
+  .featured > * { position: relative; z-index: 1; }
+
+  .featured__head {
+    margin-bottom: 1.25rem;
+  }
+  .featured__eyebrow {
+    display: inline-block;
+    padding: 0.2rem 0.6rem;
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+    color: var(--accent);
+    border-radius: 999px;
+    font-size: 0.7rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 0.65rem;
+  }
+  .featured__title {
+    margin: 0 0 0.4rem;
+    font-size: clamp(1.25rem, 3vw, 1.55rem);
+    background: var(--grad-3);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    font-weight: 800;
+  }
+  .featured__caption {
+    margin: 0;
+    color: var(--fg-muted);
+    line-height: 1.55;
+    max-width: 64ch;
+  }
+
+  /* Reset the embedded anim's own card chrome — we already own a card frame */
+  .featured__stage :global(.anim) {
+    margin: 0;
+    background: transparent;
+    border: 1px solid color-mix(in srgb, var(--card-border) 60%, transparent);
+    box-shadow: none;
+    backdrop-filter: none;
+  }
+
+  .featured__actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.6rem;
+    margin-top: 1.1rem;
+    align-items: center;
+  }
+  .featured__btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.65rem 1.05rem;
+    border-radius: 999px;
+    border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--card-border));
+    background: var(--card-bg);
+    color: var(--fg);
+    text-decoration: none;
+    font: inherit;
+    font-size: 0.92rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s ease, transform 0.08s ease, border-color 0.15s ease;
+  }
+  .featured__btn:hover {
+    background: color-mix(in srgb, var(--accent) 12%, var(--card-bg));
+    border-color: var(--accent);
+    text-decoration: none;
+  }
+  .featured__btn:active { transform: scale(0.97); }
+  .featured__btn--primary {
+    background: linear-gradient(135deg, var(--primary-dark, var(--primary)) 0%, var(--primary) 100%);
+    color: white;
+    border-color: transparent;
+    box-shadow: 0 4px 14px color-mix(in srgb, var(--primary) 35%, transparent);
+  }
+  .featured__btn--primary:hover {
+    filter: brightness(1.1);
+    color: white;
+    border-color: transparent;
+  }
+
+  /* Divider between the featured preview and the catalog */
+  .anim-page__divider {
+    margin: 2.5rem 0 1.5rem;
+    border: none;
+    height: 1px;
+    background: linear-gradient(
+      90deg,
+      transparent,
+      color-mix(in srgb, var(--card-border) 80%, transparent),
+      transparent
+    );
+  }
+
+  .anim-page__browse-head {
+    text-align: center;
+    margin-bottom: 1.25rem;
+  }
+  .anim-page__browse-head h2 {
+    margin: 0 0 0.35rem;
+    font-size: 1.25rem;
+    color: var(--fg);
+    font-weight: 700;
+  }
+  .anim-page__browse-head p {
+    margin: 0;
+    color: var(--fg-muted);
+    font-size: 0.9rem;
+  }
+</style>

@@ -1,0 +1,65 @@
+# 03 — Common patterns map
+
+> Foundations • 3/3
+
+The single most useful interview skill is **pattern recognition** — reading a problem in 30 seconds and immediately knowing which family of solutions to reach for. This page is a cheat sheet.
+
+## Keyword → pattern
+
+| You see in the problem | Try |
+| --- | --- |
+| "sorted array" + "find" | [Binary Search](../../03-binary-search/) |
+| "pair" / "triplet" summing to X | [Two Pointers](../../01-two-pointers/) (sort first) |
+| "longest / shortest contiguous subarray with property" | [Sliding Window](../../02-sliding-window/) |
+| "shortest path" + unweighted | [BFS](../../04-bfs/) |
+| "shortest path" + weighted, non-negative | [Dijkstra](../../08-graphs/02-dijkstra/) |
+| "shortest path" + negative edges | [Bellman-Ford](../../08-graphs/03-bellman-ford/) |
+| "all subsets / all permutations / generate all..." | [Backtracking](../../06-backtracking/) |
+| "top K" / "K closest" / "K largest" | [Heap](../../07-heap/) |
+| "stream" + "median / running stat" | [Heap](../../07-heap/) (two heaps) |
+| "schedule with dependencies" / "build order" | [Topological Sort](../../08-graphs/01-topological-sort/) |
+| "groups" / "connected components" / "redundant edge" | [Union-Find](../../08-graphs/05-union-find/) |
+| "minimum operations to ..." | [DP](../../09-dp/) |
+| "count number of ways" | [DP](../../09-dp/) |
+| "max / min subsequence ..." | [DP](../../09-dp/) |
+| "next greater / previous smaller" | [Monotonic Stack](../../15-stack-monotonic/) |
+| "intervals" | [Greedy](../../10-greedy/) (sort by start or end) |
+| "prefix lookup" / "auto-complete" / "many words" | [Trie](../../11-trie/) |
+| "appears once, rest appear twice" | [XOR](../../12-bit-manipulation/) |
+
+## Two-question filter
+
+When you see a problem, ask:
+
+1. **Is the input sorted / can it be sorted?** → Binary search, two pointers, greedy on intervals.
+2. **Is the output a single value or a structure?** → Counting → DP / heap. Generating → backtracking. Yes/no → DFS / BFS / DP.
+
+## Common red flags
+
+- **"All permutations / combinations of ..."** but with non-trivial n → backtracking is exponential by nature; check constraints.
+- **"On the order of 10⁹"** → must be O(log) or O(1) per query; think prefix sums, binary search, hashing.
+- **"Cyclic / circular"** → trick is often to *concatenate the array with itself* and do a linear pass.
+- **"K matters"** → heap of size K → O(n log K) is the usual win.
+
+## When you don't recognize anything
+
+Fall back to the **brute force**:
+
+1. State the brute force out loud, get its complexity, **agree it's too slow**.
+2. Identify *what work is repeated* in the brute force. That's almost always the entry point — caching it leads to DP/memoization; eliminating it via a smart data structure leads to a heap or hash.
+3. Ask the interviewer: *"Are duplicates allowed? Negatives? What's the range of n?"* — constraints shape the algorithm.
+
+## Pattern coverage
+
+Every page in this section follows the same template:
+
+1. **What it is** — interview-ready definition.
+2. **When to use** — pattern triggers.
+3. **The algorithm** — clean pseudocode.
+4. **Walkthrough** — step-by-step on a small example.
+5. **Visualization** — interactive widget with code-panel highlighting.
+6. **Complexity** — time and space.
+7. **Pitfalls** — common bugs.
+8. **Practice** — top LeetCode problems for the pattern.
+
+Now pick a pattern from the [DSA overview](../../) and start clicking through.

@@ -1,5 +1,12 @@
 import type { AnimModule, AnimHandle } from '~/lib/anim/types';
-import { buildFrame, svgEl, htmlEl, makeBtn } from '~/lib/anim/svg';
+import {
+  buildFrame,
+  svgEl,
+  htmlEl,
+  makeBtn,
+  attachCodePanel,
+  attachStepRunner,
+} from '~/lib/anim/svg';
 import { token, onThemeChange } from '~/lib/anim/theme';
 import { prefersReducedMotion } from '~/lib/anim/a11y';
 import meta from './meta';
@@ -33,17 +40,33 @@ interface Step {
   current: number;
   relaxEdge: [number, number] | null;
   note: string;
+  /** Index into the pseudocode `CODE` array — drives the line-highlight. */
+  codeLine: number;
 }
+
+const CODE = [
+  'dist[*] = ∞',
+  'dist[start] = 0',
+  'heap = [(0, start)]',
+  'while heap:',
+  '    (d, u) = pop_min(heap)',
+  '    if d > dist[u]: continue',
+  '    for (v, w) in adj(u):',
+  '        if d + w < dist[v]:',
+  '            dist[v] = d + w',
+  '            push(heap, (d+w, v))',
+];
 
 const dijkstra: AnimModule = {
   ...meta,
 
   mount(host): AnimHandle {
-    const { stage, controls, readout } = buildFrame(host, {
+    const frame = buildFrame(host, {
       title: meta.title,
       caption: meta.caption,
-      badge: 'Interactive',
+      badge: 'Step-by-step',
     });
+    const { stage, controls, readout } = frame;
 
     const SIZE_W = 480;
     const SIZE_H = 280;
@@ -54,19 +77,10 @@ const dijkstra: AnimModule = {
     });
     stage.appendChild(svg);
 
+    const codePanel = attachCodePanel(frame, { lines: CODE });
+
     let start = 0;
-    let speed = 1;
-    let paused = false;
-    let runToken = 0;
     let steps: Step[] = [];
-    let cursor = 0;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    function clearTimer(): void {
-      if (timer) {
-        clearTimeout(timer);
-        timer = null;
-      }
-    }
 
     function neighbors(i: number): Array<{ v: number; w: number }> {
       const out: Array<{ v: number; w: number }> = [];
@@ -84,19 +98,28 @@ const dijkstra: AnimModule = {
       states[start] = 'frontier';
       const finalized = new Set<number>();
       steps = [];
-      const push = (current: number, relaxEdge: [number, number] | null, note: string): void => {
+      const push = (
+        current: number,
+        relaxEdge: [number, number] | null,
+        note: string,
+        codeLine: number,
+      ): void => {
         steps.push({
           states: [...states],
           dist: [...dist],
           current,
           relaxEdge,
           note,
+          codeLine,
         });
       };
-      push(-1, null, `init: dist[${start}]=0, others=∞`);
+      push(-1, null, `init: dist[*]=∞`, 0);
+      push(-1, null, `init: dist[${start}]=0`, 1);
+      push(-1, null, `push (0, ${start}) onto heap`, 2);
 
       while (finalized.size < NODES.length) {
-        // Extract min over unfinalized
+        push(-1, null, 'loop while heap not empty', 3);
+        // Extract min over unfinalized (simulating heap pop_min)
         let u = -1;
         let best = INF;
         for (let i = 0; i < NODES.length; i++) {
@@ -107,24 +130,27 @@ const dijkstra: AnimModule = {
         }
         if (u === -1) break; // disconnected
         states[u] = 'current';
-        push(u, null, `extract-min: ${u} (dist=${dist[u]})`);
+        push(u, null, `extract-min: ${u} (dist=${dist[u]})`, 4);
 
         for (const { v, w } of neighbors(u)) {
           if (finalized.has(v)) continue;
           const alt = dist[u]! + w;
+          push(u, [u, v], `consider neighbor ${v} (w=${w})`, 6);
           if (alt < dist[v]!) {
+            push(u, [u, v], `relax ${u}→${v}: ${alt} < ${dist[v] === INF ? '∞' : dist[v]}`, 7);
             dist[v] = alt;
             if (states[v] === 'unvisited') states[v] = 'frontier';
-            push(u, [u, v], `relax ${u}→${v}: ${alt} < ${alt === w + dist[u]! ? '∞ or older' : dist[v]}`);
+            push(u, [u, v], `dist[${v}] = ${alt}`, 8);
+            push(u, [u, v], `push (${alt}, ${v}) onto heap`, 9);
           } else {
-            push(u, [u, v], `relax ${u}→${v}: ${alt} ≥ ${dist[v]} (skip)`);
+            push(u, [u, v], `relax ${u}→${v}: ${alt} ≥ ${dist[v]} (skip)`, 7);
           }
         }
         states[u] = 'finalized';
         finalized.add(u);
-        push(-1, null, `finalize ${u}`);
+        push(-1, null, `finalize ${u}`, 3);
       }
-      push(-1, null, 'done');
+      push(-1, null, 'done', 3);
     }
 
     function colorFor(state: NodeState): string {
@@ -136,7 +162,7 @@ const dijkstra: AnimModule = {
       }
     }
 
-    function draw(): void {
+    function draw(cursor: number): void {
       svg.innerHTML = '';
       const s = steps[cursor];
       if (!s) return;
@@ -216,78 +242,37 @@ const dijkstra: AnimModule = {
       const distArr = s.dist.map((d, i) => `${i}:${d === INF ? '∞' : d}`).join(' ');
       readout.appendChild(htmlEl('span', {}, `dist = ${distArr}`));
       readout.appendChild(htmlEl('span', {}, `start: ${start}`));
+
+      codePanel.highlight(s.codeLine);
     }
 
-    function tick(): void {
-      if (paused) return;
-      if (cursor >= steps.length - 1) {
-        clearTimer();
-        return;
-      }
-      cursor++;
-      draw();
-      timer = setTimeout(tick, Math.max(80, 420 / speed));
-    }
-
-    function play(): void {
-      const myRun = ++runToken;
-      paused = false;
-      clearTimer();
-      if (prefersReducedMotion()) {
-        cursor = steps.length - 1;
-        draw();
-        return;
-      }
-      const loop = (): void => {
-        if (myRun !== runToken) return;
-        tick();
-      };
-      loop();
-    }
-
-    function stepOne(): void {
-      paused = true;
-      clearTimer();
-      if (cursor < steps.length - 1) cursor++;
-      draw();
-    }
-
-    function reset(): void {
-      runToken++;
-      paused = true;
-      clearTimer();
-      genSteps();
-      cursor = 0;
-      draw();
-    }
-
-    function cycleStart(): void {
-      start = (start + 1) % NODES.length;
-      reset();
-    }
-
-    controls.appendChild(makeBtn('play', play, { primary: true }));
-    controls.appendChild(makeBtn('step', stepOne));
-    controls.appendChild(makeBtn('reset', reset));
-    controls.appendChild(makeBtn('cycle start', cycleStart));
-
-    const offTheme = onThemeChange(() => draw());
     genSteps();
-    cursor = 0;
-    draw();
+
+    const runner = attachStepRunner({
+      controls,
+      totalSteps: () => steps.length,
+      onStep: draw,
+      onReset: () => genSteps(),
+      prefersReducedMotion: prefersReducedMotion(),
+    });
+
+    // Extra: "cycle start" — pick a different starting node and replay.
+    controls.appendChild(
+      makeBtn('Cycle start', () => {
+        start = (start + 1) % NODES.length;
+        genSteps();
+        runner.reset();
+      }),
+    );
+
+    const offTheme = onThemeChange(() => draw(runner.getCursor()));
 
     return {
-      pause(): void {
-        paused = true;
-        clearTimer();
-      },
-      resume(): void {
-        /* user clicks play */
-      },
-      reset,
+      pause(): void { runner.pause(); },
+      resume(): void { /* user clicks play */ },
+      reset(): void { runner.reset(); },
       destroy(): void {
-        runToken++;
-        clearTimer();
+        runner.destroy();
         offTheme();
         host.innerHTML = '';
       },

@@ -1,9 +1,52 @@
 import type { AnimModule, AnimHandle } from '~/lib/anim/types';
-import { buildFrame, svgEl, htmlEl, makeBtn, makeSlider } from '~/lib/anim/svg';
+import {
+  buildFrame,
+  svgEl,
+  htmlEl,
+  makeBtn,
+  makeSlider,
+  attachCodePanel,
+  attachStepRunner,
+} from '~/lib/anim/svg';
 import { token, onThemeChange } from '~/lib/anim/theme';
 import { mulberry32, shuffled } from '~/lib/anim/rng';
 import { prefersReducedMotion } from '~/lib/anim/a11y';
 import meta from './meta';
+
+// Frame queue model — drive the animation by enqueueing immutable snapshots.
+// The renderer is decoupled from the algorithm, so the same step()/play()
+// controls work across every DSA anim built on this template.
+interface Step {
+  arr: number[];
+  i: number;       // current scan
+  j: number;       // partition boundary
+  lo: number;
+  hi: number;
+  pivot: number;   // index
+  sorted: Set<number>;
+  note: string;
+  comparisons: number;
+  swaps: number;
+  /** Index into the pseudocode `CODE` array — drives the line-highlight. */
+  codeLine: number;
+}
+
+const CODE = [
+  'def quick_sort(a, lo, hi):',
+  '    if lo < hi:',
+  '        p = partition(a, lo, hi)',
+  '        quick_sort(a, lo, p-1)',
+  '        quick_sort(a, p+1, hi)',
+  'def partition(a, lo, hi):',
+  '    pivot = a[hi]',
+  '    i = lo - 1',
+  '    for j in range(lo, hi):',
+  '        if a[j] <= pivot:',
+  '            i += 1',
+  '            swap(a, i, j)',
+  '    swap(a, i+1, hi)',
+  '    return i+1',
+];
 
 /**
  * Quicksort — Lomuto partition.
@@ -17,12 +60,13 @@ const quicksort: AnimModule = {
   ...meta,
 
   mount(host, opts = {}): AnimHandle {
-    const { stage, controls, readout } = buildFrame(host, {
+    const frame = buildFrame(host, {
       title: 'Quicksort — Lomuto partition',
       caption:
         'Pivot moves to its final position, then the array splits around it. Watch comparisons, swaps, and the boundary advance.',
-      badge: 'Interactive',
+      badge: 'Step-by-step',
     });
+    const { stage, controls, readout } = frame;
 
     const SIZE_W = 560;
     const SIZE_H = 240;
@@ -33,37 +77,12 @@ const quicksort: AnimModule = {
     });
     stage.appendChild(svg);
 
+    const codePanel = attachCodePanel(frame, { lines: CODE });
+
     let n = Number(opts['n'] ?? quicksort.defaults!['n']);
     let seed = Number(opts['seed'] ?? quicksort.defaults!['seed']);
-    let speed = 1;
-    let paused = false;
-    let runToken = 0;
 
-    // Frame queue model — drive the animation by enqueueing immutable snapshots.
-    // The renderer is decoupled from the algorithm, so the same step()/play()
-    // controls work across every DSA anim built on this template.
-    interface Step {
-      arr: number[];
-      i: number;       // current scan
-      j: number;       // partition boundary
-      lo: number;
-      hi: number;
-      pivot: number;   // index
-      sorted: Set<number>;
-      note: string;
-      comparisons: number;
-      swaps: number;
-    }
     let steps: Step[] = [];
-    let cursor = 0;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-
-    function clearTimer(): void {
-      if (timer) {
-        clearTimeout(timer);
-        timer = null;
-      }
-    }
 
     function genSteps(): void {
       const rng = mulberry32(seed);
@@ -72,7 +91,15 @@ const quicksort: AnimModule = {
       let comparisons = 0;
       let swaps = 0;
 
-      const push = (i: number, j: number, lo: number, hi: number, pivot: number, note: string) => {
+      const push = (
+        i: number,
+        j: number,
+        lo: number,
+        hi: number,
+        pivot: number,
+        note: string,
+        codeLine: number,
+      ) => {
         steps.push({
           arr: [...arr],
           i,
@@ -84,30 +111,37 @@ const quicksort: AnimModule = {
           note,
           comparisons,
           swaps,
+          codeLine,
         });
       };
 
       function quicksortRec(lo: number, hi: number): void {
+        push(-1, -1, lo, hi, hi, `quick_sort(a, ${lo}, ${hi})`, 0);
         if (lo > hi) return;
         if (lo === hi) {
           sorted.add(lo);
-          push(lo, lo, lo, hi, lo, `lo === hi @ ${lo}, mark sorted`);
+          push(lo, lo, lo, hi, lo, `lo === hi @ ${lo}, mark sorted`, 1);
           return;
         }
+        push(-1, -1, lo, hi, hi, `lo < hi → partition`, 1);
         const pivot = hi;
-        push(lo, lo - 1, lo, hi, pivot, `partition lo=${lo} hi=${hi} pivot=${arr[pivot]}`);
+        push(lo, lo - 1, lo, hi, pivot, `partition lo=${lo} hi=${hi}`, 5);
+        push(lo, lo - 1, lo, hi, pivot, `pivot = a[${pivot}] = ${arr[pivot]}`, 6);
         let boundary = lo - 1;
+        push(lo, boundary, lo, hi, pivot, `i = ${boundary}`, 7);
         for (let k = lo; k < hi; k++) {
           comparisons++;
-          push(k, boundary, lo, hi, pivot, `compare arr[${k}]=${arr[k]} vs pivot=${arr[pivot]}`);
+          push(k, boundary, lo, hi, pivot, `j = ${k}, compare a[${k}]=${arr[k]} vs pivot=${arr[pivot]}`, 8);
           if (arr[k]! <= arr[pivot]!) {
+            push(k, boundary, lo, hi, pivot, `a[${k}] ≤ pivot`, 9);
             boundary++;
+            push(k, boundary, lo, hi, pivot, `i += 1 → ${boundary}`, 10);
             if (boundary !== k) {
               [arr[boundary], arr[k]] = [arr[k]!, arr[boundary]!];
               swaps++;
-              push(k, boundary, lo, hi, pivot, `swap → arr[${boundary}] ⇄ arr[${k}]`);
+              push(k, boundary, lo, hi, pivot, `swap a[${boundary}] ⇄ a[${k}]`, 11);
             } else {
-              push(k, boundary, lo, hi, pivot, `advance boundary to ${boundary}`);
+              push(k, boundary, lo, hi, pivot, `swap a[${boundary}] ⇄ a[${k}] (in place)`, 11);
             }
           }
         }
@@ -115,15 +149,18 @@ const quicksort: AnimModule = {
         [arr[boundary], arr[pivot]] = [arr[pivot]!, arr[boundary]!];
         swaps++;
         sorted.add(boundary);
-        push(boundary, boundary, lo, hi, boundary, `place pivot at ${boundary}, recurse`);
+        push(boundary, boundary, lo, hi, boundary, `swap a[${boundary}] ⇄ a[${hi}] — pivot placed`, 12);
+        push(boundary, boundary, lo, hi, boundary, `return ${boundary}`, 13);
+        push(boundary, boundary, lo, hi, boundary, `recurse left [${lo}, ${boundary - 1}]`, 3);
         quicksortRec(lo, boundary - 1);
+        push(boundary, boundary, lo, hi, boundary, `recurse right [${boundary + 1}, ${hi}]`, 4);
         quicksortRec(boundary + 1, hi);
       }
 
       steps = [];
       quicksortRec(0, arr.length - 1);
       for (let k = 0; k < arr.length; k++) sorted.add(k);
-      push(-1, -1, 0, arr.length - 1, -1, 'done');
+      push(-1, -1, 0, arr.length - 1, -1, 'done', 0);
     }
 
     function colorFor(idx: number, step: Step): string {
@@ -135,7 +172,7 @@ const quicksort: AnimModule = {
       return token('--anim-bar-bg');
     }
 
-    function draw(): void {
+    function draw(cursor: number): void {
       svg.innerHTML = '';
       const step = steps[cursor];
       if (!step) return;
@@ -192,60 +229,28 @@ const quicksort: AnimModule = {
       readout.appendChild(htmlEl('span', {}, `comparisons: ${step.comparisons}`));
       readout.appendChild(htmlEl('span', {}, `swaps: ${step.swaps}`));
       readout.appendChild(htmlEl('span', {}, `n: ${n} · seed: ${seed}`));
+
+      codePanel.highlight(step.codeLine);
     }
 
-    function tick(): void {
-      if (paused) return;
-      if (cursor >= steps.length - 1) {
-        clearTimer();
-        return;
-      }
-      cursor++;
-      draw();
-      timer = setTimeout(tick, Math.max(40, 280 / speed));
-    }
+    genSteps();
 
-    function play(): void {
-      const myRun = ++runToken;
-      paused = false;
-      clearTimer();
-      if (prefersReducedMotion()) {
-        cursor = steps.length - 1;
-        draw();
-        return;
-      }
-      const loop = (): void => {
-        if (myRun !== runToken) return;
-        tick();
-      };
-      loop();
-    }
+    const runner = attachStepRunner({
+      controls,
+      totalSteps: () => steps.length,
+      onStep: draw,
+      onReset: () => genSteps(),
+      prefersReducedMotion: prefersReducedMotion(),
+    });
 
-    function step(): void {
-      paused = true;
-      clearTimer();
-      if (cursor < steps.length - 1) cursor++;
-      draw();
-    }
-
-    function reset(): void {
-      runToken++;
-      paused = true;
-      clearTimer();
-      genSteps();
-      cursor = 0;
-      draw();
-    }
-
-    function reshuffle(): void {
-      seed = Math.floor(Math.random() * 1e9);
-      reset();
-    }
-
-    controls.appendChild(makeBtn('play', play, { primary: true }));
-    controls.appendChild(makeBtn('step', step));
-    controls.appendChild(makeBtn('reset', reset));
-    controls.appendChild(makeBtn('reshuffle', reshuffle));
+    // Extras: reshuffle + n slider. Speed is handled by the standard runner.
+    controls.appendChild(
+      makeBtn('Reshuffle', () => {
+        seed = Math.floor(Math.random() * 1e9);
+        genSteps();
+        runner.reset();
+      }),
+    );
     controls.appendChild(
       makeSlider({
         label: 'n',
@@ -255,41 +260,23 @@ const quicksort: AnimModule = {
         value: n,
         onChange: (v) => {
           n = v;
-          reset();
-        },
-      }),
-    );
-    controls.appendChild(
-      makeSlider({
-        label: 'speed',
-        min: 0.25,
-        max: 4,
-        step: 0.25,
-        value: speed,
-        onChange: (v) => {
-          speed = v;
+          genSteps();
+          runner.reset();
         },
       }),
     );
 
-    const offTheme = onThemeChange(() => draw());
-    genSteps();
-    cursor = 0;
-    draw();
+    const offTheme = onThemeChange(() => draw(runner.getCursor()));
 
     return {
-      pause(): void {
-        paused = true;
-        clearTimer();
-      },
+      pause(): void { runner.pause(); },
       resume(): void {
         // Only resume if user had set it running.
         // Default is "paused on load" — user explicitly clicks play.
       },
-      reset,
+      reset(): void { runner.reset(); },
       destroy(): void {
-        runToken++;
-        clearTimer();
+        runner.destroy();
         offTheme();
         host.innerHTML = '';
       },

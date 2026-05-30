@@ -1,4 +1,9 @@
 ---
+import { getMeta } from '~/lib/anim/registry';
+import { canAccess } from '~/lib/billing/entitlement';
+import { getDb } from '~/lib/db';
+import Paywall from './Paywall.astro';
+
 interface Props {
   id: string;
   /** Optional per-instance options passed via data-* attributes (numbers parsed). */
@@ -7,15 +12,43 @@ interface Props {
   bare?: boolean;
 }
 const { id, opts = {}, bare = false } = Astro.props;
+
+// Entitlement check at SSR. Only meaningful inside SSR routes (the
+// /learn/dsa/* and /learn/notes/* renderers). When invoked from a
+// prerendered page (e.g. /animations/[id].astro, /notes/) the runtime
+// env isn't available — fall through to "allowed" and let the standalone
+// page enforce its own gate.
+const meta = getMeta(id);
+const env = Astro.locals.runtime?.env;
+let allowed = true;
+if (env?.DB && meta) {
+  const db = await getDb({ env });
+  const access = await canAccess(
+    db,
+    {
+      kind: 'anim',
+      id,
+      defaultPremium: meta.premium ?? false,
+    },
+    Astro.locals.user,
+  );
+  allowed = access.allowed;
+}
+
 const dataAttrs: Record<string, string> = { 'data-anim': id };
 for (const [k, v] of Object.entries(opts)) {
   dataAttrs[`data-${k}`] = String(v);
 }
 ---
-<div {...dataAttrs} class={bare ? '' : 'anim-host'}></div>
+{allowed ? (
+  <div {...dataAttrs} class={bare ? '' : 'anim-host'}></div>
+) : (
+  <Paywall reason="anim" next={Astro.url.pathname} />
+)}
 
 <script>
   // Ensures the mount runtime is loaded once per page. The runtime itself is
-  // idempotent (mountOne is a no-op for already-mounted hosts).
+  // idempotent (mountOne is a no-op for already-mounted hosts) and a no-op
+  // when no `[data-anim]` host is present (the paywalled case).
   import '~/lib/anim/mount';
 </script>

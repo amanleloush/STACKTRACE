@@ -1,17 +1,42 @@
 ---
 import BaseLayout from '~/layouts/BaseLayout.astro';
 import Anim from '~/components/Anim.astro';
-import { listAnimMetas, getMeta } from '~/lib/anim/registry';
+import Paywall from '~/components/Paywall.astro';
+import { getMeta } from '~/lib/anim/registry';
+import { getDb } from '~/lib/db';
+import { canAccess } from '~/lib/billing/entitlement';
 
-export function getStaticPaths() {
-  return listAnimMetas().map((a) => ({ params: { id: a.id } }));
-}
+// SSR (not prerendered) so we can run the entitlement check against the
+// current user's session — same gating pattern as /learn/dsa/[slug].astro.
+// Standalone anim deep-links honor admin overrides + per-anim premium just
+// like the embedded <Anim> in note bodies.
+export const prerender = false;
 
 const { id } = Astro.params;
-const anim = getMeta(id!);
-if (!anim) throw new Error(`Unknown animation: ${id}`);
+if (!id) return new Response('Not found', { status: 404 });
+const anim = getMeta(id);
+if (!anim) return new Response('Not found', { status: 404 });
+
+const env = Astro.locals.runtime?.env;
+const db = await getDb({ env });
+const access = await canAccess(
+  db,
+  {
+    kind: 'anim',
+    id: anim.id,
+    defaultPremium: anim.premium ?? false,
+  },
+  Astro.locals.user,
+);
+
+Astro.response.headers.set('Vary', 'Cookie');
+if (Astro.locals.user || import.meta.env.DEV) {
+  Astro.response.headers.set('Cache-Control', 'private, no-store');
+} else {
+  Astro.response.headers.set('Cache-Control', 'public, max-age=60, s-maxage=300');
+}
 ---
-<BaseLayout title={`${anim.title} — sysviz`} description={anim.caption}>
+<BaseLayout title={`${anim.title} — StackTrace`} description={anim.caption}>
   <nav style="margin-bottom: 1rem; font-size: 0.85rem; color: var(--fg-muted);">
     <a href="/animations/">← Animations</a>
   </nav>
@@ -23,5 +48,7 @@ if (!anim) throw new Error(`Unknown animation: ${id}`);
     </div>
   </header>
 
-  <Anim id={anim.id} />
+  {access.allowed
+    ? <Anim id={anim.id} />
+    : <Paywall reason="anim" next={Astro.url.pathname} />}
 </BaseLayout>

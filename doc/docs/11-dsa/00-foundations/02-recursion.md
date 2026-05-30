@@ -1,0 +1,86 @@
+# 02 — Recursion fundamentals
+
+> Foundations • 2/3
+
+## The shape
+
+A recursive function solves a problem by:
+
+1. **Base case** — a small input it can answer directly (no recursion).
+2. **Recursive case** — reduce the problem to a smaller version of itself, then combine.
+
+Miss the base case → infinite recursion → stack overflow. Miss the reduction → same.
+
+```python
+def factorial(n):
+    if n <= 1: return 1        # base case
+    return n * factorial(n - 1) # recursive case
+```
+
+## The call stack
+
+Each call gets its own frame: local variables, parameters, return address. The stack grows on every call and shrinks on every return. Most languages limit recursion depth to ~1000–10000 frames before a `StackOverflowError`.
+
+For deep recursion (e.g. tree depth in the millions), convert to an explicit stack iteratively — same complexity, no recursion limit.
+
+## Tail recursion
+
+A function is *tail-recursive* if the recursive call is the last thing it does. Some compilers/runtimes (Scala, Scheme, Kotlin with `tailrec`) optimize this into a loop — no stack growth. Most do not (Python, Java, JavaScript) — convert manually.
+
+## Memoization — turn O(2ⁿ) into O(n)
+
+Naïve Fibonacci:
+
+```python
+def fib(n):
+    if n < 2: return n
+    return fib(n-1) + fib(n-2)   # recomputes the same subproblems
+```
+
+This is O(2ⁿ). Cache the answers:
+
+```python
+from functools import lru_cache
+@lru_cache
+def fib(n):
+    if n < 2: return n
+    return fib(n-1) + fib(n-2)
+```
+
+Now O(n) time, O(n) space. Memoization = top-down DP.
+
+## Recursion vs iteration
+
+| Recursion | Iteration |
+| --- | --- |
+| Natural for trees, graphs, divide-and-conquer | Natural for arrays, fixed loops |
+| Easier to write for backtracking | No stack-overflow risk |
+| O(depth) stack space | O(1) extra space |
+| Slower in practice (function call overhead) | Faster |
+
+In interviews, *prefer the clearer one*. If the interviewer asks for the iterative version, convert it.
+
+## Recurrence relations
+
+A recursive function's runtime obeys a recurrence:
+
+- **Merge sort**: T(n) = 2T(n/2) + O(n) → O(n log n)
+- **Binary search**: T(n) = T(n/2) + O(1) → O(log n)
+- **Naïve Fibonacci**: T(n) = T(n-1) + T(n-2) → O(2ⁿ)
+
+The **Master Theorem** solves T(n) = aT(n/b) + O(n^d):
+
+- a > b^d → O(n^{log_b a})
+- a = b^d → O(n^d log n)
+- a < b^d → O(n^d)
+
+## Patterns where recursion shines
+
+- **Tree traversal** — recurse on children.
+- **Backtracking** — try a choice, recurse, undo.
+- **Divide and conquer** — split, recurse, merge.
+- **DP top-down** — solve subproblems lazily with memoization.
+
+## What's next
+
+[Common patterns map](../03-patterns-map/) — learn to read a problem and pick the right pattern in 60 seconds.

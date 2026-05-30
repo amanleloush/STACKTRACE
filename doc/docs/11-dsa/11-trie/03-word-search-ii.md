@@ -1,0 +1,81 @@
+# 03 — Word Search II (trie + grid DFS)
+
+> Trie • Position 3/4
+
+## Problem
+Given a grid of letters and a list of words, return every word that can be spelled by a path of adjacent (4-dir) cells without revisiting any cell.
+
+## Intuition
+Running Word Search I once per word is O(W · 4^L). Instead, **build a trie from all words** and run a single DFS from every cell, carrying the current trie node alongside the path. At each step you check whether the current letter is a child of the node — if not, prune instantly. When you hit `node.end`, record the word and clear the end-flag (or null the leaf) to avoid duplicates. Add one more optimization: when a trie node has no children left, splice it out so future paths bail earlier. This is the difference between "passes LC tests" and "passes in 50 ms."
+
+## Algorithm
+```python
+def findWords(board, words):
+    root = {}
+    for w in words:                  # build trie
+        node = root
+        for ch in w: node = node.setdefault(ch, {})
+        node["$"] = w                # word at terminal
+
+    R, C, out = len(board), len(board[0]), []
+
+    def dfs(r, c, node):
+        ch = board[r][c]
+        nxt = node.get(ch)
+        if not nxt: return
+        if "$" in nxt:
+            out.append(nxt.pop("$"))  # dedupe
+        board[r][c] = "#"
+        for dr, dc in ((1,0),(-1,0),(0,1),(0,-1)):
+            nr, nc = r+dr, c+dc
+            if 0 <= nr < R and 0 <= nc < C and board[nr][nc] != "#":
+                dfs(nr, nc, nxt)
+        board[r][c] = ch
+        if not nxt: node.pop(ch)     # prune dead branch
+
+    for r in range(R):
+        for c in range(C):
+            dfs(r, c, root)
+    return out
+```
+
+## Walkthrough
+Example: grid `[["o","a","t"], ["e","a","h"]]`, words `["oath", "oat", "eat"]`.
+
+1. **Build trie + seed start cells.** Trie root has children `o` and `e`. DFS frames are pushed for every cell `(r,c)` and tried in row-major order with `cursor = root`.
+2. **Start at (0,0)='o' — finds "oat".** Trie has child `o`, descend. Spawn DFS into (0,1)='a' (cursor walks `o → a`) — `a` node is also `end` for "oat", so record **"oat"**. From (0,1) spawn DFS into (1,1)='a' (no `a` child below) — pruned.
+3. **Continue from "oa" — finds "oath".** Back at (0,1), spawn into (0,2)='t' → descend to `t` node. From (0,2) spawn into (1,2)='h' → descend to `h` (end-flag) → record **"oath"**.
+4. **Other starts get pruned fast.** Starts at (0,1)='a', (0,2)='t', (1,1)='a', (1,2)='h' all fail the very first child lookup under root (root only has `o` and `e`) → prune immediately. **This is where the trie pays off.**
+5. **Start at (1,0)='e' — finds "eat".** Descend root → `e` node. Spawn into neighbours; (0,0)='o' isn't an `a` child → prune; (1,1)='a' descends `e → a`. From (1,1)='a', neighbour (0,1)='a' has no `a` child of `a` → prune. The path completes only when DFS eventually reaches a 't' adjacent to an 'a' under the `e` branch → record **"eat"**. Final result: **{oat, oath, eat}**.
+
+<div class="dsa-viz" data-algo="word-search-ii"></div>
+
+## Complexity
+
+<div class="dsa-bigO">
+  <span>time <strong>O(R·C·4^L)</strong></span>
+  <span>space <strong>O(Σ L)</strong></span>
+</div>
+
+## Pitfalls
+- Not deduping found words — pop `$` from the node, or use a set.
+- Forgetting to restore `board[r][c]` after recursion — corrupts later starting cells.
+- Iterating all words inside DFS instead of indexing them in the trie — kills the optimization.
+- Trie node pruning is what makes it fast; skip it and large inputs TLE.
+- Diagonal moves are not allowed in LC 79/212 — only 4-direction.
+
+<div class="dsa-practice">
+  <h4>Practice — LeetCode</h4>
+  <ul>
+    <li><a href="https://leetcode.com/problems/word-search-ii/">212 Word Search II (Hard)</a> — canonical.</li>
+    <li><a href="https://leetcode.com/problems/word-search/">79 Word Search (Med)</a> — single-word base case.</li>
+    <li><a href="https://leetcode.com/problems/unique-paths-iii/">980 Unique Paths III (Hard)</a> — grid backtracking with state.</li>
+    <li><a href="https://leetcode.com/problems/camelcase-matching/">1023 Camelcase Matching (Med)</a> — pattern subsequence on trie.</li>
+    <li><a href="https://leetcode.com/problems/search-suggestions-system/">1268 Search Suggestions System (Med)</a> — trie + per-node top-K.</li>
+    <li><a href="https://leetcode.com/problems/stream-of-characters/">1032 Stream of Characters (Hard)</a> — reverse trie over stream.</li>
+    <li><a href="https://leetcode.com/problems/word-squares/">425 Word Squares (Hard)</a> — backtracking with prefix lookups.</li>
+    <li><a href="https://leetcode.com/problems/concatenated-words/">472 Concatenated Words (Hard)</a> — DP over a trie.</li>
+    <li><a href="https://leetcode.com/problems/word-break-ii/">140 Word Break II (Hard)</a> — trie + memoized DFS.</li>
+    <li><a href="https://leetcode.com/problems/prefix-and-suffix-search/">745 Prefix and Suffix Search (Hard)</a> — pair-encoded trie.</li>
+  </ul>
+</div>

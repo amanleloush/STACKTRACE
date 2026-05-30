@@ -20,9 +20,114 @@ const notes = (await getCollection('dsa', (n) => !n.data.draft && n.data.phase =
   .sort((a, b) => a.data.order - b.data.order);
 
 const totalMinutes = notes.reduce((s, n) => s + (n.data.estimatedMinutes ?? 0), 0);
+
+// --- Inline markdown helpers --------------------------------------------------
+// The prose in DsaPhase fields is copied verbatim from brain-detox-arc and
+// carries light inline markdown. We render `**bold**`, `*italic*`, and
+// `` `code` `` into matching HTML, with HTML angle brackets escaped first so
+// raw `<` / `>` from the source can never leak out as live markup.
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function renderInline(s: string): string {
+  // Inline code first — its contents must not be parsed for ** or *.
+  const codeSpans: string[] = [];
+  let buf = s.replace(/`([^`]+)`/g, (_m, inner) => {
+    const idx = codeSpans.length;
+    codeSpans.push(`<code>${escapeHtml(inner)}</code>`);
+    return ` CODE${idx} `;
+  });
+  buf = escapeHtml(buf);
+  buf = buf.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  // italic: single `*` pairs, not crossing newlines
+  buf = buf.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
+  buf = buf.replace(/ CODE(\d+) /g, (_m, i) => codeSpans[Number(i)]);
+  return buf;
+}
+
+// --- Block markdown renderer (used only for `extras`) ------------------------
+// Handles `## heading`, paragraphs, `-` bullet lists, and pipe-style tables.
+// Deliberately small — covers what brain-detox's 09-dp and 13-sorting extras
+// actually use; anything fancier should land in a real markdown pipeline.
+function renderBlocks(md: string): string {
+  const lines = md.split('\n');
+  const out: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (line.trim() === '') {
+      i++;
+      continue;
+    }
+    if (line.startsWith('## ')) {
+      out.push(`<h2 class="phase-section__title">${renderInline(line.slice(3).trim())}</h2>`);
+      i++;
+      continue;
+    }
+    if (line.startsWith('- ')) {
+      const items: string[] = [];
+      while (i < lines.length && lines[i].startsWith('- ')) {
+        items.push(`<li>${renderInline(lines[i].slice(2))}</li>`);
+        i++;
+      }
+      out.push(`<ul class="phase-bullets">${items.join('')}</ul>`);
+      continue;
+    }
+    if (line.startsWith('|')) {
+      // Collect contiguous table block.
+      const rows: string[] = [];
+      while (i < lines.length && lines[i].startsWith('|')) {
+        rows.push(lines[i]);
+        i++;
+      }
+      const cells = (row: string) =>
+        row
+          .replace(/^\|/, '')
+          .replace(/\|$/, '')
+          .split('|')
+          .map((c) => c.trim());
+      const isSeparator = (row: string) => /^\|?\s*[-:]+\s*(\|\s*[-:]+\s*)+\|?$/.test(row);
+      let header: string[] = [];
+      const body: string[][] = [];
+      for (let r = 0; r < rows.length; r++) {
+        if (isSeparator(rows[r])) continue;
+        const c = cells(rows[r]);
+        if (header.length === 0) header = c;
+        else body.push(c);
+      }
+      const thead = `<thead><tr>${header
+        .map((h) => `<th>${renderInline(h)}</th>`)
+        .join('')}</tr></thead>`;
+      const tbody = `<tbody>${body
+        .map((r) => `<tr>${r.map((c) => `<td>${renderInline(c)}</td>`).join('')}</tr>`)
+        .join('')}</tbody>`;
+      out.push(`<table class="phase-table">${thead}${tbody}</table>`);
+      continue;
+    }
+    // Plain paragraph — accumulate until blank line or block boundary.
+    const para: string[] = [line];
+    i++;
+    while (
+      i < lines.length &&
+      lines[i].trim() !== '' &&
+      !lines[i].startsWith('## ') &&
+      !lines[i].startsWith('- ') &&
+      !lines[i].startsWith('|')
+    ) {
+      para.push(lines[i]);
+      i++;
+    }
+    out.push(`<p>${renderInline(para.join(' '))}</p>`);
+  }
+  return out.join('\n');
+}
 ---
 <BaseLayout
-  title={`${phase.title} · DSA — sysviz`}
+  title={`${phase.title} · DSA — StackTrace`}
   description={phase.blurb}
 >
   <nav class="crumbs" aria-label="Breadcrumb">
@@ -38,6 +143,26 @@ const totalMinutes = notes.reduce((s, n) => s + (n.data.estimatedMinutes ?? 0), 
       {totalMinutes ? ` · ~${totalMinutes} min total` : ''}
     </p>
   </header>
+
+  {phase.whenToUse && phase.whenToUse.length > 0 && (
+    <section class="phase-section">
+      <h2 class="phase-section__title">When to use this pattern</h2>
+      <ul class="phase-bullets">
+        {phase.whenToUse.map((item) => (
+          <li set:html={renderInline(item)} />
+        ))}
+      </ul>
+    </section>
+  )}
+
+  {phase.shapeOfSolution && (
+    <section class="phase-section">
+      <h2 class="phase-section__title">The shape of the solution</h2>
+      {phase.shapeOfSolution.split('\n\n').map((para) => (
+        <p class="phase-prose" set:html={renderInline(para)} />
+      ))}
+    </section>
+  )}
 
   {notes.length === 0 ? (
     <p class="phase-empty">Coming soon — articles for this pattern are still being written.</p>
@@ -58,6 +183,27 @@ const totalMinutes = notes.reduce((s, n) => s + (n.data.estimatedMinutes ?? 0), 
         </li>
       ))}
     </ul>
+  )}
+
+  {phase.commonVariations && phase.commonVariations.length > 0 && (
+    <section class="phase-section phase-section--after-list">
+      <h2 class="phase-section__title">Common variations</h2>
+      {phase.commonVariations.length === 1 ? (
+        <p class="phase-prose" set:html={renderInline(phase.commonVariations[0])} />
+      ) : (
+        <ul class="phase-bullets">
+          {phase.commonVariations.map((item) => (
+            <li set:html={renderInline(item)} />
+          ))}
+        </ul>
+      )}
+    </section>
+  )}
+
+  {phase.extras && (
+    <section class="phase-section phase-section--extras">
+      <div set:html={renderBlocks(phase.extras)} />
+    </section>
   )}
 </BaseLayout>
 
@@ -140,4 +286,160 @@ const totalMinutes = notes.reduce((s, n) => s + (n.data.estimatedMinutes ?? 0), 
   .phase-meta { display: inline-flex; gap: 0.5rem; align-items: center; }
   .phase-minutes { font-family: var(--font-code); font-size: 0.75rem; color: var(--fg-muted); }
   .phase-lock { font-size: 0.85rem; }
+
+  .phase-section {
+    margin: 0 0 2rem;
+  }
+  .phase-section--after-list {
+    margin-top: 2.5rem;
+  }
+  .phase-section--extras {
+    margin-top: 2.5rem;
+  }
+  .phase-section__title {
+    margin: 0 0 0.85rem;
+    font-size: 1.15rem;
+    color: var(--accent);
+    letter-spacing: 0.01em;
+  }
+
+  .phase-bullets {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: grid;
+    gap: 0.55rem;
+    max-width: 75ch;
+  }
+  .phase-bullets :global(li) {
+    position: relative;
+    padding: 0.55rem 0.85rem 0.55rem 1.6rem;
+    border-radius: 8px;
+    border: 1px solid var(--card-border);
+    background: var(--card-bg);
+    color: var(--fg);
+    line-height: 1.5;
+    font-size: 0.95rem;
+  }
+  .phase-bullets :global(li)::before {
+    content: '›';
+    position: absolute;
+    left: 0.7rem;
+    top: 0.5rem;
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .phase-bullets :global(code) {
+    font-family: var(--font-code);
+    font-size: 0.85em;
+    padding: 0.05em 0.3em;
+    border-radius: 4px;
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+    color: var(--fg);
+  }
+  .phase-bullets :global(strong) {
+    color: var(--fg);
+    font-weight: 600;
+  }
+  .phase-bullets :global(em) {
+    color: var(--fg-muted);
+    font-style: italic;
+  }
+
+  .phase-prose {
+    margin: 0 0 0.85rem;
+    max-width: 75ch;
+    line-height: 1.65;
+    color: var(--fg);
+    font-size: 0.98rem;
+  }
+  .phase-prose :global(code) {
+    font-family: var(--font-code);
+    font-size: 0.85em;
+    padding: 0.05em 0.3em;
+    border-radius: 4px;
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+  }
+  .phase-prose :global(strong) {
+    color: var(--fg);
+    font-weight: 600;
+  }
+  .phase-prose :global(em) {
+    color: var(--fg-muted);
+    font-style: italic;
+  }
+
+  /* Extras block — rendered through renderBlocks(); the wrapper :global rules
+     style headings, lists, tables, and inline markup produced by that helper. */
+  .phase-section--extras :global(h2) {
+    margin: 0 0 0.85rem;
+    font-size: 1.15rem;
+    color: var(--accent);
+    letter-spacing: 0.01em;
+  }
+  .phase-section--extras :global(ul) {
+    list-style: none;
+    padding: 0;
+    margin: 0 0 1rem;
+    display: grid;
+    gap: 0.55rem;
+    max-width: 75ch;
+  }
+  .phase-section--extras :global(li) {
+    position: relative;
+    padding: 0.55rem 0.85rem 0.55rem 1.6rem;
+    border-radius: 8px;
+    border: 1px solid var(--card-border);
+    background: var(--card-bg);
+    color: var(--fg);
+    line-height: 1.5;
+    font-size: 0.95rem;
+  }
+  .phase-section--extras :global(li)::before {
+    content: '›';
+    position: absolute;
+    left: 0.7rem;
+    top: 0.5rem;
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .phase-section--extras :global(code) {
+    font-family: var(--font-code);
+    font-size: 0.85em;
+    padding: 0.05em 0.3em;
+    border-radius: 4px;
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+  }
+  .phase-section--extras :global(strong) { font-weight: 600; }
+  .phase-section--extras :global(em) { color: var(--fg-muted); font-style: italic; }
+  .phase-section--extras :global(p) {
+    margin: 0 0 0.85rem;
+    max-width: 75ch;
+    line-height: 1.65;
+  }
+
+  .phase-table {
+    width: 100%;
+    border-collapse: collapse;
+    border: 1px solid var(--card-border);
+    border-radius: 8px;
+    overflow: hidden;
+    margin: 0 0 1rem;
+    font-size: 0.9rem;
+    background: var(--card-bg);
+  }
+  .phase-table :global(th),
+  .phase-table :global(td) {
+    padding: 0.55rem 0.75rem;
+    border-bottom: 1px solid var(--card-border);
+    text-align: left;
+  }
+  .phase-table :global(thead th) {
+    background: color-mix(in srgb, var(--accent) 8%, var(--card-bg));
+    color: var(--fg);
+    font-weight: 600;
+  }
+  .phase-table :global(tbody tr:last-child td) {
+    border-bottom: none;
+  }
 </style>

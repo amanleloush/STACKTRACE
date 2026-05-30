@@ -1,7 +1,7 @@
 import type { AstroCookies } from 'astro';
 
 const COOKIE_NAME = 'sysviz_session';
-const HINT_COOKIE_NAME = 'sysviz_signed_in';
+const HINT_COOKIE_NAME = 'stacktrace_signed_in';
 const COOKIE_MAX_AGE = 30 * 24 * 60 * 60;
 
 const baseAttrs = {

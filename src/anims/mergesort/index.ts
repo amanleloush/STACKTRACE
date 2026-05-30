@@ -1,9 +1,47 @@
 import type { AnimModule, AnimHandle } from '~/lib/anim/types';
-import { buildFrame, svgEl, htmlEl, makeBtn, makeSlider } from '~/lib/anim/svg';
+import {
+  buildFrame,
+  svgEl,
+  htmlEl,
+  makeBtn,
+  makeSlider,
+  attachCodePanel,
+  attachStepRunner,
+} from '~/lib/anim/svg';
 import { token, onThemeChange } from '~/lib/anim/theme';
 import { mulberry32, shuffled } from '~/lib/anim/rng';
 import { prefersReducedMotion } from '~/lib/anim/a11y';
 import meta from './meta';
+
+interface Step {
+  arr: number[];
+  lo: number;        // active range start (inclusive)
+  hi: number;        // active range end (exclusive)
+  mid: number;       // current split point
+  compareL: number;  // current index into left half
+  compareR: number;  // current index into right half
+  writeIdx: number;  // next position to fill in arr
+  sorted: Set<number>;
+  note: string;
+  comparisons: number;
+  writes: number;
+  /** Index into the pseudocode `CODE` array — drives the line-highlight. */
+  codeLine: number;
+}
+
+const CODE = [
+  'def merge_sort(a):',
+  '    if len(a) <= 1: return a',
+  '    mid = len(a) // 2',
+  '    L = merge_sort(a[:mid])',
+  '    R = merge_sort(a[mid:])',
+  '    return merge(L, R)',
+  'def merge(L, R):',
+  '    out = []',
+  '    while L and R:',
+  '        out.append((L if L[0] <= R[0] else R).pop(0))',
+  '    return out + L + R',
+];
 
 /**
  * Mergesort — visual companion to quicksort.
@@ -14,11 +52,12 @@ const mergesort: AnimModule = {
   ...meta,
 
   mount(host, opts = {}): AnimHandle {
-    const { stage, controls, readout } = buildFrame(host, {
+    const frame = buildFrame(host, {
       title: meta.title,
       caption: meta.caption,
-      badge: 'Interactive',
+      badge: 'Step-by-step',
     });
+    const { stage, controls, readout } = frame;
 
     const SIZE_W = 560;
     const SIZE_H = 240;
@@ -29,35 +68,12 @@ const mergesort: AnimModule = {
     });
     stage.appendChild(svg);
 
+    const codePanel = attachCodePanel(frame, { lines: CODE });
+
     let n = Number(opts['n'] ?? mergesort.defaults!['n']);
     let seed = Number(opts['seed'] ?? mergesort.defaults!['seed']);
-    let speed = 1;
-    let paused = false;
-    let runToken = 0;
-
-    interface Step {
-      arr: number[];
-      lo: number;        // active range start (inclusive)
-      hi: number;        // active range end (exclusive)
-      mid: number;       // current split point
-      compareL: number;  // current index into left half
-      compareR: number;  // current index into right half
-      writeIdx: number;  // next position to fill in arr
-      sorted: Set<number>;
-      note: string;
-      comparisons: number;
-      writes: number;
-    }
 
     let steps: Step[] = [];
-    let cursor = 0;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    function clearTimer(): void {
-      if (timer) {
-        clearTimeout(timer);
-        timer = null;
-      }
-    }
 
     function genSteps(): void {
       const rng = mulberry32(seed);
@@ -75,6 +91,7 @@ const mergesort: AnimModule = {
         cR: number,
         wIdx: number,
         note: string,
+        codeLine: number,
       ): void => {
         steps.push({
           arr: [...arr],
@@ -88,38 +105,45 @@ const mergesort: AnimModule = {
           note,
           comparisons,
           writes,
+          codeLine,
         });
       };
 
       function mergeSortRec(lo: number, hi: number): void {
+        push(lo, hi, (lo + hi) >> 1, -1, -1, -1, `merge_sort [${lo}, ${hi})`, 0);
         if (hi - lo <= 1) {
           sorted.add(lo);
-          push(lo, hi, lo, -1, -1, -1, `single element @ ${lo}, mark sorted`);
+          push(lo, hi, lo, -1, -1, -1, `single element @ ${lo}, mark sorted`, 1);
           return;
         }
         const mid = (lo + hi) >> 1;
-        push(lo, hi, mid, -1, -1, -1, `split [${lo}, ${hi}) at ${mid}`);
+        push(lo, hi, mid, -1, -1, -1, `split [${lo}, ${hi}) at ${mid}`, 2);
+        push(lo, hi, mid, -1, -1, -1, `recurse left [${lo}, ${mid})`, 3);
         mergeSortRec(lo, mid);
+        push(lo, hi, mid, -1, -1, -1, `recurse right [${mid}, ${hi})`, 4);
         mergeSortRec(mid, hi);
         // Merge
+        push(lo, hi, mid, -1, -1, -1, `merge [${lo}, ${mid}) + [${mid}, ${hi})`, 5);
         const left = arr.slice(lo, mid);
         const right = arr.slice(mid, hi);
         let i = 0;
         let j = 0;
         let k = lo;
+        push(lo, hi, mid, -1, -1, -1, `enter merge`, 6);
+        push(lo, hi, mid, -1, -1, -1, `out = []`, 7);
         while (i < left.length && j < right.length) {
           comparisons++;
-          push(lo, hi, mid, lo + i, mid + j, k, `compare ${left[i]} vs ${right[j]}`);
+          push(lo, hi, mid, lo + i, mid + j, k, `compare ${left[i]} vs ${right[j]}`, 8);
           if (left[i]! <= right[j]!) {
             arr[k] = left[i]!;
             writes++;
-            push(lo, hi, mid, lo + i, mid + j, k, `write ${left[i]} from left → ${k}`);
+            push(lo, hi, mid, lo + i, mid + j, k, `write ${left[i]} from left → ${k}`, 9);
             i++;
             k++;
           } else {
             arr[k] = right[j]!;
             writes++;
-            push(lo, hi, mid, lo + i, mid + j, k, `write ${right[j]} from right → ${k}`);
+            push(lo, hi, mid, lo + i, mid + j, k, `write ${right[j]} from right → ${k}`, 9);
             j++;
             k++;
           }
@@ -127,24 +151,24 @@ const mergesort: AnimModule = {
         while (i < left.length) {
           arr[k] = left[i]!;
           writes++;
-          push(lo, hi, mid, lo + i, -1, k, `drain left → ${k}`);
+          push(lo, hi, mid, lo + i, -1, k, `drain left → ${k}`, 10);
           i++;
           k++;
         }
         while (j < right.length) {
           arr[k] = right[j]!;
           writes++;
-          push(lo, hi, mid, -1, mid + j, k, `drain right → ${k}`);
+          push(lo, hi, mid, -1, mid + j, k, `drain right → ${k}`, 10);
           j++;
           k++;
         }
         for (let s = lo; s < hi; s++) sorted.add(s);
-        push(lo, hi, mid, -1, -1, -1, `range [${lo}, ${hi}) merged`);
+        push(lo, hi, mid, -1, -1, -1, `range [${lo}, ${hi}) merged`, 5);
       }
 
       mergeSortRec(0, arr.length);
       for (let k = 0; k < arr.length; k++) sorted.add(k);
-      push(0, arr.length, -1, -1, -1, -1, 'done');
+      push(0, arr.length, -1, -1, -1, -1, 'done', 5);
     }
 
     function colorFor(idx: number, s: Step): string {
@@ -156,7 +180,7 @@ const mergesort: AnimModule = {
       return token('--anim-bar-bg');
     }
 
-    function draw(): void {
+    function draw(cursor: number): void {
       svg.innerHTML = '';
       const s = steps[cursor];
       if (!s) return;
@@ -223,60 +247,28 @@ const mergesort: AnimModule = {
       readout.appendChild(htmlEl('span', {}, `comparisons: ${s.comparisons}`));
       readout.appendChild(htmlEl('span', {}, `writes: ${s.writes}`));
       readout.appendChild(htmlEl('span', {}, `n: ${n} · seed: ${seed}`));
+
+      codePanel.highlight(s.codeLine);
     }
 
-    function tick(): void {
-      if (paused) return;
-      if (cursor >= steps.length - 1) {
-        clearTimer();
-        return;
-      }
-      cursor++;
-      draw();
-      timer = setTimeout(tick, Math.max(40, 240 / speed));
-    }
+    genSteps();
 
-    function play(): void {
-      const myRun = ++runToken;
-      paused = false;
-      clearTimer();
-      if (prefersReducedMotion()) {
-        cursor = steps.length - 1;
-        draw();
-        return;
-      }
-      const loop = (): void => {
-        if (myRun !== runToken) return;
-        tick();
-      };
-      loop();
-    }
+    const runner = attachStepRunner({
+      controls,
+      totalSteps: () => steps.length,
+      onStep: draw,
+      onReset: () => genSteps(),
+      prefersReducedMotion: prefersReducedMotion(),
+    });
 
-    function stepOne(): void {
-      paused = true;
-      clearTimer();
-      if (cursor < steps.length - 1) cursor++;
-      draw();
-    }
-
-    function reset(): void {
-      runToken++;
-      paused = true;
-      clearTimer();
-      genSteps();
-      cursor = 0;
-      draw();
-    }
-
-    function reshuffle(): void {
-      seed = Math.floor(Math.random() * 1e9);
-      reset();
-    }
-
-    controls.appendChild(makeBtn('play', play, { primary: true }));
-    controls.appendChild(makeBtn('step', stepOne));
-    controls.appendChild(makeBtn('reset', reset));
-    controls.appendChild(makeBtn('reshuffle', reshuffle));
+    // Extras: reshuffle + n slider. Speed is handled by the standard runner.
+    controls.appendChild(
+      makeBtn('Reshuffle', () => {
+        seed = Math.floor(Math.random() * 1e9);
+        genSteps();
+        runner.reset();
+      }),
+    );
     controls.appendChild(
       makeSlider({
         label: 'n',
@@ -286,40 +278,20 @@ const mergesort: AnimModule = {
         value: n,
         onChange: (v) => {
           n = v;
-          reset();
-        },
-      }),
-    );
-    controls.appendChild(
-      makeSlider({
-        label: 'speed',
-        min: 0.25,
-        max: 4,
-        step: 0.25,
-        value: speed,
-        onChange: (v) => {
-          speed = v;
+          genSteps();
+          runner.reset();
         },
       }),
     );
 
-    const offTheme = onThemeChange(() => draw());
-    genSteps();
-    cursor = 0;
-    draw();
+    const offTheme = onThemeChange(() => draw(runner.getCursor()));
 
     return {
-      pause(): void {
-        paused = true;
-        clearTimer();
-      },
-      resume(): void {
-        /* user explicitly clicks play */
-      },
-      reset,
+      pause(): void { runner.pause(); },
+      resume(): void { /* user clicks play */ },
+      reset(): void { runner.reset(); },
       destroy(): void {
-        runToken++;
-        clearTimer();
+        runner.destroy();
         offTheme();
         host.innerHTML = '';
       },

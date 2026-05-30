@@ -7,7 +7,7 @@ const meta: AnimMeta = {
     'Explore layer-by-layer with a FIFO queue. Visits every reachable node in order of distance from the start.',
   tags: ['graph'],
   pillar: 'dsa',
-  phase: '04-graphs',
+  phase: '04-bfs',
   order: 1,
   premium: false,
 };

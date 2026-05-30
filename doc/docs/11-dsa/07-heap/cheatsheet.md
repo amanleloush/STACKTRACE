@@ -1,0 +1,97 @@
+---
+title: Heap — cheatsheet
+---
+
+# Heap · Cheatsheet
+
+> One-page recall. Print, paste in Notion, glance before the interview.
+
+## Trigger
+**You see in the problem:** "top K", "K-th largest/smallest", "median of a stream", "merge K sorted lists/arrays", "schedule tasks by frequency / priority", "K closest points".
+
+**Reach for this pattern when:**
+- You need the **best K** of n items (max/min) without sorting all of n.
+- A stream — items arrive online and you need a running top/median/min.
+- Multiple sorted sources to interleave → push one head from each, pop smallest.
+- Anything with "next best move" — Dijkstra, A*, task scheduler.
+
+**Don't reach for it when:**
+- You need the **full sorted order** → just sort, O(n log n) anyway.
+- You need an **arbitrary-rank** element fast (3rd, 7th) → quickselect, O(n) avg.
+- The data structure needs random access — heaps don't support it.
+
+## The mental model
+A heap is a partially-ordered binary tree on top of an array. **Push**: O(log n) sift up. **Pop**: O(log n) sift down. Top of heap = the min (min-heap) or max (max-heap). **Top-K trick**: keep a min-heap of size K; if new item beats the heap's min, swap. End with the K largest. Symmetrically for K smallest.
+
+## Skeleton
+
+```python
+import heapq
+
+# Top K largest — keep a min-heap of size K
+def top_k(nums, k):
+    h = []
+    for x in nums:
+        heapq.heappush(h, x)
+        if len(h) > k:
+            heapq.heappop(h)
+    return h     # k largest, in arbitrary order
+
+# Merge K sorted lists
+def merge_k(lists):
+    h = [(lst[0], i, 0) for i, lst in enumerate(lists) if lst]
+    heapq.heapify(h)
+    out = []
+    while h:
+        val, i, j = heapq.heappop(h)
+        out.append(val)
+        if j + 1 < len(lists[i]):
+            heapq.heappush(h, (lists[i][j+1], i, j+1))
+    return out
+
+# Median of stream — two heaps
+class MedianFinder:
+    def __init__(self):
+        self.lo = []   # max-heap (negated), lower half
+        self.hi = []   # min-heap, upper half
+    def add(self, x):
+        heapq.heappush(self.lo, -heapq.heappushpop(self.hi, x))
+        if len(self.lo) > len(self.hi) + 1:
+            heapq.heappush(self.hi, -heapq.heappop(self.lo))
+    def median(self):
+        if len(self.lo) > len(self.hi): return -self.lo[0]
+        return (-self.lo[0] + self.hi[0]) / 2
+```
+
+## Complexity
+- Push / Pop: **O(log n)**.
+- Heapify (bulk build): **O(n)**.
+- Top-K: **O(n log k)** time, **O(k)** space.
+
+## Variants in this pattern
+1. **Top-K largest/smallest** — size-K min/max heap.
+2. **K-way merge** — heap of K source heads.
+3. **Two-heap median** — lower-half max-heap + upper-half min-heap, kept balanced.
+4. **Frequency-driven scheduling** — max-heap on remaining counts (task scheduler).
+5. **K closest points / pairs** — heap keyed by distance.
+6. **Dijkstra / Prim** — heap of (dist, node) frontier (see Graphs cheatsheet).
+
+## Top problems
+- [LC 215 — Kth Largest Element in an Array](https://leetcode.com/problems/kth-largest-element-in-an-array/) (Med) — size-K min-heap.
+- [LC 347 — Top K Frequent Elements](https://leetcode.com/problems/top-k-frequent-elements/) (Med) — count + heap (or bucket sort O(n)).
+- [LC 23 — Merge k Sorted Lists](https://leetcode.com/problems/merge-k-sorted-lists/) (Hard) — K-way merge with heap.
+- [LC 295 — Find Median from Data Stream](https://leetcode.com/problems/find-median-from-data-stream/) (Hard) — two-heap balance.
+- [LC 973 — K Closest Points to Origin](https://leetcode.com/problems/k-closest-points-to-origin/) (Med) — max-heap of size K on -distance.
+- [LC 621 — Task Scheduler](https://leetcode.com/problems/task-scheduler/) (Med) — max-heap on remaining counts + cooldown queue.
+- [LC 502 — IPO](https://leetcode.com/problems/ipo/) (Hard) — min-heap on capital required, max-heap on profit.
+
+## Common bugs / pitfalls
+- **Python `heapq` is min-only** — negate values for max-heap, or use tuples `(-val, ...)`.
+- **Top-K direction confusion**: for the K **largest**, keep a **min**-heap of size K (the small ones get popped). For K **smallest**, keep a max-heap.
+- **Pushing instead of heappushpop** when maintaining size K — push then pop is twice the work; `heappushpop` is one op.
+- **Median balance**: lower-half size can be `hi + 1` (odd count → median = top of lower) but not more.
+- **Tuples with non-comparable second elements** crash on tie-break — add an index `(key, idx, item)`.
+- **`heapify` vs `heappush` loop**: bulk build with `heapify` is O(n); pushing one by one is O(n log n).
+
+## In 30 seconds
+Partial sort. When you need the K best of many, or a running min/max/median, reach for a heap. Negate for max-heap in Python. Top-K = size-K opposite-direction heap.

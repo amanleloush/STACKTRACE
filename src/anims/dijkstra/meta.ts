@@ -7,8 +7,8 @@ const meta: AnimMeta = {
     'Extract the closest unfinalised node, relax its outgoing edges, repeat. Same grid as BFS/DFS, weighted edges.',
   tags: ['graph'],
   pillar: 'dsa',
-  phase: '04-graphs',
-  order: 3,
+  phase: '08-graphs',
+  order: 2,
   premium: false,
 };
 

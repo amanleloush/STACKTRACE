@@ -7,8 +7,8 @@ const meta: AnimMeta = {
     'Explore as deep as possible before backtracking, using a LIFO stack. Same graph as BFS — compare the visit order.',
   tags: ['graph'],
   pillar: 'dsa',
-  phase: '04-graphs',
-  order: 2,
+  phase: '05-dfs',
+  order: 1,
   premium: false,
 };
 

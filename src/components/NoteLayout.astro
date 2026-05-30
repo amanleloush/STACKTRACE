@@ -1,24 +1,41 @@
 ---
-import type { CollectionEntry } from 'astro:content';
+import { getCollection, type CollectionEntry } from 'astro:content';
+import NoteCompletion from './NoteCompletion.astro';
+import { formatPhaseLabel } from '~/lib/phase-label';
 
 interface Props {
   entry: CollectionEntry<'notes'> | CollectionEntry<'dsa'>;
-  collectionLabel?: string; // "Notes" | "DSA"
+  collectionLabel?: string; // "System Design" | "DSA"
   /** Effective gate state from the entitlement system — overrides
    *  fm.premium for the 🔒 badge. Optional; defaults to fm.premium. */
   effectivePremium?: boolean;
 }
-const { entry, collectionLabel = 'Notes', effectivePremium } = Astro.props;
+const { entry, collectionLabel = 'System Design', effectivePremium } = Astro.props;
 const fm = entry.data;
 const showLock = effectivePremium ?? fm.premium;
-const phaseLabel = fm.phase
-  .replace(/^[0-9]+-/, '')
-  .replace(/-/g, ' ')
-  .replace(/\b\w/g, (c) => c.toUpperCase());
+const phaseLabel = formatPhaseLabel(fm.phase);
 // Prerequisite links + the breadcrumb root depend on which collection
 // we're in. NoteLayout is the only place that bridges between pillars.
-const pillarRoute = entry.collection === 'dsa' ? '/learn/dsa' : '/learn/notes';
-const tocRoute = entry.collection === 'dsa' ? '/dsa/' : '/notes/';
+const isDsa = entry.collection === 'dsa';
+const pillarRoute = isDsa ? '/learn/dsa' : '/learn/notes';
+const tocRoute = isDsa ? '/dsa/' : '/notes/';
+const progressPillar = isDsa ? 'dsa' : 'notes';
+
+// Compute the next entry: same collection + same phase + next-highest
+// order. If we're already last in the phase, fall back to the first
+// entry of the next phase (alphabetical phase-slug order). Used by
+// NoteCompletion to surface a "Next topic →" CTA after marking done.
+const collectionName = isDsa ? 'dsa' : 'notes';
+const peers = (await getCollection(collectionName, (n) => !n.data.draft)) as
+  Array<CollectionEntry<'notes' | 'dsa'>>;
+peers.sort((a, b) => {
+  if (a.data.phase !== b.data.phase) return a.data.phase.localeCompare(b.data.phase);
+  return a.data.order - b.data.order;
+});
+const here = peers.findIndex((p) => p.id === entry.id);
+const next = here >= 0 && here < peers.length - 1 ? peers[here + 1] : null;
+const nextHref = next ? `${pillarRoute}/${next.id}/` : null;
+const nextTitle = next?.data.title ?? null;
 ---
 <article class="note">
   <nav class="note__crumbs" aria-label="Breadcrumb">
@@ -48,6 +65,14 @@ const tocRoute = entry.collection === 'dsa' ? '/dsa/' : '/notes/';
   <div class="note__body">
     <slot />
   </div>
+
+  <NoteCompletion
+    pillar={progressPillar}
+    slug={entry.id}
+    title={fm.title}
+    nextHref={nextHref}
+    nextTitle={nextTitle}
+  />
 
   {fm.prerequisites && fm.prerequisites.length > 0 && (
     <footer class="note__prereqs">
@@ -109,8 +134,39 @@ const tocRoute = entry.collection === 'dsa' ? '/dsa/' : '/notes/';
     font-style: italic;
     font-size: 1rem;
   }
+  .note__body :global(h2),
+  .note__body :global(h3),
+  .note__body :global(h4) {
+    position: relative;
+    scroll-margin-top: 5.5rem;
+  }
   .note__body :global(h2) { margin-top: 2.5rem; }
   .note__body :global(h3) { margin-top: 2rem; }
+
+  /* Heading permalinks — rehype-autolink-headings appends a `¶` glyph to
+     every heading; reveal it on hover/focus of the heading or anchor. */
+  .note__body :global(.note__heading-anchor) {
+    position: absolute;
+    left: -1.5rem;
+    top: 0;
+    width: 1.5rem;
+    height: 100%;
+    display: inline-flex;
+    align-items: center;
+    color: var(--fg-faint);
+    text-decoration: none;
+    opacity: 0;
+    transition: opacity 0.15s ease, color 0.15s ease;
+  }
+  .note__body :global(h2:hover) .note__heading-anchor,
+  .note__body :global(h3:hover) .note__heading-anchor,
+  .note__body :global(h4:hover) .note__heading-anchor,
+  .note__body :global(.note__heading-anchor:focus) { opacity: 1; }
+  .note__body :global(.note__heading-anchor:hover) { color: var(--accent); }
+  .note__body :global(.note__heading-anchor-glyph) {
+    font-size: 0.85em;
+    font-weight: 400;
+  }
   .note__body :global(ul), .note__body :global(ol) {
     line-height: 1.7;
     padding-left: 1.5rem;

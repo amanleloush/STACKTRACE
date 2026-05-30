@@ -7,8 +7,8 @@ const meta: AnimMeta = {
     'Pivot moves to its final position, then the array splits around it. Watch comparisons, swaps, and the boundary advance.',
   tags: ['sorting'],
   pillar: 'dsa',
-  phase: 'sorting',
-  order: 1,
+  phase: '13-sorting',
+  order: 5,
   premium: false,
   defaults: { n: 16, seed: 7 },
 };
