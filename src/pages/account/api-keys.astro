@@ -1,0 +1,258 @@
+---
+import BaseLayout from '~/layouts/BaseLayout.astro';
+import { getDb } from '~/lib/db';
+import { listApiKeys } from '~/lib/api/keys';
+
+export const prerender = false;
+
+const user = Astro.locals.user;
+if (!user) {
+  return Astro.redirect('/login/?next=/account/api-keys/');
+}
+
+const env = Astro.locals.runtime?.env;
+const db = await getDb({ env });
+const keys = await listApiKeys(db, user.id);
+
+const justMinted = Astro.url.searchParams.get('just_minted');
+const flash = Astro.url.searchParams.get('flash');
+
+function fmtDate(unixSec: number | null | undefined): string {
+  if (!unixSec) return 'never';
+  return new Date(unixSec * 1000).toLocaleString(undefined, {
+    year: 'numeric', month: 'short', day: 'numeric',
+    hour: '2-digit', minute: '2-digit',
+  });
+}
+
+Astro.response.headers.set('Cache-Control', 'private, no-store');
+---
+<BaseLayout title="API keys — sysviz">
+  <section class="account">
+    <h1>API keys</h1>
+    <p class="account__muted">
+      Use a key as <code>Authorization: Bearer &lt;key&gt;</code> against
+      <code>/api/v1/*</code>. Each key has its own daily request quota.
+    </p>
+
+    {flash && (
+      <div class="account__flash">✓ {flash}</div>
+    )}
+
+    {justMinted && (
+      <div class="account__card account__card--minted">
+        <h2 class="account__h2 account__h2--inline">Copy this now — you won't see it again</h2>
+        <p class="account__muted">
+          This is the only time the full secret is displayed. Store it somewhere safe
+          (a password manager, an <code>.env</code> file) before navigating away.
+        </p>
+        <div class="account__keyrow">
+          <code id="just-minted-key" class="account__keybox">{justMinted}</code>
+          <button type="button" class="anim__btn" id="copy-key-btn">Copy</button>
+        </div>
+        <p class="account__muted">
+          Use it as: <code>Authorization: Bearer {justMinted}</code> against
+          <code>/api/v1/*</code> endpoints.
+        </p>
+      </div>
+    )}
+
+    <h2 class="account__h2">Mint a new key</h2>
+    <div class="account__card">
+      <form action="/api/me/api-keys/create" method="post" class="account__form">
+        <label class="account__field">
+          <span>Name</span>
+          <input type="text" name="name" required maxlength="64" placeholder="e.g. personal-laptop" />
+        </label>
+        <label class="account__field">
+          <span>Daily quota</span>
+          <select name="daily_quota">
+            <option value="100">100</option>
+            <option value="1000" selected>1000</option>
+            <option value="5000">5000</option>
+            <option value="10000">10000</option>
+          </select>
+        </label>
+        <button type="submit" class="anim__btn anim__btn--primary">Mint key</button>
+      </form>
+    </div>
+
+    <h2 class="account__h2">Your keys ({keys.length})</h2>
+    {keys.length === 0 ? (
+      <div class="account__card">
+        <p class="account__muted">No keys yet. Mint one above.</p>
+      </div>
+    ) : (
+      <div class="account__card account__card--table">
+        <table class="account__table">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Public id</th>
+              <th>Created</th>
+              <th>Last used</th>
+              <th>Usage</th>
+              <th>Status</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {keys.map((k) => {
+              const revoked = k.revokedAt != null;
+              return (
+                <tr class={revoked ? 'account__tr--revoked' : ''}>
+                  <td>{k.name}</td>
+                  <td><code class="account__code">sk_test_{k.id}.•••</code></td>
+                  <td>{fmtDate(k.createdAt)}</td>
+                  <td>{fmtDate(k.lastUsedAt)}</td>
+                  <td>{k.dailyUsed} / {k.dailyQuota}</td>
+                  <td>
+                    {revoked ? (
+                      <span class="account__badge account__badge--revoked">revoked</span>
+                    ) : (
+                      <span class="account__badge account__badge--active">active</span>
+                    )}
+                  </td>
+                  <td>
+                    {revoked ? (
+                      <button type="button" class="anim__btn" disabled>Revoked</button>
+                    ) : (
+                      <form action="/api/me/api-keys/revoke" method="post" onsubmit="return confirm('Revoke this key? Any application using it will start getting 401s immediately.')">
+                        <input type="hidden" name="id" value={k.id} />
+                        <button type="submit" class="anim__btn">Revoke</button>
+                      </form>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    )}
+
+    <p class="account__muted">
+      <a href="/account/">← Back to account</a>
+    </p>
+  </section>
+
+  <script is:inline>
+    document.addEventListener('DOMContentLoaded', () => {
+      const btn = document.getElementById('copy-key-btn');
+      const code = document.getElementById('just-minted-key');
+      if (!btn || !code) return;
+      btn.addEventListener('click', async () => {
+        try {
+          await navigator.clipboard.writeText(code.textContent || '');
+          const orig = btn.textContent;
+          btn.textContent = 'Copied!';
+          setTimeout(() => { btn.textContent = orig; }, 1500);
+        } catch {
+          btn.textContent = 'Copy failed';
+        }
+      });
+    });
+  </script>
+
+  <style>
+    .account { max-width: 52rem; margin: 3rem auto; }
+    .account__h2 { margin: 2rem 0 0.75rem; font-size: 1.05rem; color: var(--fg-muted); }
+    .account__h2--inline { margin-top: 0; }
+    .account__card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 1rem 1.25rem;
+      margin-bottom: 1rem;
+    }
+    .account__card--minted {
+      border-color: var(--anim-success);
+      background: color-mix(in srgb, var(--anim-success) 8%, var(--card-bg));
+    }
+    .account__card--table { padding: 0.5rem 0.75rem; }
+    .account__muted { color: var(--fg-muted); margin: 0.5rem 0; font-size: 0.9rem; }
+    .account__muted code { font-size: 0.82rem; }
+    .account__code { font-size: 0.78rem; color: var(--fg-faint); }
+    .account__flash {
+      margin-bottom: 1.25rem;
+      padding: 0.7rem 0.9rem;
+      background: color-mix(in srgb, var(--anim-success) 14%, transparent);
+      border: 1px solid var(--anim-success);
+      border-radius: 8px;
+      font-size: 0.9rem;
+    }
+    .account__keyrow {
+      display: flex;
+      gap: 0.5rem;
+      align-items: center;
+      margin: 0.75rem 0;
+    }
+    .account__keybox {
+      flex: 1;
+      padding: 0.55rem 0.75rem;
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 6px;
+      font-size: 0.82rem;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      overflow-x: auto;
+      white-space: nowrap;
+      color: var(--primary);
+    }
+    .account__form {
+      display: flex;
+      gap: 0.75rem;
+      align-items: flex-end;
+      flex-wrap: wrap;
+    }
+    .account__field {
+      display: flex;
+      flex-direction: column;
+      gap: 0.3rem;
+      font-size: 0.85rem;
+      color: var(--fg-muted);
+    }
+    .account__field input,
+    .account__field select {
+      padding: 0.45rem 0.6rem;
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 6px;
+      color: inherit;
+      font: inherit;
+      min-width: 12rem;
+    }
+    .account__table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.88rem;
+    }
+    .account__table th,
+    .account__table td {
+      text-align: left;
+      padding: 0.55rem 0.5rem;
+      border-bottom: 1px solid var(--card-border);
+    }
+    .account__table th { color: var(--fg-muted); font-weight: 500; font-size: 0.8rem; }
+    .account__table tr:last-child td { border-bottom: none; }
+    .account__tr--revoked { opacity: 0.55; }
+    .account__badge {
+      display: inline-block;
+      padding: 0.15rem 0.55rem;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+    }
+    .account__badge--active {
+      background: color-mix(in srgb, var(--anim-success) 18%, transparent);
+      color: var(--anim-success);
+      border: 1px solid var(--anim-success);
+    }
+    .account__badge--revoked {
+      background: color-mix(in srgb, var(--anim-danger) 14%, transparent);
+      color: var(--anim-danger);
+      border: 1px solid var(--anim-danger);
+    }
+    .account__table form { display: inline; margin: 0; }
+  </style>
+</BaseLayout>

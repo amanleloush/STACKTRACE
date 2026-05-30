@@ -22,9 +22,13 @@ const SSR_PREFIXES = [
 const SSR_KNOWN_PATHS = new Set([
   '/login/', '/login',
   '/account/', '/account',
+  '/account/api-keys/', '/account/api-keys',
   '/admin/', '/admin',
   '/admin/content/', '/admin/content',
+  '/pricing/', '/pricing',
 ]);
+// SSR prefixes whose actual paths we don't try to enumerate.
+const SSR_DYNAMIC_PREFIXES = ['/api/'];
 
 async function collectSsrSlugs(): Promise<Map<string, Set<string>>> {
   const out = new Map<string, Set<string>>();
@@ -115,6 +119,10 @@ async function main(): Promise<void> {
       // Other known SSR routes — file existence isn't a useful check.
       const trimmed = pathOnly.replace(/\/$/, '');
       if (SSR_KNOWN_PATHS.has(pathOnly) || SSR_KNOWN_PATHS.has(trimmed)) {
+        ssrChecked++;
+        continue;
+      }
+      if (SSR_DYNAMIC_PREFIXES.some((p) => pathOnly.startsWith(p))) {
         ssrChecked++;
         continue;
       }
