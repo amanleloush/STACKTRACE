@@ -3,7 +3,8 @@
 // The `slug` matches entry.data.phase in the dsa content collection.
 //
 // Prose fields (whenToUse / shapeOfSolution / commonVariations / extras)
-// are faithfully copied from brain-detox-arc/docs/11-dsa/<slug>/index.md.
+// are faithfully copied from doc/docs/11-dsa/<slug>/index.md (the archived
+// Brain Detox Arc source).
 // They may contain light inline markdown (`**bold**`, `` `code` ``) which
 // the [phase].astro page converts to <strong>/<code> at render time.
 

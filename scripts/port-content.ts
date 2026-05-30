@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Brain-Detox-arc → sysviz-next content port (plan §4, §14l).
+// Brain Detox Arc → StackTrace content port.
 // Idempotent: re-running converges. Preserves manual edits to existing
 // destination files by merging frontmatter rather than overwriting.
 //
@@ -13,10 +13,14 @@
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import url from 'node:url';
 
-const SRC_ROOT = '/Users/darshitjain/Documents/Brain-Detox-arc/docs';
-const DST_ROOT = '/Users/darshitjain/Documents/sysviz-next/src/content/notes';
-const REPORT_PATH = '/Users/darshitjain/Documents/sysviz-next/port-report.md';
+const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
+const REPO_ROOT = path.resolve(__dirname, '..');
+// Source is the archived Brain Detox Arc tree under doc/.
+const SRC_ROOT = path.join(REPO_ROOT, 'doc/docs');
+const DST_ROOT = path.join(REPO_ROOT, 'src/content/notes');
+const REPORT_PATH = path.join(REPO_ROOT, 'port-report.md');
 
 const PHASE_DIRS = [
   '01-foundations',

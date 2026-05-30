@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 /**
- * One-shot: re-insert <Anim id="X" /> tags into the sysviz DSA MDX notes
- * that were ported from brain-detox-arc.
+ * One-shot: re-insert <Anim id="X" /> tags into the StackTrace DSA MDX notes
+ * that were ported from the archived Brain Detox Arc source.
  *
  * The parallel .md -> .mdx port dropped every
  *   <div class="dsa-viz" data-algo="X"></div>
- * block. This script walks the brain-detox source tree, extracts each
+ * block. This script walks the archived source tree, extracts each
  * file's data-algo value (the first one if multiple), maps the source
- * filename to the sysviz target slug, and inserts
+ * filename to the StackTrace target slug, and inserts
  *   \n<Anim id="X" />\n
  * immediately above the first `## Complexity` header (or `## Pitfalls`
  * as a fallback) in the target MDX file.
@@ -22,7 +22,8 @@ import url from 'node:url';
 
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
-const SOURCE_ROOT = '/Users/amansinghchauhan/Downloads/brain-detox-arc/docs/11-dsa';
+// Archived Brain Detox Arc source — now lives under doc/ in this repo.
+const SOURCE_ROOT = path.join(ROOT, 'doc/docs/11-dsa');
 const TARGET_ROOT = path.join(ROOT, 'src/content/dsa');
 const ANIMS_ROOT = path.join(ROOT, 'src/anims');
 
