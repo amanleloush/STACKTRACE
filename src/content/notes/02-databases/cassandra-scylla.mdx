@@ -1,7 +1,7 @@
 ---
 title: "Cassandra / ScyllaDB: Wide-Column, Partition Keys, Gossip"
 phase: "02-databases"
-order: 12
+order: 13
 tags: ["db"]
 premium: false
 previewParagraphs: 4
@@ -51,7 +51,7 @@ CREATE TABLE messages (
 
 - Hash the partition key → token (Murmur3, 64-bit).
 - Each node owns a range of tokens (or many small ranges via vnodes).
-- Default: ~256 vnodes per physical node for even distribution.
+- Default `num_tokens`: 256 vnodes per node before Cassandra 4.0; 16 since 4.0 (paired with the token-allocation algorithm to keep distribution even).
 
 ### Replication
 
@@ -82,13 +82,13 @@ Deletes are **tombstones** (markers, not in-place removals). Compaction physical
 
 ### Lightweight Transactions (LWT)
 
-Cassandra `IF` clauses (`UPDATE ... IF status = 'OPEN'`) use **Paxos**. Strong consistency for single partition, but **4× slower** than normal writes. Use only when you must.
+Cassandra `IF` clauses (`UPDATE ... IF status = 'OPEN'`) use **Paxos**. Strong consistency for single partition, but classic Paxos needs **4 round trips** between coordinator and replicas (Cassandra 4.1's Paxos v2 trims this) — much slower than normal writes. Use only when you must.
 
 ### Scylla differences
 
 - C++, shard-per-core architecture (no shared state across cores) — saturates modern hardware.
 - Same CQL protocol and data model.
-- Often 5–10× throughput of Cassandra on the same hardware.
+- ScyllaDB's own benchmarks claim several-fold (up to ~10×) throughput vs Cassandra on the same hardware.
 - Better tail latency.
 - Drop-in for Cassandra clients in most cases.
 
@@ -107,7 +107,7 @@ Client → Coordinator (any node, ideally token-aware)
 - **Instagram**: feed timeline storage (huge write throughput).
 - **Discord**: messages — migrated from MongoDB → Cassandra → **ScyllaDB**. Wrote a great blog on why.
 - **Netflix**: countless services on Cassandra (watch history, customer events).
-- **Apple**: famously runs huge Cassandra clusters (100K+ nodes total).
+- **Apple**: famously runs huge Cassandra clusters (75,000+ nodes and 10+ PB as of its 2014 disclosure).
 - **eBay, Uber, Spotify**: heavy Cassandra users for various workloads.
 
 ## Common pitfalls
@@ -119,44 +119,163 @@ Client → Coordinator (any node, ideally token-aware)
 - **Joining at the application layer**: bad fit for Cassandra. Denormalize at write time.
 - **Choosing Cassandra for low-write OLTP**: massive operational overhead vs Postgres.
 
-## Interview questions
+## Practice questions
 
-### Q1 — Easy: What's a partition key vs clustering key?
-Partition key determines which node stores the row (via hashing onto the ring). Clustering key determines the order within a partition. Together they form the primary key.
+<Practice>
 
-### Q2 — Easy: Why is Cassandra eventually consistent?
-Writes go to multiple replicas asynchronously; replicas can diverge. With sufficient quorum on reads and writes (`R + W > RF`), you get strong consistency for those operations, but the default is tunable and often eventual.
+<QA q="What's a partition key vs a clustering key?" level="easy">
 
-### Q3 — Medium: Explain `R + W > RF`.
-With replication factor RF, if your write hits W replicas and read consults R replicas, you're guaranteed the read overlaps with at least one node that has the write. RF=3, W=2, R=2 — quorum-style — gives strong consistency.
+The **partition key** is hashed (Murmur3) onto the token ring and decides which nodes store the row. All rows with the same partition key live together. The **clustering key** decides the sort order of rows within a partition. Together they form the primary key: `PRIMARY KEY ((partition), clustering)`.
 
-### Q4 — Medium: How does Cassandra detect and repair divergence?
-Three mechanisms: (1) **Hinted handoff** — coordinator stores writes for down nodes and replays them. (2) **Read repair** — if read responses disagree, the coordinator picks the latest and propagates to others. (3) **Anti-entropy repair** (`nodetool repair`) — periodic Merkle-tree comparison across replicas, sync up the diffs. Must run before `gc_grace_seconds` to avoid resurrected tombstones.
+</QA>
 
-### Q5 — Medium: Why do tombstones cause problems?
-Deletes don't physically remove data — they write a marker (tombstone). Reads must skip them. Heavy delete + range scan = scanning thousands of tombstones for every query → slow + memory pressure. Mitigate with TTL-only deletes, time-windowed partitions, or compaction tuning (TWCS).
+<QA q="Why is Cassandra eventually consistent?" level="easy">
 
-### Q6 — Hard: Design a Cassandra schema for a chat app — users, channels, messages.
+It's leaderless: writes go to several replicas and only some need to acknowledge, so replicas can diverge for a while. Consistency is **tunable per operation**. If reads and writes overlap (`R + W > RF`) you get strong consistency for those operations, while lower levels like `ONE` trade it for latency and availability.
+
+</QA>
+
+<QA q="Why is `ALLOW FILTERING` a red flag in Cassandra?" level="easy">
+
+It lets a query filter on columns that aren't part of the partition key, which forces a scatter-gather scan across nodes and partitions instead of a direct lookup. Fine on a tiny table, a production-killer at scale. The fix is to model a table for that access pattern (denormalize at write time).
+
+</QA>
+
+<QA q="How do Cassandra nodes know about cluster membership without a master?" level="easy">
+
+**Gossip**: each node exchanges state with a few peers every second, and membership and health information spreads epidemically. Within seconds the whole cluster converges on the same view, with no central master. Clients can also be **token-aware** and send each request straight to a replica, skipping an extra coordinator hop.
+
+</QA>
+
+<QA q="Explain the rule `R + W` greater than `RF`." level="medium">
+
+With replication factor RF, if a write is acknowledged by W replicas and a read consults R replicas, `R + W > RF` guarantees the two sets overlap in at least one replica that has the latest write. With RF=3, QUORUM = `floor(3/2) + 1` = 2, so W=2 and R=2 gives 4 > 3: read-your-writes consistency.
+
+</QA>
+
+<QA q="How does Cassandra detect and repair divergence between replicas?" level="medium">
+
+1. **Hinted handoff**: the coordinator stores writes meant for a down node and replays them when it returns.
+2. **Read repair**: when replica responses disagree on a read, the coordinator picks the newest value and writes it back to the stale replicas.
+3. **Anti-entropy repair** (`nodetool repair`): periodic Merkle-tree comparison across replicas that syncs the differences. It must run within `gc_grace_seconds`, or deleted data can come back.
+
+</QA>
+
+<QA q="Why do tombstones cause problems?" level="medium">
+
+Deletes write a marker (a tombstone) instead of removing data, and compaction only purges it after `gc_grace_seconds` (10 days by default). Reads have to skip tombstones, so heavy deletes plus range scans mean scanning thousands of tombstones per query: slow reads and memory pressure. Mitigate with TTL-based expiry, time-bucketed partitions, and TWCS compaction.
+
+</QA>
+
+<QA q="What are the main compaction strategies and when do you use each?" level="medium">
+
+Compaction merges immutable SSTables in the background.
+
+- **STCS** (size-tiered): merges SSTables of similar size. Cheap on write-heavy workloads, but a partition can be spread across many SSTables.
+- **LCS** (leveled): keeps data in levels of non-overlapping SSTables, so reads touch few files. Better for read-heavy or update-heavy tables, at the cost of more compaction I/O.
+- **TWCS** (time-window): groups SSTables by time window. Ideal for time series with TTLs, because whole windows expire together.
+
+</QA>
+
+<QA q="What are lightweight transactions and why should you use them sparingly?" level="hard">
+
+LWTs are conditional writes (`INSERT ... IF NOT EXISTS`, `UPDATE ... IF status = 'OPEN'`) implemented with **Paxos**, which gives compare-and-set semantics within a single partition. Classic Paxos needs about **4 round trips** between the coordinator and replicas (Cassandra 4.1's Paxos v2 trims this), so LWTs are much slower than normal writes. Use them only where you truly need uniqueness or check-then-set. Otherwise prefer idempotent or commutative writes (counters, sets).
+
+</QA>
+
+<QA q="Why did Discord migrate from Cassandra to ScyllaDB?" level="hard">
+
+Cassandra's JVM garbage-collection pauses caused p99 spikes, and Discord's messaging needed predictable latency at huge scale. Scylla's shard-per-core C++ design has no GC. They went from 177 Cassandra nodes to 72 Scylla nodes; p99 historical-read latency dropped from 40–125 ms to ~15 ms, and p99 inserts from 5–70 ms to a steady ~5 ms. CQL compatibility meant minimal application changes.
+
+</QA>
+
+<QA q="Design a Cassandra schema for a chat app with users, channels and messages." level="scenario">
+
 ```cql
 CREATE TABLE messages_by_channel (
   channel_id uuid,
-  bucket_day text,           -- e.g., '2026-05-29' for partition bounding
+  bucket_day text,           -- e.g. '2026-05-29', bounds partition size
   message_id timeuuid,
   user_id uuid,
   body text,
   PRIMARY KEY ((channel_id, bucket_day), message_id)
 ) WITH CLUSTERING ORDER BY (message_id DESC);
 ```
-Bucket by day to bound partition size. Newest-first ordering for fast tail reads. For "all messages by user," create a second denormalized table keyed by `user_id`.
 
-### Q7 — Hard: A Cassandra cluster has one node with 3× the load. Why?
-- **Hot partition**: one celebrity user's data pinned to that node's range. Mitigate with bucketing.
-- **Token ranges uneven**: insufficient vnodes per node, or a node was bootstrapped with wrong tokens.
-- **Hardware variance** (older box, slow disks).
-- **Long compaction backlog** monopolizing CPU/IO. Check `nodetool compactionstats`.
+Bucketing by day bounds partition size. Newest-first clustering makes "last 50 messages" a fast slice. For "all messages by a user", write a second denormalized table keyed by `user_id`. Query-first modeling with no joins.
 
-### Q8 — Hard: Why did Discord migrate to ScyllaDB?
-Cassandra's JVM GC pauses caused p99 spikes; their messaging service needed predictable latency at huge scale. Scylla's shard-per-core C++ design eliminated GC, gave them 5–10× throughput per node, and dropped p99 dramatically. The CQL compatibility meant minimal application changes.
+</QA>
+
+<QA q="One node in a Cassandra cluster has 3x the load of the others. Why?" level="scenario">
+
+- **Hot partition**: one celebrity user's or tenant's partition pinned to that node's token range. Mitigate by bucketing the partition key.
+- **Uneven token ranges**: too few vnodes, or a node bootstrapped with bad tokens.
+- **Hardware variance**: an older box or slower disks.
+- **Compaction backlog** eating CPU and I/O. Check `nodetool compactionstats`.
+
+</QA>
+
+<QA q="Reads for some users have become slow and the GC log on one node shows long pauses. The table is keyed by `user_id` and stores every event a user generates. What's wrong and how do you fix it?" level="scenario">
+
+The partitions are **unbounded**: heavy users accumulate millions of events in a single partition (tens of GB on one replica set), which causes huge reads, GC pressure and slow compaction. Fix by bucketing the partition key, e.g. `((user_id, day), event_time)`, so each partition stays bounded, and query the buckets you need. If old events expire, add a TTL and use TWCS. Migrate by dual-writing to the new table and backfilling.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="With RF=3, which read/write consistency combination guarantees a read sees the latest acknowledged write?" options={["W=ONE, R=ONE", "W=ONE, R=TWO", "W=QUORUM, R=QUORUM", "W=TWO, R=ONE"]} answer={2}>
+
+QUORUM is 2 with RF=3, so 2 + 2 = 4 > 3 guarantees overlap. The other combinations sum to 2 or 3, which is not greater than RF, so a read can miss the replica holding the write.
+
+</MCQ>
+
+<MCQ q="In PRIMARY KEY ((channel_id), message_id), what does message_id determine?" options={["Which node stores the row", "The replication factor", "The compaction strategy", "The sort order of rows within the channel partition"]} answer={3}>
+
+channel_id is the partition key, which the token ring uses for placement. message_id is the clustering key, which orders rows inside the partition. Replication and compaction are table or keyspace settings.
+
+</MCQ>
+
+<MCQ q="A team deletes many rows and then runs range scans over the same partitions. Reads get slower and slower. Why?" options={["Deletes write tombstones that reads must scan until compaction purges them after gc_grace_seconds", "Deletes trigger a full repair on every read", "Bloom filters are disabled after deletes", "Deleted rows are moved to a slower disk tier"]} answer={0}>
+
+Tombstones are markers, not physical removals, and range scans wade through them. Bloom filters and repair aren't what slows these reads down.
+
+</MCQ>
+
+<MCQ q="Why must nodetool repair run more often than gc_grace_seconds?" options={["Otherwise hinted handoff is disabled", "Otherwise a replica that missed a delete can resurrect the data after the tombstone is purged elsewhere", "Otherwise the commit log fills the disk", "Otherwise gossip stops propagating membership"]} answer={1}>
+
+If tombstones are compacted away before every replica learns about the delete, the stale replica's copy looks live and repair spreads it back. That's the reason for the default 10-day grace period.
+
+</MCQ>
+
+<MCQ q="Which compaction strategy fits an IoT time-series table where every row has a 30-day TTL?" options={["Size-tiered (STCS)", "Leveled (LCS)", "No compaction", "Time-window (TWCS)"]} answer={3}>
+
+TWCS groups data by time window, so whole SSTables expire together and are dropped cheaply. STCS and LCS mix old and new data, leaving expired rows scattered across files.
+
+</MCQ>
+
+<MCQ q="You need a unique username constraint in Cassandra. What is the appropriate tool, and its cost?" options={["A lightweight transaction (INSERT IF NOT EXISTS) using Paxos, which costs several extra round trips", "A secondary index, which is free", "Consistency level ALL on a normal insert, which guarantees uniqueness", "ALLOW FILTERING on a read before the insert"]} answer={0}>
+
+Only Paxos-based LWTs give compare-and-set semantics. A read-then-write, even at ALL, can race with a concurrent insert, and ALLOW FILTERING just adds a full scan.
+
+</MCQ>
+
+<MCQ q="A query uses ALLOW FILTERING on a non-key column in a 2-billion-row table. What happens?" options={["The query uses a bloom filter and returns instantly", "Cassandra automatically creates an index", "The query scatters across nodes and scans far more data than it returns", "The query is rejected at parse time"]} answer={2}>
+
+ALLOW FILTERING explicitly permits an inefficient scan, which hurts at scale. Cassandra doesn't auto-index, and the clause is what lets the query run instead of being rejected.
+
+</MCQ>
+
+<MCQ q="What was the main driver of Discord's move from Cassandra to ScyllaDB?" options={["Cassandra lacked CQL support", "Unpredictable tail latency from JVM garbage-collection pauses", "Scylla supports multi-row ACID joins", "Cassandra cannot replicate across datacenters"]} answer={1}>
+
+GC pauses produced p99 spikes, and Scylla's C++ shard-per-core design avoids GC entirely. Both use CQL and support multi-DC replication, and neither offers joins.
+
+</MCQ>
+
+</Quiz>
 
 ## TL;DR cheat sheet
 
@@ -171,7 +290,7 @@ Cassandra's JVM GC pauses caused p99 spikes; their messaging service needed pred
 
 ## Go deeper
 
-- **DataStax Academy**: [datastax.com/learn](https://www.datastax.com/learn) (free Cassandra courses).
+- **Cassandra data modeling guide**: [cassandra.apache.org — Data Modeling](https://cassandra.apache.org/doc/latest/cassandra/developing/data-modeling/index.html).
 - **Scylla University**: [university.scylladb.com](https://university.scylladb.com/) (free, equivalent to DataStax for Scylla).
 - **DDIA Chapters 2 and 5**.
 - **Discord engineering blog**: [How Discord Stores Trillions of Messages](https://discord.com/blog/how-discord-stores-trillions-of-messages) (Cassandra → Scylla).

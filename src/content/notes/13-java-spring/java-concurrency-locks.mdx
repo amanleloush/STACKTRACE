@@ -1,0 +1,583 @@
+---
+title: "Java Concurrency: synchronized, Locks, volatile, ConcurrentHashMap"
+phase: "13-java-spring"
+order: 128
+tags: ["java", "concurrency", "jmm", "locks"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 22
+prerequisites: ["os-concurrency", "java-collections-hashmap"]
+summary: "How Java threads share memory safely: intrinsic locks, ReentrantLock and friends, the Java Memory Model and happens-before, volatile, atomics and CAS, and how ConcurrentHashMap gets thread safety without one big lock."
+---
+
+## Definition (interview-ready)
+
+Java gives you three layers of tools for sharing data between threads:
+
+1. **Locks** give **mutual exclusion** (only one thread in a critical section at a time). The built-in one is `synchronized`, which locks an object's **monitor**. The library ones live in `java.util.concurrent.locks`: `ReentrantLock`, `ReentrantReadWriteLock`, `StampedLock`.
+2. The **Java Memory Model (JMM)**, defined in JLS chapter 17, says when a write made by one thread is guaranteed to be **visible** to another. The key idea is **happens-before**: if action A happens-before action B, then B sees A's effects. Unlocking a lock, writing a `volatile` field, starting a thread and joining a thread all create happens-before edges.
+3. **Lock-free building blocks**: `volatile` fields (visibility and ordering, but no atomic read-modify-write), atomic classes like `AtomicInteger` built on **CAS** (compare-and-swap, a CPU instruction that updates a value only if it still equals what you expect), and concurrent collections like `ConcurrentHashMap`.
+
+How to say it in an interview: "A lock gives me atomicity and visibility. `volatile` gives me visibility and ordering only. Atomics give me atomic single-variable updates without blocking. And `ConcurrentHashMap` uses CAS for empty buckets and a per-bucket lock otherwise, so threads writing different buckets don't block each other."
+
+## Why it matters
+
+Concurrency bugs are the worst kind of bug. They are rare, timing-dependent, and often disappear when you add logging. Interviewers use this topic to check whether you understand *why* code is safe, not just which keyword to type.
+
+Typical bugs this note prevents:
+
+- A counter that loses increments because `count++` isn't atomic, even when `count` is `volatile`.
+- A "stop" flag that a worker thread never sees, so it loops forever.
+- A lazily created singleton that another thread sees half-built.
+- A check-then-act race on a map (`if (!map.containsKey(k)) map.put(k, v)`) that runs twice.
+- Deadlocks from taking two locks in different orders.
+
+It also comes up in system design: caches, rate limiters and connection pools are all shared mutable state inside one JVM.
+
+## Core concepts
+
+### Three things can go wrong: atomicity, visibility, ordering
+
+- **Atomicity**: a compound action (read, modify, write) can be interleaved with another thread's. `count++` is three steps: load, add, store. Two threads can both load 5 and both store 6.
+- **Visibility**: a write sitting in one core's cache or a register may not be seen by another thread for a long time, or ever, unless something forces it.
+- **Ordering**: the compiler, the JIT and the CPU may reorder independent instructions to go faster. Inside one thread you can't tell. Another thread can.
+
+A lock fixes all three. `volatile` fixes visibility and ordering but **not** atomicity. Atomics fix atomicity and visibility for one variable.
+
+### Intrinsic locks (monitors) and `synchronized`
+
+Every Java object has a built-in lock called its **monitor**. `synchronized` acquires it on entry and releases it on exit, even if an exception is thrown.
+
+```java
+class Counter {
+    private int count;
+
+    // Instance method: locks 'this'
+    public synchronized void increment() { count++; }
+
+    // Static method: locks Counter.class
+    public static synchronized void staticWork() { }
+
+    // Block: locks whatever object you name, for only part of the method
+    private final Object lock = new Object();
+    public void add(int n) {
+        // ... work that doesn't need the lock ...
+        synchronized (lock) {
+            count += n;
+        }
+    }
+}
+```
+
+**Methods vs blocks:**
+
+- A `synchronized` method locks `this` (or the `Class` object for static methods) for the whole method.
+- A `synchronized` block lets you pick the lock object and keep the critical section small.
+- A **private final lock object** is safer than `this`, because outside code can also `synchronized (yourObject)` and interfere with your locking.
+
+**Reentrancy**: a thread that already holds a monitor can enter another `synchronized` region on the same monitor without blocking itself. The JVM keeps a hold count. This is why a `synchronized` method can call another `synchronized` method on the same object.
+
+**wait / notify**: a monitor also acts as a simple condition queue.
+
+```java
+synchronized (lock) {
+    while (!ready) {          // always a loop, never 'if'
+        lock.wait();          // releases the lock and sleeps
+    }
+    // ready is true and we hold the lock again
+}
+
+// another thread
+synchronized (lock) {
+    ready = true;
+    lock.notifyAll();
+}
+```
+
+Rules worth knowing:
+
+- You must hold the monitor to call `wait`, `notify` or `notifyAll`, or you get `IllegalMonitorStateException`.
+- `wait()` releases the lock while waiting and re-acquires it before returning.
+- Always wait in a **loop** that re-checks the condition. Threads can wake up without a notify (**spurious wakeups**), and another thread may have changed the state before you got the lock back.
+- Prefer `notifyAll()`. `notify()` wakes one arbitrary waiter, which can be the wrong one when waiters wait for different conditions.
+
+### `ReentrantLock`
+
+`java.util.concurrent.locks.ReentrantLock` does what `synchronized` does, plus more. You lock and unlock explicitly, so **always unlock in `finally`**.
+
+```java
+private final ReentrantLock lock = new ReentrantLock();
+
+void update() {
+    lock.lock();
+    try {
+        // critical section
+    } finally {
+        lock.unlock();
+    }
+}
+```
+
+Extra features:
+
+- **`tryLock()`**: take the lock only if it's free right now, otherwise return `false`. Great for avoiding deadlock: if you can't get the second lock, release the first and retry.
+- **`tryLock(timeout, unit)`**: wait at most this long.
+- **`lockInterruptibly()`**: wait for the lock but give up if the thread is interrupted. A thread blocked entering `synchronized` can't be interrupted.
+- **Fairness**: `new ReentrantLock(true)` hands the lock to the longest-waiting thread. The default (unfair) lets a newly arriving thread "barge" ahead, which gives much higher throughput. Note that the untimed `tryLock()` barges even on a fair lock.
+- **`Condition`s**: `lock.newCondition()` gives you separate wait queues on one lock (for example `notFull` and `notEmpty` in a bounded buffer). `await()` / `signal()` / `signalAll()` replace `wait` / `notify` / `notifyAll`, with the same "wait in a loop" rule.
+- **Introspection**: `isLocked()`, `isHeldByCurrentThread()`, `getQueueLength()` for debugging and monitoring.
+
+```java
+private final ReentrantLock lock = new ReentrantLock();
+private final Condition notEmpty = lock.newCondition();
+private final Deque<Job> queue = new ArrayDeque<>();
+
+Job take() throws InterruptedException {
+    lock.lock();
+    try {
+        while (queue.isEmpty()) notEmpty.await();
+        return queue.poll();
+    } finally {
+        lock.unlock();
+    }
+}
+```
+
+### `synchronized` vs `ReentrantLock`
+
+| | `synchronized` | `ReentrantLock` |
+|---|---|---|
+| Release | Automatic at block exit, even on exception | Manual: you must call `unlock()` in `finally` |
+| Reentrant | Yes | Yes |
+| Try without blocking | No | `tryLock()` |
+| Timeout | No | `tryLock(time, unit)` |
+| Interruptible wait for lock | No | `lockInterruptibly()` |
+| Fairness option | No (unfair) | Yes, `new ReentrantLock(true)` |
+| Condition queues | One per monitor (`wait` / `notify`) | Many (`newCondition()`) |
+| Lock across methods | No, must be block-structured | Yes (lock in one method, unlock in another) |
+| Memory-model effect | Same happens-before guarantees | Same happens-before guarantees |
+| Virtual threads | Pinned the carrier before JDK 24; fixed by JEP 491 in JDK 24 | Never pinned |
+
+Default advice (from *Java Concurrency in Practice* and still valid): use `synchronized` unless you need one of the extra features. It's shorter and you can't forget to unlock.
+
+### `ReadWriteLock` and `StampedLock`
+
+**`ReentrantReadWriteLock`** has two locks: many threads can hold the **read** lock at once, but the **write** lock is exclusive. It helps when reads are frequent, long enough to matter, and writes are rare.
+
+- **Downgrading** is allowed: hold the write lock, take the read lock, release the write lock.
+- **Upgrading** is not: a thread holding the read lock that asks for the write lock waits forever (it's waiting for itself to release the read lock).
+- For short critical sections, the extra bookkeeping can make it slower than a plain lock. Measure.
+
+**`StampedLock`** (Java 8) adds an **optimistic read**: `tryOptimisticRead()` returns a stamp without locking, you read fields into local variables, then `validate(stamp)` tells you whether a writer got in. If it did, retry with a real read lock. Readers never block writers in the optimistic path. Caveats: it is **not reentrant** and has **no `Condition` support**, so it's for small, self-contained classes, not general use.
+
+```java
+long stamp = sl.tryOptimisticRead();
+double cx = x, cy = y;              // copy to locals
+if (!sl.validate(stamp)) {          // a writer interfered
+    stamp = sl.readLock();
+    try { cx = x; cy = y; } finally { sl.unlockRead(stamp); }
+}
+return Math.hypot(cx, cy);
+```
+
+### The Java Memory Model and happens-before
+
+The JMM doesn't promise that threads see writes in real-time order. It promises: **if A happens-before B, then A's effects are visible to B and appear ordered before B.** Without a happens-before chain, a read may see an old value. That's called a **data race**.
+
+The rules you need (JLS 17.4.4 and 17.4.5):
+
+| Rule | Meaning |
+|---|---|
+| Program order | Within one thread, each action happens-before the next one. |
+| Monitor lock | Unlocking a monitor happens-before every later lock of the **same** monitor. (`ReentrantLock` gives the same guarantee.) |
+| `volatile` | A write to a volatile field happens-before every later read of **that** field. |
+| Thread start | `t.start()` happens-before anything the new thread does. |
+| Thread join | Everything a thread does happens-before another thread returns from `join()` on it. |
+| Interrupt | Calling `t.interrupt()` happens-before `t` detects the interrupt. |
+| Transitivity | If A hb B and B hb C, then A hb C. |
+
+Transitivity is what makes "publish via volatile" work: everything you wrote *before* the volatile write becomes visible to a thread that reads that volatile and sees the new value.
+
+`java.util.concurrent` adds its own guarantees on top. For example, putting an object into a `BlockingQueue` or `ConcurrentHashMap` happens-before another thread takes it out, and submitting a task to an executor happens-before the task runs.
+
+Two more JMM facts that come up:
+
+- **`final` fields**: if an object is fully constructed before its reference escapes, every thread sees the correct values of its `final` fields, even without synchronization. This is why immutable objects are thread-safe.
+- **`long` and `double`**: a plain (non-volatile) write of a 64-bit `long` or `double` may be split into two 32-bit writes, so a reader could see half of each. Marking them `volatile` makes reads and writes atomic. Reference writes are always atomic.
+
+### `volatile`: visibility and ordering, not atomicity
+
+Declaring a field `volatile` means:
+
+- Every read sees the most recent write to that field (no stale cached copy).
+- Writes before a volatile write can't be reordered after it, and reads after a volatile read can't be reordered before it.
+
+It does **not** make compound operations atomic.
+
+```java
+class Stats {
+    private volatile int count = 0;
+    void hit() { count++; }   // BROKEN: read, add, write can interleave
+}
+```
+
+Two threads both read 5, both write 6. One increment is lost. Fixes: `synchronized`, `AtomicInteger.incrementAndGet()`, or `LongAdder.increment()`.
+
+Where `volatile` is the right tool:
+
+```java
+class Worker implements Runnable {
+    private volatile boolean running = true;   // without volatile, the loop may never see false
+    public void stop() { running = false; }
+    public void run() {
+        while (running) { doWork(); }
+    }
+}
+```
+
+Rule of thumb: `volatile` is enough when **one thread writes** (or writes don't depend on the current value) and others only read, like status flags or publishing a fully built immutable object.
+
+### Double-checked locking, done right
+
+The goal: create a singleton lazily without paying for a lock on every call.
+
+```java
+class Config {
+    private static volatile Config instance;   // volatile is required
+
+    static Config get() {
+        Config local = instance;               // one volatile read on the fast path
+        if (local == null) {
+            synchronized (Config.class) {
+                local = instance;
+                if (local == null) {
+                    local = new Config();
+                    instance = local;
+                }
+            }
+        }
+        return local;
+    }
+}
+```
+
+Why `volatile` is required: `instance = new Config()` is really "allocate, run the constructor, store the reference". Without `volatile`, the store can become visible to another thread before the constructor's writes do. That thread skips the lock (it sees non-null) and uses a half-built object. The `volatile` write makes everything the constructor did happen-before any read that sees the reference. This works since Java 5, when the memory model was revised (JSR-133).
+
+Simpler and usually better: the **holder class idiom**, which relies on the JVM's thread-safe, lazy class initialization.
+
+```java
+class Config {
+    private Config() {}
+    private static class Holder { static final Config INSTANCE = new Config(); }
+    static Config get() { return Holder.INSTANCE; }   // Holder is initialized on first call
+}
+```
+
+Or a single-element `enum`.
+
+### Atomics and CAS
+
+**CAS (compare-and-swap)**: "set this memory location to `new` only if it still holds `expected`; tell me whether it worked." The CPU does this as one indivisible instruction. If another thread changed the value first, CAS fails and you retry. No thread ever blocks, so this is called **lock-free**.
+
+```java
+AtomicInteger hits = new AtomicInteger();
+hits.incrementAndGet();                     // atomic ++
+hits.updateAndGet(x -> Math.min(x + 1, 100)); // atomic update with a function (retries internally)
+
+// What a CAS loop looks like
+int cur, next;
+do {
+    cur = hits.get();
+    next = cur * 2;
+} while (!hits.compareAndSet(cur, next));
+```
+
+Family: `AtomicInteger`, `AtomicLong`, `AtomicBoolean`, `AtomicReference<V>`, and array versions. Atomic fields have `volatile` read/write semantics.
+
+**Problems with CAS:**
+
+- **Contention**: with many threads hammering one variable, most CAS attempts fail and retry, wasting CPU.
+- **ABA**: a value changes A to B and back to A; CAS thinks nothing changed. Use `AtomicStampedReference` (value plus version number) when this matters, typically in lock-free data structures that reuse nodes.
+- **One variable only**: you can't atomically update two separate atomics. Put both in an immutable object behind one `AtomicReference`, or use a lock.
+
+**`LongAdder`** (Java 8) fixes contention for counters. It keeps a base value plus an array of **cells**. Under contention, different threads add to different cells, so they don't fight over one memory location. `sum()` adds them all up. The trade-off: more memory, and `sum()` is not an atomic snapshot while updates are happening. Use `AtomicLong` when you need exact read-modify-write (like generating IDs); use `LongAdder` for high-traffic counters and metrics.
+
+### `ConcurrentHashMap` (Java 8+ design)
+
+`ConcurrentHashMap` is a thread-safe hash map built for high concurrency. Its Java 8 rewrite has no segment locks. Here is how it works:
+
+```
+table (array of bins, power-of-two size)
+ ┌────┬────┬────┬────┬────┬────┬────┬────┐
+ │null│ N1 │null│ FWD│ TB │null│ N4 │null│
+ └────┴─┬──┴────┴────┴─┬──┴────┴─┬──┴────┘
+        │              │         │
+        N2→N3      TreeBin     N5     ← list or red-black tree per bin
+                (≥ 8 nodes, table ≥ 64)
+ FWD = ForwardingNode during resize: "this bin moved to the new table"
+```
+
+- **Reads (`get`) take no lock.** Node values and next pointers are `volatile`, so a reader sees the latest completed update.
+- **Putting into an empty bin uses CAS.** No lock at all. With a decent hash spread, this is the most common case.
+- **Updating a non-empty bin locks only that bin**, using `synchronized` on the bin's first node. Threads writing to other bins don't wait.
+- **Treeification**: a bin with 8 or more nodes turns into a red-black tree, but only once the table has at least 64 bins (otherwise the map resizes instead). Trees turn back into lists at 6 or fewer during a resize. This limits the damage from many keys colliding.
+- **Resizing is cooperative.** When the table grows, threads claim ranges of bins to move. A moved bin gets a `ForwardingNode` so readers look in the new table. Other writers that run into a resize help with it instead of waiting.
+- **Size is counted with a `LongAdder`-style scheme** (a base count plus `CounterCell`s), so `put` doesn't contend on one counter. `size()` and `mappingCount()` are estimates while writes are happening. Prefer `mappingCount()`, which returns a `long`.
+- **No null keys or values.** `get(k)` returning `null` must mean "absent". If null values were allowed, you couldn't tell "absent" from "mapped to null" without a second call, and between the two calls another thread could change the map.
+- **Atomic compound operations**: `putIfAbsent`, `computeIfAbsent`, `computeIfPresent`, `compute`, `merge`, `replace(k, old, new)`, `remove(k, v)`. Each runs atomically for that key. The function you pass runs while the bin is locked, so keep it **short** and **never modify the same map inside it**. Recursive updates can throw `IllegalStateException` or deadlock.
+- **Iterators are weakly consistent.** They never throw `ConcurrentModificationException`. They reflect the map at some point at or after the iterator was created, and may or may not show later changes.
+- The `concurrencyLevel` constructor argument still exists for compatibility, but in Java 8+ it's only a sizing hint. There's an unused `Segment` class kept only for serialization compatibility with Java 7.
+
+**The check-then-act trap:**
+
+```java
+// BROKEN: two threads can both see 'absent' and both create
+if (!cache.containsKey(key)) {
+    cache.put(key, load(key));
+}
+
+// RIGHT: atomic per key, load() runs at most once per absent key
+cache.computeIfAbsent(key, k -> load(k));
+
+// Counting words safely
+ConcurrentHashMap<String, LongAdder> freq = new ConcurrentHashMap<>();
+freq.computeIfAbsent(word, k -> new LongAdder()).increment();
+// or
+ConcurrentHashMap<String, Integer> counts = new ConcurrentHashMap<>();
+counts.merge(word, 1, Integer::sum);
+```
+
+### `ConcurrentHashMap` vs `Hashtable` vs `Collections.synchronizedMap`
+
+| | `Hashtable` | `Collections.synchronizedMap(m)` | `ConcurrentHashMap` |
+|---|---|---|---|
+| Locking | Every method `synchronized` on the table | Every method `synchronized` on one mutex | CAS for empty bins, per-bin lock otherwise, lock-free reads |
+| Concurrent reads | Serialized | Serialized | Fully parallel |
+| Concurrent writes | Serialized | Serialized | Parallel across bins |
+| Null keys/values | Not allowed | Whatever the wrapped map allows (`HashMap` allows them) | Not allowed |
+| Iteration while others write | Fail-fast, may throw `ConcurrentModificationException` | Must manually `synchronized (map)` around the whole loop | Weakly consistent, never throws |
+| Atomic compound ops | `putIfAbsent`, `compute*`, `merge` are `synchronized` methods, so atomic but fully serialized | Same: they run under the one mutex | Built in, atomic per key, other keys keep going |
+| Status | Legacy (Java 1.0) | Fine for low contention or wrapping a special map type | Default choice for shared maps |
+
+How to say it in an interview: "`Hashtable` and `synchronizedMap` use one lock for everything, so every thread queues up. `ConcurrentHashMap` lets reads run without locks and writes to different bins run in parallel."
+
+## How it works
+
+### What `synchronized` does under the hood
+
+- A `synchronized` block compiles to `monitorenter` and `monitorexit` bytecodes (with an extra `monitorexit` on the exception path). A `synchronized` method is flagged with `ACC_SYNCHRONIZED` and the JVM acquires the monitor on call.
+- HotSpot uses a cheap lightweight lock when there's no contention and **inflates** to a heavyweight monitor (with an OS-level wait queue) when threads actually contend or someone calls `wait()`.
+- The JIT can remove locks that provably can't be shared (**lock elision**, using escape analysis) and merge adjacent locks on the same object (**lock coarsening**).
+
+### How the JMM is enforced
+
+The JVM inserts **memory barriers** (CPU instructions that stop certain reorderings and flush or invalidate store buffers) around volatile accesses and lock operations. On x86 most of these are cheap, apart from the barrier after a volatile write. On ARM more barriers are needed. You never write barriers yourself; you write `volatile`, `synchronized` or `java.util.concurrent` code and the JVM picks the right instructions.
+
+### How `ReentrantLock` works
+
+`ReentrantLock` is built on `AbstractQueuedSynchronizer` (AQS): an `int` state (0 = free, n = held n times by the owner) changed with CAS, plus a FIFO queue of waiting threads that are parked with `LockSupport.park()`. `Semaphore`, `CountDownLatch` and `ReentrantReadWriteLock` are built on the same framework.
+
+## Real-world examples
+
+- **Caches and memoization**: `ConcurrentHashMap.computeIfAbsent` is the standard way to build an in-process "load once per key" cache. Caffeine and Guava caches build on similar per-key atomicity.
+- **Metrics libraries**: Micrometer's `CumulativeCounter` is backed by a `DoubleAdder` (the `double` sibling of `LongAdder`), so request threads don't contend on one hot counter.
+- **`java.util.concurrent` itself**: `ArrayBlockingQueue` uses one `ReentrantLock` with two `Condition`s (`notEmpty`, `notFull`), the textbook producer-consumer setup.
+- **Graceful shutdown flags**: most worker loops (Kafka consumer loops, schedulers) use a `volatile boolean` or `AtomicBoolean` as a stop flag set from a shutdown hook.
+
+## Common pitfalls
+
+- **`volatile` counters**: `volatile int x; x++` loses updates. Use `AtomicInteger` or `LongAdder`.
+- **Locking on the wrong object**: two methods guarding the same data with different locks protect nothing. Also don't lock on a `String` literal, a boxed `Integer`, or anything that can be shared or re-assigned. Lock on a `private final` object.
+- **Forgetting `unlock()` in `finally`** with `ReentrantLock`. One exception and the lock is held forever.
+- **`if` instead of `while` around `wait()` / `await()`**: spurious wakeups and stolen signals break the logic.
+- **Lock ordering deadlocks**: thread 1 takes A then B, thread 2 takes B then A. Always acquire multiple locks in one global order (for example by account ID), or use `tryLock` with a timeout and back off.
+- **Check-then-act on concurrent collections**: each call is atomic, the combination is not. Use `putIfAbsent`, `computeIfAbsent` or `merge`.
+- **Slow or recursive work inside `compute*`**: it holds the bin lock, blocking other writers to that bin, and updating the same map inside can throw or deadlock.
+- **Unsafe publication**: assigning a new object to a plain field that another thread reads. Use `volatile`, a `final` field, a concurrent collection, or a lock.
+- **Calling unknown code while holding a lock** (listeners, callbacks): it may block or take other locks, leading to deadlock. Copy what you need, release, then call out.
+- **Over-locking**: holding a lock during I/O or a remote call serializes your service. Keep critical sections tiny.
+- **Read-to-write upgrade** with `ReentrantReadWriteLock`: deadlocks the thread against itself.
+
+## Practice questions
+
+<Practice>
+
+<QA q="What is the difference between a `synchronized` method and a `synchronized` block?" level="easy">
+
+A `synchronized` instance method locks `this` for the whole method; a static one locks the `Class` object. A block locks an object you choose, for only the lines inside it. Blocks are preferred because they keep the critical section small and let you use a `private final` lock object that outside code can't also lock on. Both give the same atomicity and visibility guarantees.
+
+</QA>
+
+<QA q="What does reentrancy mean for a lock, and why does it matter?" level="easy">
+
+A reentrant lock can be re-acquired by the thread that already holds it. The lock keeps an owner and a hold count, and it's only released when the count returns to zero. Without reentrancy, a `synchronized` method calling another `synchronized` method on the same object, or a subclass method calling `super.method()`, would deadlock on itself. Both `synchronized` and `ReentrantLock` are reentrant; `StampedLock` is not.
+
+</QA>
+
+<QA q="Is `volatile int count; count++;` thread-safe? Why or why not?" level="easy">
+
+No. `volatile` guarantees each read sees the latest write and prevents reordering, but `count++` is three steps: read, add, write. Two threads can read the same value and both write value + 1, losing an update. Fix it with `AtomicInteger.incrementAndGet()`, `LongAdder` for heavily contended counters, or a lock.
+
+</QA>
+
+<QA q="Why must `wait()` be called inside a `while` loop?" level="easy">
+
+Three reasons: spurious wakeups (a thread can wake without any notify), another thread can grab the lock and change the state between the notify and your re-acquiring the lock, and `notifyAll` wakes threads waiting for different conditions. The loop re-checks the condition after every wakeup. Also, `wait` must be called while holding the object's monitor, otherwise you get `IllegalMonitorStateException`.
+
+</QA>
+
+<QA q="What is happens-before? Name the rules you use most." level="medium">
+
+Happens-before is the JMM's ordering guarantee: if A happens-before B, then B sees A's writes and they appear in order. Without it, a read can see a stale value. Main rules: program order within a thread; unlock of a monitor before the next lock of the same monitor; a volatile write before every later read of that variable; `Thread.start()` before the started thread's actions; a thread's actions before another thread's `join()` returns; and transitivity. `java.util.concurrent` adds more, for example putting into a concurrent queue happens-before taking that element out.
+
+</QA>
+
+<QA q="When would you pick `ReentrantLock` over `synchronized`?" level="medium">
+
+When you need something `synchronized` can't do: `tryLock()` to avoid deadlock or fail fast, a timed `tryLock`, `lockInterruptibly()` so waiting threads can be cancelled, a fair lock, multiple `Condition` queues on one lock, or lock and unlock in different methods. Before JDK 24 another reason was virtual threads, because blocking inside `synchronized` pinned the carrier thread; JEP 491 fixed that in JDK 24. Otherwise prefer `synchronized`: it's simpler and releases automatically.
+
+</QA>
+
+<QA q="Explain double-checked locking. Why was it broken and how do you fix it?" level="medium">
+
+It checks the singleton field without a lock, and only locks (and checks again) if it was null, so the common path doesn't lock. Without `volatile`, the write of the reference can become visible before the constructor's writes, so another thread can see a non-null but half-initialized object. Fix: make the field `volatile` (works since Java 5's memory model, JSR-133), which makes the constructor's writes happen-before any read that sees the reference. Better still, use the holder class idiom or an enum, which rely on the JVM's thread-safe lazy class initialization.
+
+</QA>
+
+<QA q="How does CAS work and what are its drawbacks?" level="medium">
+
+CAS atomically sets a variable to a new value only if it still holds the expected value, and reports success. Atomic classes loop: read, compute, CAS, retry on failure. No thread blocks. Drawbacks: under heavy contention many attempts fail and burn CPU (use `LongAdder` for counters); the ABA problem, where a value changes and changes back so CAS can't tell (`AtomicStampedReference` adds a version); and it only covers one variable, so multi-field invariants need an `AtomicReference` to an immutable holder or a lock.
+
+</QA>
+
+<QA q="`AtomicLong` vs `LongAdder` — when do you use each?" level="medium">
+
+`AtomicLong` is one value updated with CAS. It gives exact, atomic read-modify-write operations like `incrementAndGet` or `compareAndSet`, so it's right for sequence numbers or anything where the returned value matters. `LongAdder` spreads updates across a base and multiple cells, so contended increments rarely collide; `sum()` adds them up but isn't an atomic snapshot during updates. Use it for high-write, rarely-read counters like request metrics.
+
+</QA>
+
+<QA q="How does `ConcurrentHashMap` achieve thread safety in Java 8+?" level="medium">
+
+Reads take no lock; fields are volatile so `get` sees completed updates. Inserting into an empty bin uses CAS. Updating a non-empty bin uses `synchronized` on that bin's first node, so only writers to the same bin contend. Long bins (8 or more, table of 64 or more) become red-black trees. Resizing is shared: threads move ranges of bins and leave `ForwardingNode`s behind. The size is tracked with a `LongAdder`-like counter. Java 7's segment locks are gone; `concurrencyLevel` is now just a sizing hint.
+
+</QA>
+
+<QA q="Why doesn't `ConcurrentHashMap` allow null keys or values?" level="medium">
+
+Because `get(key)` returning `null` must unambiguously mean 'not present'. In a single-threaded `HashMap` you can call `containsKey` to disambiguate, but in a concurrent map another thread can change the map between the two calls, so the answer would be meaningless. Banning null keeps `get`, `putIfAbsent` and the `compute` methods unambiguous. `Hashtable` also bans nulls.
+
+</QA>
+
+<QA q="Compare `Hashtable`, `Collections.synchronizedMap` and `ConcurrentHashMap`." level="hard">
+
+`Hashtable` and `synchronizedMap` both put one lock around every method, so reads and writes are fully serialized. Their iterators are fail-fast, and with `synchronizedMap` you must hold the map's lock for the whole iteration. `ConcurrentHashMap` has lock-free reads, per-bin locking for writes, atomic per-key compound methods, and weakly consistent iterators that never throw `ConcurrentModificationException`. `synchronizedMap` allows nulls if the wrapped map does; the other two don't. Use `ConcurrentHashMap` by default; `synchronizedMap` is fine for low contention or when you need to wrap a special map such as a `TreeMap` (though `ConcurrentSkipListMap` is the concurrent sorted option).
+
+</QA>
+
+<QA q="What can go wrong inside the function passed to `computeIfAbsent`?" level="hard">
+
+The function runs while the bin is locked. If it's slow (say it does a network call), other writers that hash to that bin wait, and the docs warn some updates by other threads may be blocked. If it modifies the same map, for example a recursive memoized Fibonacci that calls `computeIfAbsent` again, it can throw `IllegalStateException` ('Recursive update') or deadlock. Keep the function short, do slow loading outside or use a cache library built for async loading, and never touch the same map inside.
+
+</QA>
+
+<QA q="How do `ReadWriteLock` and `StampedLock` differ, and when would you use them?" level="hard">
+
+`ReentrantReadWriteLock` allows many concurrent readers or one writer. It's reentrant, supports conditions on the write lock, allows write-to-read downgrading but not upgrading. It pays off when reads are long and frequent and writes rare. `StampedLock` adds optimistic reads: take a stamp, read fields into locals, then `validate`; on failure retry with a real read lock. It's faster for tiny read-mostly sections but isn't reentrant and has no conditions, so it's easy to misuse. For short critical sections a plain lock often wins; benchmark before choosing.
+
+</QA>
+
+<QA q="A service's in-memory request counter, implemented as `volatile long total` with `total++`, under-reports at high load. Diagnose and fix." level="scenario">
+
+`total++` on a volatile is a non-atomic read-modify-write, so concurrent increments overwrite each other, and the loss grows with contention. Switching to `AtomicLong.incrementAndGet()` makes it correct, but at very high request rates every core fights over one cache line. Since the counter is written constantly and read rarely (by a metrics scrape), `LongAdder.increment()` with `sum()` on read is the best fit. Add a concurrency test that hammers it from many threads and checks the total.
+
+</QA>
+
+<QA q="Two threads transfer money between accounts by locking the source then the destination. The service hangs under load. What happened and how do you fix it?" level="scenario">
+
+Classic lock-ordering deadlock: thread 1 transfers A to B and holds A's lock waiting for B; thread 2 transfers B to A and holds B's lock waiting for A. A thread dump shows both 'BLOCKED' with a 'Found one Java-level deadlock' section. Fixes: always lock accounts in a global order (for example lower ID first) regardless of transfer direction; or use `ReentrantLock.tryLock(timeout)` on both, and on failure release everything, back off with jitter, and retry. Keep the critical section to the balance updates only, with no I/O inside.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="What does declaring a field volatile guarantee?" options={["Atomic read-modify-write operations such as ++", "Visibility of the latest write and ordering with respect to surrounding reads and writes", "Mutual exclusion for any code that touches the field", "That the field is stored in main memory and never cached"]} answer={1}>
+
+volatile gives visibility and ordering (a volatile write happens-before later reads of it). It does not make ++ atomic or provide mutual exclusion. The 'never cached' story is a simplification; the real guarantee is defined by happens-before, not by hardware caches.
+
+</MCQ>
+
+<MCQ q="Which statement about ConcurrentHashMap in Java 8+ is correct?" options={["It splits the map into 16 segments, each with a ReentrantLock", "Every get acquires a read lock on its bin", "Inserting into an empty bin uses CAS, and updating a non-empty bin locks that bin's first node", "It allows one null key like HashMap"]} answer={2}>
+
+Java 8 removed segment locking; concurrencyLevel is only a sizing hint. Reads are lock-free. Empty bins are filled with CAS and other updates synchronize on the bin head. Null keys and values are not allowed.
+
+</MCQ>
+
+<MCQ q="Why does double-checked locking need the instance field to be volatile?" options={["So that only one thread can enter the synchronized block", "Because without it another thread may see a non-null reference to an object whose constructor writes are not yet visible", "Because static fields cannot be read without volatile", "To make the constructor run atomically"]} answer={1}>
+
+Without volatile, the reference store can become visible before the constructor's writes, so the unsynchronized first check can return a half-built object. The synchronized block already provides mutual exclusion, and volatile doesn't make a constructor atomic.
+
+</MCQ>
+
+<MCQ q="Which of these is NOT a happens-before edge in the Java Memory Model?" options={["Thread.start() and the first action of the started thread", "Unlock of monitor M and a later lock of monitor M", "A write to volatile field v and a later read of a different volatile field w", "All actions of thread T and another thread returning from T.join()"]} answer={2}>
+
+The volatile rule applies to the same variable: a write to v happens-before later reads of v. Reading a different volatile field doesn't create an edge with the write to v by itself. The other three are standard JLS rules.
+
+</MCQ>
+
+<MCQ q="You need to give up if a lock isn't free within 200 ms. What do you use?" options={["synchronized with Thread.sleep(200)", "lock.tryLock(200, TimeUnit.MILLISECONDS) on a ReentrantLock", "A volatile boolean flag", "Object.wait(200) without holding the monitor"]} answer={1}>
+
+Only Lock.tryLock with a timeout gives a timed lock acquisition. synchronized cannot time out, a volatile flag gives no mutual exclusion, and wait requires holding the monitor and is for conditions, not lock acquisition.
+
+</MCQ>
+
+<MCQ q="A metrics counter is incremented by hundreds of threads per millisecond and read once every 15 seconds. Best choice?" options={["AtomicLong", "volatile long", "LongAdder", "synchronized method on a long field"]} answer={2}>
+
+LongAdder spreads contended updates across cells, so threads rarely collide, and the occasional sum() is cheap enough. AtomicLong is correct but contends on one variable, volatile long loses updates, and a synchronized method serializes every increment.
+
+</MCQ>
+
+<MCQ q="A thread holding the read lock of a ReentrantReadWriteLock calls writeLock().lock(). What happens?" options={["The lock is upgraded atomically", "It throws IllegalMonitorStateException", "It blocks forever, because the write lock waits for all read locks including its own", "The read lock is released automatically first"]} answer={2}>
+
+Upgrading read to write is not supported, so the thread waits for readers to finish, including itself. Downgrading (write then read then release write) is the supported direction.
+
+</MCQ>
+
+<MCQ q="What does iterating over a ConcurrentHashMap while other threads modify it do?" options={["Throws ConcurrentModificationException", "Blocks writers until iteration ends", "Returns a weakly consistent view that never throws and may or may not reflect concurrent changes", "Returns an exact snapshot taken at iterator creation"]} answer={2}>
+
+CHM iterators are weakly consistent: they reflect the state at some point at or after creation and never throw ConcurrentModificationException. They don't block writers and they are not snapshots.
+
+</MCQ>
+
+<MCQ q="Which call makes 'insert the value only if the key is absent, loading it at most once' atomic on a ConcurrentHashMap?" options={["if (!map.containsKey(k)) map.put(k, load(k))", "map.computeIfAbsent(k, key -> load(key))", "map.get(k) == null ? map.put(k, load(k)) : null", "synchronized (k) { map.put(k, load(k)); }"]} answer={1}>
+
+computeIfAbsent runs the whole check-and-insert atomically for that key and calls the function at most once when absent. The two check-then-act versions race, and locking on the key object doesn't coordinate with other code paths or guarantee load runs once.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **Three hazards**: atomicity, visibility, ordering. Locks fix all three; `volatile` fixes visibility and ordering; atomics fix all three for one variable.
+- **`synchronized`**: locks a monitor, reentrant, auto-release, `wait` / `notifyAll` in a `while` loop. Prefer a `private final` lock object.
+- **`ReentrantLock`**: `tryLock`, timeout, `lockInterruptibly`, fairness, many `Condition`s. Unlock in `finally`.
+- **`ReentrantReadWriteLock`**: many readers or one writer; downgrade yes, upgrade no. **`StampedLock`**: optimistic reads, not reentrant, no conditions.
+- **Happens-before**: program order, unlock then lock (same lock), volatile write then read (same field), `start`, `join`, interrupt, transitivity.
+- **`volatile`**: right for flags and safe publication; wrong for `count++`.
+- **DCL**: field must be `volatile`; holder class idiom is simpler.
+- **CAS**: lock-free retry loop; watch contention and ABA. **`LongAdder`** for hot counters, **`AtomicLong`** for exact sequences.
+- **`ConcurrentHashMap`**: lock-free `get`, CAS on empty bin, `synchronized` on bin head, trees at 8 (table at least 64), cooperative resize, `LongAdder`-style size, no nulls, atomic `compute*` / `merge`, weakly consistent iterators.
+- **Never** check-then-act on a concurrent map; never lock in different orders; never do I/O inside a lock or a `compute` function.
+
+## Go deeper
+
+- **JLS chapter 17**: [Threads and Locks (Java SE 21)](https://docs.oracle.com/javase/specs/jls/se21/html/jls-17.html), the formal memory model.
+- **Javadoc**: [java.util.concurrent package summary](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html), including "Memory Consistency Properties".
+- **Javadoc**: [ConcurrentHashMap](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ConcurrentHashMap.html) and [StampedLock](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/locks/StampedLock.html).
+- **JSR-133 FAQ**: [Java Memory Model FAQ](https://www.cs.umd.edu/~pugh/java/memoryModel/jsr-133-faq.html) by Jeremy Manson and Brian Goetz.
+- **Doug Lea**: [Using JDK 9 Memory Order Modes](https://gee.cs.oswego.edu/dl/html/j9mm.html) for VarHandle access modes beyond volatile.
+- **Book**: *Java Concurrency in Practice* (Goetz et al.), chapters 2, 3, 13, 15 and 16.

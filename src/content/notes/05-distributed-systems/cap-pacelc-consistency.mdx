@@ -1,7 +1,7 @@
 ---
 title: "CAP + PACELC + Consistency Models"
 phase: "05-distributed-systems"
-order: 22
+order: 44
 tags: ["distsys"]
 premium: false
 previewParagraphs: 4
@@ -42,7 +42,7 @@ CAP only addresses partitions, which are rare. PACELC says:
 Every system always trades L vs C even when healthy. Examples:
 - **PC/EC** (Spanner): strong consistency always, at the cost of latency.
 - **PA/EL** (Cassandra default): availability and low latency, eventual consistency.
-- **PC/EL** (DynamoDB with eventually consistent reads): refuse on partition but fast reads otherwise.
+- **PC/EL** (Yahoo PNUTS, per Abadi): gives up availability on partition but favors latency otherwise.
 
 ### Consistency hierarchy
 
@@ -50,12 +50,12 @@ From strongest (most expensive) to weakest:
 
 ```
 Strict serializability  ⊃ Linearizability  ⊃ Sequential  ⊃ Causal  ⊃ Eventual
-       (rare)               (Spanner)         (txn order)    (Pulsar)   (Cassandra default)
+       (Spanner)            (etcd)            (txn order)    (COPS)     (Cassandra default)
 ```
 
 #### Linearizability
 
-There exists a single global order of operations consistent with real-time order. If op A finishes before op B starts (wall-clock), B sees A's effect. **Strong reads** in Postgres, **Spanner reads**, etcd, Zookeeper.
+There exists a single global order of operations consistent with real-time order. If op A finishes before op B starts (wall-clock), B sees A's effect. **Strong reads** in Postgres, **Spanner reads**, etcd. (ZooKeeper writes are linearizable, but its reads are not unless preceded by `sync`.)
 
 #### Sequential consistency
 
@@ -123,8 +123,7 @@ AP system:
 - **Cassandra**: AP by default; tunable to CP via QUORUM.
 - **MongoDB**: write concern majority + read concern majority → strong consistency.
 - **DNS**: classic AP. Eventually consistent. Stale records can persist for TTL.
-- **S3**: was eventually consistent for years (could read your own write after a delay); became strongly consistent in 2020 — major engineering effort.
-- **Discord**: causal consistency model for message ordering in channels.
+- **S3**: was eventually consistent for years (overwrites, deletes and LISTs could return stale results); became strongly read-after-write consistent in December 2020 — major engineering effort.
 
 ## Common pitfalls
 
@@ -135,35 +134,164 @@ AP system:
 - **CRDT lazy-merging surprises**: counters and sets behave well; ordering-dependent operations don't merge cleanly.
 - **Believing CAP is one-time choice**: it's per-operation (Cassandra: read at ONE = AP, read at ALL = CP).
 
-## Interview questions
+## Practice questions
 
-### Q1 — Easy: State the CAP theorem.
-In a distributed system, when a network partition occurs, you can guarantee at most two of Consistency, Availability, and Partition tolerance. Since partitions happen in real networks, you must choose between C and A during partitions.
+<Practice>
 
-### Q2 — Easy: Give an example of an AP database and a CP database.
-AP: Cassandra (default), DynamoDB (eventually consistent reads), Riak. CP: Spanner, etcd, Zookeeper, Postgres (majority), MongoDB (write concern majority).
+<QA q="State the CAP theorem." level="easy">
 
-### Q3 — Medium: What does PACELC add to CAP?
-PACELC accounts for the everyday tradeoff between latency and consistency *even without partitions*. CAP only addresses partition-time behavior; PACELC also describes "else" (no partition) — latency vs consistency. Useful because partitions are rare; the everyday choice is the bigger deal.
+In a distributed system, when a network partition occurs, you can guarantee at most two of Consistency, Availability, and Partition tolerance. Since partitions happen in real networks, you must choose between **C and A during a partition**.
 
-### Q4 — Medium: Explain causal consistency and where it helps.
-Causally related operations are seen in causal order by all observers. Independent operations can be seen in any order. Useful for social apps: reply must follow original message, comment must follow post. Cheaper than linearizable, more useful than eventual.
+</QA>
 
-### Q5 — Medium: Difference between linearizable and serializable.
-Linearizable = per-object real-time order. Serializable = transactions appear to run in some serial order, but no real-time guarantee. **Strict serializable** = serializable + real-time. Spanner provides strict serializability.
+<QA q="Why do people say P is not optional in CAP?" level="easy">
 
-### Q6 — Hard: How does Google Spanner provide global strong consistency despite WAN delays?
-Spanner uses **TrueTime**, an API that returns time as an interval `[earliest, latest]` bounded by GPS + atomic clock uncertainty (~7ms typically). Commits wait out the uncertainty interval before returning success → guarantees that any future transaction sees a strictly later timestamp. Combined with Paxos for replication, this yields external (strict serializable) consistency.
+Any system spread over a network will eventually see dropped or delayed messages — you can't opt out of partitions. So a 'CA' distributed system isn't a real option; the actual decision is what to do **when** a partition happens: refuse some requests (CP) or answer with possibly-stale data (AP).
 
-### Q7 — Hard: A team claims "we use Cassandra with QUORUM, so we're consistent." Critique.
-QUORUM with `R+W>RF` gives you **strong consistency for single-key, single-DC reads**. It does **not** give you:
-- Cross-row atomicity (different keys may be inconsistent).
-- Read-your-writes across DCs (LOCAL_QUORUM doesn't traverse DCs).
-- Linearizability under all conditions — Cassandra's LWT (Paxos) is needed for that.
-- Protection from clock skew issues (last-write-wins).
+</QA>
 
-### Q8 — Hard: Design a feed system that needs read-your-writes guarantee with a multi-replica DB.
-Options: (a) After write, route the user's subsequent reads to the primary for a TTL. (b) Track a "user version" — client carries it; reads compare and wait or retry. (c) Sticky sessions to one replica that contains the write (after enough lag time). (d) Use a primary-only path for user-personalized data; eventually-consistent for non-personalized. Real systems combine: primary write, then write-through cache, then user-affinitized reads.
+<QA q="Give an example of an AP database and a CP database." level="easy">
+
+**AP**: Cassandra (default), DynamoDB (eventually consistent reads), Riak. **CP**: Spanner, etcd, ZooKeeper, Postgres with synchronous replication, MongoDB with majority write concern.
+
+</QA>
+
+<QA q="What does PACELC add to CAP?" level="medium">
+
+PACELC adds the everyday tradeoff between **latency and consistency even without partitions**. CAP only covers partition-time behavior; PACELC also describes the 'else' case. Partitions are rare, so the everyday L vs C choice matters more. Example: Spanner is PC/EC; Cassandra by default is PA/EL.
+
+</QA>
+
+<QA q="Explain causal consistency and where it helps." level="medium">
+
+Causally related operations (B read a value A wrote, so A precedes B) are seen in causal order by all observers; concurrent, unrelated operations can be seen in any order. Useful for social apps: a reply must appear after the original message, a comment after its post. Cheaper than linearizable, more useful than eventual. Implemented with vector clocks or hybrid logical clocks.
+
+</QA>
+
+<QA q="How does sequential consistency differ from linearizability?" level="medium">
+
+Both require one order of operations that every node agrees on, with each node's operations in its own program order. **Linearizability** additionally requires that order to respect **real time**: if A finishes before B starts, B sees A. Sequential consistency allows a globally agreed order that lags real time. It's common in shared-memory multiprocessors, rarely in databases.
+
+</QA>
+
+<QA q="What are session guarantees, and how are they usually implemented?" level="medium">
+
+Per-client guarantees weaker than causal consistency but practical:
+- **Read-your-writes**: your reads see at least your own writes.
+- **Monotonic reads**: you never see an older version after a newer one.
+- **Monotonic writes**: your writes apply in the order you sent them.
+- **Writes-follow-reads**: a write made after reading v is ordered after v.
+
+Usually implemented with sticky sessions or by tracking the user's latest version and reading from a replica that has it.
+
+</QA>
+
+<QA q="Difference between linearizable and serializable." level="medium">
+
+**Linearizable** = real-time order for **single-object** operations. **Serializable** = transactions appear to run in some serial order, with no real-time guarantee — a serializable read can return a snapshot from the past. **Strict serializable** = serializable plus real-time order; Spanner provides it.
+
+</QA>
+
+<QA q="Is the CAP choice made once per database? Explain with Cassandra." level="hard">
+
+No — it's often **per operation**. Cassandra's consistency level is set per request: reads and writes at `ONE` favor availability and latency (AP, PA/EL), while `QUORUM` with `R + W` greater than RF gives strong single-key reads at the cost of availability when too many replicas are unreachable. DynamoDB likewise offers eventual or strongly consistent reads per request.
+
+</QA>
+
+<QA q="How does Google Spanner provide global strong consistency despite WAN delays?" level="hard">
+
+Spanner uses **TrueTime**, an API that returns time as an interval `[earliest, latest]` bounded by GPS and atomic-clock uncertainty (ε typically 1–7 ms, about 4 ms average per the 2012 paper). Commits **wait out** the uncertainty interval before returning, guaranteeing any later transaction gets a strictly greater timestamp. Combined with Paxos replication, this yields external consistency (strict serializability).
+
+</QA>
+
+<QA q="A team claims 'we use Cassandra with QUORUM, so we're consistent.' Critique." level="scenario">
+
+QUORUM with `R + W` greater than RF gives **strong consistency for single-key reads** (within the scope of the quorum). It does **not** give:
+- Cross-row atomicity (different keys can be inconsistent).
+- Read-your-writes across DCs (`LOCAL_QUORUM` doesn't cross DCs).
+- Linearizability under all conditions — that needs Cassandra's LWT (Paxos).
+- Protection from clock-skew issues in last-write-wins.
+
+</QA>
+
+<QA q="Design a feed system that needs read-your-writes with a multi-replica DB." level="scenario">
+
+- After a write, route that user's reads to the **primary** for a short window.
+- Track a **user version**: the client carries it, and reads wait or retry until the replica has caught up to it.
+- **Sticky sessions** to a replica that already has the write.
+- A primary-only path for the user's own data; eventually consistent replicas for everything else.
+
+Real systems combine these: write to the primary, write-through cache, then user-affinitized reads.
+
+</QA>
+
+<QA q="During a partition, a 3-node cluster splits into A and B, C. A client on A's side reads key x. How do CP and AP systems respond?" level="scenario">
+
+**CP**: A can't reach a majority, so it returns an error or blocks rather than risk a stale value; writes go through on the B, C majority side. **AP**: A answers with its local, possibly stale value and may accept writes; after the partition heals, replicas converge via repair/anti-entropy, resolving conflicts (e.g., last-write-wins).
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="According to CAP, what must a distributed system choose between during a network partition?" options={["Latency and throughput", "Consistency and availability", "Durability and consistency", "Partition tolerance and availability"]} answer={1}>
+
+Partitions can't be avoided in real networks, so P is a given and the choice is C or A while partitioned. Latency only enters with PACELC.
+
+</MCQ>
+
+<MCQ q="What does the EL in a PA/EL system describe?" options={["With no partition, it favors low latency over consistency", "During a partition it favors latency", "It is always linearizable", "It elects a leader on every partition"]} answer={0}>
+
+The E (else) branch describes normal operation: L means it chooses latency over consistency. Cassandra at default settings is the classic PA/EL system.
+
+</MCQ>
+
+<MCQ q="Which system is PC/EC in PACELC terms?" options={["Cassandra at consistency level ONE", "DynamoDB eventually consistent reads", "DNS", "Google Spanner"]} answer={3}>
+
+Spanner keeps strong consistency both during partitions and in normal operation, paying latency for it. The others favor availability and latency.
+
+</MCQ>
+
+<MCQ q="Op A completes before op B starts. Which model guarantees that B observes A's effect?" options={["Eventual consistency", "Causal consistency", "Linearizability", "Sequential consistency"]} answer={2}>
+
+Only linearizability requires the order to respect real time. Sequential consistency needs one agreed order but not a real-time one; causal only orders causally related ops.
+
+</MCQ>
+
+<MCQ q="Why can a serializable database return a result that looks stale to a client?" options={["Serializable allows dirty reads", "Serializable guarantees a serial order but not one that matches real time", "Serializable only applies to writes", "Serializable disables MVCC"]} answer={1}>
+
+Serializable only requires that transactions appear in some serial order, which may place a read before a write that finished earlier in wall-clock time. Strict serializability adds the real-time requirement.
+
+</MCQ>
+
+<MCQ q="A user reads a newer version from one replica, then an older version from another. Which guarantee is violated?" options={["Monotonic writes", "Writes-follow-reads", "Strict serializability only", "Monotonic reads"]} answer={3}>
+
+Monotonic reads promises you never see an older version after a newer one. Sticky sessions to one replica fix this.
+
+</MCQ>
+
+<MCQ q="How does Spanner use TrueTime to guarantee external consistency?" options={["Commits wait out the clock-uncertainty interval before returning", "It synchronizes all clocks to exactly zero skew", "It uses vector clocks instead of physical time", "It routes all writes through one global leader"]} answer={0}>
+
+TrueTime returns a bounded interval; commit-wait ensures the commit timestamp is in the past everywhere before acknowledging. Clocks still have skew, which is why it waits.
+
+</MCQ>
+
+<MCQ q="Cassandra with QUORUM reads and writes and R + W greater than RF guarantees what?" options={["Atomic multi-row transactions", "Read-your-writes across data centers with LOCAL_QUORUM", "Strong consistency for single-key reads", "Immunity from last-write-wins clock skew"]} answer={2}>
+
+Overlapping quorums mean a read sees the latest acked write for that key. Cross-row atomicity, cross-DC guarantees with LOCAL_QUORUM, and clock-skew safety are not provided.
+
+</MCQ>
+
+<MCQ q="Which consistency model best fits ensuring replies always appear after the message they reply to, at low cost?" options={["Strict serializability", "Causal consistency", "Eventual consistency", "Linearizability"]} answer={1}>
+
+Causal consistency orders causally related events (message then reply) without the cost of global real-time ordering. Eventual gives no ordering; the stronger models work but cost more.
+
+</MCQ>
+
+</Quiz>
 
 ## TL;DR cheat sheet
 

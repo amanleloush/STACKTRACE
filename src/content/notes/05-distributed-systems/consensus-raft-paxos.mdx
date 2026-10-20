@@ -1,7 +1,7 @@
 ---
 title: "Consensus: Raft (Deep), Paxos (Overview)"
 phase: "05-distributed-systems"
-order: 23
+order: 45
 tags: ["distsys", "consensus"]
 premium: false
 previewParagraphs: 4
@@ -11,7 +11,7 @@ prerequisites: []
 
 ## Definition (interview-ready)
 
-**Consensus** is the problem of getting multiple distributed processes to agree on a single value (or sequence of values) despite failures and network partitions. **Paxos** (Lamport, 1989) is the original algorithm — correct but notoriously hard to understand. **Raft** (Ongaro & Ousterhout, 2014) is a more understandable redesign with the same safety guarantees, used by etcd, Consul, CockroachDB, TiDB, MongoDB replica sets, Redis Cluster (variant), and Kafka KRaft.
+**Consensus** is the problem of getting multiple distributed processes to agree on a single value (or sequence of values) despite failures and network partitions. **Paxos** (Lamport; written 1989, published 1998) is the original algorithm — correct but notoriously hard to understand. **Raft** (Ongaro & Ousterhout, 2014) is a more understandable redesign with the same safety guarantees, used by etcd, Consul, CockroachDB, TiDB, and Kafka KRaft (a pull-based Raft variant); MongoDB replica sets use a Raft-inspired protocol.
 
 ## Why it matters
 
@@ -77,7 +77,7 @@ Each node is one of: **Follower**, **Candidate**, **Leader**.
 - Leader appends client commands to its log.
 - Sends `AppendEntries` to followers.
 - Followers append and acknowledge.
-- Once a majority has acknowledged, the entry is **committed** and applied to the state machine.
+- Once a majority has acknowledged, the entry is **committed** and applied to the state machine. (A leader only counts replicas this way for entries from its *current* term; older entries commit indirectly.)
 - Leader sends commit index in next AppendEntries.
 
 #### Safety invariants
@@ -92,7 +92,7 @@ Logs grow unboundedly. Periodically take a snapshot of state and discard log ent
 
 #### Cluster membership changes
 
-Done in two steps via **joint consensus** to avoid two majority cliques: old config + new config briefly both active until the transition commits.
+The Raft paper does this in two steps via **joint consensus** to avoid two majority cliques: old config + new config briefly both active until the transition commits. Ongaro's dissertation adds a simpler **single-server change** (add/remove one node at a time), which most implementations (e.g., etcd) use.
 
 ### Paxos (overview)
 
@@ -107,7 +107,7 @@ Paxos is **algorithmically equivalent in safety/availability to Raft** but harde
 
 - **Multi-Paxos**: Paxos for a log of decisions.
 - **Egalitarian Paxos (EPaxos)**: lets any node serve as leader for non-conflicting operations.
-- **Zab** (ZooKeeper): a Paxos variant.
+- **Zab** (ZooKeeper): a Paxos-like atomic broadcast protocol (its authors stress it is distinct from Paxos).
 - **Viewstamped Replication**: an academic ancestor to Raft/Paxos.
 - **PBFT / Tendermint / HotStuff**: Byzantine fault tolerant — handle malicious nodes (blockchain).
 
@@ -135,7 +135,7 @@ Paxos is **algorithmically equivalent in safety/availability to Raft** but harde
 - **CockroachDB**: Raft per range (a shard), thousands of Raft groups per cluster.
 - **TiKV / TiDB**: same pattern.
 - **MongoDB replica sets**: Raft-like.
-- **Kafka KRaft**: Raft replacing ZooKeeper for metadata.
+- **Kafka KRaft**: Raft variant replacing ZooKeeper for metadata (ZooKeeper mode removed in Kafka 4.0).
 - **Google Chubby**: Paxos-based lock service — foundational paper.
 - **Apache ZooKeeper**: Zab, used for coordination by HBase, Hadoop, Solr.
 
@@ -150,37 +150,156 @@ Paxos is **algorithmically equivalent in safety/availability to Raft** but harde
 - **Joint consensus implementation bugs**: many Raft bugs in cluster reconfiguration; use a battle-tested library.
 - **Believing consensus is cheap**: every committed entry is one RTT to a majority. Cross-DC = expensive. Place voters in same region.
 
-## Interview questions
+## Practice questions
 
-### Q1 — Easy: Why does Raft need an odd number of nodes?
-Because consensus requires a majority quorum. Even N gives the same fault tolerance as N-1 (e.g., 4 tolerates 1 fault same as 3) but uses more nodes for the same majority. Odd is the efficient choice.
+<Practice>
 
-### Q2 — Easy: What does it mean for a Raft entry to be "committed"?
-An entry is committed when the leader has replicated it to a majority of nodes (including itself). Committed entries are durable across leader changes and will eventually be applied to the state machine on every node.
+<QA q="Why does Raft use an odd number of nodes?" level="easy">
 
-### Q3 — Medium: Walk through Raft leader election.
-On election timeout (randomized, e.g., 150–300ms), a follower becomes candidate, increments its term, votes for itself, and sends RequestVote to all peers. Followers grant a vote if they haven't voted this term AND the candidate's log is at least as up-to-date as their own. Candidate with majority becomes leader. Randomization prevents continuous split votes.
+Consensus needs a majority quorum (`floor(N/2) + 1`). An even N gives the same fault tolerance as N − 1 — 4 nodes tolerate 1 failure, same as 3 — but needs more nodes for the majority. Odd N is the efficient choice: 3 tolerate 1, 5 tolerate 2, 7 tolerate 3.
 
-### Q4 — Medium: How does Raft handle a network partition?
-Side with the majority can still elect a leader and commit; side with minority cannot — they may elect a candidate but can't get a majority. When partition heals, minority leader (if any) steps down on seeing higher term; their uncommitted entries are discarded.
+</QA>
 
-### Q5 — Medium: Why are Paxos and Raft considered equivalent?
-Both solve consensus with the same safety properties (agreement, validity), tolerate f failures with 2f+1 nodes, and rely on majority quorums. Paxos is more general but harder to implement; Raft is opinionated (strong leader) and easier to understand and verify.
+<QA q="What does it mean for a Raft entry to be 'committed'?" level="easy">
 
-### Q6 — Hard: A 5-node Raft cluster has 2 nodes in DC-A and 3 in DC-B. DC-B becomes unreachable. What happens?
-The 2 DC-A nodes can't form a majority (need 3). They stop committing and may keep electing without success. The 3 DC-B nodes (if connected to each other) can keep operating with their majority — they continue serving writes and reads.
+The leader has replicated it to a **majority** of nodes (including itself). Committed entries survive leader changes and will eventually be applied to the state machine on every node. (A leader only counts replicas this way for entries from its current term; older entries commit indirectly.)
 
-If DC-B becomes split-brain (its 3 nodes can talk to each other but not DC-A), DC-A is effectively unavailable for writes. Reconfigure proactively or accept the asymmetry.
+</QA>
 
-### Q7 — Hard: How would you minimize consensus latency across regions?
-- **Place voters in same region** when possible — cross-region RTT is brutal.
-- **Use read-only learners** in other regions — they don't vote but can serve stale reads.
-- **Lease-based reads** (Raft optimization): leader holds a lease and can serve reads without consulting followers.
-- **Multi-Raft per range** (CockroachDB approach): different Raft groups, different leader placements per data range.
-- **Don't put consensus in the hot path** for everything — use it for metadata and replication, not every key operation.
+<QA q="What's the difference between safety and liveness in consensus?" level="easy">
 
-### Q8 — Hard: A Raft cluster has 3 nodes. Node 1 (leader) crashes. Nodes 2 and 3 elect node 2. Node 1 returns with uncommitted entries. What happens?
-On rejoining, node 1 will hear from leader node 2 with a higher term. Node 1 reverts to follower, **discards any uncommitted entries** in its log that conflict with the new leader's, and accepts the new leader's log. If node 1 had committed entries that the new leader doesn't have — that's impossible by Raft's leader-completeness property (a new leader is guaranteed to have all committed entries because it needs a majority vote, and that majority must include at least one node with the committed entry).
+**Safety**: nothing bad happens — no two leaders in a term, no committed entry lost. Raft and Paxos always preserve it. **Liveness**: progress eventually happens — it depends on a reasonably timely network and can stall during long partitions or repeated split votes.
+
+</QA>
+
+<QA q="Walk through Raft leader election." level="medium">
+
+On a randomized election timeout (e.g., 150–300 ms) with no heartbeat, a follower becomes a **candidate**, increments its term, votes for itself, and sends `RequestVote` to all peers. A node grants its vote if it hasn't voted this term **and** the candidate's log is at least as up-to-date as its own. A candidate with a majority becomes leader. Randomized timeouts make repeated split votes unlikely.
+
+</QA>
+
+<QA q="How does Raft handle a network partition?" level="medium">
+
+The side with a majority can elect a leader and keep committing; the minority side can't — candidates there never get enough votes. When the partition heals, a stale leader on the minority side sees a higher term and steps down, and its uncommitted entries are discarded in favor of the new leader's log.
+
+</QA>
+
+<QA q="Why are Paxos and Raft considered equivalent?" level="medium">
+
+Both solve consensus with the same safety properties, tolerate f failures with 2f + 1 nodes, and rely on majority quorums. Paxos is more general but harder to implement correctly; Raft is opinionated (a strong leader) and easier to understand and verify.
+
+</QA>
+
+<QA q="Describe the two phases of Paxos." level="medium">
+
+1. **Prepare**: a proposer picks a proposal number and asks acceptors to promise not to accept lower-numbered proposals; it needs promises from a majority. Acceptors also report any value they've already accepted, and the proposer must then propose the highest-numbered such value instead of its own.
+2. **Accept**: the proposer asks acceptors to accept a value under that number; once a majority accepts, the value is chosen and learners are told.
+
+Basic Paxos decides a single value. **Multi-Paxos** extends it to a log by keeping a stable leader, so the prepare phase is amortized across many entries.
+
+</QA>
+
+<QA q="Why does Raft need snapshotting?" level="medium">
+
+The log grows without bound. Periodically each node snapshots its state machine and discards log entries up to the snapshot index. A new or far-behind follower receives the snapshot plus the log tail to catch up. Take snapshots asynchronously — a blocking snapshot stalls the cluster.
+
+</QA>
+
+<QA q="What does the FLP result say, and how do real consensus systems live with it?" level="hard">
+
+FLP (Fischer, Lynch, Paterson, 1985) proves that in a fully asynchronous network, no deterministic consensus algorithm can guarantee termination if even one node may fail. Real systems keep safety unconditional and get liveness in practice with **timeouts** and **randomization** — e.g., Raft's randomized election timeouts.
+
+</QA>
+
+<QA q="How does Raft change cluster membership safely?" level="hard">
+
+A naive switch from the old to the new configuration could let two disjoint majorities exist at once. The Raft paper uses **joint consensus** — both old and new configurations must agree during the transition until it commits. Ongaro's dissertation adds a simpler **single-server change** (add or remove one node at a time), which most implementations such as etcd use. Reconfiguration is a common source of Raft bugs, so use a battle-tested library.
+
+</QA>
+
+<QA q="A 5-node Raft cluster has 2 nodes in DC-A and 3 in DC-B. DC-B becomes unreachable from DC-A. What happens?" level="scenario">
+
+The 2 DC-A nodes can't form a majority (they need 3), so they stop committing and may keep running elections without success. The 3 DC-B nodes, if they can reach each other, still have a majority and keep serving reads and writes. So DC-A is effectively unavailable for writes — reconfigure proactively, or accept that asymmetry when choosing voter placement.
+
+</QA>
+
+<QA q="How would you minimize consensus latency across regions?" level="scenario">
+
+- **Place voters in one region** when possible — every commit is a round trip to a majority, and cross-region RTT is brutal.
+- **Read-only learners** in other regions — they don't vote but can serve stale reads.
+- **Lease-based reads**: the leader holds a lease and serves reads without contacting followers.
+- **Multi-Raft per range** (CockroachDB): many Raft groups with leaders placed near their data.
+- **Keep consensus off the hot path** — use it for metadata and replication, not every key operation.
+
+</QA>
+
+<QA q="3-node cluster: leader node 1 crashes, nodes 2 and 3 elect node 2, then node 1 returns with uncommitted entries. What happens?" level="scenario">
+
+Node 1 hears from leader node 2 with a higher term, reverts to follower, **discards uncommitted entries** that conflict with the new leader's log, and adopts the leader's log. It can't hold committed entries that node 2 lacks — by **leader completeness**, a winning candidate needs a majority vote, that majority includes a node holding every committed entry, and voters reject candidates with less up-to-date logs.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="How many node failures can a 5-node Raft cluster tolerate while still committing writes?" options={["1", "2", "3", "4"]} answer={1}>
+
+A majority of 5 is 3, so up to 2 nodes can fail. Losing 3 leaves only 2, which can't form a majority.
+
+</MCQ>
+
+<MCQ q="Why is a 4-node consensus cluster usually not worth it compared with 3 nodes?" options={["4 nodes cannot elect a leader", "4 nodes require unanimous agreement", "4 nodes tolerate the same 1 failure as 3 but need a larger majority", "4 nodes are always split-brained"]} answer={2}>
+
+A majority of 4 is 3, so it still tolerates only 1 failure, like a 3-node cluster, while adding more nodes to coordinate.
+
+</MCQ>
+
+<MCQ q="When does a Raft follower grant its vote to a candidate?" options={["When it hasn't voted this term and the candidate's log is at least as up-to-date as its own", "Whenever the candidate has the highest node ID", "Whenever the candidate's term is lower", "Only if the old leader approves"]} answer={0}>
+
+Both conditions are required. The log check ensures a new leader has every committed entry, which is the basis of leader completeness.
+
+</MCQ>
+
+<MCQ q="Why does Raft randomize election timeouts?" options={["To encrypt heartbeat traffic", "To spread log entries evenly", "To let followers skip AppendEntries", "To make it unlikely that several followers become candidates at once and split the vote"]} answer={3}>
+
+If all followers timed out together, they'd keep splitting votes. Randomization lets one candidate usually win before others start.
+
+</MCQ>
+
+<MCQ q="During a partition, the minority side of a Raft cluster receives a write. What happens?" options={["It commits locally and reconciles later", "It cannot commit the write because it can't reach a majority", "It forwards the write to a learner", "It commits after a longer timeout"]} answer={1}>
+
+Commits require majority acknowledgment. The minority side gives up availability to keep consistency; anything it appends stays uncommitted.
+
+</MCQ>
+
+<MCQ q="What does the FLP impossibility result state?" options={["Consensus is impossible with more than 5 nodes", "Byzantine nodes can always break Paxos", "No deterministic algorithm can guarantee consensus terminates in a fully asynchronous network with one faulty node", "Raft and Paxos are not equivalent"]} answer={2}>
+
+FLP is about termination under full asynchrony. Practical systems keep safety and achieve liveness with timeouts and randomization.
+
+</MCQ>
+
+<MCQ q="What does Multi-Paxos optimize compared with basic Paxos?" options={["It amortizes the prepare phase across many log entries via a stable leader", "It tolerates Byzantine faults", "It removes the need for a majority", "It lets any node commit without a quorum"]} answer={0}>
+
+Basic Paxos decides one value with prepare and accept phases. Multi-Paxos keeps a leader so it can skip repeated prepares while still using majority quorums.
+
+</MCQ>
+
+<MCQ q="Which technique reduces read latency in Raft without contacting followers for every read?" options={["Joint consensus", "Increasing the election timeout", "Adding an even number of voters", "Leader leases for reads"]} answer={3}>
+
+With a lease, the leader knows no other leader can exist yet and can serve reads locally. Joint consensus is for membership changes; the other options don't help reads.
+
+</MCQ>
+
+<MCQ q="A returning ex-leader has log entries the new leader doesn't have. What are those entries guaranteed to be?" options={["Committed, so the new leader must copy them", "Uncommitted, so they are discarded", "Snapshots", "Membership changes"]} answer={1}>
+
+By leader completeness, the new leader has every committed entry, so any extra entries on the old leader were never committed and get overwritten.
+
+</MCQ>
+
+</Quiz>
 
 ## TL;DR cheat sheet
 
@@ -201,6 +320,6 @@ On rejoining, node 1 will hear from leader node 2 with a higher term. Node 1 rev
 - **Animated Raft**: [thesecretlivesofdata.com/raft](https://thesecretlivesofdata.com/raft/) — best visualization.
 - **Raft Visualization** (interactive): [raft.github.io](https://raft.github.io/).
 - **Ousterhout talk**: ["Designing for Understandability — The Raft Consensus Algorithm"](https://www.youtube.com/watch?v=vYp4LYbnnW8).
-- **Paxos**: Lamport's ["Paxos Made Simple"](https://lamport.azurewebsites.net/pubs/paxos-simple.pdf) (the title is ironic — it isn't).
+- **Paxos**: Lamport's ["Paxos Made Simple"](https://lamport.azurewebsites.net/pubs/paxos-simple.pdf) (Lamport meant the title sincerely; many readers still find it hard).
 - **Heidi Howard's blog** — modern consensus research, very accessible.
 - **Book**: *Designing Data-Intensive Applications*, Chapter 9.

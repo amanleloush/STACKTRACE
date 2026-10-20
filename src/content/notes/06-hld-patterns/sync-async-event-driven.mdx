@@ -1,7 +1,7 @@
 ---
 title: "Sync vs Async Communication, Event-Driven Architecture"
 phase: "06-hld-patterns"
-order: 30
+order: 53
 tags: []
 premium: false
 previewParagraphs: 4
@@ -98,7 +98,7 @@ Separate models for writes (commands) and reads (queries). Often paired with eve
 
 ### Choreography vs orchestration
 
-Same dichotomy as in sagas (Topic 24):
+Same dichotomy as in sagas ([Distributed Transactions](/learn/notes/distributed-transactions/)):
 - **Choreography**: services react to each other's events. Loose, but emergent flow.
 - **Orchestration**: a central process drives the flow. Clear, observable.
 
@@ -138,7 +138,7 @@ Async makes these mandatory:
 - Order matters within a key → key-aware partitioning.
 - Duplicates happen → dedup with idempotency keys.
 
-(See Topic 19.)
+(See [Delivery Semantics](/learn/notes/delivery-semantics/).)
 
 ## How it works (event-driven order placement)
 
@@ -160,9 +160,8 @@ Async makes these mandatory:
 ## Real-world examples
 
 - **Uber**: trip events flow as Kafka events; many consumers (pricing, ETA, driver matching, accounting).
-- **Netflix**: most internal state propagation is event-driven via Keystone (Kafka).
+- **Netflix**: Keystone, its real-time event pipeline (Kafka + Flink), carries events to many consumers.
 - **Shopify**: order events → fulfillment, ML, marketing.
-- **Square**: payment flows via events with sagas for failures.
 - **Slack**: messages → many consumers (notifications, search index, mobile push).
 
 ## Common pitfalls
@@ -175,47 +174,168 @@ Async makes these mandatory:
 - **Forgetting backpressure**: queue fills, OOM.
 - **Hidden coupling via shared event shape**: "lightweight" events that secretly require all consumers to upgrade together.
 
-## Interview questions
+## Practice questions
 
-### Q1 — Easy: When would you use async over sync?
-For side effects the user doesn't need immediately (emails, analytics, downstream propagation), long-running work (image processing), decoupling producer from many consumers (event fan-out), absorbing bursty load via queue. Use sync when the user needs an answer right now.
+<Practice>
 
-### Q2 — Easy: What's the difference between event notification and event-carried state transfer?
-Event notification = small "X happened" event; consumers call back to the producer for details. Event-carried state transfer = event includes all data the consumer needs, no callback. Notification keeps events small but couples consumers to the producer; state transfer decouples but creates larger, duplicated events.
+<QA q="When would you use async over sync?" level="easy">
 
-### Q3 — Medium: What is CQRS and when does it help?
-Command Query Responsibility Segregation — separate models (and often stores) for writes (commands) and reads (queries). Helpful when read and write requirements diverge a lot: many read shapes, complex aggregations, real-time vs OLAP. Justifies the complexity only at scale; for small systems it's overkill.
+For side effects the user doesn't need immediately (emails, analytics, downstream propagation), long-running work (image processing, reports), decoupling a producer from many consumers (event fan-out), and absorbing bursty load in a queue. Use sync when the user needs an answer right now or when strong consistency is required (charge the card before showing 'success').
 
-### Q4 — Medium: Compare event sourcing with traditional state storage.
-Traditional: store current state; mutations overwrite. Event sourcing: store events as the source of truth; derive state by replay. Benefits: full audit history, time-travel queries, easy debugging. Costs: event versioning, snapshot machinery, complex projections, eventual consistency for queries.
+</QA>
 
-### Q5 — Medium: How would you guarantee the order of events for a single user?
-Use a message system that supports per-key ordering (Kafka, Pulsar's Key_Shared). Partition the topic by user ID; same user → same partition; order preserved within a partition. Across partitions, no global order — but per-user is what most apps actually need.
+<QA q="What's the difference between event notification and event-carried state transfer?" level="easy">
 
-### Q6 — Hard: Design event flow for a "place order" use case across cart, payment, inventory, fulfillment.
-- Order Service: receives request (sync), creates pending order in DB + outbox event.
-- Saga orchestrator (Temporal): consumes "OrderPlaced," runs:
-  1. Inventory.reserve(items) — async RPC.
-  2. Payment.charge(amount, orderId as idempotency key).
-  3. Fulfillment.create(order).
-- On failure: compensations (refund payment, release inventory).
-- Side consumers: Notifications, Analytics — listen to events independently.
-- API returns "pending" immediately; client polls or receives webhook on completion.
+**Event notification** = a small 'X happened' event; consumers call back to the producer for details. **Event-carried state transfer** = the event carries all the data consumers need, so no callback. Notification keeps events small but couples consumers to the producer's API; state transfer decouples them at the cost of larger events and data duplicated across systems.
 
-### Q7 — Hard: A team made everything async and now users see stale data 5+ seconds after writes. Fix?
-- **Identify which writes need read-after-write**: the user's own immediate views.
-- For those: synchronously update the read store (write-through), or sticky-read from the primary for a TTL.
-- Use optimistic UI: show the change immediately, reconcile if backend disagrees.
-- Add a "last updated" timestamp; client retries until it catches up.
-- Don't make everything sync — just the user-visible critical path.
+</QA>
 
-### Q8 — Hard: How do you version events without breaking consumers?
-- Additive evolution only: new fields ok, never reuse field IDs (Protobuf rules).
-- Maintain forward compatibility: consumers ignore unknown fields.
-- Maintain backward compatibility: producers don't drop fields without a deprecation period.
-- Use a **schema registry** (Confluent, Apicurio) to enforce compatibility on publish.
-- For breaking changes: new event type / new topic; dual-publish during migration.
+<QA q="What's the difference between an event and a command?" level="easy">
+
+An **event** is an immutable fact about something that already happened ('OrderPlaced'); the producer doesn't know or care who reacts. A **command** asks a specific receiver to do something ('ReserveInventory') and can be rejected. Mixing them — 'DoX' messages dressed up as events — blurs ownership and semantics, so be explicit about which one you're sending.
+
+</QA>
+
+<QA q="What is CQRS and when does it help?" level="medium">
+
+Command Query Responsibility Segregation — separate models (and often stores) for writes (commands) and reads (queries). It helps when read and write requirements diverge a lot: many read shapes, complex aggregations, real-time vs OLAP. It's often paired with event sourcing. It justifies its complexity only at scale; for small systems it's overkill.
+
+</QA>
+
+<QA q="Compare event sourcing with traditional state storage." level="medium">
+
+**Traditional**: store current state; mutations overwrite it. **Event sourcing**: store events as the source of truth and derive state by replaying them. Benefits: full audit history, time-travel queries, easier debugging. Costs: event versioning, snapshot machinery, complex projections, and eventually consistent queries.
+
+</QA>
+
+<QA q="How would you guarantee the order of events for a single user?" level="medium">
+
+Use a messaging system with per-key ordering (Kafka, Pulsar's Key_Shared). Partition the topic by user ID so the same user always lands on the same partition, where order is preserved. There's no global order across partitions — but per-user order is what most apps actually need.
+
+</QA>
+
+<QA q="Choreography or orchestration — how do you choose?" level="medium">
+
+- **Choreography**: services react to each other's events. Loosely coupled, but the overall flow is emergent and hard to see.
+- **Orchestration**: a central process (Temporal, Step Functions) drives the steps. Clear and observable.
+
+Orchestrate complex multi-step flows with compensations; choreograph simple fan-outs.
+
+</QA>
+
+<QA q="How does backpressure differ between sync and async communication?" level="medium">
+
+**Sync**: backpressure is implicit — callers wait. If a callee is slow, callers pile up and exhaust threads and connections, which cascades. **Async**: the queue absorbs the burst, then fills; you cap it (drop or return 429 to producers), expose consumer lag as a metric, and scale consumers out. Async with visible backpressure is the safer mode.
+
+</QA>
+
+<QA q="How do you version events without breaking consumers?" level="hard">
+
+- Evolve additively: new fields are fine; never reuse field IDs (Protobuf rules).
+- Forward compatibility (old consumers, new events): consumers ignore unknown fields, and producers don't drop fields old consumers rely on without a deprecation period.
+- Backward compatibility (new consumers, old events): new fields get defaults so upgraded consumers can still read old events.
+- Enforce compatibility on publish with a **schema registry** (Confluent, Apicurio).
+- Breaking changes: a new event type or topic, dual-published during migration.
 - Document an event contract per topic.
+
+</QA>
+
+<QA q="Why does the order flow write the OrderPlaced event to an outbox in the same transaction as the order?" level="hard">
+
+Writing the order to the DB and publishing to Kafka separately is a dual write: a crash between them leaves an order with no event, or an event with no order. Writing the event to an **outbox table in the same DB transaction** makes both commit or neither; CDC then streams the outbox to Kafka. Consumers must still be idempotent, because the relay can deliver an event more than once.
+
+</QA>
+
+<QA q="Design event flow for a 'place order' use case across cart, payment, inventory, fulfillment." level="scenario">
+
+- **Order Service**: receives the request (sync), creates a pending order plus an outbox event in one transaction.
+- **Saga orchestrator** (Temporal) consumes 'OrderPlaced' and runs:
+  1. `Inventory.reserve(items)`.
+  2. `Payment.charge(amount)` with the order ID as the idempotency key.
+  3. `Fulfillment.create(order)`.
+- **On failure**: compensations (refund payment, release inventory).
+- **Side consumers** (Notifications, Analytics) listen independently.
+- The API returns 'pending' immediately; the client polls or gets a webhook on completion.
+
+</QA>
+
+<QA q="A team made everything async and now users see stale data 5+ seconds after writes. Fix?" level="scenario">
+
+- Identify which writes need **read-after-write** — usually the user's own immediate views.
+- For those, update the read store synchronously (write-through), or sticky-read from the primary for a short TTL.
+- Use **optimistic UI**: show the change immediately and reconcile if the backend disagrees.
+- Add a 'last updated' timestamp and let the client retry until it catches up.
+- Don't make everything sync — only the user-visible critical path.
+
+</QA>
+
+<QA q="Customers were charged twice after a consumer crashed and restarted. What went wrong and how do you fix it?" level="scenario">
+
+Async delivery is at-least-once: the consumer charged the card but crashed before committing its offset, so the message was redelivered and processed again. Fix with **idempotent consumers**: pass an idempotency key (the order ID) to the payment provider, and/or record processed message IDs and skip duplicates, ideally in the same transaction as the side effect. Send messages that keep failing to a DLQ instead of retrying forever.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="A user clicks Place order. Which step should usually stay synchronous?" options={["Sending the confirmation email", "Updating the analytics dashboard", "Recording the order and returning a result the user is waiting for", "Notifying the recommendations service"]} answer={2}>
+
+The user is waiting for the order to be accepted, so that response belongs on the sync path. Email, analytics and recommendations are side effects that should run asynchronously.
+
+</MCQ>
+
+<MCQ q="An event contains only orderId, and consumers call the Order API for the details. Which pattern is this?" options={["Event-carried state transfer", "Event notification", "Event sourcing", "CQRS"]} answer={1}>
+
+A thin event plus a callback for details is event notification. Event-carried state transfer would include the details, event sourcing stores events as the source of truth, and CQRS splits read and write models.
+
+</MCQ>
+
+<MCQ q="Why must async consumers be idempotent?" options={["Messages can be redelivered, so processing the same message twice must not repeat side effects", "Brokers reject non-idempotent consumers", "It guarantees global ordering", "It removes the need for retries"]} answer={0}>
+
+At-least-once delivery means duplicates happen, so consumers must handle a repeat safely. Brokers don't check idempotency, it doesn't create ordering, and retries are still needed.
+
+</MCQ>
+
+<MCQ q="You need all events for one user processed in order. What do you do in Kafka?" options={["Increase the partition count and let the producer round-robin", "Use random partition assignment", "Add more consumer groups", "Use the user ID as the message key so the user maps to one partition"]} answer={3}>
+
+Keying by user ID sends a user's events to one partition, where order is preserved, while other users spread across partitions. Round-robin or random assignment scatters one user's events across partitions and breaks their order, and more consumer groups don't affect ordering.
+
+</MCQ>
+
+<MCQ q="A multi-step workflow with compensations keeps failing in ways nobody can trace across five services that react to each other's events. What is the usual recommendation?" options={["Add more event types", "Move to orchestration with a central workflow engine", "Make every call synchronous", "Remove the compensations"]} answer={1}>
+
+Complex multi-step flows are easier to see and control with an orchestrator such as Temporal. More events add to the emergent mess, making everything sync brings back fragility, and dropping compensations leaves inconsistent state.
+
+</MCQ>
+
+<MCQ q="What problem does the transactional outbox solve?" options={["It guarantees consumers receive each event exactly once", "It makes Kafka writes faster", "It ensures the DB change and the event are committed together, avoiding a dual-write gap", "It removes the need for a schema registry"]} answer={2}>
+
+The outbox commits the event in the same DB transaction as the state change, and CDC publishes it, so you never get one without the other. It doesn't give exactly-once delivery, doesn't speed up Kafka, and doesn't replace schema management.
+
+</MCQ>
+
+<MCQ q="A slow downstream service causes callers' thread pools to fill up and fail. Which communication style is this a symptom of?" options={["Synchronous calls with implicit backpressure", "Asynchronous messaging with a full queue", "Event sourcing snapshots", "CQRS read models"]} answer={0}>
+
+In sync calls the caller waits, so a slow callee makes callers stack up and exhaust resources. With async the queue would grow instead and consumer lag would show it; snapshots and read models are unrelated.
+
+</MCQ>
+
+<MCQ q="When is CQRS most clearly justified?" options={["For any new CRUD app", "When read and write requirements diverge strongly, such as many read shapes and heavy aggregations", "When there is only one consumer", "To avoid using a database"]} answer={1}>
+
+CQRS pays off when reads and writes need very different models. For simple CRUD it's overkill, the number of consumers isn't the trigger, and it still uses databases, often more than one.
+
+</MCQ>
+
+<MCQ q="A producer must make a breaking change to an event's structure. What is the safe approach?" options={["Change the existing event in place and redeploy consumers later", "Reuse an old field ID for the new data", "Remove the old fields immediately", "Introduce a new event type or topic and dual-publish during migration"]} answer={3}>
+
+A new event type or topic, published alongside the old one until consumers move, avoids breaking anyone. In-place changes, reused field IDs and immediate removals all break existing consumers.
+
+</MCQ>
+
+</Quiz>
 
 ## TL;DR cheat sheet
 

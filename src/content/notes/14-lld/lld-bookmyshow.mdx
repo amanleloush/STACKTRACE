@@ -1,0 +1,823 @@
+---
+title: "LLD: BookMyShow (Movie Ticket Booking)"
+phase: "14-lld"
+order: 143
+tags: ["lld", "machine-coding", "java", "concurrency", "observer-pattern", "booking"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 40
+prerequisites: ["behavioral-patterns", "machine-coding-strategy", "java-concurrency-locks", "hld-flash-sale-inventory"]
+summary: "A complete, tested Java 21 movie-ticket booking system: catalog of movies, theatres, screens and shows; all-or-nothing seat holds with a TTL driven by an injected Clock; payment success, failure, timeout and late-payment refunds; Observer notifications; and a multi-threaded test proving no seat is ever sold twice."
+---
+
+## Problem statement
+
+> Design a movie ticket booking system like BookMyShow.
+>
+> - Cities have **theatres**; a theatre has **screens**; a screen has **seats** of different types (regular, premium).
+> - A **show** is a movie playing on a screen at a start time, with a price per seat type.
+> - A user can browse shows for a movie in a city, see available seats, **select seats** and **pay**.
+> - Selected seats are **held** for a few minutes while the user pays. If payment fails, times out, or the user walks away, the seats go back on sale.
+> - **Two users must never get the same seat.**
+> - Notify users when a booking is confirmed or their hold expires.
+
+The real test is the last two bullets. Everything else is CRUD. Interviewers want to see an **atomic multi-seat hold**, a **TTL** you can test without sleeping, and **proof** (not a claim) that concurrent users cannot double book.
+
+## Clarifying questions to ask
+
+| Question | Assumed answer |
+|---|---|
+| Single process or distributed? | **Single process, in memory.** The distributed version (Redis holds, DB unique constraints) is in [HLD: Flash Sale + Inventory](/learn/notes/hld-flash-sale-inventory/), section "Variant: ticket booking with seat selection". |
+| How long is a seat hold? | 10 minutes, configurable. |
+| Partial success when booking several seats? | **No. All or nothing.** Half a row is useless to a family. |
+| How do we talk to the payment provider? | Through a `PaymentGateway` interface returning SUCCESS, FAILED or TIMED_OUT. A test fake implements it. |
+| What happens if the payment succeeds after the hold expired? | Refund and mark the booking EXPIRED. Never confirm a seat you no longer hold. |
+| Who needs notifications? | The user (confirmed, failed, hold expired). Channels (email, SMS, push) are pluggable. |
+| Money type? | `long` paise (1 rupee = 100 paise) to avoid floating-point errors. |
+| Cancellations, refunds after confirmation, offers, food, seat-map UI? | Out of scope; mention as extensions. |
+
+## Requirements
+
+**Functional (in scope)**
+
+1. Catalog: movies, theatres, screens, seats with types, shows with prices per seat type. Search shows by city and movie.
+2. `holdSeats(user, show, seats)`: atomically hold all requested seats for a TTL, or fail with `SeatUnavailableException`. Creates a `PENDING` booking with the total price.
+3. `pay(booking)`: charge via the gateway.
+   - SUCCESS and hold still valid: seats become **booked**, booking `CONFIRMED`.
+   - SUCCESS but hold expired: **refund**, booking `EXPIRED`.
+   - FAILED or TIMED_OUT: release the hold, booking `FAILED`.
+4. Holds expire after the TTL: lazily (when someone else tries those seats) and via a periodic **sweeper**.
+5. Observers get `onConfirmed`, `onFailed`, `onLockExpired`.
+6. `availableSeats(show)`.
+
+**Non-functional**
+
+- **Correctness under concurrency**: a seat is in at most one confirmed booking, ever.
+- **Testable time**: expiry is driven by an injected `java.time.Clock`, so tests advance time instantly.
+- **No slow I/O under a lock**: the payment call happens with no seat lock held.
+
+**Out of scope**: persistence, multiple app instances, seat-map UI, coupons, cancellation after confirmation.
+
+## Entities and relationships
+
+```
+ Theatre(city) 1 ──► * Screen 1 ──► * Seat(id, type)
+                         ▲
+ Movie ◄── Show ─────────┘    Show = movie + theatre + screen + start + price per SeatType
+
+ Catalog ── findShows(city, movie)
+
+ BookingService ──uses──► SeatLockManager ─── per show: ShowSeats { holdBySeat, holdByBooking, booked }
+      │                         (synchronized per show, TTL from Clock)
+      ├──uses──► «interface» PaymentGateway   (charge / refund)
+      ├──notifies──► «interface» BookingListener * (onConfirmed / onFailed / onLockExpired)
+      └──owns──► Booking { id, user, show, seats, amount, status: AtomicReference }
+
+ Hold { bookingId, userId, seats, expiresAt }       BookingStatus: PENDING -> CONFIRMED | FAILED | EXPIRED
+```
+
+- **Catalog objects are immutable records.** They never change during a booking, so they need no locking.
+- **Seat state is per show**, not per seat object: seat A1 in the 6:30 show and A1 in the 9:30 show are different inventory. That's why the lock manager keys everything by `showId`.
+- A **Hold** groups the seats of one booking so they expire, release and confirm together.
+
+## Design patterns used and why
+
+| Pattern | Where | Why |
+|---|---|---|
+| [Observer](/learn/notes/behavioral-patterns/) | `BookingListener`, subscribed to `BookingService` | Email, SMS, push and analytics react to the same events without the service knowing about them. Listeners are stored in a `CopyOnWriteArrayList`, which is safe to iterate while others subscribe. |
+| [Strategy / dependency inversion](/learn/notes/solid-principles/) | `PaymentGateway`, `Clock` | The service depends on abstractions. Tests plug in `ScriptedGateway` and `MutableClock`; production plugs in a real gateway [Adapter](/learn/notes/structural-patterns/) and `Clock.systemUTC()`. |
+| State machine (enum + CAS) | `BookingStatus` with `AtomicReference.compareAndSet` | Only four states and simple transitions, so an enum is enough (see "Strategy vs State" in [Behavioral Patterns](/learn/notes/behavioral-patterns/)). CAS guarantees exactly one transition out of `PENDING` even if a payment thread and the sweeper race. |
+| Facade | `BookingService` | One entry point hiding catalog, locks, payment and events. |
+
+## Solution walkthrough
+
+### Step 1: the catalog
+
+Records for `Movie`, `Seat`, `Screen`, `Theatre`, `Show`. `Show.seat(id)` validates that a seat exists on that screen. `Catalog` is a `ConcurrentHashMap` of shows with a simple search. Nothing interesting here, and that's the point: spend your time on the hold logic.
+
+### Step 2: the seat lock manager (the heart of the problem)
+
+```
+per show:  holdBySeat:    A1 -> Hold(B7), A2 -> Hold(B7)
+           holdByBooking: B7 -> Hold(B7, user, {A1, A2}, expiresAt)
+           booked:        {C4, C5}
+```
+
+**tryLock (all or nothing)**, inside `synchronized (showSeats)`:
+
+1. Read `now` from the injected `Clock`.
+2. Evict every expired hold in this show (and remember them so the service can notify).
+3. If **any** requested seat is booked or held, return failure. Nothing has been written yet, so there is no partial hold to undo.
+4. Otherwise create one `Hold` with `expiresAt = now + ttl` and map every seat to it.
+
+Steps 3 and 4 are a classic **check-then-act**. They are only correct because they run under the same lock. Remove the `synchronized` and two threads both see A1 as free and both write it. In fact, the concurrency test below fails on the very first round when that line is removed.
+
+**Why one lock per show?** All seats a user picks belong to one show, so a per-show lock makes the multi-seat check atomic with no lock-ordering worries. Different shows never block each other. A single global lock would also be correct but would serialize every show in the country. Per-seat locks would need to be taken in sorted order to avoid deadlock. Per-show is the sweet spot.
+
+**confirm** (under the same lock): look up the booking's hold; if it's gone or expired, return false; otherwise move its seats into `booked` and drop the hold.
+
+**release**: drop the hold if present. Idempotent.
+
+**evictAllExpired**: the sweeper. Visits each show under its lock and evicts expired holds.
+
+### Step 3: TTL with an injected Clock
+
+Expiry compares `clock.instant()` with `hold.expiresAt()`. `java.time.Clock` is an abstract class meant exactly for this: production uses `Clock.systemUTC()`, tests use a subclass whose time only moves when the test says so. A hold expires at **exactly** `expiresAt` (`!now.isBefore(expiresAt)`), and the tests check both 9 minutes (still held) and 10 minutes (expired).
+
+**Lazy expiry plus a sweeper.** Correctness never depends on the sweeper: any operation treats an expired hold as free. The sweeper exists so that bookings move to `EXPIRED` and users get the "hold expired" notification even if nobody else touches those seats.
+
+### Step 4: the booking flow and payment outcomes
+
+```
+holdSeats ──► PENDING ──pay──► charge() ──SUCCESS──► confirm() ok ──► CONFIRMED  (notify)
+                 │                    │                     └─ hold lost ──► refund, EXPIRED (notify)
+                 │                    └─FAILED / TIMED_OUT──► release ──► FAILED (notify)
+                 └── TTL passes (lazy eviction or sweeper) ──► EXPIRED (notify)
+```
+
+Key rules:
+
+- **Check before charging.** If the hold is already gone, don't charge at all.
+- **Never hold the seat lock during `charge()`.** A payment call can take seconds; holding the show lock would block every other user of that show.
+- **Re-check after charging.** The hold may have expired during the payment. `confirm()` re-validates under the lock. If it fails, refund. This is the "late payment" case.
+- **CAS on the booking status.** `transition(PENDING, X)` uses `AtomicReference.compareAndSet`. If the sweeper and the payment thread both try to finish the same booking, exactly one wins, so the user gets exactly one notification.
+- **TIMED_OUT is treated like FAILED here**, which is the simple interview answer. In a real system a timeout means "unknown": the charge may have gone through, so you reconcile with the gateway's status API later and refund if needed.
+
+### Step 5: Observer notifications
+
+`BookingListener` has default no-op methods, so a listener only overrides what it cares about. Events are published **after** the state change and **outside** any seat lock, so a slow listener (sending an email) never blocks seat booking. In production you'd hand events to an executor or a message queue rather than calling listeners on the request thread.
+
+## Full solution code
+
+One file, Java 21, compiles with `javac Main.java` and runs with `java Main`. `MutableClock` and `ScriptedGateway` are test doubles that the demo also uses.
+
+```java
+import java.time.*;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import java.util.stream.Collectors;
+
+// ---------- Catalog: immutable value objects ----------
+enum SeatType { REGULAR, PREMIUM }
+record Movie(String id, String title, int durationMinutes) {}
+record Seat(String id, SeatType type) {}
+record Screen(String id, String name, List<Seat> seats) {}
+record Theatre(String id, String name, String city, List<Screen> screens) {}
+record Show(String id, Movie movie, Theatre theatre, Screen screen, LocalDateTime start, Map<SeatType, Long> pricePaise) {
+    Seat seat(String seatId) {
+        return screen.seats().stream().filter(s -> s.id().equals(seatId)).findFirst()
+                .orElseThrow(() -> new IllegalArgumentException("no seat " + seatId + " in " + screen.name()));
+    }
+}
+
+final class Catalog {
+    private final Map<String, Show> shows = new ConcurrentHashMap<>();
+    void addShow(Show s) { shows.put(s.id(), s); }
+    Show show(String id) {
+        Show s = shows.get(id);
+        if (s == null) throw new IllegalArgumentException("no show " + id);
+        return s;
+    }
+    List<Show> showsFor(String city, String movieId) {
+        return shows.values().stream()
+                .filter(s -> s.theatre().city().equals(city) && s.movie().id().equals(movieId))
+                .sorted(Comparator.comparing(Show::start)).toList();
+    }
+}
+
+// ---------- Booking with a guarded lifecycle ----------
+enum BookingStatus { PENDING, CONFIRMED, FAILED, EXPIRED }
+
+final class Booking {
+    private final String id, userId, showId;
+    private final List<String> seatIds;
+    private final long amountPaise;
+    private final AtomicReference<BookingStatus> status = new AtomicReference<>(BookingStatus.PENDING);
+
+    Booking(String id, String userId, String showId, List<String> seatIds, long amountPaise) {
+        this.id = id; this.userId = userId; this.showId = showId;
+        this.seatIds = List.copyOf(seatIds); this.amountPaise = amountPaise;
+    }
+    String id() { return id; }
+    String userId() { return userId; }
+    String showId() { return showId; }
+    List<String> seatIds() { return seatIds; }
+    long amountPaise() { return amountPaise; }
+    BookingStatus status() { return status.get(); }
+    /** Exactly one caller wins a transition out of PENDING. */
+    boolean transition(BookingStatus from, BookingStatus to) { return status.compareAndSet(from, to); }
+    @Override public String toString() { return id + seatIds + " " + status.get(); }
+}
+
+// ---------- Seat lock manager: in-memory holds with a TTL ----------
+record Hold(String bookingId, String userId, Set<String> seatIds, Instant expiresAt) {
+    boolean expired(Instant now) { return !now.isBefore(expiresAt); }
+}
+
+final class SeatLockManager {
+    private final Clock clock;
+    private final Duration ttl;
+    private final Map<String, ShowSeats> shows = new ConcurrentHashMap<>();
+
+    /** Per-show state. Every access is inside synchronized(this ShowSeats). */
+    private static final class ShowSeats {
+        final Map<String, Hold> holdBySeat = new HashMap<>();
+        final Map<String, Hold> holdByBooking = new HashMap<>();
+        final Set<String> booked = new HashSet<>();
+
+        List<Hold> evictExpired(Instant now) {
+            List<Hold> gone = holdByBooking.values().stream().filter(h -> h.expired(now)).toList();
+            gone.forEach(this::remove);
+            return gone;
+        }
+        void remove(Hold h) {
+            holdByBooking.remove(h.bookingId());
+            h.seatIds().forEach(holdBySeat::remove);
+        }
+    }
+
+    record LockResult(boolean locked, List<Hold> expired) {}
+
+    SeatLockManager(Clock clock, Duration ttl) { this.clock = clock; this.ttl = ttl; }
+
+    private ShowSeats seats(String showId) { return shows.computeIfAbsent(showId, k -> new ShowSeats()); }
+
+    /** All-or-nothing: either every seat is held for this booking, or none is. */
+    LockResult tryLock(String showId, List<String> seatIds, String bookingId, String userId) {
+        ShowSeats s = seats(showId);
+        synchronized (s) {
+            Instant now = clock.instant();
+            List<Hold> expired = s.evictExpired(now);
+            for (String seat : seatIds)
+                if (s.booked.contains(seat) || s.holdBySeat.containsKey(seat)) return new LockResult(false, expired);
+            Hold h = new Hold(bookingId, userId, Set.copyOf(seatIds), now.plus(ttl));
+            s.holdByBooking.put(bookingId, h);
+            seatIds.forEach(seat -> s.holdBySeat.put(seat, h));
+            return new LockResult(true, expired);
+        }
+    }
+
+    boolean isHeld(String showId, String bookingId) {
+        ShowSeats s = seats(showId);
+        synchronized (s) {
+            Hold h = s.holdByBooking.get(bookingId);
+            return h != null && !h.expired(clock.instant());
+        }
+    }
+
+    /** Turns a live hold into booked seats. False if the hold expired or vanished. */
+    boolean confirm(String showId, String bookingId) {
+        ShowSeats s = seats(showId);
+        synchronized (s) {
+            Hold h = s.holdByBooking.get(bookingId);
+            if (h == null || h.expired(clock.instant())) return false;
+            s.remove(h);
+            s.booked.addAll(h.seatIds());
+            return true;
+        }
+    }
+
+    void release(String showId, String bookingId) {
+        ShowSeats s = seats(showId);
+        synchronized (s) {
+            Hold h = s.holdByBooking.get(bookingId);
+            if (h != null) s.remove(h);
+        }
+    }
+
+    /** Sweeper entry point (a scheduler calls this every few seconds in production). */
+    List<Hold> evictAllExpired() {
+        List<Hold> all = new ArrayList<>();
+        Instant now = clock.instant();
+        for (ShowSeats s : shows.values()) synchronized (s) { all.addAll(s.evictExpired(now)); }
+        return all;
+    }
+
+    Set<String> available(Show show) {
+        ShowSeats s = seats(show.id());
+        synchronized (s) {
+            Instant now = clock.instant();
+            return show.screen().seats().stream().map(Seat::id)
+                    .filter(id -> !s.booked.contains(id))
+                    .filter(id -> { Hold h = s.holdBySeat.get(id); return h == null || h.expired(now); })
+                    .collect(Collectors.toCollection(TreeSet::new));
+        }
+    }
+
+    Set<String> booked(String showId) {
+        ShowSeats s = seats(showId);
+        synchronized (s) { return Set.copyOf(s.booked); }
+    }
+}
+
+// ---------- Payment: an external dependency behind an interface ----------
+enum PaymentStatus { SUCCESS, FAILED, TIMED_OUT }
+
+interface PaymentGateway {
+    PaymentStatus charge(String bookingId, long amountPaise);
+    void refund(String bookingId, long amountPaise);
+}
+
+// ---------- Observer: notifications ----------
+interface BookingListener {
+    default void onConfirmed(Booking b) {}
+    default void onFailed(Booking b, String reason) {}
+    default void onLockExpired(Booking b) {}
+}
+
+final class SeatUnavailableException extends RuntimeException {
+    private static final long serialVersionUID = 1L;
+    SeatUnavailableException(String msg) { super(msg); }
+}
+
+// ---------- Service: orchestrates catalog, locks, payment, events ----------
+final class BookingService {
+    private final Catalog catalog;
+    private final SeatLockManager locks;
+    private final PaymentGateway gateway;
+    private final Map<String, Booking> bookings = new ConcurrentHashMap<>();
+    private final List<BookingListener> listeners = new CopyOnWriteArrayList<>();
+    private final AtomicLong ids = new AtomicLong();
+
+    BookingService(Catalog catalog, SeatLockManager locks, PaymentGateway gateway) {
+        this.catalog = catalog; this.locks = locks; this.gateway = gateway;
+    }
+
+    void subscribe(BookingListener l) { listeners.add(l); }
+    Booking booking(String id) { return bookings.get(id); }
+    Set<String> availableSeats(String showId) { return locks.available(catalog.show(showId)); }
+
+    /** Step 1: user picks seats -> seats are held, booking is PENDING. */
+    Booking holdSeats(String userId, String showId, List<String> seatIds) {
+        if (seatIds.isEmpty() || new HashSet<>(seatIds).size() != seatIds.size())
+            throw new IllegalArgumentException("seat list must be non-empty and distinct");
+        Show show = catalog.show(showId);
+        long amount = seatIds.stream().mapToLong(id -> show.pricePaise().get(show.seat(id).type())).sum();
+        Booking b = new Booking("B" + ids.incrementAndGet(), userId, showId, seatIds, amount);
+        bookings.put(b.id(), b);                           // register first, so a sweeper that evicts the new hold finds it
+        SeatLockManager.LockResult r = locks.tryLock(showId, seatIds, b.id(), userId);
+        r.expired().forEach(this::expire);                 // holds we evicted on the way
+        if (!r.locked()) {
+            bookings.remove(b.id());
+            throw new SeatUnavailableException("seats " + seatIds + " not available");
+        }
+        return b;
+    }
+
+    /** Step 2: pay. Never call the gateway while holding a seat lock. */
+    BookingStatus pay(String bookingId) {
+        Booking b = bookings.get(bookingId);
+        if (b == null) throw new IllegalArgumentException("no booking " + bookingId);
+        if (b.status() != BookingStatus.PENDING) throw new IllegalStateException(b.id() + " is " + b.status());
+        if (!locks.isHeld(b.showId(), b.id())) { expireBooking(b); return b.status(); }
+
+        PaymentStatus p = gateway.charge(b.id(), b.amountPaise());
+        switch (p) {
+            case SUCCESS -> {
+                if (locks.confirm(b.showId(), b.id()) && b.transition(BookingStatus.PENDING, BookingStatus.CONFIRMED)) {
+                    listeners.forEach(l -> l.onConfirmed(b));
+                } else {                                    // paid too late: hold expired meanwhile
+                    gateway.refund(b.id(), b.amountPaise());
+                    expireBooking(b);
+                }
+            }
+            case FAILED, TIMED_OUT -> {
+                locks.release(b.showId(), b.id());
+                if (b.transition(BookingStatus.PENDING, BookingStatus.FAILED))
+                    listeners.forEach(l -> l.onFailed(b, "payment " + p));
+            }
+        }
+        return b.status();
+    }
+
+    /** Called periodically by a scheduler. */
+    int sweepExpiredHolds() {
+        List<Hold> expired = locks.evictAllExpired();
+        expired.forEach(this::expire);
+        return expired.size();
+    }
+
+    private void expire(Hold h) {
+        Booking b = bookings.get(h.bookingId());
+        if (b != null) expireBooking(b);
+    }
+
+    private void expireBooking(Booking b) {
+        locks.release(b.showId(), b.id());
+        if (b.transition(BookingStatus.PENDING, BookingStatus.EXPIRED))
+            listeners.forEach(l -> l.onLockExpired(b));
+    }
+}
+
+// ---------- Test doubles that are also used by the demo ----------
+final class MutableClock extends Clock {
+    private volatile Instant now;
+    MutableClock(Instant start) { this.now = start; }
+    void advance(Duration d) { now = now.plus(d); }
+    @Override public Instant instant() { return now; }
+    @Override public ZoneId getZone() { return ZoneOffset.UTC; }
+    @Override public Clock withZone(ZoneId zone) { return this; }
+}
+
+final class ScriptedGateway implements PaymentGateway {
+    private final Map<String, PaymentStatus> outcomes = new ConcurrentHashMap<>();
+    final List<String> refunds = new CopyOnWriteArrayList<>();
+    Runnable duringCharge = () -> {};
+    void willReturn(String bookingId, PaymentStatus s) { outcomes.put(bookingId, s); }
+    public PaymentStatus charge(String bookingId, long amount) {
+        duringCharge.run();
+        return outcomes.getOrDefault(bookingId, PaymentStatus.SUCCESS);
+    }
+    public void refund(String bookingId, long amount) { refunds.add(bookingId); }
+}
+
+public class Main {
+    public static void main(String[] args) {
+        MutableClock clock = new MutableClock(Instant.parse("2026-01-01T10:00:00Z"));
+        Movie movie = new Movie("M1", "Interstellar", 169);
+        List<Seat> seats = List.of(new Seat("A1", SeatType.REGULAR), new Seat("A2", SeatType.REGULAR),
+                new Seat("A3", SeatType.REGULAR), new Seat("P1", SeatType.PREMIUM), new Seat("P2", SeatType.PREMIUM));
+        Screen audi1 = new Screen("S1", "Audi 1", seats);
+        Theatre pvr = new Theatre("T1", "PVR Forum", "Bengaluru", List.of(audi1));
+        Catalog catalog = new Catalog();
+        catalog.addShow(new Show("SH1", movie, pvr, audi1, LocalDateTime.of(2026, 1, 1, 18, 30),
+                Map.of(SeatType.REGULAR, 20000L, SeatType.PREMIUM, 35000L)));
+
+        ScriptedGateway gateway = new ScriptedGateway();
+        BookingService svc = new BookingService(catalog, new SeatLockManager(clock, Duration.ofMinutes(10)), gateway);
+        svc.subscribe(new BookingListener() {
+            public void onConfirmed(Booking b) { System.out.println("  [notify] " + b.userId() + ": confirmed " + b); }
+            public void onFailed(Booking b, String why) { System.out.println("  [notify] " + b.userId() + ": failed (" + why + ") " + b); }
+            public void onLockExpired(Booking b) { System.out.println("  [notify] " + b.userId() + ": hold expired " + b); }
+        });
+
+        Show show = catalog.showsFor("Bengaluru", "M1").get(0);
+        System.out.println("Shows: " + show.id() + " at " + show.start() + " in " + show.theatre().name());
+
+        Booking alice = svc.holdSeats("alice", "SH1", List.of("A1", "A2"));
+        System.out.println("alice holds A1,A2 for Rs " + alice.amountPaise() / 100);
+        try { svc.holdSeats("bob", "SH1", List.of("A2", "A3")); }
+        catch (SeatUnavailableException e) { System.out.println("bob: " + e.getMessage()); }
+        svc.pay(alice.id());
+
+        Booking bob = svc.holdSeats("bob", "SH1", List.of("A3"));
+        gateway.willReturn(bob.id(), PaymentStatus.FAILED);
+        svc.pay(bob.id());
+        System.out.println("available after bob's failed payment: " + svc.availableSeats("SH1"));
+
+        Booking carol = svc.holdSeats("carol", "SH1", List.of("P1", "P2"));
+        clock.advance(Duration.ofMinutes(11));
+        System.out.println("11 minutes later, sweeper expired " + svc.sweepExpiredHolds() + " hold(s)");
+        Booking dave = svc.holdSeats("dave", "SH1", List.of("P1"));
+        gateway.willReturn(dave.id(), PaymentStatus.TIMED_OUT);
+        svc.pay(dave.id());
+        System.out.println("final: alice=" + alice.status() + " bob=" + bob.status()
+                + " carol=" + carol.status() + " dave=" + dave.status());
+    }
+}
+```
+
+## Concurrency and edge cases
+
+### Why this cannot double book
+
+1. Every read and write of a show's holds and booked set happens inside `synchronized (showSeats)` for that show. `ConcurrentHashMap.computeIfAbsent` guarantees all threads get the **same** `ShowSeats` object for a show, so they all lock the same monitor.
+2. `tryLock` checks every seat and writes the hold in one critical section, so no two holds ever cover the same live seat.
+3. `confirm` moves seats to `booked` only if the caller's own hold is still present and unexpired, in the same critical section. A seat in `booked` is never held again (step 2 checks `booked`).
+4. So a seat enters `booked` at most once, and only through the booking that held it.
+
+`synchronized` also gives **visibility**: changes made inside the block are seen by the next thread that takes the same lock (happens-before). See [Java Concurrency and Locks](/learn/notes/java-concurrency-locks/).
+
+### Edge cases handled
+
+| Case | Behaviour |
+|---|---|
+| Overlapping request (one of several seats taken) | Whole request fails; no partial hold. |
+| Duplicate seat in one request, empty list, unknown seat or show | `IllegalArgumentException`. |
+| Pay twice, or pay a FAILED/EXPIRED booking | `IllegalStateException`. |
+| Hold expires, nobody touches the seats | Sweeper expires it, notifies the user. |
+| Hold expires, another user grabs a seat | Lazy eviction during `tryLock`; the old booking becomes EXPIRED and is notified. |
+| Payment succeeds after the hold expired | Refund, EXPIRED, seat stays available for others. |
+| Payment FAILED or TIMED_OUT | Hold released immediately, seats back on sale. |
+| Sweeper and payment race on one booking | CAS on status: exactly one outcome, one notification. |
+| Clock exactly at `expiresAt` | Treated as expired. |
+
+### What changes when there are many app servers
+
+An in-memory lock only protects one JVM. With several instances you need a shared source of truth: a Redis `SET key value NX EX ttl` per seat (grabbed in a Lua script for all-or-nothing), or a conditional `UPDATE ... WHERE status = 'AVAILABLE' OR hold_expires_at < now()` in the database, plus a **unique constraint** on (show, seat) in the booked table as the last line of defence. That design, along with payment-timeout handling and waiting rooms, is covered in [HLD: Flash Sale + Inventory](/learn/notes/hld-flash-sale-inventory/) under "Variant: ticket booking with seat selection". The in-memory `SeatLockManager` here has the same shape, so moving to Redis or SQL is a new implementation behind the same methods.
+
+## Testing it
+
+### Unit tests (JUnit 5 style)
+
+These mirror the plain-Java harness that was actually run (it uses a small `check()` helper instead of JUnit).
+
+```java
+class BookingServiceTest {
+    MutableClock clock = new MutableClock(Instant.parse("2026-01-01T10:00:00Z"));
+    ScriptedGateway gateway = new ScriptedGateway();
+    List<String> events = new CopyOnWriteArrayList<>();
+    BookingService svc;   // built in @BeforeEach: show SH1 with seats S1..S10, TTL 10 min, listener -> events
+
+    @Test void successfulPaymentConfirmsAndNotifies() {
+        Booking b = svc.holdSeats("u1", "SH1", List.of("S1", "S5"));   // regular + premium
+        assertEquals(45000, b.amountPaise());
+        assertEquals(BookingStatus.CONFIRMED, svc.pay(b.id()));
+        assertEquals(List.of("confirmed " + b.id()), events);
+        assertFalse(svc.availableSeats("SH1").contains("S1"));
+    }
+
+    @Test void multiSeatHoldIsAllOrNothing() {
+        svc.pay(svc.holdSeats("u1", "SH1", List.of("S1")).id());
+        assertThrows(SeatUnavailableException.class, () -> svc.holdSeats("u2", "SH1", List.of("S2", "S1")));
+        assertTrue(svc.availableSeats("SH1").contains("S2"));          // no partial hold
+    }
+
+    @Test void failedAndTimedOutPaymentsReleaseSeats() {
+        Booking c = svc.holdSeats("u3", "SH1", List.of("S3"));
+        gateway.willReturn(c.id(), PaymentStatus.FAILED);
+        assertEquals(BookingStatus.FAILED, svc.pay(c.id()));
+        Booking d = svc.holdSeats("u4", "SH1", List.of("S3"));         // seat is free again
+        gateway.willReturn(d.id(), PaymentStatus.TIMED_OUT);
+        assertEquals(BookingStatus.FAILED, svc.pay(d.id()));
+        assertTrue(svc.availableSeats("SH1").contains("S3"));
+    }
+
+    @Test void holdExpiresExactlyAtTtl() {
+        Booking first = svc.holdSeats("u1", "SH1", List.of("S1", "S2"));
+        clock.advance(Duration.ofMinutes(9));
+        assertThrows(SeatUnavailableException.class, () -> svc.holdSeats("u2", "SH1", List.of("S1")));
+        clock.advance(Duration.ofMinutes(1));
+        svc.holdSeats("u2", "SH1", List.of("S1"));                      // lazy eviction
+        assertEquals(BookingStatus.EXPIRED, first.status());
+        assertTrue(events.contains("expired " + first.id()));
+        assertTrue(svc.availableSeats("SH1").contains("S2"));          // whole hold released
+    }
+
+    @Test void latePaymentIsRefunded() {
+        Booking b = svc.holdSeats("u1", "SH1", List.of("S4"));
+        gateway.duringCharge = () -> clock.advance(Duration.ofMinutes(11)); // gateway is slow
+        assertEquals(BookingStatus.EXPIRED, svc.pay(b.id()));
+        assertEquals(List.of(b.id()), gateway.refunds);
+    }
+
+    @RepeatedTest(20) void twoHundredThreadsOneSeatOneWinner() throws Exception {
+        var pool = Executors.newFixedThreadPool(32);
+        var go = new CountDownLatch(1);
+        var wins = new AtomicInteger();
+        List<Future<?>> fs = new ArrayList<>();
+        for (int i = 0; i < 200; i++) {
+            String user = "u" + i;
+            fs.add(pool.submit(() -> {
+                go.await();                                             // start everyone together
+                try {
+                    Booking x = svc.holdSeats(user, "SH1", List.of("S7"));
+                    if (svc.pay(x.id()) == BookingStatus.CONFIRMED) wins.incrementAndGet();
+                } catch (SeatUnavailableException ignored) {}
+                return null;
+            }));
+        }
+        go.countDown();
+        for (var f : fs) f.get();
+        pool.shutdown();
+        assertEquals(1, wins.get());
+    }
+}
+```
+
+The harness also runs a **randomized stress test**: 16 threads each make 300 attempts at 1 to 3 random seats out of 30, with 25% payment failures, 10% abandoned holds, random 4-minute clock jumps and concurrent sweeps. Afterwards it asserts: no seat appears in two confirmed bookings, no booking is left `PENDING` after a final sweep, available plus sold equals all 30 seats, and the number of "confirmed" events equals the number of confirmed bookings.
+
+**Proving the test has teeth:** with the `synchronized (s)` removed from `tryLock` (and the maps switched to `ConcurrentHashMap` so nothing else breaks), the one-seat race fails on round 0 with more than one winner. A concurrency test that still passes when you delete the lock is not testing anything.
+
+**Harness result** (25 checks, run 8 times in a row with no failures):
+
+```
+PASS price = regular + premium
+PASS successful payment confirms
+PASS observer got confirmed event
+PASS booked seat not available
+PASS overlap with booked seat rejected
+PASS failed multi-seat hold leaves no partial lock
+PASS duplicate seats rejected
+PASS unknown seat rejected
+PASS unknown show rejected
+PASS paying a confirmed booking twice rejected
+PASS failed payment releases seat
+PASS timeout releases seat
+PASS hold still valid at 9 min
+PASS hold expires at exactly TTL, observer notified
+PASS all seats of expired hold freed
+PASS cannot pay an expired booking
+PASS sweeper expires idle holds
+PASS sweeper is idempotent
+PASS late payment refunded
+PASS seat free after late payment
+PASS exactly one winner for one seat, 20 rounds x 200 threads
+PASS no seat in two confirmed bookings (30 seats sold)
+PASS no booking left PENDING after sweep
+PASS available + sold = all seats
+PASS one confirmed event per confirmed booking
+25 checks passed
+```
+
+### Demo output (real output of `java Main`)
+
+```
+Shows: SH1 at 2026-01-01T18:30 in PVR Forum
+alice holds A1,A2 for Rs 400
+bob: seats [A2, A3] not available
+  [notify] alice: confirmed B1[A1, A2] CONFIRMED
+  [notify] bob: failed (payment FAILED) B3[A3] FAILED
+available after bob's failed payment: [A3, P1, P2]
+  [notify] carol: hold expired B4[P1, P2] EXPIRED
+11 minutes later, sweeper expired 1 hold(s)
+  [notify] dave: failed (payment TIMED_OUT) B5[P1] FAILED
+final: alice=CONFIRMED bob=FAILED carol=EXPIRED dave=FAILED
+```
+
+Bob's first attempt fails because A2 is held by Alice (all or nothing, so A3 is not held either). Booking id B2 was used by that failed attempt, which is why Bob's next booking is B3. Carol's hold expires after 11 simulated minutes and the sweeper notifies her; Dave then holds P1, but his payment times out and the seat is released.
+
+## Extensions interviewers ask for (and how the design absorbs them)
+
+| Extension | Change |
+|---|---|
+| **Multiple app servers** | Replace `SeatLockManager` with a Redis- or SQL-backed implementation of the same methods; add a unique constraint on booked (show, seat). See [HLD: Flash Sale + Inventory](/learn/notes/hld-flash-sale-inventory/). |
+| **Email / SMS / push notifications** | New `BookingListener` implementations. Make delivery async (executor or queue) so slow channels don't slow booking. |
+| **Dynamic pricing, offers, convenience fees** | Extract a `PricingStrategy` used in `holdSeats`. Use [Decorator](/learn/notes/structural-patterns/) to stack fees and discounts. |
+| **Cancellation after confirmation** | New status `CANCELLED`, a `release` of booked seats in the lock manager, a refund policy strategy (full refund before X hours). |
+| **Extend hold while on the payment page** | `extend(bookingId)` under the show lock, if the hold is still valid, with a cap on total time. |
+| **Seat selection rules** (no single empty seat left between bookings) | A validation step (chain of validators) before `tryLock`. |
+| **Waiting list for a sold-out show** | Observer on "hold expired / payment failed" events that offers freed seats to the next user in a queue. |
+| **Idempotent payment callbacks** | Use the booking id as the idempotency key; `pay` already rejects non-PENDING bookings, and CAS prevents double transitions. |
+| **Persistence** | Repositories for catalog and bookings behind interfaces; the service code doesn't change. |
+
+## Common mistakes
+
+- **Check-then-act without a lock**: "if seat is free, mark it held" as two separate steps, or `ConcurrentHashMap.get` then `put`. A concurrent map makes each call safe, not the sequence.
+- **Locking seats one at a time without ordering**: user 1 locks A1 then waits for A2, user 2 locks A2 then waits for A1, and both deadlock. Lock per show, or sort seat ids before locking.
+- **Partial holds**: holding A1 and A2 before discovering A3 is taken, then forgetting to roll back.
+- **Calling the payment gateway while holding the lock**: one slow payment freezes the whole show.
+- **Confirming on payment success without re-checking the hold**: the hold may have expired mid-payment and someone else may own the seat now. Always re-validate; refund if lost.
+- **`Thread.sleep` in TTL tests** (slow and flaky). Inject a `Clock`.
+- **`System.currentTimeMillis()` scattered through the code**: untestable. Same fix.
+- **`double` for money**: rounding errors. Use `long` minor units or `BigDecimal`.
+- **Firing notifications inside the critical section**: a slow listener now holds the seat lock.
+- **A concurrency "test" that would pass without the lock**: always check that your test fails when you break the code.
+- **Relying only on the in-memory lock in a multi-server design**: it only protects one JVM.
+
+## Practice questions
+
+<Practice>
+
+<QA q="What are the core entities, and why is seat state stored per show rather than on the Seat object?" level="easy">
+
+Movie, Theatre, Screen, Seat, Show, Booking, plus Hold for temporary reservations. A `Seat` is a physical chair on a screen; the same chair is sold separately for every show. So availability belongs to the pair (show, seat). Keeping catalog objects immutable and storing state in a per-show structure also means the catalog needs no locking.
+
+</QA>
+
+<QA q="Why should a multi-seat hold be all or nothing?" level="easy">
+
+A group wants seats together; holding two of three is useless and blocks others. Atomicity also simplifies everything else: there is never a half-held booking to clean up. The implementation checks all seats first and writes only if all are free, inside one critical section.
+
+</QA>
+
+<QA q="How do you test a 10-minute TTL without waiting 10 minutes?" level="easy">
+
+Inject a `java.time.Clock` instead of calling `Instant.now()` directly. Production passes `Clock.systemUTC()`; tests pass a mutable clock subclass and call `advance(Duration.ofMinutes(10))`. Tests run instantly and deterministically, and you can test the exact boundary (9 minutes held, 10 minutes expired).
+
+</QA>
+
+<QA q="Why is there one lock per show instead of one global lock or one lock per seat?" level="medium">
+
+A booking touches seats of a single show, so a per-show lock makes the multi-seat check-then-act atomic. Different shows don't contend. A global lock is correct but serializes the whole system. Per-seat locks allow more parallelism but must be acquired in a consistent (sorted) order to avoid deadlock, and you still need to roll back if a later seat is taken. Per-show is simple and enough.
+
+</QA>
+
+<QA q="Why is the payment gateway called outside the seat lock, and what problem does that create?" level="medium">
+
+A payment call can take seconds. Holding the show lock during it would block every other user of that show. The cost: the hold might expire while payment is in progress. So after a successful charge, `confirm()` re-validates under the lock; if the hold is gone, the service refunds and marks the booking EXPIRED.
+
+</QA>
+
+<QA q="Why does Booking use AtomicReference.compareAndSet for its status?" level="medium">
+
+Several threads can try to finish the same booking: the payment thread confirming or failing it, the sweeper expiring it, or another user's `tryLock` evicting it. `compareAndSet(PENDING, X)` lets exactly one of them win, so the booking ends in one state and the user gets one notification.
+
+</QA>
+
+<QA q="Lazy expiry vs a background sweeper: which one guarantees correctness?" level="medium">
+
+Lazy expiry. Every operation that reads holds compares `expiresAt` with the clock, so an expired hold is treated as free even if nothing cleaned it up. The sweeper is for liveness and UX: it moves abandoned bookings to EXPIRED and notifies users even if no one else touches those seats. If the sweeper stopped, booking would still be correct.
+
+</QA>
+
+<QA q="How does your test prove there is no double booking, and how do you know the test is meaningful?" level="hard">
+
+200 threads wait on a `CountDownLatch`, then all try to hold and pay for the same seat; the test asserts exactly one CONFIRMED, repeated 20 times. A randomized stress test with overlapping multi-seat requests, payment failures, abandoned holds and clock jumps asserts no seat appears in two confirmed bookings and that available plus sold equals capacity. To show the test has teeth, remove the `synchronized` block: the test fails immediately with multiple winners.
+
+</QA>
+
+<QA q="What does Observer give you here, and what pitfalls should you avoid?" level="medium">
+
+The service publishes events (confirmed, failed, hold expired) without knowing who listens, so email, SMS, analytics and a waiting list can be added without touching booking code. Pitfalls: calling listeners while holding a lock, letting one listener's exception break the booking flow, slow synchronous listeners (use an executor or queue), and forgetting to unsubscribe. A `CopyOnWriteArrayList` makes subscribing during iteration safe.
+
+</QA>
+
+<QA q="The payment gateway times out. Should you release the seats?" level="scenario">
+
+In this design, yes: TIMED_OUT is treated like FAILED so seats go back on sale quickly. But a timeout really means 'unknown': the money may have been taken. A production system records the booking as payment-unknown, queries the gateway's status API (or waits for its webhook) and refunds if the charge did succeed. Use the booking id as the idempotency key so retries never double-charge.
+
+</QA>
+
+<QA q="A user pays successfully at 10 minutes and 2 seconds, after their hold expired and another user took the seat. What happens?" level="scenario">
+
+`confirm()` finds the hold gone or expired and returns false, so the service refunds the charge and marks the booking EXPIRED, and the observer tells the user. The other user keeps the seat. The rule: never confirm just because the payment succeeded; confirm only if you still own the seat. Showing the user a slightly shorter timer than the real TTL reduces how often this happens.
+
+</QA>
+
+<QA q="How would you move this to several application servers?" level="scenario">
+
+Replace the in-memory `SeatLockManager` with shared storage behind the same methods: Redis `SET NX EX` per seat taken in a Lua script for all-or-nothing, or a conditional `UPDATE` in the database that treats expired holds as free, with a unique constraint on booked (show, seat) as the final guard. The service, observer and payment flow stay the same. The [HLD: Flash Sale + Inventory](/learn/notes/hld-flash-sale-inventory/) note covers this design in detail.
+
+</QA>
+
+<QA q="Why use long paise instead of double rupees for prices?" level="easy">
+
+Binary floating point can't represent most decimal fractions exactly, so sums drift (0.1 + 0.2 is not 0.3). Storing integer minor units (paise) makes addition exact. `BigDecimal` is the alternative when you need rates or division.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="Two threads both call get(seat) on a ConcurrentHashMap, see null, then both call put(seat, hold). What is wrong?" options={["Nothing, ConcurrentHashMap makes this safe", "The check-then-act sequence is not atomic, so both think they won", "ConcurrentHashMap throws on concurrent put", "Only the first put is stored, so it is fine"]} answer={1}>
+
+Each individual call is thread-safe, but the sequence is not. Both threads pass the check and both write; the second silently overwrites the first. Use one lock around the sequence, or an atomic method like `putIfAbsent`.
+
+</MCQ>
+
+<MCQ q="Why lock per show rather than per seat in this design?" options={["Per-seat locks are impossible in Java", "A booking's seats are all in one show, so one lock makes the multi-seat hold atomic without lock-ordering issues", "Per-show locks allow more parallelism than per-seat locks", "Shows have fewer seats than screens"]} answer={1}>
+
+Per-seat locking is possible but needs consistent ordering and rollback. Per-show locking is simpler and still lets different shows proceed in parallel.
+
+</MCQ>
+
+<MCQ q="What is the main reason to inject a Clock?" options={["Clock is faster than Instant.now()", "Tests can control time and check expiry boundaries instantly and deterministically", "It handles time zones for theatres", "It is required by ConcurrentHashMap"]} answer={1}>
+
+Controllable time is the point. Time zones are a side benefit of `Clock`, not why it is injected here.
+
+</MCQ>
+
+<MCQ q="The gateway returns SUCCESS but confirm() returns false. What should the service do?" options={["Confirm the booking anyway since money was taken", "Retry confirm until it succeeds", "Refund and mark the booking EXPIRED", "Throw an exception and leave the booking PENDING"]} answer={2}>
+
+The hold expired during payment and the seat may belong to someone else now. Refund, record the outcome, notify the user.
+
+</MCQ>
+
+<MCQ q="Which statement about the sweeper is true?" options={["Without it, two users could book the same seat", "It is needed for correctness because tryLock ignores expiry", "Correctness comes from lazy expiry checks; the sweeper moves abandoned bookings to EXPIRED and notifies users", "It must hold a global lock across all shows"]} answer={2}>
+
+Every operation treats expired holds as free, so correctness doesn't depend on the sweeper. It locks one show at a time.
+
+</MCQ>
+
+<MCQ q="Why is Booking status an AtomicReference updated with compareAndSet?" options={["To make Booking serializable", "So exactly one of several racing threads can move it out of PENDING", "Because enums cannot be assigned in Java", "To avoid using the per-show lock in tryLock"]} answer={1}>
+
+The payment thread, the sweeper and another user's eviction may race to finish a booking; CAS ensures one winner and one notification.
+
+</MCQ>
+
+<MCQ q="A concurrency test for no double booking still passes after you delete the synchronized block. What does that tell you?" options={["The lock was unnecessary", "The test does not create real contention and proves nothing", "Java added the lock automatically", "The JIT removed the race"]} answer={1}>
+
+A good concurrency test must fail when the protection is removed. Use a start latch, many threads and the same seats to force contention.
+
+</MCQ>
+
+<MCQ q="Where should notification listeners be called?" options={["Inside the synchronized block, so they see consistent state", "After the state change and outside any seat lock, ideally asynchronously", "Before the payment is charged", "Only from the sweeper thread"]} answer={1}>
+
+Calling listeners under the lock lets a slow email or SMS call block every booking for that show.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **Entities**: Movie, Theatre, Screen, Seat (immutable catalog), Show (movie + screen + time + prices), Booking (status via CAS), Hold (booking's seats + `expiresAt`).
+- **State lives per show**: `holdBySeat`, `holdByBooking`, `booked`, all under `synchronized (showSeats)`.
+- **Hold**: evict expired, check all seats, write all or nothing, in one critical section.
+- **TTL**: `expiresAt = clock.instant() + ttl`; expired means `!now.isBefore(expiresAt)`; lazy expiry for correctness, sweeper for notifications.
+- **Pay**: check hold, charge **outside** the lock, `confirm()` re-checks under the lock; lost hold means refund + EXPIRED; FAILED/TIMED_OUT means release + FAILED.
+- **Observer**: `onConfirmed`, `onFailed`, `onLockExpired`; publish after state change, outside locks.
+- **Proof**: 200 threads on one seat gives exactly 1 winner; randomized stress keeps "no seat in two confirmed bookings"; the test fails when the lock is removed.
+- **Money**: `long` paise. **Time**: injected `Clock`. **Scale-out**: Redis `SET NX EX` or SQL conditional update + unique (show, seat), see the flash-sale HLD note.
+
+## Go deeper
+
+- **JDK API**: [java.time.Clock](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/time/Clock.html) (designed to be swapped for testing), [AtomicReference](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/atomic/AtomicReference.html), [CopyOnWriteArrayList](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CopyOnWriteArrayList.html).
+- **refactoring.guru**: [Observer pattern](https://refactoring.guru/design-patterns/observer).
+- **Book**: Brian Goetz et al., *Java Concurrency in Practice*: check-then-act races, lock ordering, testing concurrent programs.
+- Related notes: [HLD: Flash Sale + Inventory](/learn/notes/hld-flash-sale-inventory/) (distributed seat booking), [Behavioral Patterns](/learn/notes/behavioral-patterns/), [Java Concurrency and Locks](/learn/notes/java-concurrency-locks/), [Machine Coding Strategy](/learn/notes/machine-coding-strategy/), [LLD: Elevator System](/learn/notes/lld-elevator-system/).

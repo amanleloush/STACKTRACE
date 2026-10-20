@@ -1,7 +1,7 @@
 ---
 title: "HLD: Web Crawler"
 phase: "07-hld-problems"
-order: 47
+order: 70
 tags: []
 premium: false
 previewParagraphs: 4
@@ -87,7 +87,7 @@ Per-domain rate limit (typical: 1 req/sec/domain).
 Implementation:
 - Per-domain bucket in Redis or in-process token bucket.
 - Worker holding a domain's lease must respect crawl-delay.
-- robots.txt cached per domain (refetch weekly).
+- robots.txt cached per domain (refetch ~daily; RFC 9309 says not to use a cached copy for more than 24 hours).
 
 ### Fetcher
 
@@ -110,7 +110,7 @@ Implementation:
 URL dedup:
 - Bloom filter per shard: "have we seen this URL?"
 - Negative result → definitely new; positive → likely seen, check.
-- 10B URLs at ~5 bits/URL ≈ 6 GB per bloom.
+- 10B URLs at ~5 bits/URL ≈ 6 GB per bloom — but that's a ~10% false-positive rate; ~10 bits/URL (~12 GB) gets ~1%.
 
 Content dedup:
 - Hash content (SimHash for near-duplicates).
@@ -163,42 +163,154 @@ Content dedup:
 - **Storage tier**: keep recent pages hot, older pages cold (Glacier).
 - **Fresh vs broad coverage**: budget for both — high-priority sites get fresh; tail gets stale.
 
-## Interview questions
+## Practice questions
 
-### Q1: How do you avoid hitting a domain too aggressively?
-Per-domain rate limiter (token bucket in Redis or in-process). Honor `Crawl-Delay` in robots.txt. Default to 1 req/sec/domain (configurable). Workers acquire a domain lease before fetching; release after honor delay.
+<Practice>
 
-### Q2: How to deduplicate URLs at scale?
-Bloom filters per shard for fast "have we seen it?" check. Bloom is probabilistic — false positives mean we may skip a new URL (acceptable); false negatives never. Backed by persistent storage for definitive checks when needed.
+<QA q="What's a crawler trap?" level="easy">
 
-### Q3: Storage estimation.
-1B pages/day × 200KB = 200 TB/day raw. With compression (3×), ~70 TB/day. Over 5 years = ~120 PB compressed. Cold tier (Glacier) for old; hot tier (HBase) for recent.
+Pages that generate an endless supply of URLs: calendars with an infinite 'next month' link, paginations that never end, query-parameter explosions. Mitigations: depth limits, URL length limits, parameter normalization, and heuristics or blocklists that flag trap and spam sites.
 
-### Q4: What's a crawler trap?
-Infinite-link pages: calendars with infinite next-month, paginations that never end, query-parameter explosions. Mitigations: depth limits, URL length limits, parameter normalization, heuristics flagging spam sites.
+</QA>
 
-### Q5: How do you scale to billions of pages?
-- Distributed fetchers (many workers).
+<QA q="Why normalize URLs before deduplication?" level="easy">
+
+The same page is reachable under many spellings. Normalizing (drop `#fragments`, sort query params, lowercase the host) and honoring `<link rel='canonical'>` collapses them to one key, so the dedup check and the frontier don't treat each variant as a new page.
+
+</QA>
+
+<QA q="Why is DNS caching a big win for a crawler?" level="easy">
+
+Every fetch needs a host lookup, and the crawler hits the same hosts over and over. Without a cache, DNS becomes a bottleneck and adds latency to every request. Cache aggressively in the fetchers and spread lookups over multiple recursors.
+
+</QA>
+
+<QA q="How to deduplicate URLs at scale?" level="medium">
+
+Bloom filters per shard for a fast 'have we seen it?' check. A Bloom filter is probabilistic: a negative means definitely new; a positive means probably seen. False positives make us skip some new URLs (acceptable); false negatives never happen. Size matters: ~10 bits/URL gives ~1% false positives (~12 GB for 10B URLs). Back it with persistent storage for definitive checks when needed.
+
+</QA>
+
+<QA q="How do you avoid hitting a domain too aggressively?" level="medium">
+
+Per-domain rate limiter (token bucket in Redis or in-process). Honor `Crawl-Delay` in robots.txt where you choose to (it's non-standard and not in RFC 9309; Bing honors it, Google ignores it). Default to ~1 req/sec/domain, configurable. Workers acquire a domain lease before fetching and release it after the delay.
+
+</QA>
+
+<QA q="Why is the URL frontier sharded by domain and persisted?" level="medium">
+
+Politeness is a per-domain rule, so putting all of a domain's URLs in one shard lets one worker enforce its rate limit without cross-worker coordination. Persistence matters because crawlers crash often; a durable frontier (for example Kafka topics per priority tier) means a restart doesn't lose the queue. Priority tiers let important or fast-changing sites jump ahead of the long tail.
+
+</QA>
+
+<QA q="How do you detect duplicate content, not just duplicate URLs?" level="medium">
+
+Hash the content. An exact hash catches byte-identical copies (and using it as the S3 key gives natural dedup). For near-duplicates (same article with different ads or timestamps), use SimHash: similar documents produce fingerprints that differ in only a few bits, so you compare against seen fingerprints and skip pages that are too close.
+
+</QA>
+
+<QA q="How do you schedule recrawls?" level="medium">
+
+- Priority per site: news every hour, blogs daily, static sites weekly or monthly.
+- Adaptive: track change frequency per page; pages that change often get recrawled more often.
+- Re-evaluate stale entries periodically.
+- Burst recrawls on sitemap signals or trending events.
+
+</QA>
+
+<QA q="Storage estimation." level="medium">
+
+1B pages/day × 200 KB = 200 TB/day raw. With ~3× compression, ~70 TB/day. Over 5 years that's ~120 PB compressed. Keep recent pages in a hot tier (HBase/S3) and move old ones to a cold tier (Glacier).
+
+</QA>
+
+<QA q="How do you scale to billions of pages?" level="hard">
+
+- Distributed fetchers (many workers) using async I/O, each holding thousands of in-flight requests.
 - Sharded URL frontier (by domain hash).
 - Distributed parser/processor pools.
 - Sharded storage (S3 with key-prefix sharding).
-- Async I/O — fetchers can hold thousands of in-flight HTTP requests.
+- Bloom filters per shard so dedup state stays in memory.
 
-### Q6: How do you handle JavaScript-heavy pages (SPAs)?
-- Detect via content (mostly empty `<body>` + JS).
+</QA>
+
+<QA q="Politeness vs throughput — design." level="hard">
+
+Politeness is a per-domain constraint. Throughput comes from **parallelism across domains**, not within one. With ~387M registered domains (Verisign DNIB, end of Q4 2025) at 1 req/sec each, the theoretical ceiling is hundreds of millions of req/sec. In practice the long tail dominates: be polite to each domain and keep many domains in flight at once.
+
+</QA>
+
+<QA q="How do you handle JavaScript-heavy pages (SPAs)?" level="scenario">
+
+- Detect via content (mostly empty `<body>` plus JS bundles).
 - Route to a headless browser pool (Puppeteer/Playwright).
-- Expensive: 100× the cost; budget per page.
+- It's roughly 100× the cost, so set a budget per page.
 - Cache rendered content aggressively.
-- Many crawlers prioritize cheap HTML and only escalate to JS rendering for high-value pages.
+- Most crawlers parse cheap HTML first and escalate to JS rendering only for high-value pages.
 
-### Q7: How do you schedule recrawls?
-- Priority per domain: news sites every hour, blogs daily, static sites weekly.
-- Adaptive: track change frequency per page; pages that change often → frequent recrawls.
-- Bloom-aged data: re-evaluate stale entries.
-- Burst recrawls on sitemap signal or trending events.
+</QA>
 
-### Q8: Politeness vs throughput — design.
-Politeness is a per-domain constraint. Throughput is achieved by **parallelism across domains**, not within a domain. With 1B unique domains and 1 req/sec per domain, theoretical limit = 1B req/sec. In practice: long-tail dominates, polite to each, total throughput high.
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="A crawler's Bloom filter says a URL has NOT been seen. What can you conclude?" options={["It was probably seen; check the persistent store", "It is definitely new", "Nothing; Bloom filters give false negatives", "It was seen but has expired"]} answer={1}>
+
+Bloom filters have no false negatives, so a negative is certain. Only a positive is uncertain (possible false positive). They don't track expiry.
+
+</MCQ>
+
+<MCQ q="Each domain is limited to about 1 request per second. How does the crawler still reach high total throughput?" options={["By raising the per-domain rate during off-peak hours", "By using HTTP/2 to send many parallel requests to each domain", "By crawling many domains in parallel", "By ignoring robots.txt for large sites"]} answer={2}>
+
+Politeness is a per-domain cap; throughput comes from parallelism across the huge number of domains. Raising per-domain concurrency or ignoring robots.txt breaks politeness.
+
+</MCQ>
+
+<MCQ q="Why shard the URL frontier by domain?" options={["So one worker can enforce a domain's rate limit without coordination", "Because domains hash more evenly than URLs", "To make Bloom filters smaller", "So pages from a domain are stored together in S3"]} answer={0}>
+
+Politeness is per domain, so keeping a domain's URLs in one shard lets a single worker own its rate limit. The other options are not the reason.
+
+</MCQ>
+
+<MCQ q="What is SimHash used for in a crawler?" options={["Checking whether a URL is in the frontier", "Encrypting stored pages", "Choosing the partition for a URL", "Detecting near-duplicate page content"]} answer={3}>
+
+SimHash makes fingerprints where similar documents differ in few bits, so it catches near-duplicates. URL membership uses Bloom filters; partitioning uses a domain hash.
+
+</MCQ>
+
+<MCQ q="What is the status of the Crawl-delay directive?" options={["Required by RFC 9309", "Non-standard; Bing honors it, Google ignores it", "Deprecated and ignored by all crawlers", "Only valid in sitemaps"]} answer={1}>
+
+Crawl-delay is not part of RFC 9309. Support varies by crawler: Bing honors it, Google does not.
+
+</MCQ>
+
+<MCQ q="Per RFC 9309, how long may a crawler use a cached robots.txt?" options={["No more than 7 days", "Until the site returns a 404", "No more than 24 hours", "Indefinitely if the file is unchanged"]} answer={2}>
+
+RFC 9309 says crawlers should not use a cached copy for more than 24 hours, which is why robots.txt is refetched about daily.
+
+</MCQ>
+
+<MCQ q="Roughly how many fetches per second is 1 billion fetches per day?" options={["About 12,000", "About 1,200", "About 120,000", "About 1.2 million"]} answer={0}>
+
+A day has 86,400 seconds; 1e9 / 86,400 is about 11,600, so roughly 12K/sec.
+
+</MCQ>
+
+<MCQ q="Which is the best mitigation for a calendar page with an endless next-month link?" options={["Increase the fetch timeout", "Render it in a headless browser", "Use SimHash to detect it", "Apply depth and URL-length limits plus trap heuristics"]} answer={3}>
+
+Traps generate endless distinct URLs; depth limits, URL length limits, parameter normalization and blocklists stop them. Timeouts and rendering don't, and SimHash may miss pages whose content differs slightly.
+
+</MCQ>
+
+<MCQ q="What is the usual strategy for JavaScript-heavy pages?" options={["Render every page in a headless browser", "Parse HTML first and render with a headless browser only for high-value pages", "Skip all SPAs", "Ask site owners for an API"]} answer={1}>
+
+Full rendering is about 100× more expensive, so crawlers escalate only when the page is valuable and the HTML is nearly empty.
+
+</MCQ>
+
+</Quiz>
 
 ## TL;DR cheat sheet
 

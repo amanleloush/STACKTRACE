@@ -1,0 +1,582 @@
+---
+title: "JVM Memory Areas and Class Loading"
+phase: "13-java-spring"
+order: 127
+tags: ["java", "jvm", "memory", "classloading", "oom"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 20
+prerequisites: ["memory-gc", "java-core-language"]
+summary: "Where a running JVM keeps everything (heap generations, metaspace, thread stacks, PC registers, code cache, direct memory), how objects are laid out, how classes are loaded, linked and initialized, what each OutOfMemoryError message means, and which flags and tools to reach for in production."
+---
+
+## Definition (interview-ready)
+
+A running JVM splits its memory into several **run-time data areas**. The JVM spec (JVMS 2.5) defines the logical ones, and HotSpot (the JVM in OpenJDK) adds a few of its own:
+
+| Area | One per | Holds | Failure |
+|---|---|---|---|
+| **Heap** | JVM | Every object and array; split into **young** (eden + survivors) and **old** generations | `OutOfMemoryError: Java heap space` |
+| **Metaspace** (the spec's "method area") | JVM | Class metadata: methods, bytecode, field layouts, constant pools. **Native memory**, replaced PermGen in **Java 8** | `OutOfMemoryError: Metaspace` |
+| **JVM stack** | Thread | One **frame** per method call: local variables, operand stack | `StackOverflowError` |
+| **PC register** | Thread | Address of the bytecode instruction being executed | — |
+| **Native method stack** | Thread | Frames of native (C/C++) code called through JNI | `StackOverflowError` |
+| **Code cache** | JVM | Machine code produced by the JIT compiler | JIT stops compiling |
+| **Direct memory** | JVM | Off-heap buffers from `ByteBuffer.allocateDirect` (used by Netty, NIO) | `OutOfMemoryError` mentioning direct buffer memory |
+
+**Class loading** is how a `.class` file becomes a usable class: a **class loader** finds and loads the bytes, the JVM **links** them (verify, prepare, resolve) and finally **initializes** the class by running its static initializers, lazily, on first active use. Loaders form a parent chain (bootstrap → platform → application) and **delegate to the parent first**.
+
+How to say it in an interview: "Objects live on the heap, class metadata in metaspace, which is native memory since Java 8, and each thread has its own stack and PC. The heap is only part of the process's memory, so in a container I size the heap as a percentage and leave room for metaspace, stacks, code cache and direct buffers."
+
+## Why it matters
+
+- **Containers**: "the heap is 60% used but the pod was OOM-killed" is one of the most common Java production incidents. You can only diagnose it if you know what lives *outside* the heap.
+- **Every `OutOfMemoryError` message points at a different area** with a different fix. Raising `-Xmx` for a Metaspace or "unable to create native thread" error does nothing, or makes it worse.
+- **Class loading** explains `ClassNotFoundException` vs `NoClassDefFoundError`, static initialization order bugs, classloader leaks on redeploys, and why the same class loaded twice is two different types.
+- It's a staple of Java interviews ("explain the JVM memory model") and a foundation for GC tuning. Collectors themselves are covered in [Memory and Garbage Collection](/learn/notes/memory-gc/); this note covers the layout they work on.
+
+## Core concepts
+
+### The big picture
+
+```
+                         one JVM process
+ ┌──────────────────────────────────────────────────────────────────┐
+ │  Java heap (-Xms / -Xmx)                                         │
+ │  ┌──────────────── young ───────────────┐ ┌────── old ────────┐  │
+ │  │  eden            │ S0     │ S1       │ │ long-lived objects │  │
+ │  └──────────────────────────────────────┘ └────────────────────┘  │
+ ├──────────────────────────────────────────────────────────────────┤
+ │  native memory (outside -Xmx)                                    │
+ │   metaspace + compressed class space   code cache (JIT output)   │
+ │   thread stacks (-Xss each)            direct ByteBuffers        │
+ │   GC bookkeeping, JIT compiler arenas, symbol table, JNI libs    │
+ └──────────────────────────────────────────────────────────────────┘
+ per thread: JVM stack (frames) · PC register · native method stack
+```
+
+### The heap: young and old generations
+
+The heap holds every object created with `new`, every array, and (since JDK 7) the string pool. It's shared by all threads and managed by the garbage collector. Most collectors split it by age, based on the observation that most objects die young:
+
+- **Eden**: where new objects are allocated. Each thread gets a private chunk of eden called a **TLAB** (thread-local allocation buffer), so most allocations are just a pointer bump with no locking.
+- **Survivor spaces (S0 and S1)**: objects that survive a young (minor) GC are copied here. Only one survivor space is in use at a time; each young GC copies live objects from eden and the active survivor into the other one.
+- **Age and promotion**: each survival increments the object's age. Once it reaches the tenuring threshold (at most 15, `-XX:MaxTenuringThreshold`; the age is stored in 4 bits of the object header) or survivors fill up, the object is **promoted** to the old generation.
+- **Old (tenured) generation**: long-lived objects such as caches, pools and singletons. Collected less often and more expensively.
+
+With **G1** (the default since JDK 9), the heap is a set of equal-sized **regions**, and each region is tagged eden, survivor, old or humongous, so the generations are logical rather than two fixed blocks. Generational ZGC (JDK 21+) also separates young and old. How each collector cleans these spaces is in [Memory and Garbage Collection](/learn/notes/memory-gc/).
+
+### Metaspace (and the PermGen it replaced)
+
+The JVM spec calls it the **method area**: per-class data such as the run-time constant pool, field and method data, and bytecode. In HotSpot:
+
+- **Before Java 8**: a fixed-size heap area called the **Permanent Generation** (PermGen), sized with `-XX:MaxPermSize`. Apps that loaded many classes (app servers, heavy proxies) hit `OutOfMemoryError: PermGen space`.
+- **Java 8+ (JEP 122)**: PermGen was removed. Class metadata lives in **metaspace**, allocated from **native memory**. Interned strings had already moved to the heap in JDK 7, and class static variables live with the `Class` object on the heap.
+
+Metaspace facts worth knowing:
+
+- **`-XX:MaxMetaspaceSize` is unlimited by default.** A classloader leak can therefore grow it until the container or OS kills the process. Setting a cap turns that into a clear `OutOfMemoryError: Metaspace`.
+- `-XX:MetaspaceSize` is not a size; it's the **high-water mark** that triggers the first GC to unload classes (about 21 MB by default on the JDK 21 build tested for this note).
+- With compressed class pointers (the default on 64-bit), class structures go in a separate **compressed class space**, reserved at 1 GB by default (`-XX:CompressedClassSpaceSize`). It has its own error: `OutOfMemoryError: Compressed class space`.
+- **Classes are unloaded only when their class loader becomes unreachable**, along with every class it loaded and every instance of those classes. One stray reference from a long-lived object to anything from that loader keeps all its metadata alive.
+
+### JVM stacks and frames
+
+Each thread gets its own **JVM stack** when it starts. Each method call pushes a **frame**; return or an uncaught exception pops it. A frame holds:
+
+- the **local variable array**: `this` (for instance methods), parameters and locals. Primitives are stored directly; objects are stored as **references** to the heap,
+- the **operand stack**: the scratch space bytecode instructions push and pop values on (the JVM is a stack machine),
+- a reference to the **run-time constant pool** of the method's class, used to resolve method and field references (dynamic linking).
+
+The stack size is fixed per thread by `-Xss` (or the `stackSize` argument of a `Thread` constructor). The JDK 21 `java` docs list a default of 1 MB on Linux and macOS x64 and 2 MB on AArch64 (Linux and macOS). Recursion that's too deep throws `StackOverflowError`. How many frames fit depends on the frame sizes, and on whether the method is interpreted or JIT-compiled, so there's no fixed "max depth".
+
+Thread stacks are **native memory**. 1,000 threads at 1 MB each can reserve up to 1 GB outside the heap (actual usage is usually lower because the OS commits stack pages only as they're touched). This is one reason [virtual threads](/learn/notes/java-executors-virtual-threads/) are attractive: their stacks are heap objects that grow and shrink.
+
+### PC register and native method stacks
+
+- **PC (program counter) register**: one per thread. It holds the address of the JVM instruction currently being executed. If the thread is running a `native` method, the spec says its value is undefined. It's what lets each thread resume where it left off after a context switch.
+- **Native method stack**: used when Java calls native code through JNI (or the JVM's own C++ code). In HotSpot, Java and native frames share the same thread stack, so `-Xss` covers both.
+
+### Code cache
+
+When a method gets hot, the JIT compiler turns its bytecode into machine code and stores it in the **code cache**, which is native memory. The JDK 21 default maximum (`-XX:ReservedCodeCacheSize`) is 240 MB with tiered compilation. Since JDK 9 it's **segmented** (JEP 197) into non-method code, profiled code and non-profiled code. If it fills up, the JVM logs a warning and **stops compiling**, and performance quietly drops back toward interpreted speed. See [Compiled vs Interpreted, Bytecode and JIT](/learn/notes/compilation-jit-bytecode/).
+
+### Direct (off-heap) memory
+
+`ByteBuffer.allocateDirect(n)` allocates `n` bytes of native memory, wrapped by a small heap object. Network and file I/O can use it without an extra copy, which is why Netty and NIO-based servers use it heavily. Facts:
+
+- The total is capped by `-XX:MaxDirectMemorySize`. If unset, the JDK uses the maximum heap size (`Runtime.getRuntime().maxMemory()`) as the cap. So direct memory can roughly **double** the heap's footprint if you don't set it.
+- The native memory is freed only when the small wrapper object is garbage collected (or a framework frees it explicitly, as Netty's pooled allocator does). A tiny heap with rare GCs can sit on a lot of direct memory.
+- Memory-mapped files (`FileChannel.map`) also live outside the heap.
+
+### Object layout: headers and compressed oops
+
+On a 64-bit HotSpot JVM, every object starts with a **header**:
+
+```
+ ┌─────────────────────── object header ───────────────────────┐
+ │ mark word (8 bytes)                │ class pointer (4 bytes) │ [array length 4 bytes] │ fields... │ padding
+ │ identity hash, GC age, lock state  │ compressed by default   │  arrays only           │           │ to 8 bytes
+ └─────────────────────────────────────────────────────────────┘
+```
+
+- **Mark word** (8 bytes): identity hash code (once computed), GC age bits, and lock state.
+- **Class pointer**: points to the class metadata in metaspace. 4 bytes with compressed class pointers (default), 8 without.
+- **Arrays** also store their length (4 bytes).
+- Objects are **aligned to 8 bytes** (`-XX:ObjectAlignmentInBytes=8`), so a plain `new Object()` takes 16 bytes: a 12-byte header plus 4 bytes of padding.
+
+**Compressed oops** ("ordinary object pointers"): on 64-bit JVMs, object references in the heap are stored as **32-bit offsets** that are shifted left by 3 bits (multiplied by 8, the alignment) when used. 2^32 × 8 bytes = **32 GB** of addressable heap. Benefits: smaller references, so smaller objects and better CPU cache use. They're on by default when the max heap is below about 32 GB. On the JDK 21 used for this note, `-Xmx31g` leaves `UseCompressedOops` on and `-Xmx32g` turns it off. The practical consequence: **a 32 GB heap can hold fewer objects than a 31 GB heap**, because every reference doubles to 8 bytes. If you need more than about 31 GB, jump well past it (for example 48 GB or more), or reconsider.
+
+**Compact object headers**: JEP 450 (experimental in JDK 24) and JEP 519 (product feature in JDK 25, still opt-in with `-XX:+UseCompactObjectHeaders`) squeeze the mark word and class pointer into a single **8-byte** header, which shrinks heaps full of small objects.
+
+### Class loading: the three built-in loaders
+
+Since **Java 9** (the module system, JEP 261), the JDK has three built-in class loaders:
+
+| Loader | Loads | `getClassLoader()` returns |
+|---|---|---|
+| **Bootstrap** | Core platform modules like `java.base` (`String`, `Object`, collections). Built into the JVM, written in native code | `null` |
+| **Platform** (was the "extension" loader before Java 9) | Other Java SE and JDK modules, such as `java.sql` | the loader named `platform` |
+| **Application** (system) | Your classes from the class path and module path | the loader named `app` |
+
+You can add your own (`URLClassLoader`, framework loaders for plugins, app servers, hot reload).
+
+```java
+// Compile and run: javac -d out Loaders.java && java -cp out Loaders
+public class Loaders {
+    public static void main(String[] args) throws Exception {
+        System.out.println("String       -> " + String.class.getClassLoader());
+        System.out.println("java.sql.Date -> " + java.sql.Date.class.getClassLoader().getName());
+        ClassLoader app = Loaders.class.getClassLoader();
+        System.out.println("Loaders      -> " + app.getName());
+        System.out.println("app parent   -> " + app.getParent().getName());
+        System.out.println("platform parent -> " + app.getParent().getParent());
+    }
+}
+```
+
+```
+String       -> null
+java.sql.Date -> platform
+Loaders      -> app
+app parent   -> platform
+platform parent -> null
+```
+
+(Running it as a single source file with `java Loaders.java` prints a different loader for `Loaders`, because source-file mode compiles into memory and loads the class with its own loader.)
+
+### Parent delegation
+
+The default `ClassLoader.loadClass(name)` does three steps, in order:
+
+1. **Already loaded?** `findLoadedClass(name)`. If yes, return it.
+2. **Ask the parent** (the bootstrap loader if the parent is `null`).
+3. Only if the parent can't find it, call this loader's own **`findClass(name)`**.
+
+```
+ loadClass("com.shop.Order")
+   app loader ──asks──▶ platform loader ──asks──▶ bootstrap
+                                                    │ not found
+                         platform: not found ◀──────┘
+   app loader: findClass → reads com/shop/Order.class from the class path ✔
+```
+
+Why parent-first:
+
+- **Safety**: a `java.lang.String` on your class path can never replace the real one, because the bootstrap loader is asked first.
+- **Consistency**: each core class is loaded once, by one loader, so every part of the program sees the same `Class` object.
+
+A class's runtime identity is **(class name, defining loader)**. The same `.class` file loaded by two different loaders produces two different types, and casting between them throws `ClassCastException` ("`com.shop.Order` cannot be cast to `com.shop.Order`"). Some environments deliberately break parent-first: servlet containers usually load a web app's own classes **child-first** so each app can use its own library versions.
+
+### Loading, linking, initialization
+
+JVMS chapter 5 splits the lifecycle into steps:
+
+1. **Loading**: find the binary representation (usually a `.class` file) and create the `Class` object.
+2. **Linking**:
+   - **Verification**: the bytecode verifier checks that the code is type-safe and well-formed (no jumping into the middle of an instruction, no treating an `int` as a reference). Failure → `VerifyError`.
+   - **Preparation**: allocate static fields and set them to **default values** (0, `false`, `null`). No user code runs yet.
+   - **Resolution**: turn symbolic references in the constant pool (names of classes, methods and fields) into direct references. HotSpot does this **lazily**, the first time each reference is used.
+3. **Initialization**: run the class's static initializer, the compiler-generated method named `<clinit>`, which contains static field initializers and `static` blocks in source order. The JVM guarantees this happens **once**, under a lock, even if many threads trigger it at the same time. That's what makes the holder-class singleton idiom thread-safe.
+
+**When does initialization happen?** JLS 12.4.1: immediately before the first of these:
+
+- an instance of the class is created,
+- a static method declared by the class is invoked,
+- a static field declared by the class is assigned,
+- a static field declared by the class is used, **unless it's a constant variable** (a `static final` primitive or `String` initialized with a compile-time constant; the compiler inlines those),
+- plus certain reflective calls such as `Class.forName(name)`.
+
+Superclasses are initialized before subclasses. A static field reference only initializes the class that **declares** the field, even if you access it through a subclass. Creating an array of a class does not initialize it.
+
+```java
+// Run with: java InitOrder.java
+public class InitOrder {
+    static class Super {
+        static int taxi = 1729;
+        static { System.out.println("init Super"); }
+    }
+    static class Sub extends Super {
+        static final int CONST = 42;                 // compile-time constant
+        static int counter = 0;
+        static { System.out.println("init Sub"); }
+    }
+
+    public static void main(String[] args) {
+        System.out.println("1. Sub.CONST = " + Sub.CONST);     // inlined: no init
+        Sub[] arr = new Sub[3];                                  // array creation: no init
+        System.out.println("2. array of Sub created, length " + arr.length);
+        System.out.println("3. Sub.taxi = " + Sub.taxi);        // declared in Super: only Super initializes
+        System.out.println("4. Sub.counter = " + Sub.counter);  // now Sub initializes
+    }
+}
+```
+
+```
+1. Sub.CONST = 42
+2. array of Sub created, length 3
+init Super
+3. Sub.taxi = 1729
+init Sub
+4. Sub.counter = 0
+```
+
+**`ClassNotFoundException` vs `NoClassDefFoundError`:**
+
+- `ClassNotFoundException` (checked exception): you asked for a class **by name** at run time (`Class.forName`, `loadClass`) and no loader could find it.
+- `NoClassDefFoundError` (an `Error`): the class was present at **compile time** but can't be loaded now, typically a missing JAR at run time. It is also thrown on later attempts to use a class whose **static initializer previously failed**: the first attempt throws `ExceptionInInitializerError`, and every attempt after that gets `NoClassDefFoundError`.
+
+### OutOfMemoryError: every message means something different
+
+| Message | What ran out | Typical causes | First fix to try |
+|---|---|---|---|
+| `Java heap space` | The heap | Leak (objects still reachable), loading too much data at once, heap too small for the live set | Heap dump, look for the dominator; then size the heap |
+| `GC overhead limit exceeded` | Progress: over about 98% of time in GC while recovering under 2% of the heap, several collections in a row | Live data barely fits in the heap | Same as heap space; this is an early warning of it (historically implemented by the Parallel collector) |
+| `Metaspace` | Metaspace hit `MaxMetaspaceSize` | Classloader leak (redeploys, plugins), runaway dynamic class generation (proxies, scripting, lambdas spun per call) | Find who keeps old loaders alive; class histogram; raise the cap only if the count is legitimately high |
+| `Compressed class space` | The compressed class space | Very many classes | Raise `CompressedClassSpaceSize` or fix the class leak |
+| `Requested array size exceeds VM limit` | Nothing yet: the array is bigger than the JVM allows | A bug computing a size, for example near `Integer.MAX_VALUE` | Fix the size computation |
+| `unable to create native thread` (older JDKs: `unable to create new native thread`) | OS threads or native memory for stacks | Thread leak, unbounded thread creation, OS or container process/thread limits | Thread dump, bound pools, check `ulimit -u` and the cgroup PID limit; **don't** raise `-Xmx` |
+| Direct buffer memory (JDK 21 says `Cannot reserve N bytes of direct buffer memory`) | `MaxDirectMemorySize` | Netty/NIO buffers leaked or not released, too many connections | Fix buffer release, set the cap explicitly |
+| `request N bytes for ... Out of swap space?` | Native memory (`malloc` failed) | Process near the OS or container limit | Native Memory Tracking; shrink heap or other native users |
+
+When the **kernel** kills the process for exceeding a container's memory limit, there's **no `OutOfMemoryError` at all**: the process just disappears with exit code 137 (SIGKILL). That's an RSS problem, not a heap problem.
+
+A few of these, reproduced on JDK 21:
+
+```java
+// javac -d out Oom.java
+// java -Xmx32m -cp out Oom heap
+// java -cp out Oom array
+// java -XX:MaxDirectMemorySize=8m -cp out Oom direct
+import java.nio.ByteBuffer;
+import java.util.*;
+
+public class Oom {
+    public static void main(String[] args) {
+        switch (args[0]) {
+            case "heap" -> {
+                List<byte[]> hold = new ArrayList<>();
+                while (true) hold.add(new byte[1024 * 1024]);
+            }
+            case "array" -> { int[] a = new int[Integer.MAX_VALUE]; }
+            case "direct" -> {
+                List<ByteBuffer> hold = new ArrayList<>();
+                while (true) hold.add(ByteBuffer.allocateDirect(1024 * 1024));
+            }
+        }
+    }
+}
+```
+
+```
+java.lang.OutOfMemoryError: Java heap space
+java.lang.OutOfMemoryError: Requested array size exceeds VM limit
+java.lang.OutOfMemoryError: Cannot reserve 1048576 bytes of direct buffer memory (allocated: 8388608, limit: 8388608)
+```
+
+And a classic **classloader leak** filling metaspace: every iteration creates a new loader that loads its own copy of a class, and a list keeps them all reachable, so nothing can be unloaded.
+
+```java
+// javac -d plugin-classes Plugin.java   (Plugin: public class Plugin { public String name() { return "plugin"; } })
+// javac -d out MetaspaceLeak.java && java -XX:MaxMetaspaceSize=32m -cp out MetaspaceLeak
+import java.net.URL;
+import java.net.URLClassLoader;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+
+public class MetaspaceLeak {
+    public static void main(String[] args) throws Exception {
+        URL[] path = { Path.of("plugin-classes").toUri().toURL() };
+        List<Object> leaked = new ArrayList<>();          // keeps every loader reachable
+        for (int i = 0; ; i++) {
+            ClassLoader loader = new URLClassLoader(path, null); // parent = bootstrap
+            Class<?> c = loader.loadClass("Plugin");      // a fresh copy of the class each time
+            leaked.add(c.getDeclaredConstructor().newInstance());
+            if (i % 5000 == 0) System.out.println("loaded " + i + " copies");
+        }
+    }
+}
+```
+
+```
+loaded 0 copies
+loaded 5000 copies
+Exception in thread "main" java.lang.OutOfMemoryError: Metaspace
+```
+
+Each `Plugin` instance points to its class, which points to its loader, which points to every class it loaded. Real-world versions of this: a `ThreadLocal` or JDBC driver registration that outlives a web-app redeploy, or a static cache in a parent loader holding an object from a child loader.
+
+### Key flags
+
+| Flag | What it does | Default (JDK 21) |
+|---|---|---|
+| `-Xms` / `-Xmx` | Initial / maximum heap | Derived from RAM: initial 1/64 (1.5625%), max 1/4 (25%) of physical or container memory |
+| `-XX:MaxRAMPercentage` / `-XX:InitialRAMPercentage` | Heap max / initial as a % of available RAM. Ignored if `-Xmx` / `-Xms` is set | 25 / 1.5625 |
+| `-XX:MinRAMPercentage` | Despite the name, the max heap % used only when available memory is very small (the docs describe heaps of roughly 125 MB) | 50 |
+| `-XX:MaxMetaspaceSize` | Cap on metaspace | Unlimited |
+| `-Xss` | Thread stack size | 1 MB on x64, 2 MB on AArch64 (Linux, macOS) |
+| `-XX:MaxDirectMemorySize` | Cap on direct buffers | Equal to max heap |
+| `-XX:ReservedCodeCacheSize` | JIT code cache cap | 240 MB (tiered) |
+| `-XX:+UseContainerSupport` | Read cgroup CPU and memory limits instead of the host's | On (Linux) |
+| `-XX:+HeapDumpOnOutOfMemoryError`, `-XX:HeapDumpPath` | Write an `.hprof` heap dump on OOM | Off |
+| `-XX:+ExitOnOutOfMemoryError` | Exit immediately on the first OOM so the orchestrator restarts a clean process | Off |
+| `-XX:NativeMemoryTracking=summary` | Track native memory by JVM subsystem (small overhead) | Off |
+
+**Container awareness**: since **JDK 10** (JDK-8146115, backported to 8u191), the JVM reads the container's cgroup memory and CPU limits instead of the host's. cgroup v2 support arrived in **JDK 15** (backported to 11.0.16 and 8u372). So in a pod with a 2 GB limit, the default max heap is 25% of 2 GB = 512 MB, which is often too small for a dedicated service. The common setting is `-XX:MaxRAMPercentage=70` to `75`, leaving the rest for metaspace, stacks, code cache, direct memory and GC structures. Verify with `java -XX:+PrintFlagsFinal -version` or `Runtime.getRuntime().maxMemory()` inside the container.
+
+### Tools
+
+| Tool | Use it for |
+|---|---|
+| `jcmd <pid> GC.heap_info` | Current heap usage by space |
+| `jcmd <pid> GC.class_histogram` | Instance count and bytes per class: quick leak triage without a full dump |
+| `jcmd <pid> GC.heap_dump /path/file.hprof` | Full heap dump for MAT or VisualVM. Pauses the app and writes a file the size of the live heap |
+| `jcmd <pid> Thread.print` | Thread dump: deadlocks, stuck threads, thread counts |
+| `jcmd <pid> VM.native_memory summary` | Where non-heap memory goes (needs `-XX:NativeMemoryTracking=summary` at startup) |
+| `jcmd <pid> VM.metaspace` | Metaspace usage, including per class loader |
+| `jcmd <pid> VM.flags` | The flags the JVM is actually running with |
+| `jstat -gcutil <pid> 1000` | Live % usage of eden, survivors, old, metaspace and GC counts/times every second |
+| **JFR** (`jcmd <pid> JFR.start`, `JFR.dump`, or `-XX:StartFlightRecording`) | Low-overhead always-on profiling: allocations, GC, locks, I/O. View in JDK Mission Control |
+| **Eclipse MAT** | Analyse heap dumps: dominator tree, retained sizes, "path to GC roots", leak suspects |
+| **VisualVM** | Live monitoring, sampling profiler, heap dump browsing on a dev machine |
+
+## How it works (memory during one request)
+
+A Spring service handles `GET /orders/42`:
+
+1. A Tomcat worker thread (its **stack** already exists, sized by `-Xss`) calls the controller; a **frame** is pushed for each method call, holding references to the request objects.
+2. The first time `OrderController` is used after startup, its class was **loaded** by the app loader, **linked**, and **initialized** (static fields set). Its metadata sits in **metaspace**.
+3. The repository returns an `Order`: the object and its strings are allocated in this thread's **TLAB in eden**. Only references live in the stack frames.
+4. The response is serialized to bytes. On a Netty-based server (for example Spring WebFlux), those bytes are written from pooled **direct buffers** (off-heap) to the socket.
+5. The handler method is hot, so the JIT has compiled it; the machine code lives in the **code cache**.
+6. The request ends, frames pop, and the `Order` becomes unreachable. The next **young GC** doesn't even copy it, because it's dead. Only long-lived objects (caches, pools, Spring beans) get promoted to the **old generation**.
+
+## Real-world examples
+
+- **JEP 122 (Java 8)** removed PermGen, ending the era of `OutOfMemoryError: PermGen space` on app servers that redeployed often (though classloader leaks now show up as metaspace growth instead).
+- **JDK-8146115 (JDK 10, backported to 8u191)** made the JVM container-aware. Before it, JVMs in Docker sized the heap and GC threads from the **host's** RAM and CPU count, which could easily push a process past its container limit.
+- **JEP 519 (JDK 25)** made compact object headers a product feature, cutting the header from 12 to 8 bytes for workloads with many small objects.
+- **Netty** uses pooled direct buffers and has a built-in leak detector, because unreleased direct buffers are a classic off-heap leak.
+
+## Common pitfalls
+
+- **`-Xmx` equal to the container limit.** Non-heap memory pushes RSS past the limit → exit 137 with no Java error.
+- **Relying on the 25% default** in a dedicated container and wondering why the heap is tiny.
+- **Unbounded metaspace** hiding a classloader leak until the pod is killed. Set `MaxMetaspaceSize` in production so it fails loudly.
+- **Raising `-Xmx` for `unable to create native thread`.** That leaves less memory for thread stacks. Fix the thread leak or limits.
+- **Assuming `MaxDirectMemorySize` is small by default.** It defaults to the max heap size.
+- **Heaps of 32 to around 40 GB** that lose compressed oops and hold less than a 31 GB heap.
+- **Static initializers that can throw** (reading config, connecting to things). One failure turns into `NoClassDefFoundError` on every later use, which is confusing to debug.
+- **Thinking `String`/static data still lives in PermGen.** Interned strings moved to the heap in JDK 7; PermGen is gone since 8.
+- **Taking a heap dump of a large production heap casually.** It pauses the JVM and writes a huge file; route traffic away first.
+
+## Practice questions
+
+<Practice>
+
+<QA q="Name the JVM run-time data areas. Which are shared and which are per thread?" level="easy">
+
+Shared by all threads: the **heap** (objects and arrays) and the **method area**, implemented in HotSpot as **metaspace** (class metadata, run-time constant pools). Per thread: the **JVM stack** (frames with locals and the operand stack), the **PC register** (current bytecode instruction), and the **native method stack**. HotSpot also has the **code cache** for JIT output, and direct (off-heap) buffers live in native memory too.
+
+</QA>
+
+<QA q="What is stored on the stack versus the heap in Java?" level="easy">
+
+Each frame on a thread's stack holds that method's primitive locals, parameters and **references**. All objects and arrays created with `new` live on the heap (logically; the JIT may scalar-replace objects that never escape). So in `Order o = new Order()`, the reference `o` is in the frame and the `Order` object is on the heap. Static fields belong to the class and live with the `Class` object on the heap in modern HotSpot.
+
+</QA>
+
+<QA q="What replaced PermGen, and why?" level="easy">
+
+In Java 8 (JEP 122), PermGen was removed and class metadata moved to **metaspace**, which is allocated from native memory and is unlimited by default. PermGen had a fixed maximum that was hard to size, causing `OutOfMemoryError: PermGen space` in apps loading many classes. Interned strings had already moved to the heap in JDK 7. You can still cap metaspace with `-XX:MaxMetaspaceSize`, and classloader leaks still cause metaspace growth.
+
+</QA>
+
+<QA q="What is the difference between `StackOverflowError` and `OutOfMemoryError`?" level="easy">
+
+`StackOverflowError` means one thread's stack ran out of room, almost always from deep or infinite recursion; raising `-Xss` only helps for legitimately deep recursion. `OutOfMemoryError` means a shared area ran out: the heap, metaspace, direct memory, native memory for new threads, and so on. The message tells you which. Both are `Error`s, not exceptions you should normally catch.
+
+</QA>
+
+<QA q="Explain the parent delegation model and why it exists." level="medium">
+
+When a class loader is asked for a class, it first checks whether it has already loaded it, then asks its **parent**, and only if the parent can't find it does it look itself (`findClass`). The chain is application → platform → bootstrap. This guarantees core classes like `java.lang.String` always come from the bootstrap loader (an app can't substitute its own), and that each class is loaded once, so all code shares the same `Class` object. Servlet containers deliberately load web-app classes child-first so each app can bundle its own library versions.
+
+</QA>
+
+<QA q="What happens during linking and initialization of a class?" level="medium">
+
+Linking has three parts: **verification** checks the bytecode is type-safe and well-formed (`VerifyError` otherwise); **preparation** allocates static fields with default values; **resolution** replaces symbolic references with direct ones, lazily in HotSpot. **Initialization** then runs the static initializer method (static field initializers and static blocks in source order) exactly once, under a JVM-held lock, on the first active use: creating an instance, calling a static method, or touching a non-constant static field. Superclasses are initialized first.
+
+</QA>
+
+<QA q="Does reading a `static final int` constant from another class initialize that class?" level="medium">
+
+No, if it's a constant variable: a `static final` primitive or `String` initialized with a compile-time constant expression. The compiler inlines the value into the caller, so the declaring class isn't touched. A `static final` field initialized with something non-constant (like `new Object()` or a method call) does trigger initialization. Also, a static field accessed through a subclass only initializes the class that declares it, and creating an array of a class doesn't initialize it.
+
+</QA>
+
+<QA q="`ClassNotFoundException` vs `NoClassDefFoundError`?" level="medium">
+
+`ClassNotFoundException` is a checked exception from asking for a class by name at run time (`Class.forName`, `loadClass`) when no loader can find it. `NoClassDefFoundError` is an `Error` thrown when a class that existed at compile time can't be found or defined when the JVM tries to link it, typically a missing JAR. It's also what you get on every use after a class's static initializer failed once (the first failure is `ExceptionInInitializerError`).
+
+</QA>
+
+<QA q="What are compressed oops, and why is a 32 GB heap a bad size?" level="medium">
+
+On 64-bit JVMs, references are stored as 32-bit values scaled by the 8-byte object alignment, so they can address 2^32 × 8 = 32 GB with half-size references. That makes objects smaller and caches more effective. Once the max heap reaches about 32 GB, the JVM switches to full 64-bit references, every reference doubles, and a 32 GB heap can hold less data than a 31 GB one. Stay just under the limit, or go substantially above it.
+
+</QA>
+
+<QA q="How big is the object header on 64-bit HotSpot, and what is in it?" level="medium">
+
+By default 12 bytes: an 8-byte mark word (identity hash, GC age, lock state) plus a 4-byte compressed class pointer. Arrays add a 4-byte length. Objects are padded to 8 bytes, so `new Object()` uses 16 bytes. Without compressed class pointers the header is 16 bytes. Compact object headers (experimental in JDK 24, product in JDK 25, opt-in with `-XX:+UseCompactObjectHeaders`) shrink it to 8 bytes.
+
+</QA>
+
+<QA q="How does the JVM decide the heap size in a container, and what would you set?" level="medium">
+
+Since JDK 10 (and 8u191), with `UseContainerSupport` on by default, the JVM reads the cgroup memory limit and uses it as 'physical memory'. Default max heap is 25% of that (`MaxRAMPercentage`), initial heap 1.5625%, and 50% for very small limits. For a dedicated service container, set `-XX:MaxRAMPercentage` to around 70 to 75 rather than a fixed `-Xmx`, so the heap scales with the limit while leaving room for metaspace, thread stacks, code cache, direct buffers and GC structures. Check with `-XX:+PrintFlagsFinal`.
+
+</QA>
+
+<QA q="List the `OutOfMemoryError` variants and what each one tells you." level="hard">
+
+`Java heap space`: heap full of live objects (leak or undersized). `GC overhead limit exceeded`: almost all time spent in GC recovering almost nothing, an early heap-space signal. `Metaspace` / `Compressed class space`: too many classes, usually a classloader leak or runaway class generation. `Requested array size exceeds VM limit`: an impossible array size, a bug. `unable to create native thread`: OS thread limit or no native memory for a stack, so fix thread counts, not the heap. Direct buffer memory (`Cannot reserve ... direct buffer memory` on recent JDKs): `MaxDirectMemorySize` exhausted. `Out of swap space?` with a request size: a native `malloc` failed. And an exit code 137 with no error at all is the kernel OOM-killing the process for exceeding the container limit.
+
+</QA>
+
+<QA q="Why do classloader leaks happen and how do you find one?" level="hard">
+
+A class can be unloaded only when its loader and every class and instance from that loader are unreachable. A single reference from something longer-lived (a `ThreadLocal` on a pool thread, a JDBC driver registered in `DriverManager`, a shutdown hook, a static cache in a parent loader, a running thread started by the app) pins the whole loader and all its metadata. On each redeploy, a new loader is created and the old one stays, so metaspace grows. Find it with `jcmd VM.metaspace` or `GC.class_histogram` (duplicate class names), then a heap dump in MAT: look for multiple instances of the app's loader and follow 'path to GC roots' from the old one.
+
+</QA>
+
+<QA q="A pod with a 4 GB limit and `-Xmx4g` keeps getting killed with exit code 137, but there is no `OutOfMemoryError` in the logs. Explain and fix." level="scenario">
+
+Exit 137 is SIGKILL from the kernel's OOM killer: the process's total memory (RSS) exceeded the cgroup limit. With the heap allowed to use the whole 4 GB, metaspace, thread stacks, code cache, direct buffers, GC data structures and native libraries push RSS over. The JVM never throws, because the heap itself didn't fill. Fix: drop `-Xmx` and use `-XX:MaxRAMPercentage=70` to `75` (or set `-Xmx` to about 3 GB), cap `MaxDirectMemorySize` and `MaxMetaspaceSize`, check thread count, and confirm with Native Memory Tracking (`jcmd VM.native_memory summary`) where the non-heap memory goes.
+
+</QA>
+
+<QA q="After each hot redeploy in a long-running app server, memory grows until `OutOfMemoryError: Metaspace`. What is happening and how do you confirm it?" level="scenario">
+
+A classloader leak: each redeploy creates a new web-app loader and loads all classes again, but something still references the old loader, so none of its classes can be unloaded. Confirm with `jcmd <pid> VM.metaspace` (growing loader count) or `GC.class_histogram` (the same application class appearing many times), then take a heap dump and use MAT to find multiple instances of the app loader and the GC-root path keeping old ones alive: typical culprits are `ThreadLocal`s on container threads, threads the app started, JDBC drivers not deregistered, and static caches in shared libraries. Fix the reference; in the meantime, prefer full restarts over hot redeploys.
+
+</QA>
+
+<QA q="A service throws `OutOfMemoryError: unable to create native thread` with a mostly empty heap. What do you check?" level="scenario">
+
+This is about OS threads, not the heap. Check the live thread count over time (`jcmd Thread.print`, `jstat`, metrics): a steady climb means a thread leak, such as creating `new Thread` or a new executor per request without shutting it down. Check limits: `ulimit -u` for the user, the container's PID limit (`pids.max`), and kernel-wide limits. Check memory: each thread needs a native stack (`-Xss`), so a huge heap can leave too little room. Fixes: bounded, shared thread pools (or virtual threads for blocking I/O), shutting executors down, raising limits if the count is legitimate, and not increasing `-Xmx`.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="Since Java 8, where does HotSpot store class metadata?" options={["In the PermGen area of the heap", "In metaspace, allocated from native memory", "In the young generation", "In the code cache"]} answer={1}>
+
+JEP 122 removed PermGen in Java 8 and moved class metadata to metaspace in native memory. The young generation holds new objects and the code cache holds JIT-compiled machine code.
+
+</MCQ>
+
+<MCQ q="What is the default value of MaxMetaspaceSize in JDK 21?" options={["64 MB", "256 MB", "Unlimited", "25% of RAM"]} answer={2}>
+
+By default metaspace is not capped, so a leak grows until the OS or container stops the process. MetaspaceSize (around 21 MB) is only the threshold for the first class-unloading GC, not a cap. 25% of RAM is the default max heap.
+
+</MCQ>
+
+<MCQ q="String.class.getClassLoader() returns what?" options={["The application class loader", "The platform class loader", "null, because String is loaded by the bootstrap loader", "A new loader per call"]} answer={2}>
+
+Core classes in java.base are loaded by the bootstrap loader, which is built into the JVM and represented as null. The platform loader loads modules such as java.sql, and the application loader loads class-path classes.
+
+</MCQ>
+
+<MCQ q="Code reads Sub.taxi, where taxi is a non-constant static field declared in Super and Sub extends Super. Which classes are initialized?" options={["Sub only", "Super only", "Both Super and Sub", "Neither"]} answer={1}>
+
+JLS 12.4.1: a static field reference initializes only the class that declares the field, even when accessed through a subclass name. Sub stays uninitialized until something else triggers it.
+
+</MCQ>
+
+<MCQ q="With default settings in a container whose memory limit is 2 GB, roughly what is the default maximum heap on JDK 21?" options={["2 GB", "1.5 GB", "1 GB", "512 MB"]} answer={3}>
+
+The JVM is container-aware and uses MaxRAMPercentage, which defaults to 25%, so the max heap is about 512 MB. That is why services usually raise MaxRAMPercentage to around 70 to 75.
+
+</MCQ>
+
+<MCQ q="Which OutOfMemoryError is NOT fixed by increasing -Xmx?" options={["Java heap space caused by an undersized heap", "GC overhead limit exceeded with a legitimately large live set", "unable to create native thread", "Java heap space when loading a large but bounded file"]} answer={2}>
+
+Native thread creation fails due to OS or container thread limits or native memory for stacks. A bigger heap leaves even less native memory. The other three are heap-capacity problems where more heap can help, after ruling out a leak.
+
+</MCQ>
+
+<MCQ q="On 64-bit HotSpot with default settings, how many bytes does new Object() occupy?" options={["8", "12", "16", "24"]} answer={2}>
+
+The header is 12 bytes (8-byte mark word plus 4-byte compressed class pointer), and objects are aligned to 8 bytes, so it rounds up to 16. 8 would require compact object headers, which are opt-in.
+
+</MCQ>
+
+<MCQ q="Why can a 32 GB heap hold fewer objects than a 31 GB heap?" options={["The GC reserves 1 GB per region at 32 GB", "At about 32 GB the JVM can no longer use compressed oops, so every reference grows from 4 to 8 bytes", "Metaspace is moved into the heap at 32 GB", "TLABs are disabled above 31 GB"]} answer={1}>
+
+Compressed oops scale 32-bit offsets by the 8-byte alignment, covering about 32 GB. Above that, references are full 64-bit pointers, inflating every object that holds references. The other options are not real behaviours.
+
+</MCQ>
+
+<MCQ q="In the default loadClass implementation, what happens first after checking that the class is not already loaded?" options={["The loader searches its own class path", "The loader delegates to its parent", "The class is initialized", "The bytecode is verified"]} answer={1}>
+
+The documented order is findLoadedClass, then the parent's loadClass (the bootstrap loader if the parent is null), then the loader's own findClass. Verification and initialization happen later, during linking and first active use.
+
+</MCQ>
+
+<MCQ q="A pod is killed with exit code 137 and the logs contain no OutOfMemoryError. What is the most likely cause?" options={["A StackOverflowError", "The heap was full", "The kernel OOM killer stopped the process because total RSS exceeded the container memory limit", "Metaspace hit MaxMetaspaceSize"]} answer={2}>
+
+Exit 137 is SIGKILL. When the cgroup limit is exceeded, the kernel kills the process without the JVM getting a chance to throw. A full heap or metaspace cap would produce an OutOfMemoryError in the logs, and stack overflow throws StackOverflowError.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **Shared**: heap (eden + survivors + old; string pool since JDK 7) and metaspace (class metadata, native, replaced PermGen in Java 8, unlimited by default).
+- **Per thread**: JVM stack of frames (locals, operand stack), PC register, native method stack. `-Xss` default 1 MB (x64) / 2 MB (AArch64).
+- **Also native**: code cache (240 MB), direct buffers (default cap = max heap), thread stacks, GC structures.
+- **Object header**: 12 bytes (mark word + compressed class pointer), 8-byte alignment, `new Object()` = 16 bytes. Compressed oops below about 32 GB. Compact headers: 8 bytes, JDK 25 opt-in.
+- **Loaders**: bootstrap (`null`) → platform → app; **parent-first** delegation; class identity = name + defining loader.
+- **Lifecycle**: load → verify → prepare (defaults) → resolve (lazy) → initialize (static init, once, thread-safe) on first active use; constants don't trigger it.
+- **OOM messages**: heap space, GC overhead, Metaspace, Compressed class space, array size, native thread, direct buffer, out of swap. Exit 137 = kernel kill, no OOM.
+- **Containers**: container-aware since JDK 10 / 8u191 (cgroup v2: 15 / 11.0.16 / 8u372); default heap 25% → set `MaxRAMPercentage` around 70 to 75.
+- **Tools**: `jcmd` (heap_info, class_histogram, heap_dump, Thread.print, VM.native_memory, VM.metaspace, JFR), `jstat -gcutil`, MAT, VisualVM, JFR + JMC.
+- Collectors and GC tuning: see [Memory and Garbage Collection](/learn/notes/memory-gc/).
+
+## Go deeper
+
+- **JVM spec (SE 21)**: [Chapter 2, Run-Time Data Areas](https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-2.html) and [Chapter 5, Loading, Linking, and Initializing](https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-5.html).
+- **JLS (SE 21)**: [Chapter 12, Execution](https://docs.oracle.com/javase/specs/jls/se21/html/jls-12.html) (12.4 on class initialization).
+- **Javadoc**: [ClassLoader](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/ClassLoader.html).
+- **Oracle**: [Troubleshooting memory leaks (OutOfMemoryError messages)](https://docs.oracle.com/en/java/javase/21/troubleshoot/troubleshooting-memory-leaks.html), [the java command and its -XX options](https://docs.oracle.com/en/java/javase/21/docs/specs/man/java.html), [jcmd](https://docs.oracle.com/en/java/javase/21/docs/specs/man/jcmd.html).
+- **OpenJDK**: [JEP 122 Remove the Permanent Generation](https://openjdk.org/jeps/122), [CompressedOops wiki](https://wiki.openjdk.org/display/HotSpot/CompressedOops), [JEP 450](https://openjdk.org/jeps/450) and [JEP 519](https://openjdk.org/jeps/519) (compact object headers).
+- **Tools**: [Eclipse MAT](https://eclipse.dev/mat/), [VisualVM](https://visualvm.github.io/), [JDK Flight Recorder on dev.java](https://dev.java/learn/jvm/jfr/).

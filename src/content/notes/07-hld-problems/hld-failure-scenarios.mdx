@@ -1,0 +1,591 @@
+---
+title: "Failure Scenario Drills: What Happens When X Fails?"
+phase: "07-hld-problems"
+order: 74
+tags: ["hld", "interview", "reliability", "failures", "incident-response"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 22
+prerequisites: ["hld-framework", "replication-sharding", "circuit-breakers-retries", "cache-stampede-ttl"]
+summary: "Ready-to-use answers for the 'what happens when X fails?' questions — database failover, replica lag, cache stampedes, queue backlogs, region outages, slow dependencies, hot shards, poison messages, partitions, clock skew, full disks, expired certificates and bad deploys."
+---
+
+## Definition (interview-ready)
+
+A **failure scenario drill** is a practised answer to "what happens when X fails?" for a part of your design. A good answer always has the same four parts:
+
+1. **Impact** — what users actually see, and how far it spreads (the **blast radius**).
+2. **Detection** — which metric or alert tells you, ideally before users do.
+3. **Immediate mitigation** — what you do in the first minutes to stop the bleeding, even if it's ugly (fail over, shed load, roll back, serve stale data).
+4. **Long-term fix** — the design change that makes it not happen again, or makes it hurt less.
+
+Interviewers use these questions to tell people who have **drawn** systems from people who have **run** them.
+
+## Why it matters
+
+Every design looks good when nothing breaks. Failure questions show whether you understand what each component really guarantees: what replication does and doesn't protect, what a cache hides, what a queue buffers, what a retry costs.
+
+They are also the most predictable part of the deep dive. There are only a dozen or so classic failure modes. If you've rehearsed a structured answer for each, you can handle almost any "what if" without freezing, and the same playbook is what you'll use on call.
+
+Two ideas sit behind every answer:
+
+- **Mitigate first, diagnose second.** In a real incident, restoring service (roll back, fail over, shed load) comes before finding the root cause.
+- **Degrade, don't die.** A system that serves stale data, drops non-critical features or rejects some requests is much better than one that falls over completely.
+
+## Core concepts
+
+### The answer template
+
+Say it in this order, about 60–90 seconds per scenario:
+
+```
+WHAT BREAKS   → "Writes fail for ~30 s; reads from replicas keep working."
+DETECT        → "Health checks + error rate on the write path + replication lag alert."
+MITIGATE NOW  → "Automated failover promotes a replica; clients retry with backoff."
+FIX FOR GOOD  → "Semi-sync replication so failover loses nothing; fencing to stop split brain."
+TRADE-OFF     → "Semi-sync adds a network round trip to every commit."
+```
+
+### Vocabulary you'll use
+
+- **Blast radius** — how much of the system or how many users one failure affects.
+- **RPO** (recovery point objective) — how much recent data you can afford to lose. **RTO** (recovery time objective) — how long you can afford to be down. See [multi-region RPO/RTO](/learn/notes/multi-region-rpo-rto/).
+- **Graceful degradation** — turning off non-essential features to keep the core working.
+- **Load shedding** — deliberately rejecting some requests (fast) so the rest succeed.
+- **Fencing** — making sure an old leader that thinks it's still in charge can't write anymore.
+- **Idempotency** — doing the same operation twice has the same effect as once, which makes retries safe.
+
+### Detection basics
+
+Most detection comes from a few signals. See [golden signals](/learn/notes/red-use-golden-signals/) and [alerting design](/learn/notes/alerting-design/):
+
+- **Latency, traffic, errors, saturation** on every service and dependency.
+- **Lag**: replication lag, consumer lag, queue age (age of the oldest message).
+- **Resource headroom**: disk, connections, memory, file descriptors, certificate expiry days.
+- **Symptom-based alerts** (users are failing, the SLO is burning — see [SLOs and error budgets](/learn/notes/sli-slo-sla-error-budgets/)) page someone. Cause-based alerts (CPU is high) go to dashboards.
+
+## How it works
+
+The drills. Each one follows the same shape so you can recall it under pressure.
+
+### 1. The database primary dies
+
+**What breaks.** All writes fail. Reads from replicas keep working if the app reads from them. In-flight transactions are lost. If replication was asynchronous, writes that the primary committed but hadn't yet shipped to the replica are **lost on failover** (RPO greater than zero).
+
+**Detect.** Connection errors and write error rate spike; health checks from the failover manager (Patroni, Orchestrator, a managed service like RDS Multi-AZ) fail.
+
+**Mitigate now.**
+- Automated failover promotes the most up-to-date replica and moves the writer endpoint (DNS or a proxy) to it.
+- Apps reconnect and **retry idempotent writes** with backoff. Non-idempotent writes need idempotency keys, or they risk doubling.
+- Optionally run read-only mode: serve reads, queue or reject writes with a clear error.
+
+**Fix for good.**
+- **Semi-synchronous or synchronous replication** to at least one replica, so a commit isn't acknowledged until a second copy exists. Costs a round trip per commit.
+- **Fencing** the old primary (STONITH, revoking its writer role, or a fencing token checked by storage) so that if it comes back it can't accept writes. Otherwise you get **split brain**: two primaries, diverging data.
+- Connection pools and drivers that handle endpoint changes quickly (short DNS TTL, proxies like PgBouncer or ProxySQL).
+- Practise failovers regularly so they're boring.
+
+**Go deeper:** [replication and sharding](/learn/notes/replication-sharding/), [consensus](/learn/notes/consensus-raft-paxos/), [transactions](/learn/notes/transactions-isolation/).
+
+### 2. Replica lag
+
+**What breaks.** Reads from replicas return **stale data**. The classic bug: a user updates their profile, the next page reads from a replica, and the old value appears ("my change disappeared"). If lag grows large, failover would lose more data.
+
+**Detect.** Replication lag metrics: `replay_lag` in Postgres' `pg_stat_replication` (Postgres 10+), `Seconds_Behind_Source` in MySQL (`Seconds_Behind_Master` before 8.0.22). Alert on the p99 against what the product can tolerate.
+
+**Mitigate now.**
+- Route reads that need freshness to the primary (temporarily, or for that user's session).
+- Find the cause: a long-running query on the replica blocking replay, a huge batch write or migration on the primary, an undersized replica, network trouble.
+- Pause or throttle the big batch job.
+
+**Fix for good.**
+- **Read-your-writes**: after a write, read from the primary for a short window, or track the write's log position and only read from a replica that has caught up to it.
+- Break big writes into small batches; run migrations with throttling tools.
+- Size replicas like the primary.
+- Don't put correctness-critical reads (balances, inventory checks) on replicas.
+
+**Go deeper:** [CAP, PACELC and consistency models](/learn/notes/cap-pacelc-consistency/), [replication](/learn/notes/replication-sharding/).
+
+### 3. Cache cluster goes down (stampede)
+
+**What breaks.** Every request that used to be a cache hit now goes to the database. If the cache was absorbing, say, 95% of reads, the database suddenly gets up to 20× its normal read load. It saturates, latency climbs, requests time out and retry, and the load gets worse: a **cache stampede** (also called a thundering herd or dog-pile). The same happens on a smaller scale when one very hot key expires.
+
+**Detect.** Cache errors or hit ratio dropping; DB CPU, connections and latency spiking together.
+
+**Mitigate now.**
+- **Shed load and protect the DB**: rate-limit or reject non-essential reads, turn off expensive features with flags.
+- **Request coalescing** ("single flight"): only one request per key goes to the DB; the others wait for its result.
+- Serve **stale data** where possible (from a local in-process cache or a stale-while-revalidate copy).
+- When the cache comes back, **warm it gradually** instead of letting all traffic hit an empty cache.
+
+**Fix for good.**
+- Run the cache as a replicated, multi-AZ cluster so one node or zone failing doesn't empty it.
+- Two-level caching: small local caches in front of the shared cache.
+- **Jittered TTLs** so keys don't expire together; early probabilistic refresh for hot keys.
+- **Capacity plan the DB** for the realistic cache-miss load, or accept degraded mode explicitly.
+
+**Go deeper:** [cache stampede and TTLs](/learn/notes/cache-stampede-ttl/), [cache patterns](/learn/notes/cache-patterns/), [Redis](/learn/notes/redis-deep/).
+
+### 4. Queue backlog / consumers down
+
+**What breaks.** Producers keep writing, nothing (or not enough) is consumed. Work is **delayed, not lost** — as long as the backlog stays within retention. Users see stale effects: notifications late, search index behind, orders stuck "processing". If retention runs out, messages are lost. When consumers come back, the catch-up burst can overload whatever they write to.
+
+**Detect.** **Consumer lag** (messages behind) and, better, **lag in time** (age of the oldest unprocessed message). Consumer error rate, rebalance storms in Kafka.
+
+**Mitigate now.**
+- Find why consumers stopped: crash loop, a poison message (see below), a slow downstream, constant rebalances.
+- **Scale consumers out**. In Kafka, parallelism is capped by the number of partitions in the topic: extra consumers in a group sit idle.
+- Prioritise: drain urgent topics first, pause low-value ones.
+- Throttle catch-up so the downstream DB isn't flattened.
+- Extend retention temporarily if the backlog is close to the limit.
+
+**Fix for good.**
+- Autoscale consumers on lag; plan partitions for peak parallelism.
+- Make consumers **idempotent** so restarts and redelivery are safe.
+- Separate critical and bulk workloads into different topics/queues.
+- Alert on time-lag against the business SLA ("notifications must go out within 1 minute").
+
+**Go deeper:** [Kafka scenarios](/learn/notes/kafka-scenarios/), [consumer rebalancing](/learn/notes/kafka-consumer-rebalancing/), [delivery semantics](/learn/notes/delivery-semantics/), [async messaging fundamentals](/learn/notes/async-messaging-fundamentals/).
+
+### 5. A whole region goes down
+
+**What breaks.** Everything in that region: compute, databases, caches, queues. Users routed there fail until traffic moves. Writes that hadn't replicated out are at risk.
+
+**Detect.** External probes from other regions and from outside your cloud (your own monitoring may be in the dead region); provider status; global error rate by region.
+
+**Mitigate now.**
+- **Shift traffic** to healthy regions (DNS/GSLB weights, anycast, edge routing).
+- Promote replicas in the healthy region to primaries (active-passive), or simply stop sending traffic to the dead region (active-active).
+- Turn on degraded mode if the remaining regions lack capacity.
+
+**Fix for good.**
+- Choose a topology for the RPO/RTO you need: active-passive, active-active, or geo-partitioned.
+- **Keep headroom**: the surviving regions must carry the failed region's traffic, so don't run every region near full.
+- **Avoid hidden cross-region dependencies** (a single global config service, auth provider, or control plane living in one region).
+- **Static stability**: a term from the AWS Builders' Library for designs that keep working during a failure without needing to make changes (for example, capacity already provisioned rather than scaled up during the event).
+- Run region evacuation drills.
+
+**Go deeper:** [multi-region RPO/RTO](/learn/notes/multi-region-rpo-rto/), [DNS and load balancing](/learn/notes/dns-load-balancing/).
+
+### 6. A dependency gets slow (not down)
+
+**What breaks.** "Slow" is often worse than "down". By **Little's law**, the number of requests in flight = arrival rate × time each one takes. If a dependency goes from 50 ms to 5 s, each caller holds 100× more threads, connections and memory. Thread pools fill up, and the caller stops serving **everything**, including requests that never touch the slow dependency. That's a **cascading failure**.
+
+**Detect.** Per-dependency latency (p99), in-flight request counts, thread/connection pool saturation, timeouts.
+
+**Mitigate now.**
+- Make sure **timeouts** are short enough to protect you; tighten them if needed.
+- Trip the **circuit breaker** (or a feature flag) to stop calling the dependency and use a **fallback**: cached value, default, "temporarily unavailable" for that one widget.
+- Shed load at the edge if you're saturated.
+
+**Fix for good.**
+- **Timeouts on every network call**, derived from your own latency budget; propagate **deadlines** downstream (gRPC deadlines) so work stops when the caller has given up.
+- **Bulkheads**: separate thread pools or connection pools per dependency, so one slow dependency can only use its own share.
+- **Circuit breakers** with fallbacks.
+- **Retries** only for idempotent calls, with exponential backoff, jitter, and a **retry budget** (for example, retries capped at a small fraction of requests), so retries don't multiply the load.
+- Make non-critical calls async.
+
+**Go deeper:** [circuit breakers, retries, bulkheads](/learn/notes/circuit-breakers-retries/), [rate limiting](/learn/notes/rate-limiting/).
+
+### 7. Hot shard / hot key
+
+**What breaks.** One partition gets far more traffic than the others: a celebrity's posts, a viral product, a big tenant, or a badly chosen shard key (for example, by date, so today's shard takes all writes). That shard's latency spikes and errors climb while the rest of the cluster sits idle. Adding nodes doesn't help, because the load is on **one key**.
+
+**Detect.** Per-shard and per-key metrics: QPS, CPU, latency, throttling (for example, partition-level throttling in managed stores). Top-N key sampling.
+
+**Mitigate now.**
+- Cache the hot key closer to clients (local in-process cache, CDN) with a short TTL.
+- Rate-limit the specific tenant or key.
+- For writes: buffer and batch (one aggregated write per second instead of one per event).
+
+**Fix for good.**
+- **Split the key**: `counter:post:123` becomes `counter:post:123:{0..15}`, writes go to a random sub-key, reads sum them.
+- Replicate hot read keys across nodes and read from any copy.
+- Choose a **shard key with high cardinality and even access**; add a hash prefix to time-based keys.
+- Move big tenants to dedicated shards.
+- Split hot partitions dynamically if the store supports it.
+
+**Go deeper:** [sharding strategies](/learn/notes/sharding-strategies/), [Redis patterns](/learn/notes/redis-patterns-use-cases/), [news feed (celebrity problem)](/learn/notes/hld-news-feed/).
+
+### 8. Poison message
+
+**What breaks.** One message that always fails (bad schema, unexpected null, a bug for one edge case). The consumer fails, retries, fails again. In an **ordered log** like Kafka, the consumer can't commit past it, so the **whole partition stops** behind it. In a queue like SQS or RabbitMQ, it keeps being redelivered and wastes capacity.
+
+**Detect.** Lag growing on a single partition while others are fine; the same offset or message ID in repeated error logs; a stuck consumer with high error rate.
+
+**Mitigate now.**
+- Move the message aside: publish it to a **dead-letter queue (DLQ)** with error details and skip it. If there's no DLQ, a carefully recorded manual offset skip.
+- Deploy a fix if it's a code bug, then replay the DLQ.
+
+**Fix for good.**
+- **Bounded retries, then DLQ**, as standard: SQS redrive policies (`maxReceiveCount`), RabbitMQ dead-letter exchanges, retry and DLT topics in Kafka clients like Spring Kafka.
+- Separate **retryable** errors (timeout, dependency down: retry with backoff) from **non-retryable** ones (validation failure: straight to DLQ).
+- Schema validation at the producer (schema registry, compatibility checks).
+- DLQ alerting, ownership and a replay tool. A DLQ nobody watches is just a slower way to lose data.
+- If per-key order matters, decide whether skipping one message breaks the entity's state; you may need to park all later messages for that key.
+
+**Go deeper:** [Kafka scenarios](/learn/notes/kafka-scenarios/), [delivery semantics](/learn/notes/delivery-semantics/), [schema evolution](/learn/notes/schema-evolution/).
+
+### 9. Thundering herd after a deploy or restart
+
+**What breaks.** New instances start **cold**: empty local caches, no warm connection pools, and on the JVM, code not yet JIT-compiled. If they get full traffic immediately, latency spikes. At the same time, every instance opens its DB connections at once (a **connection storm**), and clients that were disconnected all reconnect and retry at the same moment. Scheduled jobs that all fire at `:00` cause the same pattern.
+
+**Detect.** Latency and error spikes right after deploy or scale-up events; DB connection count jumping; cold-start metrics.
+
+**Mitigate now.**
+- Slow or pause the rollout; reduce the batch size.
+- Raise capacity temporarily.
+
+**Fix for good.**
+- **Slow start / warm-up**: load balancers can ramp traffic to new targets over time (for example, AWS ALB slow start mode, Envoy slow start); run warm-up requests before marking a pod ready.
+- **Readiness probes** that only pass when the instance is actually ready.
+- **Jitter** on reconnects, retries, cache TTLs and cron schedules.
+- Connection pool limits and a pooler (PgBouncer) in front of the DB.
+- Rolling deploys in small batches, not all at once.
+
+**Go deeper:** [cache stampede](/learn/notes/cache-stampede-ttl/), [Kubernetes](/learn/notes/kubernetes/), [circuit breakers and retries](/learn/notes/circuit-breakers-retries/).
+
+### 10. Network partition
+
+**What breaks.** Nodes are alive but can't reach each other. Each side may think the other is dead. The danger is **split brain**: both sides elect a leader and accept writes, and the data diverges. This is where the **CAP** trade-off becomes real: during a partition you must choose between staying available (accept writes on both sides, reconcile later) and staying consistent (refuse writes on the minority side).
+
+A real example: in October 2018 a **43-second** network partition between GitHub's East Coast hub and its primary data center triggered automatic database failover to the West Coast. Some writes on the East Coast had not replicated, so the two sites held writes the other lacked. GitHub chose data integrity over fast recovery, and the site was degraded for **just over 24 hours**.
+
+**Detect.** Heartbeat failures between specific node groups (not all), leader elections, quorum loss, error spikes in one zone or region only.
+
+**Mitigate now.**
+- Make sure only the **majority side** keeps a leader (quorum-based systems do this automatically).
+- Stop writes on the minority side; fail requests there or route users to the majority side.
+- If writes happened on both sides, freeze and reconcile carefully. Don't fail back blindly.
+
+**Fix for good.**
+- Use **quorum-based** consensus (Raft, Paxos, ZooKeeper, etcd) for leadership, with an odd number of voters spread across failure domains.
+- **Fencing tokens**: a monotonically increasing number issued with each leadership/lease; storage rejects writes with an older token.
+- Decide per data type: strong consistency (refuse writes) for money and inventory; availability plus conflict resolution (CRDTs, last-write-wins, merge) for carts, likes, presence.
+- Restrict automatic failovers that the application can't tolerate (GitHub's lesson: block cross-region primary promotion that the app couldn't serve well).
+
+**Go deeper:** [CAP and PACELC](/learn/notes/cap-pacelc-consistency/), [consensus: Raft and Paxos](/learn/notes/consensus-raft-paxos/), [multi-region](/learn/notes/multi-region-rpo-rto/).
+
+### 11. Clock skew / clocks jumping
+
+**What breaks.** Anything that trusts wall-clock time across machines:
+- **Last-write-wins** picks the wrong winner when one node's clock is ahead, silently dropping newer writes.
+- **Leases and locks** expire early or late, so two nodes can both believe they hold a lock.
+- **Time-based IDs** (Snowflake) can repeat or go out of order if a clock steps backwards.
+- **Token and certificate validation** fails if a host's clock is far off (JWT `exp`/`nbf`, TLS validity).
+- **Durations measured with the wall clock** can come out negative. Cloudflare's DNS outage on 1 January 2017 came from exactly this: a leap second made time step back, code assumed the difference between two timestamps could never be negative, and a negative value caused a panic in resolver selection.
+
+**Detect.** Monitor NTP offset on every host; alert on large offsets or steps. Look for errors like "token not yet valid".
+
+**Mitigate now.**
+- Fix time sync on the affected hosts; take badly skewed hosts out of rotation.
+- Treat ordering decisions made during the skew as suspect.
+
+**Fix for good.**
+- Use a **monotonic clock** for durations and timeouts (Java `System.nanoTime()`, Go's `time.Since` with monotonic readings, `CLOCK_MONOTONIC`).
+- Don't use wall-clock time to order events across machines; use **logical clocks**, version vectors, or **hybrid logical clocks**, or let a single leader assign order.
+- Leases with **safety margins** and fencing tokens, not "I checked the time, I still own it".
+- Configure NTP to **slew** small corrections rather than step the clock; handle leap seconds by smearing.
+- Allow small clock skew in token validation.
+
+**Go deeper:** [clocks: Lamport, vector, HLC](/learn/notes/clocks-vector-lamport-hlc/), [distributed ID generation](/learn/notes/distributed-id-generation/).
+
+### 12. Disk full
+
+**What breaks.** Writes fail, often in surprising ways. Databases may stop entirely: the PostgreSQL manual warns that if the disk holding WAL fills up, the server can **panic and shut down**. Kafka brokers take a full log directory offline. Applications can't write logs or temp files, so they crash or hang. Usual causes: logs without rotation, retention set too long, a stuck replication slot or a replica holding back WAL cleanup, a runaway temp table, deleted files still held open by a process.
+
+**Detect.** Alert on disk usage **and on growth rate** ("full in 4 hours", e.g. Prometheus `predict_linear`), not only on a fixed percentage. Alert on inode usage too: a disk can run out of inodes with free space left.
+
+**Mitigate now.**
+- Free space safely: delete or compress old logs, shorten retention temporarily, drop an unused replication slot, find deleted-but-open files (`lsof +L1`) and restart the process holding them.
+- Grow the volume if the platform allows it.
+- **Don't** delete database data or WAL files by hand.
+
+**Fix for good.**
+- Log rotation and retention everywhere; ship logs off the box.
+- Separate volumes for data, WAL and logs, so log growth can't kill the database.
+- Cap WAL retained for replication slots (Postgres 13+ `max_slot_wal_keep_size`) and alert on inactive slots.
+- Capacity planning with growth trends.
+
+**Go deeper:** [storage fundamentals](/learn/notes/storage-fundamentals/), [Kafka operations](/learn/notes/kafka-operations-tuning/), [Postgres/MySQL internals](/learn/notes/mysql-postgres-internals/).
+
+### 13. Certificate expiry
+
+**What breaks.** At the expiry second, every TLS handshake using that certificate fails. It's all-or-nothing: no gradual degradation. Internal mTLS certificates can take down service-to-service traffic across the whole platform. It's entirely preventable, which is why it's embarrassing.
+
+It's becoming more frequent to handle: under CA/Browser Forum ballot SC-081, the maximum lifetime of public TLS certificates is being cut in steps from 398 days, starting in March 2026, down to **47 days by March 2029**. Manual renewal won't scale.
+
+**Detect.** Monitor **days until expiry** for every certificate (public endpoints, internal CAs, client certs, intermediate certs), with alerts at, say, 30, 14 and 7 days. External probes that check the full chain.
+
+**Mitigate now.**
+- Issue and deploy a new certificate immediately; restart or reload processes that cache certificates.
+- Check the whole chain, not just the leaf certificate.
+
+**Fix for good.**
+- **Automate issuance and renewal** (ACME, the protocol behind Let's Encrypt, in RFC 8555; cert-manager in Kubernetes; managed certificates from your cloud).
+- Keep an inventory of all certificates and owners.
+- Short-lived internal certificates from an automated internal CA (service mesh) so renewal is routine and constantly exercised.
+
+**Go deeper:** [mTLS and certificates](/learn/notes/mtls-certificates/), [TLS basics](/learn/notes/networking-tcp-udp-tls/), [secrets management](/learn/notes/secrets-management/).
+
+### 14. Bad deploy
+
+**What breaks.** A new version (code, config, feature flag, schema change, or infrastructure command) introduces errors, latency or wrong results. Config and rule changes are especially dangerous because they often skip the safeguards code goes through.
+
+Two well-known examples:
+- **Cloudflare, 2 July 2019**: a WAF rule with a badly backtracking regular expression was pushed globally at once, maxed out CPU on machines handling HTTP traffic worldwide, and caused about 27 minutes of 502 errors. Normal software went through staged rollouts; WAF rule changes did not.
+- **AWS S3, 28 February 2017**: during debugging, a mistyped input to an operational command removed far more servers than intended, including capacity for S3's index subsystem in US-EAST-1. The restart took much longer than expected. AWS changed the tool to remove capacity more slowly and to refuse to go below minimum capacity.
+
+**Detect.** Compare error rate, latency and business metrics **by version** during rollout (canary analysis); alert on SLO burn right after a deploy.
+
+**Mitigate now.**
+- **Roll back first**, debug later. Or turn off the feature flag.
+- Stop the rollout pipeline.
+- If a schema change can't be rolled back, roll forward with a minimal fix.
+
+**Fix for good.**
+- **Canary and staged rollouts** for code, **config and rules alike**, with automatic rollback on bad metrics.
+- **Feature flags** to separate deploy from release.
+- **Backwards-compatible schema changes** (expand → migrate → contract), so the old version still works if you roll back.
+- Guard rails on operational tools: rate limits, minimum-capacity checks, dry runs.
+- Blameless post-mortems that fix the process, not the person.
+
+**Go deeper:** [feature flags and canaries](/learn/notes/feature-flags-canary/), [CI/CD pipeline design](/learn/notes/cicd-pipeline-design/), [schema evolution](/learn/notes/schema-evolution/).
+
+### Quick-reference table
+
+| Failure | First signal | First action | Long-term fix |
+|---|---|---|---|
+| DB primary dies | Write errors, health check | Failover, retry idempotently | Semi-sync replica, fencing, drills |
+| Replica lag | Lag metric | Read from primary for fresh data | Read-your-writes, throttled batches |
+| Cache down | Hit ratio, DB load | Shed load, coalesce, serve stale | HA cache, local cache, jittered TTL |
+| Queue backlog | Consumer lag (time) | Fix cause, scale consumers | Autoscale on lag, idempotent consumers |
+| Region outage | External probes | Shift traffic, promote replicas | Headroom, no hidden cross-region deps |
+| Slow dependency | Dependency p99, pool saturation | Circuit break, fallback | Timeouts, bulkheads, retry budgets |
+| Hot shard | Per-shard/key metrics | Cache, rate-limit the key | Split keys, better shard key |
+| Poison message | One stuck partition | DLQ and skip | Bounded retries + DLQ + schema checks |
+| Herd after deploy | Spike after rollout | Slow rollout, add capacity | Slow start, readiness, jitter |
+| Network partition | Quorum loss, elections | Keep majority only | Quorum consensus, fencing tokens |
+| Clock skew | NTP offset | Fix sync, isolate host | Monotonic clocks, logical clocks |
+| Disk full | Usage + growth rate | Free space safely | Rotation, separate volumes, caps |
+| Cert expiry | Days-to-expiry | Reissue, reload | Automated renewal, inventory |
+| Bad deploy | Metrics by version | Roll back / flag off | Canary everything, expand-contract |
+
+## Real-world examples
+
+- **GitHub, October 2018** — a 43-second partition triggered cross-country database failover, leaving unreplicated writes on both coasts; about 24 hours of degraded service while integrity was restored.
+- **Cloudflare, July 2019** — a WAF regex deployed globally without staging exhausted CPU worldwide for about 27 minutes.
+- **Cloudflare, January 2017** — a leap second stepped time backwards; code assuming non-negative time differences caused DNS resolution failures.
+- **AWS S3, February 2017** — a mistyped operational command removed too much capacity in US-EAST-1; recovery was slow because the subsystems hadn't been fully restarted in years.
+
+## Common pitfalls
+
+- **Answering "add more replicas"** to everything. Name what breaks, what you do now, and what you change.
+- **Forgetting async replication loses data on failover.** RPO isn't zero unless something synchronous guarantees it.
+- **Retries without backoff, jitter or budgets** — turning a small blip into an outage.
+- **No timeouts**, or timeouts longer than the caller's own timeout.
+- **Treating the DLQ as the end of the story.** It needs alerts, owners and replay.
+- **Health checks that only test "process is up"**, so broken instances stay in rotation, or deep checks that fail all instances at once when a shared dependency blips.
+- **Monitoring from inside the failure domain** — your alerting dies with the region.
+- **Rolling forward under pressure** when a rollback was available.
+- **Assuming clocks agree** across machines.
+- **Not testing failover.** An untested failover is a hope, not a plan.
+
+## Practice questions
+
+<Practice>
+
+<QA q="What four things should every 'what happens when X fails' answer contain?" level="easy">
+
+**Impact** (what users see, blast radius), **detection** (which signal tells you), **immediate mitigation** (stop the bleeding: fail over, shed load, roll back, serve stale) and **long-term fix** (design change), plus the **trade-off** of that fix. Keep it to about a minute and let the interviewer pull on whichever part they care about.
+
+</QA>
+
+<QA q="Why is a slow dependency often worse than a dead one?" level="easy">
+
+A dead dependency fails fast; a slow one holds your threads and connections. By Little's law, in-flight requests = rate × latency, so 100× latency means 100× resources held. Pools fill up and the caller stops serving everything, a cascading failure. Fix: timeouts, bulkheads, circuit breakers with fallbacks, and retry budgets.
+
+</QA>
+
+<QA q="What is a poison message, and how do you stop it from blocking a Kafka partition?" level="easy">
+
+A message that always fails processing (bad data, bug). Because a Kafka consumer commits offsets in order, it can't move past it, so the partition stops. Use bounded retries, then publish it to a dead-letter topic with error details and continue. Separate retryable errors (backoff) from non-retryable ones (straight to DLQ), and alert on and replay the DLQ.
+
+</QA>
+
+<QA q="The primary database fails and a replica is promoted. Can you lose data? Why?" level="medium">
+
+Yes, with asynchronous replication. The primary acknowledges commits before the replica has them, so the last few transactions may never arrive. RPO equals the replication lag at failure. To reduce it: semi-synchronous or synchronous replication to at least one replica (a commit waits for a second copy), at the cost of commit latency. Also fence the old primary so it can't accept writes if it comes back.
+
+</QA>
+
+<QA q="Users complain that their profile edit 'disappears' after saving. What's going on and how do you fix it?" level="medium">
+
+Read-after-write on a lagging replica: the write went to the primary, the next read hit a replica that hadn't caught up. Fix with **read-your-writes**: route that user's reads to the primary for a short window after a write, or track the write's log position and only use replicas that have reached it. Also check why lag is high (long queries on the replica, big batch writes).
+
+</QA>
+
+<QA q="Your Redis cache cluster is down. Walk through what happens and what you do." level="medium">
+
+All reads fall through to the DB. With a 95% hit ratio, DB read load jumps up to 20×; it saturates, timeouts and retries pile on. Now: shed non-critical load, use feature flags to turn off heavy features, coalesce requests per key, serve stale from local caches. When Redis returns, warm it gradually. Long term: replicated multi-AZ cache, local L1 cache, jittered TTLs, and capacity planning for a realistic miss rate.
+
+</QA>
+
+<QA q="Consumer lag on a critical topic keeps growing. How do you respond?" level="medium">
+
+Check the cause first: crashed consumers, a stuck partition (poison message), slow downstream, or rebalance storms. If it's throughput, scale consumers up to the partition count (extra consumers in a group sit idle). Prioritise critical topics, throttle catch-up so the downstream survives, and extend retention if you're near the limit. Long term: autoscale on lag, alert on time-lag against the SLA, idempotent consumers, enough partitions for peak.
+
+</QA>
+
+<QA q="How do you handle a hot key, e.g. a viral post's like counter?" level="medium">
+
+Spread and batch. Split the counter into N sub-keys (write to a random one, sum on read); aggregate increments in memory or via a queue and write once per second; cache the read value briefly, including in a local cache. For hot reads, replicate the key and read any copy. If one tenant is hot, rate-limit or isolate it.
+
+</QA>
+
+<QA q="What is split brain and how do you prevent it?" level="hard">
+
+Two nodes both believe they're the leader (usually after a network partition) and both accept writes, so data diverges. Prevent it with **quorum-based** leader election (only the majority side can elect a leader), odd numbers of voters across failure domains, and **fencing**: each leader gets an increasing token, and storage rejects writes carrying an older token, so a paused or partitioned old leader can't do damage.
+
+</QA>
+
+<QA q="Why should you measure durations with a monotonic clock instead of the wall clock?" level="hard">
+
+The wall clock can jump: NTP steps, manual changes, VM migration, leap-second handling. A duration computed from two wall-clock readings can then be wrong or negative. Cloudflare's 2017 DNS incident came from code assuming a time difference couldn't be negative when a leap second stepped time back. Monotonic clocks (`System.nanoTime()`, Go's monotonic readings, `CLOCK_MONOTONIC`) only move forward.
+
+</QA>
+
+<QA q="A region goes down in an active-passive setup. What are RPO and RTO here and what decides them?" level="hard">
+
+RPO = data written in the primary region that hadn't replicated, roughly the async replication lag at failure. RTO = time to detect, decide, promote the passive region's databases, warm it up and move traffic (DNS TTLs, health checks). Decided by replication mode, automation versus manual decision, how warm the passive region is, and whether it has the capacity to take full load. Practise it so the numbers are measured, not guessed.
+
+</QA>
+
+<QA q="Right after a deploy, p99 latency triples for 10 minutes, then recovers on its own. What's likely happening, and how do you prevent it?" level="scenario">
+
+Cold start: new instances have empty local caches, cold connection pools and (on the JVM) code not yet JIT-compiled, and they got full traffic immediately. Possibly also a DB connection storm from all instances starting together. Prevent with slow start on the load balancer, warm-up requests before readiness passes, smaller rollout batches, connection pool limits or a pooler, and jitter on reconnects.
+
+</QA>
+
+<QA q="At 3 a.m. every service calling the payments API starts failing TLS handshakes. Nothing was deployed. What do you check first?" level="scenario">
+
+Certificate expiry: the server certificate, an intermediate in the chain, or a client certificate used for mTLS. Check the expiry dates on the endpoint with an external probe. Mitigate by issuing and deploying a new certificate and reloading anything that caches it. Also check clocks: a host with a badly wrong time sees valid certificates as expired or not yet valid. Long term: automated renewal (ACME / cert-manager), a certificate inventory, and days-to-expiry alerts.
+
+</QA>
+
+<QA q="The orders DB disk is at 97% and climbing. What do you do, and what must you not do?" level="scenario">
+
+Act now: the Postgres docs warn a full WAL disk can cause a panic and shutdown. Find what's growing: logs, WAL held by an inactive replication slot or lagging replica, temp files, deleted-but-open files (`lsof +L1`). Free space safely (rotate/compress logs, drop a dead slot after confirming, grow the volume). Never delete WAL or data files by hand. Then: separate volumes for WAL and logs, `max_slot_wal_keep_size`, and alert on growth rate, not just percentage.
+
+</QA>
+
+<QA q="A config change pushed to all regions at once caused a global outage. What process changes do you propose?" level="scenario">
+
+Treat config like code: version it, review it, test it (including performance tests for things like regexes), and roll it out in **stages** (internal → canary → small percentage → region by region) with automatic rollback on error or latency regressions. Keep a fast global kill switch for real emergencies only. Add guard rails to the tooling. This is the core lesson of Cloudflare's July 2019 outage.
+
+</QA>
+
+<QA q="During a network partition, your two data centers both accepted writes for 40 seconds. Connectivity is back. What do you do?" level="scenario">
+
+Don't fail back blindly; that could overwrite one side's writes. Freeze automatic failover, pick a single primary (usually the one with the most important or most recent writes), and keep serving from it. Extract the writes from the other side that never replicated and reconcile them (replay, merge, or manual review for conflicts). Accept a longer degraded period in exchange for integrity, as GitHub did in 2018. Then fix the root cause: quorum and fencing so only one side can accept writes.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="With asynchronous replication, what happens to the most recent commits when the primary crashes and a replica is promoted?" options={["They may be lost, up to the replication lag", "They are always preserved", "They are replayed from the client automatically", "The replica refuses promotion"]} answer={0}>
+
+The primary acknowledged them before shipping them. RPO equals the lag at the moment of failure.
+
+</MCQ>
+
+<MCQ q="Why can adding consumers fail to reduce Kafka consumer lag?" options={["Kafka limits groups to 3 consumers", "More consumers increase broker replication", "Each partition is consumed by at most one consumer in a group, so consumers beyond the partition count sit idle", "Consumers share a single offset"]} answer={2}>
+
+Parallelism within a group is capped by partitions. Also check for a poison message or a slow downstream.
+
+</MCQ>
+
+<MCQ q="Which technique stops a single hot key from overwhelming one shard of a counter?" options={["Longer TTLs", "Adding more shards", "Switching to UUID keys", "Splitting the counter into several sub-keys and summing on read"]} answer={3}>
+
+More shards don't help when the load is on one key. Splitting the key spreads it.
+
+</MCQ>
+
+<MCQ q="A fencing token protects against which problem?" options={["Clock drift in metrics", "An old leader that wakes up and writes after a new leader was elected", "Cache stampede", "Certificate expiry"]} answer={1}>
+
+Storage rejects writes with an older token, so a stale leader can't corrupt data.
+
+</MCQ>
+
+<MCQ q="What is the best first action when a deploy clearly caused a spike in errors?" options={["Debug in production to find the root cause", "Scale up the database", "Wait for it to recover", "Roll back or turn off the feature flag"]} answer={3}>
+
+Mitigate first, diagnose later.
+
+</MCQ>
+
+<MCQ q="Which is the most reliable way to measure how long an operation took?" options={["Use a monotonic clock", "Subtract two wall-clock timestamps", "Compare NTP server times", "Use the database's now()"]} answer={0}>
+
+Wall clocks can step backwards or forwards; monotonic clocks only move forward.
+
+</MCQ>
+
+<MCQ q="Why should disk alerts consider growth rate, not just a fixed percentage?" options={["Percentages are inaccurate", "Growth rate is cheaper to compute", "A disk at 70% growing fast is more urgent than one at 90% that is stable", "Filesystems report percentage wrongly"]} answer={2}>
+
+Time-to-full is what matters for response.
+
+</MCQ>
+
+<MCQ q="After the cache cluster recovers, what should you avoid?" options={["Warming it gradually", "Letting all traffic hit the empty cache at once", "Serving stale data", "Request coalescing"]} answer={1}>
+
+A cold cache under full load causes another stampede to the DB. Warm gradually and coalesce.
+
+</MCQ>
+
+<MCQ q="Retries should normally be combined with which of these?" options={["Exponential backoff, jitter and a retry budget, and only for idempotent operations", "Shorter TLS certificates", "A larger thread pool", "Synchronous replication"]} answer={0}>
+
+Otherwise retries amplify load and can duplicate non-idempotent work.
+
+</MCQ>
+
+<MCQ q="What lesson did Cloudflare's July 2019 outage most clearly teach?" options={["Use more regex", "Disable WAFs", "Increase CPU per server", "Config and rule changes need staged rollouts just like code"]} answer={3}>
+
+A WAF rule was pushed globally at once and exhausted CPU worldwide. Staged rollout would have limited the blast radius.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **Template**: what breaks (blast radius) → detect → mitigate now → fix for good → trade-off.
+- **Mitigate first, diagnose second.** **Degrade, don't die.**
+- **DB primary dies**: failover; async = data loss up to lag; semi-sync + fencing.
+- **Replica lag**: stale reads; read-your-writes; throttle big writes.
+- **Cache down**: DB gets the misses; shed load, coalesce, serve stale, warm gradually.
+- **Queue backlog**: delayed not lost (within retention); fix cause, scale to partition count, throttle catch-up.
+- **Region down**: shift traffic; headroom; no hidden cross-region dependencies; drills.
+- **Slow dependency**: Little's law; timeouts, bulkheads, circuit breakers, retry budgets.
+- **Hot shard**: split keys, batch, cache, rate-limit; better shard key.
+- **Poison message**: bounded retries → DLQ → alert → replay.
+- **Herd after deploy**: slow start, readiness, jitter, small batches.
+- **Partition**: quorum + fencing; choose C or A per data type.
+- **Clock skew**: monotonic clocks for durations; logical clocks for ordering.
+- **Disk full**: alert on growth; separate volumes; never hand-delete WAL.
+- **Cert expiry**: automate renewal; days-to-expiry alerts; lifetimes shrinking to 47 days by 2029.
+- **Bad deploy**: roll back; canary code **and** config; expand-contract migrations.
+
+## Go deeper
+
+- **GitHub**: [October 21 post-incident analysis](https://github.blog/news-insights/company-news/oct21-post-incident-analysis/).
+- **Cloudflare**: [Details of the Cloudflare outage on July 2, 2019](https://blog.cloudflare.com/details-of-the-cloudflare-outage-on-july-2-2019/).
+- **Cloudflare**: [How and why the leap second affected Cloudflare DNS](https://blog.cloudflare.com/how-and-why-the-leap-second-affected-cloudflare-dns/).
+- **AWS**: [Summary of the Amazon S3 service disruption (Feb 2017)](https://aws.amazon.com/message/41926/).
+- **PostgreSQL docs**: [Disk full failure](https://www.postgresql.org/docs/current/diskusage.html).
+- **CA/Browser Forum**: [Ballot SC-081v3](https://cabforum.org/2025/04/11/ballot-sc081v3-introduce-schedule-of-reducing-validity-and-data-reuse-periods/).
+- **Google SRE book**: [Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/).
+- **AWS Builders' Library**: [Static stability using Availability Zones](https://aws.amazon.com/builders-library/static-stability-using-availability-zones/).
+- Related notes: [framework](/learn/notes/hld-framework/), [circuit breakers and retries](/learn/notes/circuit-breakers-retries/), [cache stampede](/learn/notes/cache-stampede-ttl/), [Kafka scenarios](/learn/notes/kafka-scenarios/), [multi-region](/learn/notes/multi-region-rpo-rto/), [feature flags and canaries](/learn/notes/feature-flags-canary/).

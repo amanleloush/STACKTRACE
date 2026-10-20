@@ -1,7 +1,7 @@
 ---
 title: "Cache Patterns: Aside, Through, Back, Around"
 phase: "03-caching-redis"
-order: 14
+order: 19
 tags: ["caching"]
 premium: false
 previewParagraphs: 4
@@ -150,41 +150,166 @@ next read /user/42:
 - **Different TTLs for the same key in different services**: causes flapping; centralize TTL policy.
 - **Cache the wrong thing**: derived/aggregated data is fine; per-user permissions data has correctness implications and usually deserves either no cache or aggressive invalidation.
 
-## Interview questions
+## Practice questions
 
-### Q1 — Easy: Difference between cache-aside and read-through?
-In cache-aside, the **application** checks the cache, fetches from DB on miss, fills the cache. In read-through, the **cache library** does that transparently — the app just asks the cache and the library handles the fallback.
+<Practice>
 
-### Q2 — Easy: Why is "delete on write" safer than "update on write"?
-Update-on-write has races: two concurrent updates can both write to the cache in non-DB order, leaving a stale value visible. Delete-on-write forces the next reader to refresh from DB, eliminating that class of bugs.
+<QA q="Difference between cache-aside and read-through?" level="easy">
 
-### Q3 — Medium: How would you implement read-after-write consistency with cache-aside?
-Several options: (a) Write-through so the cache is updated synchronously. (b) After writing the DB, write the new value to cache (not just delete). (c) Route the user's next read to the leader DB for a short window after their write. (d) Use a versioned key — write bumps the version; reads see the new version immediately.
+In **cache-aside**, the **application** checks the cache, fetches from the DB on a miss, and fills the cache. In **read-through**, the **cache library** does that transparently — the app just asks the cache and the library handles the fallback (e.g., AWS DAX, some Hibernate caches).
 
-### Q4 — Medium: When would you use write-around?
-When write data isn't immediately read again (logs, audit records, low-value writes). Polluting the cache with one-shot writes wastes memory and evicts useful data. Combined with cache-aside on reads, write-around is great for "cold writes, occasional reads."
+</QA>
 
-### Q5 — Medium: A stale entry sometimes appears in the cache for hours despite TTL=5min. How?
-- Race between read-miss and write — a slow read fills the cache with old data right after invalidation.
-- Some service path doesn't invalidate (batch job, scheduled task, admin tool).
-- Cache is multi-region and the invalidation message is lost.
-- TTL accidentally set to a different value somewhere (defaults).
-- Refresh-ahead misconfigured, refreshing with stale data.
+<QA q="Why is 'delete on write' safer than 'update on write'?" level="easy">
 
-### Q6 — Hard: Design caching for a price-sensitive product page (~1B reads/day, prices change every few minutes).
-- **Tiered cache**: CDN (5s TTL, edge cache control) + Redis (60s TTL) + DB.
-- **Invalidation on price change**: publish event to Kafka → invalidate Redis + purge CDN.
-- **Stampede protection**: single-flight on miss (only one process loads on miss; others wait), or `EX NX` lock pattern in Redis.
-- **Graceful staleness**: serve last-known value if DB is slow, with a "max-stale" budget (say 10 minutes).
-- **Cache key**: include locale, currency, A/B variant — careful explosion.
+Update-on-write has races: two concurrent updates can write to the cache in a different order than they hit the DB, leaving a stale value visible. Delete-on-write forces the next reader to refresh from the DB, eliminating that class of bugs.
 
-### Q7 — Hard: Walk through a race condition in cache-aside and how to fix it.
-T1 reads, misses, queries DB → gets `v1` (slow query). T2 writes `v2`, invalidates cache. T1 finishes, sets cache to `v1` — stale forever (until TTL).
+</QA>
 
-Fix: write-time version tracking. The cache layer stores `(value, version)`. On read-miss fill, only set if no newer version exists. Or use a probabilistic early-expiration (XFetch / probabilistic refresh) + single-flight to serialize loads. Or accept short TTL as your safety net.
+<QA q="What are the tradeoffs of write-through caching?" level="easy">
 
-### Q8 — Hard: Compare write-through and write-back for a session cache.
-Write-through: every session update goes to cache + DB. Safe; durability matches DB; but DB takes write load proportional to user activity. Write-back: writes only hit cache; periodic flush. Massive throughput win, but session loss is possible on cache crash → may be acceptable for "user lost their cart" but not for "lost a payment."
+On every write, the cache and DB are updated synchronously. **Pro**: cache and DB stay in sync — no staleness. **Cons**: every write pays both cache and DB latency, and the cache fills with data that may never be read, wasting memory.
+
+</QA>
+
+<QA q="What is refresh-ahead and when is it worth it?" level="easy">
+
+The cache proactively refreshes an entry **before** its TTL expires, predicting it will be read again, so hot keys never take a miss. It cuts tail latency but adds complexity (and refreshes keys that may not be needed), so it's rarely the first tool you reach for.
+
+</QA>
+
+<QA q="When would you use write-around?" level="medium">
+
+When written data isn't read again soon — logs, audit records, low-value writes. Populating the cache with one-shot writes wastes memory and evicts useful data. Combined with cache-aside on reads, write-around fits 'cold writes, occasional reads'. The cost: the first read after a write always misses.
+
+</QA>
+
+<QA q="How would you implement read-after-write consistency with cache-aside?" level="medium">
+
+- **Write-through**, so the cache is updated synchronously.
+- After writing the DB, **write the new value** to the cache (not just delete) — the next read hits, but this reintroduces the concurrent-update ordering race, so pair it with a version check.
+- Route the user's next read to the **leader DB** for a short window after their write.
+- **Versioned key** — the write bumps the version, so reads go straight to the new key.
+
+</QA>
+
+<QA q="List cache invalidation strategies from simplest to most complex." level="medium">
+
+1. **TTL only** — tolerate staleness up to the TTL.
+2. **TTL + write-time invalidation** — the write path deletes or updates affected keys (most production caches).
+3. **Versioned keys** — `user:42:v3`; bump the version on write and let the old key expire.
+4. **Pub-sub invalidation** — the writer publishes 'key X changed'; cache nodes or clients evict. Used for multi-region or multi-tier caches.
+5. **CDC-driven** — change-data-capture from the DB (e.g., Debezium) drives invalidation; eventual, but rarely stale and catches every write path.
+
+</QA>
+
+<QA q="What is write-back caching and what is its main risk?" level="medium">
+
+Writes go only to the cache and are flushed to the DB asynchronously in batches. It absorbs write bursts dramatically, but if the cache crashes before a flush, those writes are **lost**; ordering and idempotency of flushes also get hard. Use it only with explicit durability planning.
+
+</QA>
+
+<QA q="Walk through a race condition in cache-aside and how to fix it." level="hard">
+
+T1 reads, misses, and queries the DB → gets `v1` (slow query). T2 writes `v2` and invalidates the cache. T1 finishes and sets the cache to `v1` — stale until the TTL expires.
+
+Fixes: store `(value, version)` and only fill on a miss if no newer version exists; use a **lease** or lock shared by fills and invalidations, so a fill that started before the invalidation is rejected (memcache leases work this way); or accept a short TTL as the safety net.
+
+</QA>
+
+<QA q="Compare write-through and write-back for a session cache." level="hard">
+
+**Write-through**: every session update goes to cache and DB. Safe — durability matches the DB — but the DB takes write load proportional to user activity. **Write-back**: writes only hit the cache, with periodic flushes. Big throughput win, but sessions can be lost on a cache crash — maybe acceptable for 'user lost their cart', not for 'lost a payment'.
+
+</QA>
+
+<QA q="A stale entry sometimes stays in the cache for hours despite TTL = 5 min. How?" level="scenario">
+
+- A race between a read-miss and a write — a slow read fills the cache with old data right after invalidation.
+- Some write path doesn't invalidate (batch job, scheduled task, admin tool).
+- The cache is multi-region and the invalidation message is lost.
+- The TTL is set to a different value somewhere (defaults, another service).
+- Refresh-ahead is misconfigured and keeps refreshing with stale data.
+
+</QA>
+
+<QA q="Design caching for a price-sensitive product page (~1B reads/day, prices change every few minutes)." level="scenario">
+
+- **Tiered cache**: CDN (about 5 s TTL) + Redis (about 60 s TTL) + DB.
+- **Invalidation on price change**: publish an event to Kafka → invalidate Redis and purge the CDN.
+- **Stampede protection**: single-flight on miss (one loader, others wait), or a `SET NX EX` lock in Redis.
+- **Graceful staleness**: serve the last-known value if the DB is slow, within a max-stale budget (say 10 minutes).
+- **Cache key**: include locale, currency, A/B variant — but watch for key explosion.
+
+</QA>
+
+<QA q="An admin tool and a nightly batch job write directly to the DB, and users report stale data. What's wrong and how do you fix it?" level="scenario">
+
+Only the main API invalidates the cache; the other write paths don't, so their changes never evict the cached values. Fix by making **every** write path invalidate — ideally centrally, via CDC from the DB or a shared data-access layer — so invalidation can't be forgotten. Keep a TTL as a safety net, and never treat the cache as the source of truth.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="In cache-aside, who loads data from the database on a cache miss?" options={["The cache library", "The application", "The database pushes it", "A background refresher"]} answer={1}>
+
+In cache-aside the application checks the cache, queries the DB on a miss, and fills the cache. When the cache library does it transparently, that's read-through.
+
+</MCQ>
+
+<MCQ q="Which pattern risks losing acknowledged writes if the cache node crashes?" options={["Write-through", "Write-around", "Cache-aside", "Write-back"]} answer={3}>
+
+Write-back acks once the cache has the write and flushes later, so a crash before the flush loses data. The other patterns write to the DB synchronously.
+
+</MCQ>
+
+<MCQ q="A service writes millions of audit records that are rarely read. Which write pattern fits best?" options={["Write-around", "Write-through", "Write-back", "Refresh-ahead"]} answer={0}>
+
+Write-around skips the cache on write, so one-off records don't evict useful data. Write-through would fill the cache with data nobody reads.
+
+</MCQ>
+
+<MCQ q="Why is deleting the cache key on write preferred over updating it?" options={["Deletes are always faster than sets", "Updates are not supported by Redis", "Concurrent updates can land in the cache out of DB order and leave a stale value", "Deleting extends the TTL"]} answer={2}>
+
+Two writers can interleave so the older value is written to the cache last. Deleting forces the next reader to load the current value from the DB.
+
+</MCQ>
+
+<MCQ q="T1 misses and starts a slow DB read. T2 updates the DB and deletes the key. T1 then fills the cache. What is the result?" options={["The cache holds T2's new value", "The cache holds T1's stale value until TTL expires", "The cache stays empty", "The DB rolls back T2"]} answer={1}>
+
+T1 read the old value before T2's write and fills the cache after T2's delete, so the stale value persists until the TTL. Version checks, or leases that reject a fill issued before the invalidation, prevent this.
+
+</MCQ>
+
+<MCQ q="What does including a version in the key, such as user:42:v3, achieve?" options={["Compresses cached values", "Prevents cache stampedes", "Makes the cache the source of truth", "Bumping the version on write sends reads to a new key, and the old key just expires"]} answer={3}>
+
+Versioned keys sidestep invalidation: after a write, readers use the new version's key, so the old entry is never read again and ages out by TTL.
+
+</MCQ>
+
+<MCQ q="Which invalidation approach catches writes from batch jobs and admin tools without changing their code?" options={["CDC-driven invalidation from the database log", "TTL-only with a longer TTL", "Write-through in the API service", "Refresh-ahead"]} answer={0}>
+
+CDC reads every change from the DB log regardless of which client made it, so no write path is missed. The API-level options only cover writes that go through the API.
+
+</MCQ>
+
+<MCQ q="What is the main cost of write-through caching?" options={["Data loss on cache crash", "Stale reads after every write", "Every write pays cache and DB latency, and unread data fills the cache", "The first read after a write always misses"]} answer={2}>
+
+Write-through updates both synchronously, so writes get slower and the cache holds data that may never be read. Data loss is write-back's risk; first-read misses are write-around's.
+
+</MCQ>
+
+<MCQ q="A hot key expires and thousands of requests hit the DB at once. Which mitigation targets this directly?" options={["Write-around", "Single-flight so only one request reloads the key", "Deleting on write instead of updating", "Larger cache values"]} answer={1}>
+
+This is a cache stampede. Single-flight (or a lock such as SET NX in Redis) lets one request reload while others wait or get the old value.
+
+</MCQ>
+
+</Quiz>
 
 ## TL;DR cheat sheet
 

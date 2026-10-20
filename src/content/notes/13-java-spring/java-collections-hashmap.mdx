@@ -1,0 +1,678 @@
+---
+title: "Java Collections and HashMap Internals"
+phase: "13-java-spring"
+order: 125
+tags: ["java", "collections", "hashmap", "data-structures"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 20
+prerequisites: []
+summary: "How HashMap really works (hash spreading, power-of-two buckets, resize splitting, treeification), the equals/hashCode and Comparable contracts and what breaks when you violate them, and how to pick the right Java collection with its Big-O costs."
+---
+
+## Definition (interview-ready)
+
+The **Java Collections Framework** is the set of interfaces (`List`, `Set`, `Queue`, `Deque`, `Map`) and implementations (`ArrayList`, `HashMap`, `TreeMap`, `ArrayDeque`, ...) in `java.util` that every Java program uses to hold groups of objects.
+
+`HashMap` is the one interviewers dig into. In one breath:
+
+> A `HashMap` is an array of **buckets** (the source calls them bins). To store a key, it takes `key.hashCode()`, mixes the high bits into the low bits (`h ^ (h >>> 16)`), and uses `(n - 1) & hash` to pick a bucket, where `n` is the table size, always a power of two. Colliding keys share a bucket as a linked list, and `equals()` tells them apart. When the number of entries passes **capacity × load factor (0.75 by default)**, the table **doubles** and every bucket splits into a "low" and a "high" half. If one bucket grows past **8** entries (a 9th is added to a bucket of 8) and the table has at least **64** buckets, that bucket becomes a **red-black tree**, so the worst case is O(log n) instead of O(n).
+
+How to say it in an interview: "HashMap is an array of linked lists that turn into trees when they get long. It's O(1) on average because a good hash plus a 0.75 load factor keeps buckets tiny, it doubles when it gets 75% full, and it's not thread-safe."
+
+## Why it matters
+
+- `HashMap` is the default data structure for lookups, caches, counting, grouping and deduplication. You use it every day, so its failure modes hit you every day.
+- The **equals/hashCode contract** is behind a whole family of bugs: "my map lookup returns null", "my set has duplicates", "my entry disappeared after I changed the object".
+- Picking the wrong collection is a silent performance bug: `LinkedList.get(i)` in a loop is O(n²), `PriorityQueue.contains` is O(n), and `Stack` takes a lock on every call.
+- It's one of the most common Java interview topics, and a natural lead-in to [ConcurrentHashMap and the Java Memory Model](/learn/notes/java-concurrency-locks/).
+
+## Core concepts
+
+### The table of buckets
+
+```
+ table (Node[] of size n = 16, always a power of two)
+ index:  0      1      2     3    ...   14     15
+       ┌──────┬──────┬─────┬─────┬───┬──────┬──────┐
+       │  ●   │  ●   │ null│null │   │  ●   │ null │
+       └──┬───┴──┬───┴─────┴─────┴───┴──┬───┴──────┘
+          │      │                      │
+       Node(k1) Node(k2)→Node(k5)    TreeNode (red-black tree)
+                 linked list         when a bucket is long
+```
+
+Each `Node` stores four things: the cached `hash`, the `key`, the `value`, and `next`. Caching the hash means the map never calls your `hashCode()` again during resizes, and it can compare cheap `int` hashes before calling the more expensive `equals()`.
+
+A few facts straight from the OpenJDK source:
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `DEFAULT_INITIAL_CAPACITY` | 16 | Table size if you don't specify one |
+| `DEFAULT_LOAD_FACTOR` | 0.75 | Resize when `size` exceeds `capacity × 0.75` |
+| `TREEIFY_THRESHOLD` | 8 | Adding to a bucket that already holds this many nodes turns it into a tree... |
+| `MIN_TREEIFY_CAPACITY` | 64 | ...but only if the table has at least 64 buckets; otherwise the map resizes instead |
+| `UNTREEIFY_THRESHOLD` | 6 | A tree that shrinks to 6 or fewer nodes during a resize split goes back to a list |
+| `MAXIMUM_CAPACITY` | 2^30 | The table never grows past this |
+
+The table itself is created **lazily**: `new HashMap<>()` allocates no array; the first `put` does.
+
+### Step 1: hash spreading
+
+```java
+static final int hash(Object key) {
+    int h;
+    return (key == null) ? 0 : (h = key.hashCode()) ^ (h >>> 16);
+}
+```
+
+Why mix the top 16 bits into the bottom 16? Because the bucket index only looks at the **low bits** of the hash. With 16 buckets, only the lowest 4 bits matter. Keys whose hash codes differ only in their high bits would all land in the same bucket. The source comment gives `Float` keys holding consecutive whole numbers as a real example. One XOR and one shift is the cheapest fix that lets the high bits influence the index. The map doesn't try harder because long buckets are already handled by trees.
+
+Note the `null` case: a `null` key has hash 0 and always lives in **bucket 0**. `HashMap` allows **one null key** and any number of null values.
+
+### Step 2: index = (n - 1) & hash
+
+Because `n` is a power of two, `n - 1` is a mask of all ones in the low bits (16 - 1 = `0b1111`). `hash & (n - 1)` gives the same result as `hash % n` for non-negative numbers, but it is a single AND instruction and it also works for negative hashes. This is why `HashMap` rounds any capacity you ask for up to a power of two (`new HashMap<>(100)` gets a 128-bucket table).
+
+```java
+// Run with: java HashDemo.java
+import java.util.*;
+
+public class HashDemo {
+    static int spread(Object key) {
+        int h;
+        return (key == null) ? 0 : (h = key.hashCode()) ^ (h >>> 16);
+    }
+
+    public static void main(String[] args) {
+        int n = 16;
+        for (String k : List.of("apple", "banana", "cherry")) {
+            int h = spread(k);
+            System.out.printf("%-7s hashCode=%11d  spread=%11d  index=%d%n",
+                    k, k.hashCode(), h, (n - 1) & h);
+        }
+    }
+}
+```
+
+```
+apple   hashCode=   93029210  spread=   93030097  index=1
+banana  hashCode=-1396355227  spread=-1396317280  index=0
+cherry  hashCode=-1361513063  spread=-1361552575  index=1
+```
+
+`apple` and `cherry` collide in bucket 1 even though their hash codes are completely different. That's normal. Collisions are expected; the load factor keeps them rare enough.
+
+### Step 3: put and get
+
+`put(k, v)`:
+
+1. Compute `hash(k)` and the index.
+2. Bucket empty → place a new node there. Done.
+3. Otherwise walk the bucket. For each node, check `node.hash == hash && (node.key == k || k.equals(node.key))`. If a match is found, **replace the value** and return the old one.
+4. No match → append a new node at the **tail** of the list (Java 8+; Java 7 inserted at the head). If the bucket already held 8 nodes (it now has 9), try to treeify.
+5. Increment `modCount` and `size`. If `size > threshold` (capacity × load factor), resize.
+
+`get(k)` follows the same path without modifying anything. Note the order of checks: compare the cached `int` hash first, then reference equality, and only then `equals()`.
+
+### Load factor 0.75 and resizing
+
+With the default capacity of 16, the **threshold** is 16 × 0.75 = 12. The 13th insert triggers a resize to 32 buckets (threshold 24), then 64 (48), and so on.
+
+Why 0.75? It's a trade-off between memory and speed. A lower load factor wastes array slots; a higher one makes buckets longer. The source comment works out that, with well-spread hashes and a 0.75 load factor, bucket sizes follow a Poisson distribution with a mean of about 0.5: about 61% of buckets are empty, 30% hold one entry, 8% hold two, and the chance of a bucket reaching 8 entries is about 6 in 100 million. That's why trees almost never appear unless the hash codes are bad.
+
+If you know the size up front, pre-size the map to skip the intermediate resizes. Since **Java 19**, `HashMap.newHashMap(expectedSize)` does the capacity math for you (`new HashMap<>(expectedSize)` sets the *capacity*, not the number of entries it can hold without resizing).
+
+### The lo/hi split during resize
+
+Doubling from `oldCap` to `2 × oldCap` adds **one more bit** to the mask. So every entry in old bucket `j` lands in exactly one of two places:
+
+- If `(hash & oldCap) == 0` → it stays at index `j` (the **lo** list).
+- Otherwise → it moves to index `j + oldCap` (the **hi** list).
+
+```
+oldCap = 16, old bucket 5 holds hashes 5, 21, 37, 53
+
+hash   binary     hash & 16   new index (mask 31)
+  5    0000101        0        5   (lo, stays)
+ 21    0010101       16       21   (hi, 5 + 16)
+ 37    0100101        0        5   (lo, stays)
+ 53    0110101       16       21   (hi, 5 + 16)
+```
+
+No hash is recomputed and no `equals()` is called. Each bucket is split into two lists that keep their **original relative order**. Java 7 recomputed each entry's index and inserted it at the head of its new bucket, which reversed list order, which made racing resizes even more dangerous (below).
+
+### Treeification: 8 to tree, 6 back to list
+
+When a node is added to a bucket whose list already holds `TREEIFY_THRESHOLD` (8) nodes, `treeifyBin` runs. If the table is smaller than `MIN_TREEIFY_CAPACITY` (64), it **resizes instead**, because a small table being crowded is better fixed by spreading entries out. Otherwise the bucket's nodes become `TreeNode`s in a red-black tree.
+
+- Tree nodes are ordered by hash first. When hashes tie, `HashMap` uses `compareTo` if the keys are of the same class and implement `Comparable`, and falls back to class name and identity hash code as tie-breakers.
+- So keys that are both badly hashed **and** `Comparable` (like `String`) still get O(log n) lookups. Keys that share the exact same hash and are not `Comparable` gain much less, because the tree can't order them by value.
+- A `TreeNode` is about twice the size of a normal node, so trees are only used when needed.
+- During a resize, if a split half has **6 or fewer** nodes, it turns back into a list. Removals can also untreeify a tree that gets too small. The gap between 8 and 6 avoids flipping back and forth.
+- This change came in **Java 8** (JEP 180), mainly as a defence against attackers sending many keys with colliding hash codes (hash-flooding denial of service).
+
+### Iteration order
+
+`HashMap` makes **no ordering guarantee**. The order depends on hash values and table size, so it can change after a resize or between JDK versions. Iterating costs time proportional to **capacity + size**, so a huge, mostly empty map is slow to iterate.
+
+Need an order? `LinkedHashMap` keeps **insertion order** (or access order), and `TreeMap` keeps **sorted order**.
+
+### Fail-fast iterators
+
+Every structural change (add or remove, not just setting a value) increments `modCount`. An iterator records `modCount` when it's created and checks it on every `next()`. If they differ, it throws `ConcurrentModificationException`.
+
+```java
+// Run with: java FailFast.java
+import java.util.*;
+
+public class FailFast {
+    public static void main(String[] args) {
+        List<Integer> nums = new ArrayList<>(List.of(1, 2, 3, 4));
+        try {
+            for (Integer x : nums) {
+                if (x % 2 == 0) nums.remove(x);   // structural change during iteration
+            }
+        } catch (ConcurrentModificationException e) {
+            System.out.println("CME thrown");
+        }
+        List<Integer> ok = new ArrayList<>(List.of(1, 2, 3, 4));
+        ok.removeIf(x -> x % 2 == 0);              // safe
+        System.out.println(ok);
+
+        Map<String, Integer> map = new HashMap<>(Map.of("a", 1, "b", 2, "c", 3));
+        Iterator<Map.Entry<String, Integer>> it = map.entrySet().iterator();
+        while (it.hasNext()) {
+            if (it.next().getValue() == 2) it.remove();   // safe: iterator's own remove
+        }
+        System.out.println(new TreeMap<>(map));
+    }
+}
+```
+
+```
+CME thrown
+[1, 3]
+{a=1, c=3}
+```
+
+Two important details:
+
+- It's **best effort**, not a guarantee. The Javadoc says you must not rely on the exception for correctness; it exists to detect bugs.
+- The name is misleading: the classic cause is **one thread** modifying a collection inside its own for-each loop, not concurrency. Use `iterator.remove()`, `removeIf`, or collect changes and apply them after the loop.
+
+### Why HashMap is not thread-safe
+
+`HashMap` has no locking and no memory-visibility guarantees. Under concurrent writes:
+
+- **Lost updates**: two threads put into the same empty bucket; one node overwrites the other.
+- **Wrong `size`**: `++size` is not atomic.
+- **Corrupted structure during resize**: one thread sees a half-moved table and misses entries. In Java 7 and earlier, racing resizes could link a bucket into a **cycle**, so a later `get` spun at 100% CPU forever. Java 8's order-preserving split removed that particular failure, but concurrent writes are still undefined behaviour.
+- **Visibility**: even with no concurrent writes, another thread may see stale or partly built entries unless the map was safely published.
+
+Fixes: `ConcurrentHashMap` for shared mutable maps, or an immutable map (`Map.copyOf`) published once. `Collections.synchronizedMap` works but serializes everything. See [Java Concurrency: synchronized, Locks, volatile, ConcurrentHashMap](/learn/notes/java-concurrency-locks/) for how `ConcurrentHashMap` uses CAS and per-bin locks.
+
+### The equals/hashCode contract
+
+From the `Object` Javadoc (and *Effective Java*, Items 10 and 11):
+
+**`equals` must be:**
+
+- **Reflexive**: `x.equals(x)` is true.
+- **Symmetric**: `x.equals(y)` if and only if `y.equals(x)`.
+- **Transitive**: `x.equals(y)` and `y.equals(z)` imply `x.equals(z)`.
+- **Consistent**: repeated calls give the same answer if nothing used in the comparison changed.
+- `x.equals(null)` is **false**.
+
+**`hashCode` must be:**
+
+- **Consistent** with itself while the fields used by `equals` don't change.
+- **Equal for equal objects**: if `a.equals(b)`, then `a.hashCode() == b.hashCode()`.
+- Unequal objects **may** share a hash code (collisions are legal), but fewer collisions means faster maps.
+
+The rule to remember: **override both or neither**, and build them from the same fields.
+
+**What breaks when you don't:**
+
+```java
+// Run with: java BrokenKey.java
+import java.util.*;
+
+public class BrokenKey {
+    // equals overridden, hashCode NOT overridden
+    static final class Point {
+        final int x, y;
+        Point(int x, int y) { this.x = x; this.y = y; }
+        @Override public boolean equals(Object o) {
+            return o instanceof Point p && p.x == x && p.y == y;
+        }
+    }
+
+    // Mutable key: hashCode depends on a field we later change
+    static final class Box {
+        int size;
+        Box(int size) { this.size = size; }
+        @Override public boolean equals(Object o) { return o instanceof Box b && b.size == size; }
+        @Override public int hashCode() { return Integer.hashCode(size); }
+    }
+
+    public static void main(String[] args) {
+        Map<Point, String> m = new HashMap<>();
+        m.put(new Point(1, 2), "A");
+        System.out.println("get equal key:  " + m.get(new Point(1, 2)));
+
+        Set<Point> s = new HashSet<>();
+        s.add(new Point(1, 2));
+        s.add(new Point(1, 2));
+        System.out.println("set size:       " + s.size());
+
+        Set<Box> boxes = new HashSet<>();
+        Box b = new Box(1);
+        boxes.add(b);
+        b.size = 2;                       // mutate after insert
+        System.out.println("contains(b):    " + boxes.contains(b));
+        System.out.println("contains(new):  " + boxes.contains(new Box(2)));
+        System.out.println("size:           " + boxes.size());
+    }
+}
+```
+
+```
+get equal key:  null
+set size:       2
+contains(b):    false
+contains(new):  false
+size:           1
+```
+
+What happened:
+
+1. **`equals` without `hashCode`**: the two equal `Point`s use `Object`'s identity-based hash code, so they (almost certainly) go to different buckets. `get` looks in the wrong bucket and returns `null`, and the set happily stores "duplicates".
+2. **Mutable key**: `b` was filed under the hash of `size = 1`. After the change, lookups compute the hash for `size = 2` and search the wrong bucket. The entry is still in the set (`size` is 1) but **unreachable**: you can't find it or remove it. In a long-lived map that's a memory leak.
+
+Lessons: use **immutable keys** (`String`, `Integer`, records), and let a `record` or your IDE generate `equals`/`hashCode` from the same fields.
+
+### Comparable vs Comparator
+
+| | `Comparable` | `Comparator` |
+|---|---|---|
+| Package | `java.lang` | `java.util` |
+| Method | `compareTo(T other)` on the object itself | `compare(T a, T b)` in a separate object |
+| Meaning | The class's **natural ordering** (one per class) | Any number of **external orderings** |
+| Used by | `Collections.sort(list)`, `TreeMap`, `TreeSet`, `PriorityQueue` with no comparator | `list.sort(cmp)`, `new TreeMap<>(cmp)`, `new PriorityQueue<>(cmp)` |
+| Example | `String`, `Integer`, `LocalDate` | `Comparator.comparing(Employee::salary)` |
+
+Both return a negative number, zero, or a positive number. Build comparators with the factory methods instead of writing subtraction:
+
+```java
+// Run with: java CompareDemo.java
+import java.math.BigDecimal;
+import java.util.*;
+
+public class CompareDemo {
+    record Employee(String name, String dept, int salary) {}
+
+    public static void main(String[] args) {
+        List<Employee> staff = new ArrayList<>(List.of(
+                new Employee("Asha", "eng", 120),
+                new Employee("Ravi", "eng", 150),
+                new Employee("Meera", "ops", 150)));
+        staff.sort(Comparator.comparingInt(Employee::salary).reversed()
+                .thenComparing(Employee::name));
+        staff.forEach(e -> System.out.println(e.name() + " " + e.salary()));
+
+        // compareTo inconsistent with equals
+        Set<BigDecimal> hash = new HashSet<>(List.of(new BigDecimal("1.0"), new BigDecimal("1.00")));
+        Set<BigDecimal> tree = new TreeSet<>(List.of(new BigDecimal("1.0"), new BigDecimal("1.00")));
+        System.out.println("HashSet size: " + hash.size() + ", TreeSet size: " + tree.size());
+    }
+}
+```
+
+```
+Meera 150
+Ravi 150
+Asha 120
+HashSet size: 2, TreeSet size: 1
+```
+
+Two traps shown here and in *Effective Java* Item 14:
+
+- **"Consistent with equals"**: sorted collections use `compareTo`/`compare`, never `equals`. `BigDecimal("1.0")` and `BigDecimal("1.00")` are not `equals` (different scale) but compare as 0, so a `HashSet` keeps both and a `TreeSet` keeps one. Keep your orderings consistent with `equals` when you can.
+- **Subtraction comparators** like `(a, b) -> a - b` overflow for large or negative values and give wrong orders. Use `Integer.compare(a, b)` or `Comparator.comparingInt`.
+
+### Choosing a collection
+
+**Lists and queues**
+
+| Collection | Backed by | get(i) | add at end | add/remove in middle | Notes |
+|---|---|---|---|---|---|
+| `ArrayList` | Resizable array | O(1) | Amortized O(1) | O(n) (shifts elements) | The default list. Grows by about 1.5× when full. Cache-friendly |
+| `LinkedList` | Doubly linked list | O(n) | O(1) | O(1) **once you have the position** via an iterator, O(n) to find it | Rarely the right choice; more memory per element, poor locality |
+| `ArrayDeque` | Circular array | — | O(1) amortized at both ends | — | The best stack **and** queue. No nulls. Javadoc: likely faster than `Stack` as a stack and `LinkedList` as a queue |
+| `Stack` | `Vector` (synchronized) | O(1) | O(1) | — | Legacy; every call takes a lock. Javadoc recommends `Deque` instead |
+| `PriorityQueue` | Binary heap in an array | — | O(log n) `offer` / `poll` | O(n) `remove(Object)` / `contains` | O(1) `peek`. Iteration order is **not** sorted. Min-heap by default |
+
+**Maps and sets**
+
+| Collection | Ordering | get / put / remove | Null keys | Use when |
+|---|---|---|---|---|
+| `HashMap` / `HashSet` | None | O(1) average, O(log n) worst for tree bins | One null key allowed | Default choice. `HashSet` is a `HashMap` with a dummy value |
+| `LinkedHashMap` / `LinkedHashSet` | Insertion order, or access order | O(1) average | Allowed | Predictable iteration, LRU caches |
+| `TreeMap` / `TreeSet` | Sorted (red-black tree) | O(log n) guaranteed | Not with natural ordering (NPE) | Range queries: `floorKey`, `ceilingKey`, `headMap`, `subMap` |
+| `EnumMap` / `EnumSet` | Enum declaration order | O(1), array or bit-vector inside | Not allowed | Keys are enum constants; fastest and most compact |
+| `ConcurrentHashMap` | None | O(1) average | Not allowed | Shared between threads (see [concurrency note](/learn/notes/java-concurrency-locks/)) |
+
+### LinkedHashMap as an LRU cache
+
+`LinkedHashMap` threads a doubly linked list through its entries. With the three-argument constructor and `accessOrder = true`, every `get` or `put` moves the entry to the end. Override `removeEldestEntry` and it evicts the head (least recently used) after each insert:
+
+```java
+// Run with: java LruCache.java
+import java.util.*;
+
+public class LruCache<K, V> extends LinkedHashMap<K, V> {
+    private final int capacity;
+
+    public LruCache(int capacity) {
+        super(16, 0.75f, true);          // true = access order
+        this.capacity = capacity;
+    }
+
+    @Override
+    protected boolean removeEldestEntry(Map.Entry<K, V> eldest) {
+        return size() > capacity;        // evict least recently used
+    }
+
+    public static void main(String[] args) {
+        LruCache<String, Integer> cache = new LruCache<>(3);
+        cache.put("a", 1);
+        cache.put("b", 2);
+        cache.put("c", 3);
+        cache.get("a");                  // a becomes most recently used
+        cache.put("d", 4);               // evicts b
+        System.out.println(cache.keySet());
+    }
+}
+```
+
+```
+[c, a, d]
+```
+
+Caveats: in access-order mode even `get` is a **structural modification** (it reorders the list), so iterating while calling `get` throws `ConcurrentModificationException`, and the class is not thread-safe. For a production cache, use Caffeine.
+
+### Immutable collections and nulls
+
+| Factory | Mutable? | Nulls | Notes |
+|---|---|---|---|
+| `List.of`, `Set.of`, `Map.of` (Java 9+) | No: mutators throw `UnsupportedOperationException` | **Rejected**: `NullPointerException`, even `contains(null)` | `Set.of` / `Map.of` throw `IllegalArgumentException` on duplicates; their iteration order is deliberately randomized per JVM run |
+| `List.copyOf`, `Set.copyOf`, `Map.copyOf` (Java 10+) | No | Rejected | A real copy; later changes to the source don't show up |
+| `Collections.unmodifiableList(list)` | No through the wrapper | Whatever the source allows | A **view**: changes to the source show through |
+| `Arrays.asList(array)` | Fixed size: `set` works, `add`/`remove` throw | Allowed | Writes through to the array |
+| `Stream.toList()` (Java 16+) | No | **Allowed** | Unlike `List.of` |
+
+```java
+// Run with: java ImmutableNulls.java
+import java.util.*;
+
+public class ImmutableNulls {
+    static void attempt(String label, Runnable r) {
+        try { r.run(); System.out.println(label + ": ok"); }
+        catch (RuntimeException e) { System.out.println(label + ": " + e.getClass().getSimpleName()); }
+    }
+
+    public static void main(String[] args) {
+        attempt("List.of(null)", () -> List.of("a", null));
+        attempt("List.of(..).contains(null)", () -> List.of("a").contains(null));
+        attempt("Map.of dup key", () -> Map.of("k", 1, "k", 2));
+        attempt("List.of(..).add", () -> List.of("a").add("b"));
+        attempt("Arrays.asList set", () -> Arrays.asList("a", "b").set(0, "z"));
+        attempt("Arrays.asList add", () -> Arrays.asList("a", "b").add("c"));
+        List<String> src = new ArrayList<>(List.of("x"));
+        List<String> view = Collections.unmodifiableList(src);
+        List<String> copy = List.copyOf(src);
+        src.add("y");
+        System.out.println("view=" + view + " copy=" + copy);
+        Map<String, Integer> hm = new HashMap<>();
+        hm.put(null, 1);
+        hm.put("k", null);
+        System.out.println("HashMap null key -> " + hm.get(null) + ", containsKey(k)=" + hm.containsKey("k"));
+        attempt("TreeMap null key", () -> new TreeMap<String, Integer>().put(null, 1));
+    }
+}
+```
+
+```
+List.of(null): NullPointerException
+List.of(..).contains(null): NullPointerException
+Map.of dup key: IllegalArgumentException
+List.of(..).add: UnsupportedOperationException
+Arrays.asList set: ok
+Arrays.asList add: UnsupportedOperationException
+view=[x, y] copy=[x]
+HashMap null key -> 1, containsKey(k)=true
+TreeMap null key: NullPointerException
+```
+
+Note the `HashMap` ambiguity: `get(k)` returns `null` both for "absent" and "mapped to null". Use `containsKey` or `getOrDefault` when null values are possible. That ambiguity is exactly why `ConcurrentHashMap` bans nulls.
+
+## How it works (one put, end to end)
+
+`map.put("cherry", 3)` on a fresh `HashMap` that already holds 12 entries:
+
+1. `hash("cherry")`: `"cherry".hashCode()` is `-1361513063` (`String` caches its hash after the first call). XOR with its upper 16 bits gives `-1361552575`.
+2. Table length is 16, so index = `-1361552575 & 15` = **1**.
+3. Bucket 1 already holds `"apple"`. Hashes differ, so it's not a match. `next` is null, so a new node is appended to the tail. The list length is 2, well under 8.
+4. `modCount++` (any live iterator will now fail fast), `size` becomes 13.
+5. 13 > threshold 12 → `resize()`: allocate 32 buckets, threshold 24. For each old bucket, split nodes into lo (stay at `j`) and hi (`j + 16`) using `hash & 16`, keeping order.
+6. `afterNodeInsertion` runs. It's a no-op for `HashMap`; `LinkedHashMap` uses this hook to call `removeEldestEntry`.
+
+## Real-world examples
+
+- **JEP 180 (Java 8)** added tree bins to `HashMap` specifically to limit the damage from many colliding keys, such as attacker-controlled request parameters, turning O(n) worst-case buckets into O(log n).
+- **`HashSet`** is literally a wrapper around a `HashMap` whose values are a shared dummy object, so everything in this note applies to sets too.
+- **`LinkedHashMap.removeEldestEntry`** is documented in the Javadoc for exactly the "keep at most N entries" cache use case.
+- **Java 19** added `HashMap.newHashMap(int)` because `new HashMap<>(n)` was widely misunderstood as "room for n entries".
+
+## Common pitfalls
+
+- **Overriding `equals` without `hashCode`** (or using different fields in each). Lookups fail and sets hold duplicates.
+- **Mutating a key** after inserting it. The entry becomes unreachable.
+- **Removing inside a for-each loop.** Use `iterator.remove()` or `removeIf`.
+- **Sharing a `HashMap` between threads** "because only one thread writes". Without safe publication, readers can see broken state. Use `ConcurrentHashMap` or an immutable copy.
+- **Assuming `HashMap` iteration order** in tests or output. It can change across resizes and JDK versions.
+- **`new HashMap<>(1000)` expecting no resize for 1000 entries.** The threshold is 1024 × 0.75 = 768. Use `HashMap.newHashMap(1000)`.
+- **Subtraction comparators** that overflow.
+- **`compareTo` inconsistent with `equals`** in `TreeSet`/`TreeMap` keys.
+- **Passing nulls to `List.of` / `Map.of`**, or assuming `Collections.unmodifiableList` is a snapshot.
+- **Using `Stack`, `Vector`, `Hashtable` or `LinkedList` by habit.** Prefer `ArrayDeque`, `ArrayList`, `HashMap`/`ConcurrentHashMap`.
+
+## Practice questions
+
+<Practice>
+
+<QA q="How does `HashMap` find the bucket for a key?" level="easy">
+
+It calls `key.hashCode()`, spreads it with `h ^ (h >>> 16)` so the high bits affect the low bits, then computes `index = (n - 1) & hash`, where `n` is the table length. Because `n` is always a power of two, `n - 1` is a bit mask and the AND equals `hash mod n` for a non-negative hash, but it's cheaper and works for negative hashes too. A `null` key gets hash 0, so it always goes to bucket 0.
+
+</QA>
+
+<QA q="What are the default capacity and load factor, and when does a resize happen?" level="easy">
+
+Default capacity is 16 and the load factor is 0.75, so the threshold is 12. When `size` exceeds the threshold (the 13th entry), the table doubles to 32 and the threshold becomes 24. The table is only allocated on the first `put`. 0.75 balances memory (fewer empty slots) against speed (short buckets).
+
+</QA>
+
+<QA q="Does `HashMap` allow null keys and values? What about `TreeMap`, `ConcurrentHashMap` and `Map.of`?" level="easy">
+
+`HashMap` allows one null key (stored in bucket 0) and any number of null values. `TreeMap` with natural ordering throws `NullPointerException` on a null key because it has to call `compareTo` (a custom comparator could allow it); null values are fine. `ConcurrentHashMap` allows neither, so `get` returning null always means absent. `Map.of` and other immutable factories reject null keys and values.
+
+</QA>
+
+<QA q="What is the equals/hashCode contract and what happens if you override only `equals`?" level="easy">
+
+Equal objects must have equal hash codes; `equals` must be reflexive, symmetric, transitive, consistent, and false for null. Unequal objects may share a hash. If you override only `equals`, two equal objects keep `Object`'s identity hash codes, so they land in different buckets: `map.get(equalKey)` returns null and a `HashSet` stores both as duplicates.
+
+</QA>
+
+<QA q="`ArrayList` vs `LinkedList` — which do you use and why?" level="easy">
+
+Almost always `ArrayList`: O(1) random access, amortized O(1) append, contiguous memory that's friendly to CPU caches, and less memory per element. `LinkedList` is O(n) for `get(i)` and only wins for inserting or removing in the middle when you already hold an iterator at that position. For a queue or stack, use `ArrayDeque` rather than `LinkedList`.
+
+</QA>
+
+<QA q="Why does `HashMap` mix the hash with `h ^ (h >>> 16)`?" level="medium">
+
+The bucket index uses only the low bits of the hash (4 bits for a 16-bucket table). Keys whose hash codes differ only in the high bits would all collide. XOR-ing the top 16 bits into the bottom 16 lets the high bits influence the index at the cost of one shift and one XOR. The JDK doesn't use a stronger mixer because most hash codes are already reasonable and tree bins handle the bad cases.
+
+</QA>
+
+<QA q="Explain how a resize moves entries without rehashing." level="medium">
+
+The table doubles, which adds one bit to the index mask. For an entry in old bucket `j`, the new index depends only on that extra bit, `hash & oldCap`. If it's 0 the entry stays at `j`; otherwise it moves to `j + oldCap`. `resize()` walks each bucket once, builds a lo list and a hi list preserving the original order, and places them. The cached hash in each node means `hashCode()` and `equals()` are never called.
+
+</QA>
+
+<QA q="When does a bucket turn into a tree, and when does it turn back?" level="medium">
+
+When a node is added to a bucket that already holds 8 nodes (`TREEIFY_THRESHOLD`), so it now has 9, `treeifyBin` runs. If the table has fewer than 64 buckets (`MIN_TREEIFY_CAPACITY`) it resizes instead, since crowding in a small table is better fixed by spreading entries. Otherwise the bucket becomes a red-black tree ordered by hash, then by `compareTo` for comparable keys of the same class. When a resize split leaves 6 or fewer nodes (`UNTREEIFY_THRESHOLD`), it reverts to a list; removals can also untreeify a tree that becomes very small. The gap between 8 and 6 avoids thrashing.
+
+</QA>
+
+<QA q="What does fail-fast mean, and is a `ConcurrentModificationException` guaranteed?" level="medium">
+
+Iterators remember the collection's `modCount` and throw `ConcurrentModificationException` on the next `next()` if a structural change happened through any path other than the iterator itself. It's best effort, not guaranteed, so it's for catching bugs, not for program logic. The usual cause is a single thread removing elements inside a for-each loop; fix it with `iterator.remove()`, `removeIf`, or by collecting changes and applying them afterwards. Concurrent collections use weakly consistent iterators that never throw it.
+
+</QA>
+
+<QA q="How would you implement an LRU cache with the JDK only?" level="medium">
+
+Extend `LinkedHashMap`, call the constructor `super(capacity, 0.75f, true)` so iteration follows access order, and override `removeEldestEntry` to return `size() > maxEntries`. Each `get`/`put` moves the entry to the tail and each insert may evict the head, all O(1). It's not thread-safe and `get` counts as a structural change in access-order mode. In production, use Caffeine, which adds concurrency and better eviction policies.
+
+</QA>
+
+<QA q="`Comparable` vs `Comparator` — and what does consistent with equals mean?" level="medium">
+
+`Comparable.compareTo` defines a class's single natural ordering; `Comparator.compare` defines external orderings you pass to `sort`, `TreeMap` or `PriorityQueue`. An ordering is consistent with equals when `compare(a, b) == 0` exactly when `a.equals(b)`. Sorted collections use only the comparison, so if they disagree, behaviour differs from hash collections: `new BigDecimal('1.0')` and `new BigDecimal('1.00')` are two elements in a `HashSet` but one in a `TreeSet`.
+
+</QA>
+
+<QA q="Why is `HashMap` not thread-safe? Give concrete failure modes." level="hard">
+
+It has no locking and no happens-before guarantees. Two threads putting into the same empty bucket can overwrite each other's node, `++size` loses increments, a reader can see a half-finished resize and miss entries, and without safe publication other threads can see partially constructed nodes. In Java 7 and earlier, concurrent resizes could even create a cycle in a bucket, causing an infinite loop in `get`. Java 8's order-preserving split removed that specific hang, but the behaviour is still undefined. Use `ConcurrentHashMap` or an immutable map.
+
+</QA>
+
+<QA q="Why is `HashMap` average O(1) but tree bins O(log n) in the worst case — and when is it still O(n)?" level="hard">
+
+With a decent hash and load factor 0.75, bucket sizes follow roughly a Poisson distribution with mean 0.5, so most buckets have 0 or 1 nodes and the expected work per lookup is constant. If many keys collide, a bucket that grows past 8 becomes a red-black tree, giving O(log n) — but tree ordering uses the hash and then `compareTo`. If keys share the same hash and are not `Comparable`, the tree can't order them by value and a lookup may have to search both subtrees, degrading toward O(n). Iteration is always O(capacity + size).
+
+</QA>
+
+<QA q="Pick a collection: a task scheduler that always runs the earliest deadline next, a browser back button, and a leaderboard needing the next-higher score." level="hard">
+
+Earliest deadline: `PriorityQueue` with a `Comparator` on deadline (O(log n) `offer`/`poll`, O(1) `peek`); note `remove(task)` is O(n), so for frequent cancellations use a lazy-delete flag. Back button: `ArrayDeque` used as a stack (`push`/`pop`), not the synchronized legacy `Stack`. Leaderboard: `TreeMap` keyed by score so `ceilingKey`/`higherEntry` and `headMap` work in O(log n); use a list or count as the value since scores can tie.
+
+</QA>
+
+<QA q="A service's cache is a static `HashMap` keyed by a request object. Memory grows steadily and lookups miss. What is going on?" level="scenario">
+
+Likely the key class has a broken or mutable `hashCode`/`equals`. If `equals`/`hashCode` aren't overridden, every request creates a new identity, so every lookup misses and every put adds an entry: unbounded growth. If they are overridden but a field used in them is changed after insertion, those entries become unreachable. Fix: use an immutable key (a record of the relevant fields), bound the cache with eviction (Caffeine or an LRU `LinkedHashMap`), and since it's static and shared by request threads, make it thread-safe too.
+
+</QA>
+
+<QA q="A batch job loads 2 million rows into a `HashMap` and spends noticeable time in `resize`. How do you fix it?" level="scenario">
+
+Starting from 16 buckets, the map doubles 18 times (up to 4,194,304 buckets), each time walking every entry. Pre-size it: `HashMap.newHashMap(2_000_000)` on Java 19+, or `new HashMap<>((int) (n / 0.75f) + 1)` on older versions. Also check that the key's `hashCode` is cheap and well spread (profile for long buckets or tree bins), and consider whether a primitive-specialised map would cut boxing overhead if keys are numbers.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="A HashMap has a table of 16 buckets. Which expression gives the bucket index for an already-spread hash h?" options={["h % 17", "(16 - 1) & h", "h >>> 16", "Math.abs(h) / 16"]} answer={1}>
+
+With a power-of-two table, (n - 1) & h keeps the low bits and equals h mod n for non-negative values, without a division and without sign problems. h >>> 16 is part of spreading, not indexing, and the others are not what HashMap does.
+
+</MCQ>
+
+<MCQ q="With default settings, which insert triggers the first resize of a new HashMap?" options={["The 16th", "The 17th", "The 13th", "The 9th"]} answer={2}>
+
+Capacity 16 times load factor 0.75 gives a threshold of 12; resize happens when size exceeds it, i.e. on the 13th entry.
+
+</MCQ>
+
+<MCQ q="A 9th entry is added to a bucket that already holds 8, but the table has only 32 buckets. What does HashMap do?" options={["Converts the bucket to a red-black tree", "Resizes the table instead of treeifying", "Throws IllegalStateException", "Starts rejecting inserts into that bucket"]} answer={1}>
+
+Treeification requires MIN_TREEIFY_CAPACITY of 64. Below that, treeifyBin resizes, because spreading entries in a bigger table is the better fix for a small crowded table.
+
+</MCQ>
+
+<MCQ q="During a resize from 16 to 32 buckets, an entry in old bucket 5 has hash & 16 != 0. Where does it go?" options={["Bucket 5", "Bucket 10", "Bucket 21", "It is rehashed with a new hash function"]} answer={2}>
+
+The extra mask bit is set, so the entry moves to j + oldCap = 5 + 16 = 21. Entries with that bit clear stay at 5. No rehashing happens; the cached hash is reused.
+
+</MCQ>
+
+<MCQ q="A class overrides equals but not hashCode. Two equal instances are added to a HashSet. What is the most likely size?" options={["1", "2", "0", "It throws an exception"]} answer={1}>
+
+They keep identity-based hash codes, so they land in different buckets and equals is never even consulted. The set stores both. This is why equals and hashCode must be overridden together.
+
+</MCQ>
+
+<MCQ q="Which is the best general-purpose choice for a LIFO stack in modern Java?" options={["java.util.Stack", "LinkedList", "ArrayDeque", "Vector"]} answer={2}>
+
+ArrayDeque is an array-backed deque with amortized O(1) push and pop and no locking. Stack extends the synchronized Vector, and the Stack Javadoc itself points to Deque. LinkedList works but uses more memory and has worse locality.
+
+</MCQ>
+
+<MCQ q="What does List.of(1, 2).contains(null) do?" options={["Returns false", "Returns true", "Throws NullPointerException", "Throws UnsupportedOperationException"]} answer={2}>
+
+The immutable collections from List.of reject nulls everywhere, including queries like contains and indexOf. UnsupportedOperationException is what mutators like add throw.
+
+</MCQ>
+
+<MCQ q="BigDecimal values 1.0 and 1.00 (both created from strings) are added to a HashSet and to a TreeSet. What are the sizes?" options={["HashSet 1, TreeSet 1", "HashSet 2, TreeSet 2", "HashSet 1, TreeSet 2", "HashSet 2, TreeSet 1"]} answer={3}>
+
+BigDecimal.equals compares scale too, so the hash set keeps both. compareTo compares numeric value only and returns 0, and TreeSet uses compareTo, so it keeps one. BigDecimal's natural ordering is not consistent with equals.
+
+</MCQ>
+
+<MCQ q="Which statement about HashMap iteration is true?" options={["It always follows insertion order", "It follows key sort order", "It has no guaranteed order and costs time proportional to capacity plus size", "It throws ConcurrentModificationException whenever another thread reads the map"]} answer={2}>
+
+HashMap promises no order, and iteration scans every bucket, so cost depends on capacity plus size. LinkedHashMap gives insertion order and TreeMap gives sorted order. Fail-fast checks are triggered by structural modifications, not reads.
+
+</MCQ>
+
+<MCQ q="Which PriorityQueue operation is O(n)?" options={["offer", "poll", "peek", "remove(Object)"]} answer={3}>
+
+The Javadoc gives O(log n) for offer and poll, constant time for peek, and linear time for remove(Object) and contains(Object), because finding an arbitrary element requires scanning the heap array.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- `HashMap` = array of buckets (power-of-two size); `hash = h ^ (h >>> 16)`; `index = (n - 1) & hash`.
+- Defaults: capacity 16, load factor 0.75 → resize at 13 entries; table allocated on first `put`; doubles each time.
+- Resize split: `hash & oldCap == 0` stays at `j`, else moves to `j + oldCap`. No rehash, order preserved.
+- Treeify when a bucket grows past **8** (on the 9th node) if the table is at least **64** buckets (else resize); back to a list at **6** or fewer. Java 8, JEP 180.
+- One null key (bucket 0); null values allowed; `get` returning null is ambiguous.
+- No iteration order; iterators are fail-fast (best effort). Not thread-safe → `ConcurrentHashMap`.
+- **equals/hashCode**: override both, same fields, immutable keys. Broken → missed lookups, duplicates, unreachable entries.
+- **Comparable** = natural order; **Comparator** = external orders built with `comparing`/`thenComparing`; avoid subtraction; keep consistent with equals.
+- Choose: `ArrayList`, `ArrayDeque`, `HashMap`/`HashSet` by default; `LinkedHashMap` for order or LRU; `TreeMap` for sorted/range queries; `PriorityQueue` for min/max; `EnumMap` for enum keys.
+- `List.of`/`Map.of`: immutable, no nulls, duplicates rejected; `unmodifiableList` is a view; `Arrays.asList` is fixed size.
+
+## Go deeper
+
+- **OpenJDK source**: [java.util.HashMap](https://github.com/openjdk/jdk/blob/master/src/java.base/share/classes/java/util/HashMap.java). Read the "Implementation notes" comment and `resize()`.
+- **Javadoc (JDK 21)**: [HashMap](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/HashMap.html), [LinkedHashMap](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/LinkedHashMap.html), [Object (equals and hashCode contracts)](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/Object.html), [Comparable](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/Comparable.html), [List (unmodifiable lists)](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/List.html).
+- **Oracle guide**: [The Java Collections Framework](https://docs.oracle.com/en/java/javase/21/core/java-collections-framework.html).
+- **Book**: *Effective Java* (3rd ed.), Items 10 and 11 (equals and hashCode) and Item 14 (Comparable).
+- **Next**: [Java Concurrency: synchronized, Locks, volatile, ConcurrentHashMap](/learn/notes/java-concurrency-locks/).

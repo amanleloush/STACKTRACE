@@ -1,7 +1,7 @@
 ---
 title: "Elasticsearch: Inverted Index, BM25, Shards"
 phase: "02-databases"
-order: 13
+order: 14
 tags: ["db", "sharding"]
 premium: false
 previewParagraphs: 4
@@ -101,7 +101,7 @@ You don't memorize the formula — just know:
 
 ### Shards & replicas
 
-- An index is split into **primary shards** (set at index creation, can't change without reindexing for older indices; data streams + ILM let you rotate).
+- An index is split into **primary shards** (set at index creation; changing it means `_split`/`_shrink` into a new index or a full reindex; data streams + ILM let you roll over to new indices instead).
 - Each primary has N **replica shards** (configurable any time).
 - A shard is a self-contained Lucene index.
 - Queries fan out to shards in parallel, results merged by the coordinating node.
@@ -128,7 +128,7 @@ Each shard is many Lucene **segments** (immutable). Background merges combine sm
 Beyond search, Elasticsearch supports rich aggregations:
 - **Metric**: avg, sum, percentile, cardinality (HyperLogLog).
 - **Bucket**: terms (group-by), date histogram, range.
-- **Pipeline**: derivative, moving avg over bucket outputs.
+- **Pipeline**: derivative, moving function (`moving_fn`; the old `moving_avg` was removed in 8.0) over bucket outputs.
 
 Used for analytics dashboards and log/metric exploration.
 
@@ -167,40 +167,153 @@ Client → Coordinating Node
 - **Heavy nested fields**: each nested object creates hidden docs. Don't go crazy.
 - **Master overload**: dynamic mapping or rapid index creation can pin the master node.
 
-## Interview questions
+## Practice questions
 
-### Q1 — Easy: What's an inverted index?
-A data structure mapping terms (tokens) to the documents that contain them. Reverse of a forward index (doc → its words). Lets full-text queries return matching docs in O(log) per term + intersection cost.
+<Practice>
 
-### Q2 — Easy: What's the difference between `text` and `keyword`?
-`text` is analyzed (tokenized, lowercased, stemmed) and used for full-text search. `keyword` is stored as-is and used for exact match, filtering, sorting, and aggregations. Map a field as both if you need both behaviors.
+<QA q="What's an inverted index?" level="easy">
 
-### Q3 — Medium: How does BM25 differ from TF-IDF?
-BM25 adds **term frequency saturation** (extra occurrences contribute less and less, prevents keyword stuffing) and **document length normalization** (rewards shorter, more relevant docs). It's a probabilistic refinement; Elasticsearch uses BM25 since 5.0.
+A map from each term (token) to the list of documents that contain it, the reverse of a forward index (doc → its words). A query for 'redis cluster' looks up both posting lists and intersects them, so full-text search costs roughly a lookup per term plus the intersection, not a scan of every document.
 
-### Q4 — Medium: How does Elasticsearch scale horizontally?
-Indices are split into **primary shards** (parallelism unit) and each primary has **replicas** (HA + read scaling). Cluster distributes shards across data nodes. Queries fan out to shards in parallel, results merged. Add nodes → rebalance shards automatically.
+</QA>
 
-### Q5 — Medium: Why is Elasticsearch only "near-real-time"?
-Indexed documents are buffered and made searchable on a periodic **refresh** (default 1s). Until that refresh, the doc isn't visible to search even though it's been written. Tunable per index — log-ingestion clusters often raise `refresh_interval` to reduce overhead.
+<QA q="What's the difference between `text` and `keyword`?" level="easy">
 
-### Q6 — Hard: A log cluster ingests 1 TB/day. How would you size and operate it?
-- **ILM**: hot shards on SSD, warm on HDD after 7 days, cold/frozen after 30 days, delete after 90 days.
-- **Daily index per source**: ~50 GB per shard target. If 1 TB/day = 20 shards/day (or use data streams to auto-roll).
-- **Mappings**: strict + dynamic templates to avoid mapping explosion.
-- **Refresh interval**: 30s+ on hot indices.
-- **Replication**: replica=1 hot, 0 on cold (rely on snapshots).
-- **Bulk indexing** with appropriate batch size (5–15 MB).
-- **Snapshots to S3** for backup.
-- **Monitor**: pending tasks, heap, GC, queue rejections, ingest latency.
+`text` is analyzed (tokenized, lowercased, stemmed) into the inverted index and used for full-text search. `keyword` is stored as-is and used for exact match, filters, sorting and aggregations. Map a field as both (`name` plus `name.keyword`) when you need both behaviours.
 
-### Q7 — Hard: An e-commerce site's search highlights products but never matches misspellings. How would you improve recall?
-Add **fuzzy queries** (`fuzziness: AUTO`) with care (slow). Better: a synonyms filter for common misspellings, an n-gram subfield for partial matches, query-time normalization (`asciifolding`, lowercase). Even better: use **vector search** with embeddings (k-NN on `dense_vector`) to capture semantic similarity, then re-rank with BM25.
+</QA>
 
-### Q8 — Hard: A team uses Elasticsearch as the source of truth for product data and lost the cluster. What went wrong?
-- Elasticsearch is **not** an ACID database; it's eventually consistent and prone to bugs that lose individual docs.
-- Snapshots aren't enough for transactional correctness — they're point-in-time but not coordinated with writes.
-- Right architecture: primary store (Postgres / Mongo / Kafka) → CDC / dual-write → Elasticsearch for queryable search. On loss, reindex from primary.
+<QA q="Can you change an index's number of primary shards after creating it?" level="easy">
+
+Not in place. The primary shard count is fixed at creation. Changing it means `_split`/`_shrink` into a new index or a full reindex. Replica count, by contrast, can be changed any time. For growing data such as logs, data streams + ILM roll over to new indices, so each new index can get a different shard count.
+
+</QA>
+
+<QA q="What does the analyzer pipeline do, and why must index and query analysis match?" level="easy">
+
+At index time, text passes through **character filters** (e.g. strip HTML) → a **tokenizer** (standard, whitespace, edge n-gram) → **token filters** (lowercase, stop words, stemming, synonyms), and the resulting tokens go into the inverted index. A query only matches if its terms are normalized the same way. Index with `standard` (which lowercases) and query an un-analyzed 'Redis', and you get no hits.
+
+</QA>
+
+<QA q="How does BM25 differ from TF-IDF?" level="medium">
+
+BM25 adds **term-frequency saturation** (extra occurrences contribute less and less, which blunts keyword stuffing) and **document length normalization** (a match in a short field counts for more than one in a long document), tunable through `k1` and `b`. Rare terms still matter more (IDF). It's been Elasticsearch's default similarity since 5.0.
+
+</QA>
+
+<QA q="How does Elasticsearch scale horizontally?" level="medium">
+
+Indices are split into **primary shards** (the unit of parallelism), and each primary has **replicas** (for HA and read scaling). The cluster spreads shards across data nodes and rebalances when you add nodes. A query fans out to one copy of each shard in parallel; each shard returns its top K, and the coordinating node merges them (then optionally fetches the source documents).
+
+</QA>
+
+<QA q="Why is Elasticsearch only near-real-time?" level="medium">
+
+Indexed documents sit in an in-memory buffer and become searchable only when a **refresh** writes them into a new Lucene segment (every `refresh_interval`, default 1 s). Until then a document is written but not visible to search. Log-ingestion clusters often raise `refresh_interval` to 30 s or more to cut the overhead.
+
+</QA>
+
+<QA q="Why is having too many small shards a problem, and what size should you aim for?" level="medium">
+
+Each shard is a full Lucene index with its own overhead: heap, file handles, segment metadata, cluster-state entries. Thousands of tiny shards waste memory, slow down cluster-state updates and add per-shard query fan-out cost. Aim for shards of roughly 10–50 GB, and use rollover and ILM rather than one index per small slice of data.
+
+</QA>
+
+<QA q="A `terms` aggregation on a high-cardinality field makes nodes run out of memory. Why, and what do you do?" level="hard">
+
+A `terms` aggregation builds buckets in memory for the distinct values on each shard, and the coordinating node merges them. Millions of unique values (user IDs, URLs) means huge bucket sets and heap blowups. Options: a **composite** aggregation to page through buckets, `cardinality` (HyperLogLog) if you only need a distinct count, filtering to a smaller scope first, or computing it in an analytics store.
+
+</QA>
+
+<QA q="A log cluster ingests 1 TB/day. How would you size and operate it?" level="scenario">
+
+- **ILM**: hot on SSD, warm on cheaper nodes after ~7 days, cold/frozen after ~30, delete after ~90.
+- **Data streams / rollover** targeting ~50 GB shards (1 TB/day ≈ 20 primaries' worth per day).
+- **Strict mappings + dynamic templates** to prevent mapping explosion.
+- `refresh_interval` of 30 s or more on hot indices; **bulk indexing** in ~5–15 MB batches.
+- Replicas = 1 on hot, 0 on cold, with **snapshots to S3** as backup.
+- Monitor pending tasks, heap/GC, thread-pool queue rejections and ingest latency.
+
+</QA>
+
+<QA q="An e-commerce search never matches misspellings. How would you improve recall?" level="scenario">
+
+- **Fuzzy queries** (`fuzziness: AUTO`), with care, since they're slower.
+- A **synonyms** filter for common misspellings and variants.
+- An **n-gram subfield** for partial matches, plus normalization (`lowercase`, `asciifolding`).
+- **Vector search**: embed queries and products (`dense_vector` + HNSW k-NN) to capture semantic similarity, then combine with BM25 for ranking.
+
+</QA>
+
+<QA q="A team used Elasticsearch as the source of truth for product data and lost the cluster. What went wrong?" level="scenario">
+
+- Elasticsearch isn't an ACID database: it's near-real-time, has no multi-document transactions, and has historically lost acknowledged writes under network partitions (Jepsen).
+- Snapshots are point-in-time and not coordinated with your writes, so they aren't a transactional backup.
+- Right architecture: a primary store (Postgres, Mongo, or a Kafka log) → CDC or dual-write → Elasticsearch as a derived, queryable index. On loss, reindex from the primary.
+
+</QA>
+
+<QA q="Users index arbitrary JSON into a shared index with dynamic mapping, and the master node is now overloaded and the cluster state is enormous. What happened and how do you fix it?" level="scenario">
+
+**Mapping explosion**: every new key in user JSON becomes a new field, so you end up with thousands of fields. The mapping lives in cluster state, which the master must update and publish to every node. Fix: make the mapping **strict** (or `dynamic: false` for unknown keys), use **dynamic templates** to control how allowed fields are mapped, or store arbitrary user attributes as key/value pairs (e.g. a `flattened` or nested key-value structure). Then reindex the bloated index.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="You need to filter products by an exact SKU and aggregate counts per brand. How should sku and brand be mapped?" options={["As text, so they are analyzed", "As keyword", "As dense_vector", "As nested objects"]} answer={1}>
+
+Exact match, sorting and aggregations need un-analyzed values, which is keyword. text would tokenize and lowercase the values, so an exact match or a per-value bucket would no longer work as intended.
+
+</MCQ>
+
+<MCQ q="A document was indexed successfully, but a search run 200 ms later doesn't find it. What is the most likely reason?" options={["The document was rejected by the mapping", "The replica is out of sync permanently", "The index needs a force-merge", "The next refresh hasn't happened yet, so the document isn't in a searchable segment"]} answer={3}>
+
+Search is near-real-time: documents become visible after a refresh, every 1 s by default. A mapping rejection would fail the index request, and force-merge has nothing to do with visibility.
+
+</MCQ>
+
+<MCQ q="What does BM25 add on top of classic TF-IDF?" options={["Term-frequency saturation and document-length normalization", "Vector embeddings", "Exact phrase matching", "A requirement that every term appears in the document"]} answer={0}>
+
+BM25 caps the benefit of repeated terms and normalizes by field length (tunable via k1 and b). Embeddings belong to vector search, and phrase matching is a query type, not a scoring formula.
+
+</MCQ>
+
+<MCQ q="An index was created with 5 primary shards and now needs 20. What are your options?" options={["Update number_of_shards in the index settings", "Add more replicas", "Use the split API into a new index or reindex, or roll over to new indices", "Restart the cluster with a new default"]} answer={2}>
+
+Primary count is fixed at creation, so you need split/reindex or rollover. Replicas add copies of existing shards, not more primaries, and restarting changes nothing for an existing index.
+
+</MCQ>
+
+<MCQ q="Text is indexed with the standard analyzer, but queries for Redis against the field hit nothing because the query side skips analysis. Why?" options={["BM25 penalizes capitalized words", "The indexed tokens were lowercased, but the query term was not, so they don't match", "The inverted index only stores stop words", "Replicas haven't been refreshed"]} answer={1}>
+
+The standard analyzer lowercases at index time, so the index holds redis. An un-analyzed query for Redis looks up a term that doesn't exist. Index-time and query-time analysis must match.
+
+</MCQ>
+
+<MCQ q="A cluster has 40,000 shards averaging 200 MB each, and heap and master load are high. What is the best remedy?" options={["Add more replicas per shard", "Lower refresh_interval to 100 ms", "Switch every field to keyword", "Consolidate into fewer, larger shards of roughly 10 to 50 GB using rollover, shrink or reindex"]} answer={3}>
+
+Every shard costs heap and cluster-state overhead, so tiny shards waste resources. More replicas multiply the shard count, and a faster refresh adds load.
+
+</MCQ>
+
+<MCQ q="Why is Elasticsearch a poor choice as the only copy of critical product data?" options={["It is near-real-time, lacks multi-document transactions, and has lost acknowledged writes under partitions", "It cannot store JSON", "It cannot replicate shards", "It only supports keyword fields"]} answer={0}>
+
+The right pattern is a primary database plus CDC into Elasticsearch, so you can reindex after a loss. It stores JSON, supports replicas, and supports text fields.
+
+</MCQ>
+
+<MCQ q="Users want product search that finds sneakers when they type running shoes. Which approach targets that best?" options={["fuzziness AUTO", "Semantic search with dense_vector embeddings, or a synonyms filter", "A keyword field with exact match", "Raising refresh_interval"]} answer={1}>
+
+Fuzzy matching handles typos, not different words with similar meaning. Synonyms or embeddings capture the semantic relationship. Exact keyword matching and refresh settings don't help recall here.
+
+</MCQ>
+
+</Quiz>
 
 ## TL;DR cheat sheet
 
@@ -217,8 +330,8 @@ Add **fuzzy queries** (`fuzziness: AUTO`) with care (slow). Better: a synonyms f
 ## Go deeper
 
 - **Elastic official docs**: [elastic.co/guide](https://www.elastic.co/guide/en/elasticsearch/reference/current/index.html) — surprisingly readable.
-- **Elastic blog**: ["BM25 explained"](https://www.elastic.co/blog/practical-bm25-part-1-how-shards-affect-relevance-scoring-in-elasticsearch), ["Mapping explosion"](https://www.elastic.co/blog/found-beginner-troubleshooting), [vector search](https://www.elastic.co/blog/introducing-elasticsearch-vector-database).
+- **Elastic blog**: ["BM25 explained"](https://www.elastic.co/blog/practical-bm25-part-1-how-shards-affect-relevance-scoring-in-elasticsearch), ["Mapping explosion"](https://www.elastic.co/blog/found-beginner-troubleshooting), [vector search](https://www.elastic.co/docs/solutions/search/vector).
 - **Book**: *Elasticsearch: The Definitive Guide* (older, free, still good fundamentals).
 - **Lucene documentation** — for when you really want to know what's under the hood.
-- **OpenSearch docs**: AWS fork of ES, mostly compatible — useful if you're on AWS.
+- **OpenSearch docs**: fork of ES 7.10 started by AWS (now governed by the Linux Foundation's OpenSearch Software Foundation), mostly compatible — useful if you're on AWS.
 - **YouTube**: ElasticON sessions, Elastic's own conference talks.

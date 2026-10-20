@@ -1,7 +1,7 @@
 ---
 title: "HLD: Distributed Job Scheduler (Airflow-Shaped)"
 phase: "07-hld-problems"
-order: 49
+order: 72
 tags: []
 premium: false
 previewParagraphs: 4
@@ -118,13 +118,13 @@ flowchart LR
 ### State machine (task instance)
 
 ```
-NONE → QUEUED → RUNNING → SUCCESS
-              ↓
-           FAILED → UP_FOR_RETRY → QUEUED ...
-              ↓
-           UPSTREAM_FAILED
-              ↓
-           SKIPPED
+NONE → SCHEDULED → QUEUED → RUNNING → SUCCESS
+                               ↓
+                  (retries left) UP_FOR_RETRY → SCHEDULED ...
+                               ↓
+                  (exhausted)  FAILED
+
+Set without running: UPSTREAM_FAILED (an upstream failed), SKIPPED (branch / short-circuit)
 ```
 
 ### Idempotency
@@ -136,7 +136,7 @@ NONE → QUEUED → RUNNING → SUCCESS
 ### Cron + sensors
 
 - Cron triggers: standard cron expressions.
-- Sensors: long-poll for an external condition (file in S3, DB row exists). Push-based via event triggers (modern Airflow deferrable operators) is better than polling.
+- Sensors: poll ("poke") for an external condition (file in S3, DB row exists). Push-based via event triggers (modern Airflow deferrable operators) is better than polling.
 
 ### Multi-tenancy
 
@@ -163,45 +163,160 @@ NONE → QUEUED → RUNNING → SUCCESS
 - **Centralized DB vs distributed state**: centralized is simpler; distributed scales further but adds consensus complexity.
 - **Polling sensors vs event-driven**: polling is simple but burns worker slots. Event-driven is efficient but requires plumbing.
 
-## Interview questions
+## Practice questions
 
-### Q1: How does the scheduler decide what to run?
-On each scan: for each active DAG run, find tasks whose dependencies are all in success state and which haven't been queued. Enqueue them. For DAGs with cron schedule, create a new run when the schedule fires.
+<Practice>
 
-### Q2: How do you handle a task failure?
-Mark task as failed. Increment retry count. If retries remain, schedule for retry after backoff delay. If max retries exhausted, mark terminal failure. DAG run failure policy: fail whole run, continue with downstream tasks, etc.
+<QA q="What is the difference between a DAG, a run, a task and a task instance?" level="easy">
 
-### Q3: Why do tasks need to be idempotent?
-Retries (failure, then re-run), backfills (re-run historical periods), partial failures (a task started but its state wasn't recorded) — all imply the same task might run more than once. Idempotency ensures no duplicate side effects.
+- **DAG**: the workflow definition (tasks plus dependencies).
+- **Task**: one unit of work in it (run bash, call an API, run a Spark job).
+- **Run**: one instantiation of the DAG for a given input or date, such as `daily_sales` for 2026-05-29.
+- **Task instance**: one task within one run. State, retries and logs are tracked at this level.
 
-### Q4: How would you scale to 100K concurrent tasks?
+</QA>
+
+<QA q="How does the scheduler decide what to run?" level="easy">
+
+On each scan: for each active DAG run, find tasks whose dependencies are all in success state and which haven't been queued. Enqueue them. For DAGs with a cron schedule, create a new run when the schedule fires.
+
+</QA>
+
+<QA q="When does a task end up UPSTREAM_FAILED or SKIPPED instead of running?" level="easy">
+
+These states are set without running the task. UPSTREAM_FAILED means a task it depends on failed, so its dependencies can never be met. SKIPPED comes from branching or short-circuit logic that chose a different path.
+
+</QA>
+
+<QA q="How do you handle a task failure?" level="medium">
+
+Mark the task as failed. Increment the retry count. If retries remain, schedule a retry after a backoff delay (UP_FOR_RETRY). If max retries are exhausted, mark terminal failure. Then apply the DAG run's failure policy: fail the whole run, continue with independent tasks, and so on.
+
+</QA>
+
+<QA q="Why do tasks need to be idempotent?" level="medium">
+
+Retries (failure, then re-run), backfills (re-run historical periods), partial failures (a task started but its state wasn't recorded) — all mean the same task may run more than once. Idempotency ensures no duplicate side effects. Pass `execution_date` / `run_id` into the task and use it as the key, for example overwrite the partition for that date instead of appending.
+
+</QA>
+
+<QA q="Compare push and pull worker models." level="medium">
+
+Pull (worker polls queue, popular in Celery/Airflow): simple, natural backpressure (workers process at their own speed), easy to scale workers up and down. Push (scheduler dispatches): lower latency, but coordination is more complex (scheduler needs a worker registry).
+
+</QA>
+
+<QA q="How does catchup vs backfill differ?" level="medium">
+
+Catchup = scheduler runs missed historical schedules on startup. Backfill = manually trigger a rerun of a historical period (typically after a bug fix or change). Catchup is automatic; backfill is operator-initiated. `catchup=False` skips the historical runs.
+
+</QA>
+
+<QA q="Why are polling sensors a scaling problem, and what replaces them?" level="medium">
+
+A classic sensor holds a worker slot while it repeatedly pokes for an external condition (file in S3, DB row exists), so thousands of waiting sensors can starve real work. Deferrable operators (Airflow 2.2+) hand the wait to an async trigger and free the worker until the condition is met. Event-driven triggers are more efficient still but need more plumbing.
+
+</QA>
+
+<QA q="How do you keep one team from starving others in a multi-tenant scheduler?" level="hard">
+
+Per-team DAG quotas, resource pools with a max parallelism (for example a `spark_cluster` pool), separate queues by priority or resource needs, and tags for cost attribution. Pools cap how much of a shared resource any set of tasks can grab at once.
+
+</QA>
+
+<QA q="Design retry policy." level="hard">
+
+- Configurable per task: max retries, base delay, exponential factor.
+- Sensible default: 3 retries, exponential backoff (for example 1m, 2m, 4m, capped). Airflow's own defaults are `retries=0`, `retry_delay=5m`.
+- Permanent failures (parse error, missing data): no retry.
+- Transient failures (5xx, timeout): retry.
+- Custom hooks to decide based on exception type.
+
+</QA>
+
+<QA q="How would you scale to 100K concurrent tasks?" level="scenario">
+
 - Multiple scheduler instances (sharded by DAG hash).
 - Many worker pools across machines.
 - Autoscaling based on queue depth.
 - Deferrable / async sensors instead of polling.
 - Sharded task DB (or specialized state store).
-- Queue tier (Kafka or Redis cluster) handles the fanout.
+- Queue tier (Kafka or Redis cluster) handles the fan-out.
 
-### Q5: Compare push and pull worker models.
-Pull (worker polls queue, popular in Celery/Airflow): simple, natural backpressure (workers process at their speed), easy to scale workers up/down. Push (scheduler dispatches): lower latency, but coordination is more complex (scheduler needs worker registry).
+</QA>
 
-### Q6: How does catchup vs backfill differ?
-Catchup = scheduler runs missed historical schedules on startup. Backfill = manually trigger rerun of historical period (typically after a bug fix or change). Catchup is automatic; backfill is operator-initiated.
+<QA q="The scheduler was down for a day. What happens when it comes back, and what could go wrong?" level="scenario">
 
-### Q7: Design retry policy.
-- Configurable per task: max retries, base delay, exponential factor.
-- Default: 3 retries, exponential backoff (1m, 5m, 15m).
-- Permanent failures (parse error, missing data): no retry.
-- Transient failures (5xx, timeout): retry.
-- Custom hooks to decide based on exception type.
+With catchup on, it creates runs for every missed schedule, which can flood the queue and workers with a day of runs at once. Control it with `catchup=False` for DAGs where only the latest run matters, concurrency limits per DAG and pools, and idempotent tasks so any overlapping or repeated runs are safe.
 
-### Q8: How to monitor 1M jobs/day?
+</QA>
+
+<QA q="How to monitor 1M jobs/day?" level="scenario">
+
 - Per-task metrics: duration, success rate, retry count.
 - Per-DAG metrics: end-to-end SLO, lateness.
 - Alerts: SLO breach, repeat failures, scheduler health.
 - Visualization: Gantt of run, dependency graph.
 - Lineage: which downstream broke because of which upstream.
 - Cost attribution per team.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="When is a task instance ready to be queued?" options={["As soon as its DAG run is created", "When all its upstream dependencies have succeeded (or been skipped per its rule)", "When a worker becomes idle", "When its retry delay expires, regardless of upstream state"]} answer={1}>
+
+The scheduler marks a task ready only once its upstream dependencies are satisfied. Run creation, idle workers or a retry timer alone don't satisfy dependencies.
+
+</MCQ>
+
+<MCQ q="A task that appends rows to a table is retried after a timeout and the table now has duplicates. What is the best fix?" options={["Set retries to 0", "Add more workers", "Make the task overwrite the partition keyed by its run date", "Switch from pull to push workers"]} answer={2}>
+
+Keying the write on execution_date or run_id makes reruns idempotent. Disabling retries loses reliability, and worker count or dispatch model don't stop duplicate side effects.
+
+</MCQ>
+
+<MCQ q="A DAG was paused for two weeks. When unpaused, you only want today's run. What do you set?" options={["catchup=False", "A backfill for the two weeks", "retries=0", "A higher pool slot count"]} answer={0}>
+
+catchup=False skips missed historical schedules. A backfill would deliberately run them, and retries or pool size don't control which schedules are created.
+
+</MCQ>
+
+<MCQ q="Thousands of sensors waiting on S3 files have exhausted the worker slots. What fixes it?" options={["Increase the poke interval to once a day", "Use deferrable operators so waiting doesn't hold a worker slot", "Mark the sensors as SKIPPED", "Move sensors to a separate DAG"]} answer={1}>
+
+Deferrable operators release the worker while an async trigger waits for the condition. Slower poking delays work, skipping breaks the pipeline, and moving sensors to another DAG still occupies the same workers.
+
+</MCQ>
+
+<MCQ q="What is the main advantage of pull-based workers?" options={["Lowest possible dispatch latency", "The scheduler always knows every worker's state", "Natural backpressure, since workers take work at their own pace", "No queue is needed"]} answer={2}>
+
+Workers polling a queue only take what they can handle, which gives backpressure and easy scaling. Lower latency is push's advantage, push needs a worker registry, and pull depends on the queue.
+
+</MCQ>
+
+<MCQ q="Task B depends on task A, and A fails with no retries left. What state does B get?" options={["FAILED", "UP_FOR_RETRY", "SKIPPED", "UPSTREAM_FAILED"]} answer={3}>
+
+B never runs because its upstream failed, so it is marked UPSTREAM_FAILED. FAILED is for a task that ran and failed, UP_FOR_RETRY for one with retries left, and SKIPPED for branching.
+
+</MCQ>
+
+<MCQ q="Which failure should NOT be retried by default?" options={["A parse error in the task's code", "An HTTP 503 from a downstream API", "A network timeout", "A temporarily locked database row"]} answer={0}>
+
+A parse error will fail the same way every time, so retrying wastes slots. 503s, timeouts and lock contention are transient and usually succeed on a later attempt.
+
+</MCQ>
+
+<MCQ q="Every task state change writes a row, and the scheduler DB is now the bottleneck. Which step helps?" options={["Remove all retries", "Disable logging to object storage", "Merge all DAGs into one", "Tune Postgres and shard the task state store"]} answer={3}>
+
+The load comes from state writes, so tuning the DB and sharding state addresses it. Dropping retries or logs loses reliability and observability, and a single giant DAG makes scheduler scans slower.
+
+</MCQ>
+
+</Quiz>
 
 ## TL;DR cheat sheet
 
@@ -219,7 +334,7 @@ Catchup = scheduler runs missed historical schedules on startup. Backfill = manu
 - **Apache Airflow docs**: [airflow.apache.org/docs](https://airflow.apache.org/docs/apache-airflow/stable/).
 - **Astronomer Academy**: free Airflow courses.
 - **Temporal docs**: [docs.temporal.io](https://docs.temporal.io/) — workflow + retry primitives at scale.
-- **Cadence (Uber's predecessor)** — same family.
+- **Cadence (Uber; Temporal's predecessor)** — same family.
 - **Argo Workflows**: Kubernetes-native.
 - **Prefect, Dagster**: modern alternatives.
-- **High Scalability**: Airbnb's Airflow story (origin).
+- **Airbnb Engineering**: Airflow's origin (created at Airbnb in 2014, open-sourced 2015).

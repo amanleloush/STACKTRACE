@@ -1,0 +1,516 @@
+---
+title: "Web Auth Security: Password Hashing, Sessions vs JWT, XSS, CSRF, CORS"
+phase: "09-production-craft"
+order: 105
+tags: ["security", "auth", "web", "jwt", "cookies", "owasp"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 24
+prerequisites: ["authn-authz-oauth-oidc-jwt", "owasp-threat-modeling", "networking-tcp-udp-tls"]
+summary: "How real web apps store passwords, keep users logged in, and defend the browser: argon2id and bcrypt settings, sessions vs JWTs, refresh-token rotation, safe token storage, and XSS, CSRF, cookie flags and CORS explained from first principles."
+---
+
+## Definition (interview-ready)
+
+**Web auth security** covers the full path of a login: storing the password safely, proving on every later request that it's still the same user, and stopping the browser itself from being turned against the user.
+
+- **Password hashing** — store a *slow, salted, memory-hard* hash (argon2id, scrypt, or bcrypt), never the password or a fast hash like SHA-256.
+- **Sessions vs JWT** — a server-side session is a random ID pointing to state on the server (easy to revoke). A JWT is a signed token carrying the state itself (no lookup, hard to revoke).
+- **Access + refresh tokens** — short-lived access token, long-lived refresh token that is **rotated** on every use, with **reuse detection**.
+- **XSS** (cross-site scripting) — attacker gets their JavaScript to run in your page. Defend with context-aware output encoding, safe DOM APIs, and a Content Security Policy.
+- **CSRF** (cross-site request forgery) — attacker's page makes the victim's browser send a request that automatically includes your cookies. Defend with SameSite cookies, CSRF tokens and origin checks.
+- **CORS** (cross-origin resource sharing) — a browser rule that controls which other origins may **read** your responses. It protects users' data in browsers; it is **not** an access-control layer for your server.
+
+This note builds on [AuthN vs AuthZ, OAuth2, OIDC, JWT](/learn/notes/authn-authz-oauth-oidc-jwt/) — read that for the OAuth roles, grant types and JWT structure.
+
+## Why it matters
+
+- Password databases leak. Whether a leak means "users must rotate a few passwords" or "every password is cracked by Friday" depends entirely on the hashing choice.
+- "Use JWT for sessions" is one of the most common interview claims — and one of the most commonly challenged. You need to know the trade-offs, not the slogan.
+- XSS and CSRF are classic browser attacks that frameworks mostly prevent *by default*, and most real bugs come from the escape hatches.
+- CORS errors are the most misunderstood thing in web development. Engineers often "fix" them with `Access-Control-Allow-Origin: *` or by reflecting any origin, which can open real holes.
+
+## Core concepts
+
+### Password hashing
+
+**Why not SHA-256?** SHA-256 is designed to be *fast*. That's great for checksums and terrible for passwords: a single GPU can try billions of SHA-256 guesses per second, so most human-chosen passwords fall quickly to a dictionary attack. A password hash must be **deliberately slow** and ideally **memory-hard** (needs lots of RAM per guess, which GPUs and custom chips can't parallelise cheaply).
+
+**Salt** — a unique random value generated *per password* and stored next to the hash. It makes the same password hash differently for two users and makes precomputed tables (rainbow tables) useless. Salts are not secret. Modern libraries generate and embed them automatically:
+
+```
+$argon2id$v=19$m=19456,t=2,p=1$<salt-b64>$<hash-b64>
+ algorithm  ver  parameters      salt       hash
+```
+
+The stored string carries the algorithm and parameters, so you can raise the cost later and **rehash on next successful login**.
+
+**Pepper** — an extra secret shared by all passwords and stored **outside the database** (secrets manager or HSM). If only the DB leaks, the attacker can't even start cracking. OWASP calls it optional **defence in depth** — not a replacement for a good password hash. See [secrets management](/learn/notes/secrets-management/).
+
+**OWASP Password Storage Cheat Sheet — minimum settings:**
+
+| Algorithm | When | Minimum OWASP config |
+|---|---|---|
+| **Argon2id** | First choice | m = 19 MiB, t = 2 iterations, p = 1 (or an equivalent trade-off, for example m = 46 MiB, t = 1, p = 1) |
+| **scrypt** | If Argon2id isn't available | N = 2^17 (128 MiB), r = 8, p = 1 |
+| **bcrypt** | Legacy systems | work factor 10 or more; passwords limited to **72 bytes** |
+| **PBKDF2** | When FIPS-140 compliance is required | HMAC-SHA256: 600,000 iterations; HMAC-SHA512: 220,000 iterations |
+
+Parameters are minimums — tune upward until a hash takes as long as your login servers can afford.
+
+**The bcrypt 72-byte limit.** bcrypt only uses the first 72 bytes of input. Longer passwords are truncated, often silently — two long passphrases sharing the first 72 bytes would both verify. Bytes, not characters: multi-byte UTF-8 characters use it up faster. Options: cap password length at 72 bytes, or move to argon2id. OWASP warns that naive **pre-hashing** (for example `bcrypt(sha256(pw))`) is risky — raw hash output can contain null bytes that some bcrypt implementations stop at, and it enables "password shucking". If you must pre-hash, OWASP suggests an HMAC with a pepper, base64-encoded, before bcrypt.
+
+**Other must-dos:** compare hashes in constant time (libraries do this), rate-limit and lock out login attempts, and check new passwords against known-breached lists.
+
+### Server-side sessions vs JWT
+
+| | Server-side session | JWT as session |
+|---|---|---|
+| What the client holds | Random opaque ID (cookie) | Signed token with claims (`sub`, `exp`, roles…) |
+| Per-request work | Lookup in Redis/DB | Verify signature, check claims |
+| Logout / ban / role change | Delete the session — instant | Token stays valid until `exp` unless you add a denylist |
+| Size | ~32 bytes | Often hundreds of bytes to a few KB on every request |
+| Data exposure | None in the cookie | Payload is base64url, readable by anyone (signed, not encrypted) |
+| Scaling story | Shared session store (Redis) | No shared store for verification |
+
+**Statelessness myths:**
+
+- *"JWTs mean no database."* Only until you need logout, "sign out of all devices", password-change invalidation, or banning a user. Then you add a **denylist** (by `jti`, the token ID) or a per-user "tokens issued before X are invalid" timestamp — both are server-side state checked on every request. You've rebuilt sessions.
+- *"Sessions don't scale."* A Redis `GET` by key is sub-millisecond and Redis scales horizontally. Session lookup is rarely the bottleneck.
+- *"JWTs are more secure."* The security of either comes from transport (HTTPS), storage (HttpOnly cookie), and lifetime. JWTs add risks: algorithm-confusion and `alg: none` bugs, weak HMAC secrets, and no instant revocation.
+
+**Where JWTs shine:** short-lived **access tokens** for APIs and microservices, where many services must verify identity without calling a central session store, and where a few minutes of revocation lag is acceptable. RFC 8725 (JWT Best Current Practices) lists the rules: pin the allowed algorithms, validate `iss` and `aud`, use enough key entropy, don't trust header fields like `kid` or `jku` blindly, and use explicit typing (`typ`).
+
+**How to say it in an interview:** "For a classic web app I'd use an opaque session ID in an HttpOnly cookie backed by Redis — instant revocation, tiny cookie. For APIs across many services I'd use short-lived JWT access tokens plus server-tracked refresh tokens, so revocation lag is bounded by the access token lifetime."
+
+### Access + refresh token pattern
+
+- **Access token** — short-lived (often 5–15 minutes), sent on every API call, verified cheaply.
+- **Refresh token** — long-lived, sent **only** to the authorization server's token endpoint to get a new access token. Stored and tracked server-side, so it can be revoked.
+
+The short access-token life bounds how long a stolen access token works. The refresh token is the high-value secret.
+
+### Refresh-token rotation with reuse detection (RFC 9700)
+
+RFC 9700 (the OAuth 2.0 Security Best Current Practice, January 2025) says refresh tokens for **public clients** (SPAs, mobile apps — they can't keep a client secret) must be either **sender-constrained** (bound to a key the client holds, via mTLS or DPoP) or use **refresh-token rotation**.
+
+**Rotation:** every time a refresh token is used, the server issues a **new** refresh token and invalidates the old one, while remembering that they belong to the same "family".
+
+**Reuse detection:** if an attacker steals refresh token R1, then either the attacker or the real client will eventually present R1 *after* it was already rotated. An already-used token showing up again is proof of theft. The server can't tell which party is legitimate, so it **revokes the whole family** — both get logged out, the attacker loses access, and the user re-authenticates.
+
+```
+login           → AT1 + RT1        (family F)
+refresh RT1     → AT2 + RT2        RT1 marked used
+attacker uses RT1 (stolen earlier)
+                → RT1 already used! revoke family F (RT2 dies too)
+real client refresh RT2 → rejected → user logs in again
+```
+
+RFC 9700 also says refresh tokens should expire after a period of client inactivity. Handle the benign race (two browser tabs refreshing at the same moment) with a short grace window or by serialising refreshes in the client.
+
+### Where to store tokens in the browser
+
+| Option | Readable by XSS? | Sent automatically (CSRF risk)? | Survives reload? | Notes |
+|---|---|---|---|---|
+| `localStorage` / `sessionStorage` | **Yes** | No | Yes / per tab | Any injected script can read and exfiltrate the token. OWASP advises against storing session identifiers here. |
+| JS memory (a variable) | Harder (not persisted), but script in the page can still intercept calls | No | No | Combine with a refresh token in an HttpOnly cookie. |
+| **HttpOnly, Secure, SameSite cookie** | **No** (JS can't read it) | Yes — needs CSRF defence | Yes | The usual recommendation for session IDs and refresh tokens. |
+| **BFF (backend-for-frontend)** | No tokens in the browser at all | Cookie session → CSRF defence | Yes | The backend holds OAuth tokens; browser gets only a session cookie. |
+
+Important nuance: an attacker with XSS can still **act as the user** from inside the page whatever you choose — HttpOnly only stops them *stealing* the credential to use later from elsewhere. RFC 10017 (*OAuth 2.0 for Browser-Based Applications*, 2026) ranks architectures by security and strongly recommends the **BFF pattern** for business and sensitive applications. See [API gateway and BFF](/learn/notes/api-gateway-bff/).
+
+### OAuth 2.0 / OIDC quick recap (with PKCE)
+
+The full walkthrough is in [AuthN vs AuthZ, OAuth2, OIDC, JWT](/learn/notes/authn-authz-oauth-oidc-jwt/). The security-relevant points:
+
+- Use **Authorization Code + PKCE**. RFC 9700: public clients **MUST** use PKCE, it's recommended for confidential clients too, and `S256` is the challenge method that doesn't expose the verifier.
+- **PKCE** (Proof Key for Code Exchange): the client makes a random `code_verifier`, sends `SHA256(verifier)` as `code_challenge` with the authorize request, and must present the verifier when exchanging the code. A stolen authorization code is useless without it.
+- The **implicit grant** should not be used (RFC 9700: SHOULD NOT) and the **resource owner password** grant must not be used (MUST NOT).
+- Use `state` (or PKCE/`nonce`) to bind the callback to the browser that started the login — otherwise login CSRF.
+- **OIDC** adds the **ID token** (who the user is). Don't send ID tokens to APIs as access tokens; validate `iss`, `aud`, `exp`, and `nonce`.
+
+### XSS: cross-site scripting
+
+**Intuition:** your page is a document the browser trusts completely. If an attacker can sneak `<script>` (or anything that becomes code) into it, their code runs with your origin's full power: read the DOM, call your APIs with the user's cookies, show fake login forms.
+
+Three flavours:
+
+| Type | Where the payload lives | Example |
+|---|---|---|
+| **Stored** (persistent) | Saved in your DB, served to every viewer | A product review containing `<img src=x onerror=...>` |
+| **Reflected** | In the request, echoed back in the response | `/search?q=<script>...</script>` rendered as "Results for …" |
+| **DOM-based** | Never touches the server; client JS moves untrusted data into a dangerous sink | `el.innerHTML = location.hash.slice(1)` |
+
+**Defences (OWASP XSS Prevention Cheat Sheet):**
+
+1. **Context-aware output encoding.** Encode for the place the data lands: HTML body (entity-encode `& < > " '`), HTML attribute (quote it and attribute-encode), JavaScript string (JS-encode), URL parameter (percent-encode), CSS (only property values, and carefully). One encoding doesn't fit all contexts.
+2. **Let the framework do it.** React, Angular, Vue and modern templates escape by default. The bugs live in escape hatches: React `dangerouslySetInnerHTML`, Angular `bypassSecurityTrust*`, Vue `v-html`, and user-controlled `href` values like `javascript:...`.
+3. **Use safe DOM sinks.** `textContent`, `createTextNode`, `setAttribute` with a fixed attribute name — not `innerHTML`, `outerHTML`, `document.write`, or `eval`.
+4. **Sanitise when you must accept HTML** (rich text): use a maintained sanitizer such as DOMPurify; don't write regexes.
+5. **Content Security Policy (CSP)** as defence in depth — a response header telling the browser which scripts may run. A strict, nonce-based policy blocks injected inline scripts:
+
+```http
+Content-Security-Policy: script-src 'nonce-r4nd0m' 'strict-dynamic'; object-src 'none'; base-uri 'none'
+```
+
+Each legitimate `<script nonce="r4nd0m">` gets a fresh random nonce per response; injected scripts don't know it. OWASP is explicit that CSP should not be your *primary* XSS defence — encoding and safe APIs are.
+
+6. **HttpOnly cookies** limit damage (the session cookie can't be read), but don't prevent XSS.
+
+### CSRF: cross-site request forgery
+
+**Intuition:** browsers attach cookies to requests based on the **destination**, not on which page started the request. So if you're logged in to `bank.com` and visit `evil.com`, this hidden form posts to the bank *with your cookies*:
+
+```html
+<form action="https://bank.com/transfer" method="POST">
+  <input name="to" value="attacker"><input name="amount" value="50000">
+</form>
+<script>document.forms[0].submit()</script>
+```
+
+The attacker can't read the response — they don't need to; the transfer already happened. CSRF exists **because of ambient credentials** (cookies, HTTP Basic auth, client certificates). APIs authenticated only by an `Authorization: Bearer` header that JS sets explicitly are not CSRF-able in this way — but then the token lives somewhere XSS can reach.
+
+**Defences:**
+
+- **SameSite cookies.** `SameSite=Lax` stops cookies on cross-site subrequests and cross-site `POST`s; they're still sent on top-level `GET` navigations. `Strict` never sends them cross-site (even clicking a link from email arrives logged out). Chromium-based browsers treat cookies **without** a SameSite attribute as `Lax` (since Chrome 80, 2020, with a short exception for POSTs within two minutes of the cookie being set); Firefox and Safari have not adopted Lax-by-default. **Always set SameSite explicitly.** OWASP: SameSite is defence in depth, not a full CSRF defence — it's scoped to the *site*, so a compromised sibling subdomain counts as same-site.
+- **Synchronizer token pattern** (stateful): the server stores a random token in the session and embeds it in each form or page; state-changing requests must echo it in a field or header. The attacker's page can't read it.
+- **Signed double-submit cookie** (stateless): token = HMAC(server secret, session ID + random value), placed in a cookie and echoed in a header/field; the server recomputes and compares. OWASP discourages the *naive* double submit (just "cookie equals field") because an attacker who can write cookies from a sibling subdomain can bypass it.
+- **Fetch Metadata / Origin checks:** reject state-changing requests where `Sec-Fetch-Site` is `cross-site`, or where the `Origin` header isn't your own.
+- **Custom header requirement for JSON APIs** (for example `X-Requested-With` or `X-CSRF-Token`): a cross-origin page can't add custom headers without a CORS preflight that you won't approve.
+- **Never change state on `GET`.**
+- Protect the **login form** too (login CSRF signs the victim into the attacker's account).
+
+### Cookie flags
+
+```http
+Set-Cookie: __Host-sid=8f3k...; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=86400
+```
+
+| Flag | What it does |
+|---|---|
+| `HttpOnly` | JavaScript can't read it (`document.cookie`). Still sent on `fetch`/XHR requests. Limits XSS token theft. |
+| `Secure` | Only sent over HTTPS (localhost excepted); can only be set from HTTPS. |
+| `SameSite=Strict / Lax / None` | Controls sending on cross-site requests. `None` **requires** `Secure`. |
+| `Domain` | Omit it → host-only cookie (not shared with subdomains). Setting it widens exposure. |
+| `Path` | Scope by path — a convenience, not a security boundary. |
+| `Max-Age` / `Expires` | Lifetime. If both are set, `Max-Age` wins. Neither → session cookie. |
+| `__Host-` prefix | Browser only accepts it if `Secure`, set from HTTPS, **no** `Domain`, and `Path=/` — so a subdomain can't plant or overwrite it. Best choice for session IDs. |
+| `__Secure-` prefix | Only accepted if `Secure` and set from HTTPS. |
+
+Cookie rules are specified in RFC 6265 and its in-progress revision, **RFC 6265bis** (an IETF draft that adds SameSite and the prefixes).
+
+**Session hygiene (OWASP Session Management Cheat Sheet):** session IDs need at least 64 bits of entropy from a CSPRNG; **regenerate the session ID after login** or any privilege change (stops *session fixation*, where the attacker plants a known ID before you log in); use idle timeouts (OWASP suggests 2–5 minutes for high-value apps, 15–30 for low-risk) and an absolute timeout; invalidate server-side on logout.
+
+### CORS: what it is and what it is not
+
+**Same-origin policy (SOP):** by default, script on `https://app.com` can *send* requests to `https://api.other.com` but cannot **read** the response. An *origin* is scheme + host + port. (A *site* is broader: scheme + registrable domain, so `a.example.com` and `b.example.com` are same-site but different origins.)
+
+**CORS** lets a server relax SOP: "these origins may read my responses".
+
+**Simple requests** — no preflight. Method is `GET`, `HEAD` or `POST`; only CORS-safelisted headers (`Accept`, `Accept-Language`, `Content-Language`, `Content-Type`, `Range` with a single range); and `Content-Type` is only `application/x-www-form-urlencoded`, `multipart/form-data`, or `text/plain`. The browser sends it directly with an `Origin` header, and then checks `Access-Control-Allow-Origin` on the response before letting JS read it.
+
+**Preflighted requests** — anything else (a `PUT`/`DELETE`, `Content-Type: application/json`, an `Authorization` or custom header). The browser first sends:
+
+```http
+OPTIONS /orders/42 HTTP/1.1
+Origin: https://app.com
+Access-Control-Request-Method: DELETE
+Access-Control-Request-Headers: authorization, content-type
+```
+
+and only sends the real request if the response allows it:
+
+```http
+Access-Control-Allow-Origin: https://app.com
+Access-Control-Allow-Methods: GET, POST, DELETE
+Access-Control-Allow-Headers: authorization, content-type
+Access-Control-Allow-Credentials: true
+Access-Control-Max-Age: 600
+Vary: Origin
+```
+
+**Credentials** (cookies, HTTP auth): the client must opt in (`fetch(url, { credentials: 'include' })`), the response must include `Access-Control-Allow-Credentials: true`, and `Access-Control-Allow-Origin` must be an **explicit origin, never `*`**. Preflight requests themselves never carry credentials.
+
+**Why CORS is not a security boundary for your server:**
+
+1. **It's enforced by browsers, not servers.** curl, Postman, scripts and other servers ignore CORS entirely. Anyone can call your API directly.
+2. **Simple requests still reach your server and execute.** CORS only decides whether the *calling page can read the response*. A cross-site form `POST` with cookies runs your handler — that's CSRF, and CORS doesn't stop it.
+3. **So:** authenticate and authorise every request on the server; use CSRF defences for cookie-authenticated endpoints. CORS protects the *user's* data from being read by other sites in their browser.
+
+**CORS misconfigurations that are real vulnerabilities:** reflecting any `Origin` back with `Allow-Credentials: true` (any site can read logged-in users' data); allowing `null` as an origin; suffix matching like "ends with example.com" (matches `evilexample.com`); forgetting `Vary: Origin` when the header changes per origin (caches serve one origin's header to another).
+
+## How it works: a secure login, end to end
+
+```
+1. POST /login  (HTTPS, CSRF token on login form, rate limited)
+   server: argon2id.verify(stored_hash, password)  — constant time
+           if params outdated → rehash and store
+2. success → regenerate session ID (anti-fixation)
+   Set-Cookie: __Host-sid=<128-bit random>; Path=/; Secure; HttpOnly; SameSite=Lax
+   session store (Redis): sid → { user_id, created, last_seen, csrf_secret }
+3. every request: cookie sent automatically
+   server: look up sid, check idle + absolute timeout
+   state-changing request? verify CSRF token / Sec-Fetch-Site / Origin
+4. responses: Content-Security-Policy with per-response nonce,
+   output encoded by the template engine
+5. API for other origins: CORS allowlist of exact origins, Vary: Origin
+6. logout: delete sid server-side + expire cookie
+   "log out everywhere": delete all sessions for user_id
+```
+
+For an SPA calling APIs across many services, swap step 2 for: BFF holds OAuth tokens (code + PKCE), browser gets only the session cookie; or, if the SPA must hold tokens, keep the access token in memory and the rotating refresh token in an HttpOnly cookie.
+
+## Real-world examples
+
+- **OWASP** publishes the parameter guidance above (Argon2id 19 MiB / 2 iterations / parallelism 1, bcrypt cost of at least 10 with a 72-byte limit, PBKDF2-HMAC-SHA256 at 600,000 iterations), and it is the usual reference in security reviews.
+- **Chromium-based browsers** switched missing-SameSite cookies to `Lax` in Chrome 80 (2020), which broke many cross-site embeds and SSO flows that hadn't set `SameSite=None; Secure` — a good example of a platform-level CSRF mitigation.
+- **The IETF OAuth working group** published RFC 9700 (January 2025), which deprecates the implicit and password grants, requires PKCE for public clients, and requires sender-constrained or rotating refresh tokens for them. RFC 10017 (2026) recommends the BFF pattern for sensitive browser apps.
+
+## Common pitfalls
+
+- **Fast hashes for passwords** (MD5, SHA-1, SHA-256 — even salted).
+- **bcrypt with long passphrases** and no 72-byte handling, or pre-hashing with raw SHA output.
+- **Storing the pepper in the same DB** as the hashes.
+- **JWT in `localStorage`** for a high-value app — any XSS exfiltrates it.
+- **Long-lived JWT access tokens** (hours or days) with no revocation path.
+- **Refresh tokens that never rotate or expire.**
+- **Not regenerating the session ID after login** — session fixation.
+- **`dangerouslySetInnerHTML` / `v-html` with user data**, or `href={userUrl}` without checking the scheme.
+- **Relying on CSP alone** — or a CSP with `'unsafe-inline'` that blocks almost nothing.
+- **State changes on `GET`** — bypasses SameSite=Lax and most CSRF defences.
+- **Assuming SameSite makes CSRF tokens unnecessary** — older browsers, sibling subdomains, and top-level GETs remain.
+- **"Fixing" a CORS error by reflecting `Origin` with credentials** — any website can now read your users' data.
+- **Treating CORS as authentication** — the API is still callable by any non-browser client.
+- **Setting `Domain=example.com` on session cookies** — every subdomain (including a forgotten marketing site) receives them.
+
+## Practice questions
+
+<Practice>
+
+<QA q="Why shouldn't you store passwords as salted SHA-256?" level="easy">
+
+SHA-256 is built to be fast. A salt stops precomputed rainbow tables and makes identical passwords hash differently, but the attacker can still try guesses for each user at GPU speed — billions per second — so weak and medium passwords fall quickly. Password hashes must be **slow and memory-hard** (argon2id, scrypt) or at least slow (bcrypt, PBKDF2 with many iterations), with tunable cost you can raise over time.
+
+</QA>
+
+<QA q="What is the difference between a salt and a pepper?" level="easy">
+
+- **Salt**: random, unique per password, stored next to the hash, not secret. Defeats rainbow tables and ensures two users with the same password get different hashes.
+- **Pepper**: one secret shared by all hashes, stored **outside** the database (secrets manager or HSM). If only the DB leaks, the attacker can't crack anything without it.
+
+A salt is mandatory; a pepper is optional defence in depth.
+
+</QA>
+
+<QA q="What do the HttpOnly, Secure and SameSite cookie attributes each protect against?" level="easy">
+
+- **HttpOnly**: JavaScript can't read the cookie, so an XSS payload can't steal it (it can still make requests that carry it).
+- **Secure**: cookie only travels over HTTPS, so it can't be sniffed on plain HTTP.
+- **SameSite** (`Strict`/`Lax`): the browser doesn't attach it to cross-site subrequests and POSTs, which blocks most CSRF. `None` allows cross-site and requires `Secure`.
+
+Add the `__Host-` prefix to also stop subdomains from setting or overwriting the cookie.
+
+</QA>
+
+<QA q="What are OWASP's recommended argon2id and bcrypt settings, and what is bcrypt's input limit?" level="medium">
+
+- **Argon2id**: at least 19 MiB memory, 2 iterations, parallelism 1 (or equivalent trade-offs like 46 MiB with 1 iteration).
+- **scrypt** (fallback): N = 2^17, r = 8, p = 1.
+- **bcrypt** (legacy): work factor 10 or more; input limited to **72 bytes**, so enforce a 72-byte max or migrate.
+- **PBKDF2-HMAC-SHA256** (FIPS): 600,000 iterations.
+
+These are minimums — increase until hashing takes as long as your servers can tolerate. Store parameters in the hash string and rehash on login when you raise them.
+
+</QA>
+
+<QA q="Compare server-side sessions and JWTs for a web app's login." level="medium">
+
+**Sessions**: opaque random ID in a cookie, state in Redis/DB. Instant revocation (logout, ban, role change), tiny cookie, nothing readable client-side. Cost: a store lookup per request.
+
+**JWT**: signed claims carried by the client, verified without a lookup. Good for many services verifying identity independently. Costs: can't revoke before `exp` without a denylist (server state again), bigger on every request, payload readable, and extra pitfalls (algorithm pinning, key management).
+
+For a single web app, sessions are usually simpler and safer. For APIs across services, short-lived JWT access tokens plus revocable refresh tokens.
+
+</QA>
+
+<QA q="Explain refresh-token rotation and reuse detection." level="medium">
+
+With **rotation**, each refresh returns a new refresh token and invalidates the old one; the server tracks them as one family. With **reuse detection**, if an already-used refresh token is presented again, the server knows a copy leaked — either the attacker or the real client is replaying it. It can't tell which, so it **revokes the whole family**, forcing re-login and cutting off the attacker. RFC 9700 requires public clients' refresh tokens to be either rotated like this or sender-constrained (mTLS or DPoP).
+
+</QA>
+
+<QA q="Stored, reflected and DOM-based XSS — what is the difference?" level="medium">
+
+- **Stored**: payload saved on the server (comment, profile name) and rendered to every viewer — highest blast radius.
+- **Reflected**: payload in the request (URL parameter) echoed into the response; victim must click a crafted link.
+- **DOM-based**: client-side JS takes untrusted data (`location.hash`, `postMessage`) and writes it into a dangerous sink like `innerHTML` — the server may never see the payload.
+
+Defences are shared: context-aware encoding, framework auto-escaping, safe sinks (`textContent`), sanitising user HTML with a library, and CSP as a backstop.
+
+</QA>
+
+<QA q="Why do cookies make CSRF possible, and why does an Authorization header not?" level="medium">
+
+Browsers attach cookies based on the destination of a request, regardless of which site initiated it. So a form on `evil.com` posting to `bank.com` arrives with the victim's bank cookies. An `Authorization: Bearer` header must be added by JavaScript running on your origin; a cross-site page can't read your token or add custom headers to a cross-origin request without a CORS preflight you'd reject. The trade-off: a token JS can read is exposed to XSS.
+
+</QA>
+
+<QA q="What is the difference between a simple CORS request and a preflighted one?" level="medium">
+
+A **simple** request uses `GET`, `HEAD` or `POST`, only safelisted headers, and a `Content-Type` of `application/x-www-form-urlencoded`, `multipart/form-data` or `text/plain`. The browser sends it immediately and checks `Access-Control-Allow-Origin` on the response before exposing it to JS.
+
+Anything else (JSON body, `PUT`/`DELETE`, `Authorization` or custom headers) triggers an `OPTIONS` **preflight** with `Access-Control-Request-Method` and `-Headers`. The real request is sent only if the server's answer allows that origin, method and headers. `Access-Control-Max-Age` lets the browser cache the preflight.
+
+</QA>
+
+<QA q="Why is CORS not a security boundary for your server?" level="hard">
+
+1. Only browsers enforce it; curl, scripts and servers ignore it, so the API is reachable by anyone.
+2. CORS controls **reading the response**, not **sending the request**. A simple cross-origin `POST` still reaches your handler and runs — the classic CSRF case.
+3. Preflights only gate non-simple requests from browsers.
+
+So every endpoint still needs authentication, authorisation and (for cookie auth) CSRF protection. CORS exists to protect users' data in their browser from being read by other sites — and a bad CORS config (reflecting any origin with credentials) *weakens* that protection.
+
+</QA>
+
+<QA q="Where should a single-page app store its tokens?" level="hard">
+
+Ranked from most to least robust:
+
+1. **BFF**: a backend runs the OAuth flow (code + PKCE) as a confidential client, keeps the tokens, and gives the browser only an HttpOnly, Secure, SameSite session cookie. RFC 10017 strongly recommends this for business/sensitive apps.
+2. **Access token in memory + refresh token in an HttpOnly cookie** (scoped to the token endpoint, rotated with reuse detection).
+3. **`localStorage`**: simplest but any XSS can read and exfiltrate tokens for use elsewhere.
+
+Whatever you choose, XSS can still act as the user while the page is open — storage choices limit theft, so XSS prevention stays essential. Cookie-based options need CSRF defences.
+
+</QA>
+
+<QA q="How do the synchronizer token and signed double-submit cookie patterns differ?" level="hard">
+
+- **Synchronizer token** (stateful): server generates a random token, stores it in the session, embeds it in pages; each state-changing request must echo it, and the server compares with the session copy.
+- **Signed double-submit** (stateless): token = HMAC(secret, session ID + random), set in a cookie and also sent in a header or field; the server recomputes the HMAC and compares. Binding to the session and signing stops an attacker who can plant cookies from a sibling subdomain — the weakness of naive double-submit.
+
+Both rely on the attacker's page being unable to read the token. Add `Sec-Fetch-Site`/`Origin` checks and SameSite as extra layers.
+
+</QA>
+
+<QA q="What is session fixation and how do you prevent it?" level="medium">
+
+The attacker gets the victim to use a session ID the attacker already knows (for example via a URL parameter or a cookie planted from a subdomain). When the victim logs in, that known ID becomes authenticated and the attacker uses it. Prevent it by **regenerating the session ID on login** and on any privilege change, never accepting session IDs from URLs, and using `__Host-` cookies so subdomains can't plant them.
+
+</QA>
+
+<QA q="A security scan reports that your API reflects any Origin header in Access-Control-Allow-Origin with Allow-Credentials true. Why is that serious and how do you fix it?" level="scenario">
+
+Any website the user visits can now make credentialed requests to your API **and read the responses** — user profile, orders, tokens. It effectively disables the same-origin policy for logged-in users.
+
+Fix: keep an explicit allowlist of exact origins (scheme + host + port), echo the origin only if it matches exactly (no suffix or substring matching, never `null`), send `Vary: Origin`, and only allow credentials for origins that truly need them. Also review whether those endpoints should be cookie-authenticated at all.
+
+</QA>
+
+<QA q="Your user database leaked. Passwords were bcrypt cost 8. What do you do now and change for the future?" level="scenario">
+
+Now: assume the hashes will be attacked offline. Force password resets (or at least for high-value accounts), invalidate all sessions and refresh tokens, notify users per policy and law, and watch for credential-stuffing on your login.
+
+Future: migrate to argon2id with OWASP parameters (19 MiB, t = 2, p = 1 or stronger). Because the algorithm and parameters are in the hash string, you can **upgrade on next login** (verify old hash, rehash with argon2id). For accounts that don't log in soon, you can wrap the old hash — argon2id(bcrypt-hash) — and unwrap on next login. Add a pepper in a secrets manager, breached-password checks, rate limiting, and MFA.
+
+</QA>
+
+<QA q="A team stores a 24-hour JWT in localStorage for their admin panel. Review it." level="scenario">
+
+Problems: any XSS (including in a third-party script) can read and exfiltrate the token, which then works from anywhere for up to 24 hours; there's no way to revoke it on logout or when an admin is removed; claims (roles) go stale for a day.
+
+Recommendations: move to a BFF or a server session in a `__Host-` HttpOnly, Secure, SameSite cookie with CSRF protection; if JWTs are kept, cut access-token life to minutes and add rotating refresh tokens with reuse detection; add a strict nonce-based CSP and remove unsafe HTML sinks; regenerate sessions on login; for an admin panel, short idle timeouts and MFA.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="Which is OWASP's first-choice password hashing algorithm?" options={["bcrypt with cost 12", "SHA-256 with a per-user salt", "Argon2id", "PBKDF2-HMAC-SHA1"]} answer={2}>
+
+OWASP recommends Argon2id first (minimum 19 MiB, 2 iterations, parallelism 1), scrypt if unavailable, bcrypt for legacy systems, and PBKDF2 only where FIPS compliance requires it. Salted SHA-256 is far too fast.
+
+</MCQ>
+
+<MCQ q="A user's passphrase is 90 bytes long and hashed with bcrypt. What happens?" options={["bcrypt rejects it with an error in all libraries", "Only the first 72 bytes affect the hash, often silently", "bcrypt automatically pre-hashes it with SHA-512", "The hash becomes twice as long"]} answer={1}>
+
+bcrypt uses at most 72 bytes of input; many implementations truncate silently. Behaviour varies by library, which is why OWASP says to enforce a 72-byte limit or use Argon2id. bcrypt does not pre-hash on its own.
+
+</MCQ>
+
+<MCQ q="Under refresh-token rotation, the server receives a refresh token that was already used. What should it do?" options={["Accept it once more as a grace", "Issue a new token and log a warning", "Revoke the entire token family, forcing re-authentication", "Ignore the request silently"]} answer={2}>
+
+Reuse means a copy leaked, and the server cannot tell attacker from client, so it revokes the family. A small grace window for concurrent tabs is an implementation detail, not the response to genuine reuse.
+
+</MCQ>
+
+<MCQ q="Which statement about CORS is correct?" options={["CORS prevents curl from calling your API", "A simple cross-origin POST is blocked from reaching the server unless CORS allows it", "CORS controls whether a page from another origin can read the response; the request may still execute", "Access-Control-Allow-Origin: * works with credentialed requests"]} answer={2}>
+
+Simple requests are sent and executed; the browser only hides the response if CORS doesn't allow it. Non-browser clients ignore CORS, and the wildcard origin is forbidden with credentials.
+
+</MCQ>
+
+<MCQ q="Which request triggers a CORS preflight?" options={["GET with only an Accept header", "POST with Content-Type application/x-www-form-urlencoded", "POST with Content-Type application/json", "HEAD with no custom headers"]} answer={2}>
+
+application/json is not one of the three safelisted content types (form-urlencoded, multipart/form-data, text/plain), so the browser sends an OPTIONS preflight first. The others are simple requests.
+
+</MCQ>
+
+<MCQ q="A cookie named __Host-sid is set with Secure; Path=/; Domain=example.com. What happens?" options={["Accepted and shared with all subdomains", "Rejected, because __Host- cookies must not have a Domain attribute", "Accepted but HttpOnly is added automatically", "Rejected because Path must be the current page path"]} answer={1}>
+
+The __Host- prefix requires Secure, HTTPS, Path=/ and no Domain, which pins the cookie to one host. Prefixes don't add HttpOnly; only the __Http- variants require it.
+
+</MCQ>
+
+<MCQ q="Why does SameSite=Lax not fully replace CSRF tokens?" options={["Lax cookies are never sent at all", "Lax still sends cookies on top-level GET navigations and treats sibling subdomains as same-site", "Lax only works over HTTP", "Lax blocks same-site requests"]} answer={1}>
+
+Lax allows cookies on top-level cross-site GET navigations, so state-changing GETs are exposed, and a compromised subdomain is same-site. OWASP treats SameSite as defence in depth.
+
+</MCQ>
+
+<MCQ q="Which is a DOM-based XSS sink you should avoid with untrusted data?" options={["element.textContent", "document.createTextNode", "element.innerHTML", "element.setAttribute('data-id', value)"]} answer={2}>
+
+innerHTML parses its input as HTML, so markup and event handlers can execute. textContent, createTextNode and setAttribute with a fixed, non-event attribute name treat the value as text.
+
+</MCQ>
+
+<MCQ q="What is the main weakness of using long-lived JWTs as sessions?" options={["They cannot be signed with RSA", "They cannot be revoked before expiry without adding server-side state", "Browsers refuse to store them", "They are encrypted, so services cannot read them"]} answer={1}>
+
+A JWT stays valid until exp unless you add a denylist or similar check, which reintroduces server state. JWTs can use RSA or EC signatures, can be stored anywhere, and are signed rather than encrypted by default.
+
+</MCQ>
+
+<MCQ q="According to RFC 9700, which OAuth grant MUST NOT be used?" options={["Authorization code with PKCE", "Client credentials", "Resource owner password credentials", "Device authorization"]} answer={2}>
+
+RFC 9700 says the resource owner password credentials grant MUST NOT be used, because it exposes the user's password to the client. The implicit grant is SHOULD NOT; the others are fine for their use cases.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **Passwords**: Argon2id (19 MiB, t = 2, p = 1 minimum) → scrypt (N = 2^17, r = 8, p = 1) → bcrypt (cost 10 or more, **72-byte limit**) → PBKDF2-SHA256 600k only for FIPS. Unique salt per password (automatic); optional pepper stored outside the DB; rehash on login when parameters rise.
+- **Sessions vs JWT**: sessions = opaque ID + server state, instant revocation. JWT = signed claims, no lookup, no revocation without state. Web app → sessions; APIs across services → short JWT access tokens.
+- **Refresh tokens**: rotate on every use; reused token → revoke the family (RFC 9700). Public clients: rotation or sender-constraining is mandatory.
+- **Browser storage**: BFF > memory + HttpOnly refresh cookie > localStorage. XSS can still act as the user.
+- **OAuth**: Authorization Code + PKCE (`S256`); no implicit, no password grant; validate `state`/`nonce`, `iss`, `aud`, `exp`.
+- **XSS**: encode for context; trust framework escaping; avoid `innerHTML`/`dangerouslySetInnerHTML`/`v-html`; sanitise rich HTML with a library; strict nonce-based CSP as backup.
+- **CSRF**: exists because cookies are ambient. SameSite (explicit!), synchronizer or signed double-submit tokens, `Sec-Fetch-Site`/`Origin` checks, no state change on GET.
+- **Cookies**: `__Host-` + `Secure` + `HttpOnly` + `SameSite` + `Path=/`, no `Domain`. Regenerate session ID on login.
+- **CORS**: browser-enforced read permission. Simple vs preflight; credentials need an exact origin; never reflect arbitrary origins; add `Vary: Origin`. **Not** server-side access control.
+
+## Go deeper
+
+- **OWASP** — [Password Storage](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html), [Session Management](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html), [XSS Prevention](https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html), [CSRF Prevention](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html), [HTML5 Security](https://cheatsheetseries.owasp.org/cheatsheets/HTML5_Security_Cheat_Sheet.html).
+- **RFC 9700** — [OAuth 2.0 Security Best Current Practice](https://www.rfc-editor.org/rfc/rfc9700.html).
+- **RFC 10017** — [OAuth 2.0 for Browser-Based Applications](https://www.rfc-editor.org/rfc/rfc10017.html).
+- **RFC 7636** — [PKCE](https://www.rfc-editor.org/rfc/rfc7636.html); **RFC 6749** — [OAuth 2.0](https://www.rfc-editor.org/rfc/rfc6749.html).
+- **RFC 7519** — [JSON Web Token](https://www.rfc-editor.org/rfc/rfc7519.html); **RFC 8725** — [JWT Best Current Practices](https://www.rfc-editor.org/rfc/rfc8725.html).
+- **RFC 6265bis** — [Cookies: HTTP State Management Mechanism (draft)](https://datatracker.ietf.org/doc/draft-ietf-httpbis-rfc6265bis/).
+- **MDN** — [CORS guide](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CORS), [Set-Cookie](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Set-Cookie), [Content Security Policy](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CSP).
+- **web.dev** — [SameSite cookies explained](https://web.dev/articles/samesite-cookies-explained).

@@ -1,0 +1,294 @@
+---
+import BaseLayout from '~/layouts/BaseLayout.astro';
+import CompanyDataCredit from '~/components/CompanyDataCredit.astro';
+import ProblemNotesDialog from '~/components/ProblemNotesDialog.astro';
+---
+<BaseLayout
+  title="My DSA notes — StackTrace"
+  description="Every problem you've solved or written notes for in the company-wise DSA tracker — one place to revise."
+>
+  <nav class="crumbs" aria-label="Breadcrumb">
+    <a href="/dsa/">DSA</a> <span aria-hidden="true">/</span>
+    <a href="/dsa/companies/">Companies</a> <span aria-hidden="true">/</span>
+    <span aria-current="page">My notes</span>
+  </nav>
+
+  <header class="mn-head">
+    <h1>My notes</h1>
+    <p class="mn-lede">
+      Every problem you've marked solved or written notes for, newest first — come back here to revise
+      before an interview.
+    </p>
+    <p class="mn-stats" aria-live="polite"></p>
+    <CompanyDataCredit />
+  </header>
+
+  <section class="mn-filters" aria-label="Filter notes">
+    <input class="mn-f mn-f--search" type="search" placeholder="Search titles, notes, companies…" aria-label="Search notes" />
+    <select class="mn-f mn-f--kind" aria-label="Show">
+      <option value="">Solved or noted</option>
+      <option value="notes">With notes</option>
+      <option value="solved">Solved</option>
+      <option value="unsolved-notes">Noted, not solved</option>
+    </select>
+    <select class="mn-f mn-f--sort" aria-label="Sort">
+      <option value="updated">Recently updated</option>
+      <option value="title">Title</option>
+      <option value="diff">Difficulty</option>
+    </select>
+  </section>
+
+  <ol class="mn-list" aria-label="Saved problems"></ol>
+
+  <div class="mn-empty" hidden>
+    <p><strong>Nothing here yet.</strong></p>
+    <p>
+      Pick a company on the <a href="/dsa/companies/">company-wise questions</a> page, tick the problems
+      you've solved and jot notes — they'll all collect here.
+    </p>
+  </div>
+  <p class="mn-nomatch" hidden>No saved problems match.</p>
+
+  <ProblemNotesDialog />
+</BaseLayout>
+
+<script>
+  import { initProblemStore, onChange, readAll } from '~/lib/problem-store';
+  import { isMeaningful, type ProgressEntry } from '~/lib/problem-progress';
+  import { difficultyName, loadProblemLookup, type ProblemLookup } from '~/lib/problem-lookup';
+
+  interface Item {
+    slug: string;
+    title: string;
+    link: string;
+    difficulty: string;
+    companies: Array<{ slug: string; name: string }>;
+    entry: ProgressEntry;
+    haystack: string;
+  }
+
+  initProblemStore();
+
+  const list = document.querySelector<HTMLOListElement>('.mn-list')!;
+  const search = document.querySelector<HTMLInputElement>('.mn-f--search')!;
+  const kind = document.querySelector<HTMLSelectElement>('.mn-f--kind')!;
+  const sort = document.querySelector<HTMLSelectElement>('.mn-f--sort')!;
+  const stats = document.querySelector<HTMLElement>('.mn-stats')!;
+  const empty = document.querySelector<HTMLElement>('.mn-empty')!;
+  const noMatch = document.querySelector<HTMLElement>('.mn-nomatch')!;
+  const DIFF_ORDER: Record<string, number> = { Easy: 0, Medium: 1, Hard: 2 };
+
+  let lookup: ProblemLookup | null = null;
+  let items: Item[] = [];
+
+  function el<K extends keyof HTMLElementTagNameMap>(
+    tag: K,
+    cls?: string,
+    text?: string,
+  ): HTMLElementTagNameMap[K] {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = text;
+    return n;
+  }
+
+  function build(): void {
+    items = Object.entries(readAll())
+      .filter(([, e]) => isMeaningful(e))
+      .map(([slug, entry]) => {
+        const p = lookup?.problems[slug];
+        const companies = (p?.[2] ?? []).map((c) => ({ slug: c, name: lookup?.companies[c] ?? c }));
+        const title = p?.[0] ?? slug;
+        return {
+          slug,
+          title,
+          link: `https://leetcode.com/problems/${slug}/`,
+          difficulty: p ? difficultyName(p[1]) : '',
+          companies,
+          entry,
+          haystack: `${title}\n${entry.notes}\n${companies.map((c) => c.name).join(' ')}`.toLowerCase(),
+        };
+      });
+    const solved = items.filter((i) => i.entry.solved).length;
+    const noted = items.filter((i) => i.entry.notes.trim()).length;
+    stats.textContent = items.length
+      ? `${solved} solved · ${noted} with notes`
+      : '';
+    render();
+  }
+
+  function render(): void {
+    const needle = search.value.trim().toLowerCase();
+    const shown = items
+      .filter((i) => {
+        const hasNotes = i.entry.notes.trim().length > 0;
+        if (kind.value === 'notes' && !hasNotes) return false;
+        if (kind.value === 'solved' && !i.entry.solved) return false;
+        if (kind.value === 'unsolved-notes' && (i.entry.solved || !hasNotes)) return false;
+        return !needle || i.haystack.includes(needle);
+      })
+      .sort((a, b) => {
+        if (sort.value === 'title') return a.title.localeCompare(b.title);
+        if (sort.value === 'diff') {
+          return (DIFF_ORDER[a.difficulty] ?? 3) - (DIFF_ORDER[b.difficulty] ?? 3) || a.title.localeCompare(b.title);
+        }
+        return b.entry.updatedAt - a.entry.updatedAt;
+      });
+
+    list.replaceChildren(...shown.map(renderItem));
+    empty.hidden = items.length > 0;
+    noMatch.hidden = items.length === 0 || shown.length > 0;
+  }
+
+  function renderItem(i: Item): HTMLLIElement {
+    const li = el('li', 'mn-item');
+    li.dataset.slug = i.slug;
+
+    const head = el('div', 'mn-item__head');
+    const a = el('a', 'mn-item__title', i.title);
+    a.href = i.link;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    head.append(a);
+    if (i.difficulty) {
+      const pill = el('span', 'diff-pill', i.difficulty);
+      pill.dataset.diff = i.difficulty;
+      head.append(pill);
+    }
+    if (i.entry.solved) head.append(el('span', 'mn-solved', '✓ Solved'));
+    const edit = el('button', 'mn-edit', i.entry.notes.trim() ? 'Edit notes' : 'Add notes');
+    edit.type = 'button';
+    edit.addEventListener('click', () => {
+      window.dispatchEvent(
+        new CustomEvent('stacktrace:open-notes', {
+          detail: {
+            slug: i.slug,
+            title: i.title,
+            link: i.link,
+            difficulty: i.difficulty || undefined,
+            companies: i.companies,
+          },
+        }),
+      );
+    });
+    head.append(edit);
+    li.append(head);
+
+    const meta = el('p', 'mn-item__meta');
+    if (i.entry.updatedAt > 0) {
+      meta.append(`Updated ${new Date(i.entry.updatedAt).toLocaleDateString(undefined, { dateStyle: 'medium' })}`);
+    }
+    if (i.companies.length) {
+      meta.append(` · asked at ${i.companies.length} ${i.companies.length === 1 ? 'company' : 'companies'}`);
+    }
+    li.append(meta);
+
+    if (i.companies.length) {
+      const ul = el('ul', 'mn-chips');
+      for (const c of i.companies) {
+        const ca = el('a', undefined, c.name);
+        ca.href = `/dsa/companies/${c.slug}/`;
+        const cli = el('li');
+        cli.append(ca);
+        ul.append(cli);
+      }
+      li.append(ul);
+    }
+
+    if (i.entry.notes.trim()) li.append(el('pre', 'mn-notes', i.entry.notes));
+    return li;
+  }
+
+  search.addEventListener('input', render);
+  kind.addEventListener('input', render);
+  sort.addEventListener('input', render);
+
+  let pending = false;
+  onChange(() => {
+    if (pending) return;
+    pending = true;
+    requestAnimationFrame(() => {
+      pending = false;
+      build();
+    });
+  });
+
+  // Paint immediately from localStorage, then again with titles/companies.
+  build();
+  void loadProblemLookup().then((l) => {
+    lookup = l;
+    build();
+  });
+</script>
+
+<style>
+  .crumbs { font-size: 0.82rem; color: var(--fg-faint); margin-bottom: 1rem; }
+  .crumbs a { color: var(--fg-muted); }
+  .mn-head h1 { margin: 0 0 0.5rem; }
+  .mn-lede { color: var(--fg-muted); max-width: 72ch; line-height: 1.55; margin: 0; }
+  .mn-stats { margin: 0.5rem 0 0; font-family: var(--font-code); font-size: 0.8rem; color: var(--fg-muted); min-height: 1em; }
+
+  .mn-filters { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 1.75rem 0 1rem; }
+  .mn-f {
+    font: inherit;
+    font-size: 0.88rem;
+    padding: 0.45rem 0.65rem;
+    border-radius: 8px;
+    border: 1px solid var(--card-border);
+    background: var(--card-bg);
+    color: var(--fg);
+    min-width: 0;
+  }
+  .mn-f--search { flex: 1 1 16rem; }
+
+  .mn-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.8rem; }
+  .mn-list :global(.mn-item) {
+    padding: 0.9rem 1rem;
+    border: 1px solid var(--card-border);
+    border-radius: 12px;
+    background: var(--card-bg);
+  }
+  .mn-list :global(.mn-item__head) { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
+  .mn-list :global(.mn-item__title) { font-weight: 600; color: var(--fg); overflow-wrap: anywhere; }
+  .mn-list :global(.mn-item__title)::after { content: ' ↗'; color: var(--fg-faint); font-size: 0.85em; }
+  .mn-list :global(.mn-solved) { font-size: 0.75rem; color: var(--anim-success); font-weight: 600; }
+  .mn-list :global(.mn-edit) {
+    margin-left: auto;
+    font: inherit;
+    font-size: 0.78rem;
+    padding: 0.25rem 0.6rem;
+    border-radius: 7px;
+    border: 1px solid var(--card-border);
+    background: transparent;
+    color: var(--fg-muted);
+    cursor: pointer;
+  }
+  .mn-list :global(.mn-edit:hover) { color: var(--fg); border-color: var(--accent); }
+  .mn-list :global(.mn-item__meta) { margin: 0.35rem 0 0; font-size: 0.75rem; color: var(--fg-faint); }
+  .mn-list :global(.mn-chips) { list-style: none; margin: 0.5rem 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 0.3rem; }
+  .mn-list :global(.mn-chips a) {
+    display: inline-block;
+    font-size: 0.7rem;
+    padding: 0.1rem 0.45rem;
+    border-radius: 999px;
+    border: 1px solid var(--card-border);
+    color: var(--fg-muted);
+    text-decoration: none;
+  }
+  .mn-list :global(.mn-chips a:hover) { color: var(--fg); border-color: var(--accent); }
+  .mn-list :global(.mn-notes) {
+    margin: 0.7rem 0 0;
+    padding: 0.7rem 0.8rem;
+    border-radius: 8px;
+    background: var(--code-bg);
+    color: var(--fg);
+    font-family: var(--font-code);
+    font-size: 0.82rem;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    max-height: 24rem;
+    overflow-y: auto;
+  }
+  .mn-empty, .mn-nomatch { color: var(--fg-muted); padding: 2rem 0; text-align: center; }
+</style>

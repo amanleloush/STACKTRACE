@@ -1,7 +1,7 @@
 ---
 title: "HLD: Distributed Rate Limiter"
 phase: "07-hld-problems"
-order: 36
+order: 59
 tags: ["rate-limit"]
 premium: false
 previewParagraphs: 4
@@ -66,7 +66,7 @@ Most production setups use **gateway-level for ingress + per-service for sensiti
 **Token bucket** (recommended):
 - Allows controlled bursting (UX-friendly).
 - O(1) per check via Lua script.
-- See Topic 25.
+- See [Rate Limiting](/learn/notes/rate-limiting/).
 
 For exact limits, sliding-window counter is the next choice.
 
@@ -87,7 +87,7 @@ if tokens >= 1 then
   tokens = tokens - 1
   ok = 1
 end
-redis.call("HMSET", KEYS[1], "tokens", tokens, "ts", ARGV[1])
+redis.call("HSET", KEYS[1], "tokens", tokens, "ts", ARGV[1])  -- HMSET is deprecated since Redis 4.0
 redis.call("EXPIRE", KEYS[1], 600)
 return ok
 ```
@@ -143,7 +143,7 @@ Acceptable for most use cases.
 
 - Each region pulls **leases** from a global counter.
 - More accurate; more complex.
-- Used by Cloudflare for strict per-second global limits.
+- Rarely worth it: even Cloudflare counts per data center (an isolated counter per PoP), i.e. approach #1.
 
 Most teams use #1 with conservative per-region caps.
 
@@ -160,7 +160,7 @@ For composite rate limits (gateway + service), the gateway can pass `X-RateLimit
 
 ## Optimizations
 
-- **In-memory cache + periodic sync**: each gateway instance maintains a local token bucket; periodically syncs with Redis to merge state. Reduces Redis pressure dramatically. Used by Stripe and others.
+- **In-memory cache + periodic sync**: each gateway instance maintains a local token bucket; periodically syncs with Redis to merge state. Reduces Redis pressure dramatically, at the cost of some accuracy.
 - **Batched updates**: instead of every request hitting Redis, batch updates per (key, window). Tradeoff: small accuracy loss.
 - **Sliding window counter** instead of token bucket for stricter limits without sacrificing too much accuracy.
 - **Sharded Redis by key**: hash key → Redis instance. Linear scaling.
@@ -172,47 +172,154 @@ For composite rate limits (gateway + service), the gateway can pass `X-RateLimit
 - **Fail open vs closed**: matters when Redis fails. Tier-based: fail closed for sensitive APIs, fail open for read-only.
 - **Per-IP limiting**: NATs and mobile carriers share IPs — false positives. Combine with user limits.
 
-## Interview questions
+## Practice questions
 
-### Q1: How would you implement rate limiting in Redis?
-Lua script implementing token bucket: read tokens + last refill timestamp, refill based on elapsed time, attempt to consume a token, write back. Lua makes it atomic in one Redis round trip.
+<Practice>
 
-### Q2: How to handle multi-region rate limiting?
-Per-region limits with sum-of-regions ≤ global is the most common. Each region operates independently; some drift accepted. For strict global limits, regions pull leases from a global counter (more complex).
+<QA q="What should a rate-limited response look like?" level="easy">
 
-### Q3: Token bucket vs sliding window counter — when to use each?
+`429 Too Many Requests` with a `Retry-After` header telling the client when to try again, plus `X-RateLimit-Limit`, `X-RateLimit-Remaining` and `X-RateLimit-Reset` so well-behaved clients can pace themselves, and a small JSON error body.
+
+</QA>
+
+<QA q="Why is limiting only by IP address risky?" level="easy">
+
+NATs and mobile carriers put many users behind one IP, so one heavy user can get everyone behind that IP blocked (false positives). Use per-IP limits as a fallback for unauthenticated traffic and combine them with per-user or per-API-key limits.
+
+</QA>
+
+<QA q="How would you implement rate limiting in Redis?" level="medium">
+
+Lua script implementing token bucket: read tokens + last refill timestamp, refill based on elapsed time, attempt to consume a token, write back, and set an `EXPIRE` so idle keys disappear. Lua makes it atomic in one Redis round trip; a plain read-then-write from the app would let concurrent requests race and both spend the same token.
+
+</QA>
+
+<QA q="Token bucket vs sliding window counter — when to use each?" level="medium">
+
 Token bucket allows controlled bursting (better UX); sliding window counter is closer to a strict rate. For user-facing APIs, bursting is desirable (a quick rush isn't abuse). For DDoS protection, smoother is better.
 
-### Q4: A rate limiter adds 5 ms to every request — too much. Optimize.
-- Local cache + periodic Redis sync: maintain local state, sync every N ms or every K requests.
-- Co-locate Redis with the gateway (same DC).
-- Batch updates.
-- Avoid extra round trips: combine plan lookup with rate check via Lua.
+</QA>
 
-### Q5: What happens when Redis fails?
-Options: fail open (let all through, risk overload), fail closed (reject all, visible outage), degraded (per-instance fallback). Tier responses by endpoint sensitivity: fail open for read paths, fail closed for write paths.
+<QA q="How do multi-tier limits (user, endpoint, IP) combine?" level="medium">
 
-### Q6: Design rate limiting for a free/pro/enterprise tiered API.
+Each tier is a separate Redis key with its own limit, such as 1000/min per user, 100/min per user on `/search`, and a per-IP fallback. A request passes only if every applicable tier allows it. When debugging a 429, find which tier tripped.
+
+</QA>
+
+<QA q="Where should the rate limiter run: gateway or per-service sidecar?" level="medium">
+
+Gateway-level is cheap and has a global view of ingress, at the cost of an extra hop. A per-service sidecar sits close to the call and can protect specific sensitive endpoints. Most production setups do both: gateway limits for ingress, per-service limits for sensitive endpoints, with the gateway passing headers like `X-RateLimit-Plan` downstream.
+
+</QA>
+
+<QA q="What happens when Redis fails?" level="medium">
+
+Options: fail open (let all through, risk overload), fail closed (reject all, visible outage), degraded (per-instance local token bucket as fallback, no global view). Tier responses by endpoint sensitivity: fail open for read paths, fail closed for sensitive write paths.
+
+</QA>
+
+<QA q="How to handle multi-region rate limiting?" level="hard">
+
+Per-region limits with sum-of-regions ≤ global is the most common. Each region operates independently with its own Redis; some drift is accepted when traffic is uneven. For strict global limits, regions pull leases from a global counter (more accurate, more complex, rarely worth it — even Cloudflare counts per data center).
+
+</QA>
+
+<QA q="Design rate limiting for a free/pro/enterprise tiered API." level="hard">
+
 - Plans table mapping user_id → plan (free 100/min, pro 1K/min, enterprise 10K/min).
-- Cached in app for fast lookup.
+- Cached in app memory, refreshed every few minutes.
 - Per-user token bucket with capacity = limit.
 - Refill rate = limit / 60 per second.
-- Optional per-endpoint sub-limits for expensive operations (e.g., 10/min on `/export`).
+- Optional per-endpoint sub-limits for expensive operations (for example 10/min on `/export`).
 - 429 + Retry-After + headers.
 
-### Q7: Design abuse detection on top of rate limiting.
+</QA>
+
+<QA q="A rate limiter adds 5 ms to every request — too much. Optimize." level="scenario">
+
+- Local cache + periodic Redis sync: maintain local state, sync every N ms or every K requests (some accuracy loss).
+- Co-locate Redis with the gateway (same DC).
+- Batch updates.
+- Avoid extra round trips: resolve the plan from the in-memory cache and do the check in a single Lua call.
+- Shard Redis by key to spread load.
+
+</QA>
+
+<QA q="Design abuse detection on top of rate limiting." level="scenario">
+
 - Stream all rate-limit events to Kafka.
 - Consumer detects patterns: same IP rotating user agents, burst-then-pause, denied requests from known abusers.
-- Auto-throttle abusers (lower their tier dynamically) or escalate to security team.
+- Auto-throttle abusers (lower their tier dynamically) or escalate to the security team.
 - WAF rules for known bad signatures.
 
-### Q8: User reports being rate-limited when they shouldn't be. Investigate.
-- Check actual recent request rate from logs vs limit.
+</QA>
+
+<QA q="User reports being rate-limited when they shouldn't be. Investigate." level="scenario">
+
+- Check actual recent request rate from logs vs the limit.
 - Look at all rate-limit tiers (user, endpoint, IP) — which one tripped?
-- Clock skew: if Lua uses local time vs Redis time, mismatch may misfire.
-- Plan misconfig: their plan downgraded?
-- Bug in Lua script under edge case (e.g., very small intervals).
-- NAT'd IP shared with abuser?
+- Clock skew: the script takes `now_ms` from the caller, so app servers with skewed clocks can miscompute refill.
+- Plan misconfig: was their plan downgraded, or is the plan cache stale?
+- Bug in the Lua script under an edge case (for example very small intervals).
+- NAT'd IP shared with an abuser?
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="Why run the token-bucket logic as a Lua script inside Redis?" options={["Lua is faster than C", "It makes read-refill-consume-write atomic in one round trip", "Redis can't store hashes otherwise", "It replicates the key to all regions"]} answer={1}>
+
+Redis runs the script atomically, so concurrent requests can't both read the same token count, and it's one network round trip. Lua isn't faster than Redis's C core, hashes work without it, and it does nothing for cross-region replication.
+
+</MCQ>
+
+<MCQ q="A pro user has a 1K/min token bucket. What capacity and refill rate fit?" options={["Capacity 1000, refill about 16.7 tokens per second", "Capacity 60, refill 1000 per second", "Capacity 1, refill 1000 per minute", "Capacity 1000, refill 1000 per second"]} answer={0}>
+
+Capacity equals the limit and refill is limit / 60 per second, about 16.7/s. A capacity of 1 removes bursting, and 1000/s refill would allow 60x the limit.
+
+</MCQ>
+
+<MCQ q="A request is checked against per-user, per-endpoint and per-IP limits. When does it pass?" options={["If any one tier allows it", "If the per-user tier allows it", "Only if every applicable tier allows it", "If at least two tiers allow it"]} answer={2}>
+
+Each tier is a separate key, and the request needs all of them to allow it. Any single tier saying no rejects it.
+
+</MCQ>
+
+<MCQ q="With per-region limits that sum to the global limit, what is the known downside?" options={["Every check needs a cross-region call", "It needs a global lease server", "Requests in one region block another region", "A user with uneven traffic across regions can briefly be limited wrongly or drift from the global limit"]} answer={3}>
+
+Each region counts independently, so uneven traffic causes drift against the global limit. Per-region limits avoid cross-region calls and leases, which belong to the global-sync approach.
+
+</MCQ>
+
+<MCQ q="Redis is down. What is a sensible behavior for a write-heavy payment endpoint versus a read-only catalog endpoint?" options={["Fail open for both", "Fail closed for the payment endpoint, fail open for the catalog", "Fail closed for both", "Fail open for payments, fail closed for the catalog"]} answer={1}>
+
+Sensitive write paths should stay protected, while read-only paths can tolerate being let through. A local per-instance bucket is a further degraded option. Failing everything closed is a visible outage; failing everything open risks overload.
+
+</MCQ>
+
+<MCQ q="Which algorithm suits a user-facing API where short bursts are normal?" options={["Token bucket", "Fixed window with a 1-hour window", "Sliding window log with no burst", "Leaky bucket with zero capacity"]} answer={0}>
+
+Token bucket allows controlled bursts up to its capacity while enforcing the average rate. The others are stricter or, like a long fixed window, allow huge spikes at window edges.
+
+</MCQ>
+
+<MCQ q="Many users on one mobile carrier report 429s at the same time. What is the most likely cause?" options={["The Lua script is not atomic", "Redis memory is full", "A shared carrier NAT IP tripped the per-IP limit", "Their plans were upgraded"]} answer={2}>
+
+Carriers put many users behind one IP, so the per-IP tier fires for all of them. The script is atomic, full memory would cause errors not targeted 429s, and an upgrade raises limits.
+
+</MCQ>
+
+<MCQ q="What does keeping a local token bucket on each gateway with periodic Redis sync trade away?" options={["Availability", "The ability to return 429", "Burst support", "Some accuracy, since instances act on slightly stale shared state"]} answer={3}>
+
+Local state cuts Redis round trips and latency, but instances don't see each other's usage until they sync, so limits can drift. Availability actually improves, and 429s and bursting still work.
+
+</MCQ>
+
+</Quiz>
 
 ## TL;DR cheat sheet
 
@@ -231,4 +338,4 @@ Options: fail open (let all through, risk overload), fail closed (reject all, vi
 - **Alex Xu Vol 1** Ch. 4.
 - **Cloudflare blog**: counting algorithms, sliding window counter.
 - **GitHub**: secondary rate limits explanation.
-- Topic 25 in this collection for algorithmic deep dive.
+- [Rate Limiting](/learn/notes/rate-limiting/) in this collection for the algorithmic deep dive.

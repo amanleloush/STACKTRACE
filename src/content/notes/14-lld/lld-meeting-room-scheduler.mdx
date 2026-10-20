@@ -1,0 +1,764 @@
+---
+title: "LLD: Meeting Room Scheduler"
+phase: "14-lld"
+order: 147
+tags: ["lld", "machine-coding", "java", "design-patterns", "concurrency", "intervals"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 40
+prerequisites: ["machine-coding-strategy", "behavioral-patterns", "java-collections-hashmap", "java-concurrency-locks"]
+summary: "Build a thread-safe meeting room booking system in Java 21: half-open time slots, O(log n) conflict checks with TreeMap floor/ceiling, best-fit room search, all-or-nothing recurring meetings, Observer notifications and Command-based undo."
+---
+
+## Problem statement
+
+> "Design a meeting room booking system for an office. There are several rooms, each with a seating capacity. A user can book a room for a time slot and invite attendees. Two meetings must never overlap in the same room. Users should be able to find a free room for a given time and group size, cancel a booking, and set up simple recurring meetings (daily or weekly). Attendees get notified when they are invited or a meeting is cancelled. Many people book at once, so it must be safe under concurrency. Bonus: undo the last action."
+
+This is a favourite 60–90 minute machine-coding round. Underneath the office story it tests one algorithmic idea — **interval overlap** — and three design ideas: keeping a **sorted calendar per room**, choosing the **right lock granularity**, and using **Observer** and **Command** where they actually help.
+
+If you have practised the DSA version ([interval merging and meeting-rooms problems](/learn/dsa/interval-scheduling/)), you already know the overlap test. Here you have to keep it correct while bookings arrive one at a time, from many threads.
+
+## Clarifying questions to ask
+
+| Question | Assumed answer |
+|---|---|
+| Is a meeting ending at 10:00 in conflict with one starting at 10:00? | **No.** Slots are half-open: [start, end). |
+| Time granularity? Any minute, or 15/30-minute blocks? | **Any minute.** Blocks are a validation rule we could add. |
+| Time zones? | **One office, local time** (`LocalDateTime`). Multi-zone is an extension (store `Instant`, convert for display). |
+| Does the organizer count toward capacity? | **Yes** — the organizer is added to the attendee set. |
+| What if the requested room is busy? | Reject with a clear conflict error naming the clashing meeting. Separately offer "book any free room". |
+| Which room should "any room" pick? | **Best fit**: the smallest room that seats everyone, so big rooms stay free for big meetings. |
+| Recurring meetings: what patterns? | **Daily or weekly, N occurrences**. All-or-nothing: if any occurrence clashes, book none. |
+| Can attendees be double-booked across rooms? | **Not checked** (people often are). Attendee conflict checks are an extension. |
+| How are notifications sent? | Through a listener interface; the demo just prints. Email/Slack would be other listeners. |
+| Persistence? | **In memory.** Mention the database version (exclusion constraint) as an extension. |
+| Undo — how far back? | **Last action, per history object**, for book and cancel. |
+
+## Requirements
+
+**Functional (in scope)**
+
+- Register rooms (id, name, capacity).
+- `book(room, slot, organizer, invitees, title)` — fails on overlap or over capacity.
+- `findAvailableRooms(slot, headcount)` — free rooms that fit, smallest first.
+- `bookAnyRoom(slot, organizer, invitees, title)` — best-fit room, safe if another thread grabs it first.
+- `bookSeries(...)` with daily/weekly recurrence, all-or-nothing.
+- `cancel(bookingId)`; `schedule(room, from, to)` to list a room's bookings.
+- Notify attendees on booking and cancellation.
+- Undo the last book or cancel.
+
+**Non-functional**
+
+- Conflict check in **O(log n)** per room, where n is that room's bookings.
+- **No double booking** under any thread interleaving.
+- Bookings in different rooms do not block each other.
+
+**Out of scope:** user auth, attendee availability, time zones, full RFC 5545 recurrence rules (exceptions, "every 2nd Tuesday"), persistence, a UI.
+
+## Entities and relationships
+
+```
+ User(id, name)            Room(id, name, capacity)
+     ▲   ▲                       ▲
+     │   │ attendees (1..*)      │ 1
+     │   └──────────┐            │
+     │ organizer 1  │            │
+  Booking(id, room, slot, organizer, attendees, title, seriesId?)
+        │ 1
+        ▼
+  TimeSlot[start, end)   — overlaps(o): start < o.end && o.start < end
+
+  MeetingScheduler ─────────────── the service (facade for callers)
+   ├─ Map<roomId, Room>
+   ├─ Map<roomId, RoomCalendar> ──► RoomCalendar
+   │                                 ├─ TreeMap<start, Booking>  (sorted, non-overlapping)
+   │                                 └─ ReentrantLock            (one per room)
+   ├─ Map<bookingId, Booking>
+   └─ List<BookingListener> ──────► AttendeeNotifier (Observer)
+
+  «interface» Command { execute(); undo(); }
+        ▲                    ▲
+   BookCommand          CancelCommand        CommandHistory (stack of done commands)
+
+  Recurrence(frequency DAILY|WEEKLY, occurrences)
+```
+
+Notes on the shape:
+
+- **`TimeSlot`, `Room`, `User`, `Booking` are immutable records.** Immutable objects are thread-safe for free and safe to hand to listeners.
+- **`RoomCalendar` owns the invariant** "no two bookings in this room overlap". Only it can insert, and it checks and inserts under one lock.
+- **`MeetingScheduler`** coordinates: validation, ids, the global booking index, notifications.
+
+## Design patterns used and why
+
+| Pattern | Where | Why here |
+|---|---|---|
+| **Observer** ([behavioral patterns](/learn/notes/behavioral-patterns/)) | `BookingListener`, `AttendeeNotifier` | Booking logic shouldn't know about email, Slack or calendar sync. New channels are new listeners; the scheduler is closed for modification. |
+| **Command** ([behavioral patterns](/learn/notes/behavioral-patterns/)) | `BookCommand`, `CancelCommand`, `CommandHistory` | "Undo" needs each action to remember how to reverse itself. Wrapping actions as objects also gives you a log/audit trail and a place to add retries. |
+| **Facade** ([structural patterns](/learn/notes/structural-patterns/)) | `MeetingScheduler` | Callers use one small API; calendars, indexes and listeners stay hidden. |
+| **Value objects** | `TimeSlot` with a compact constructor | Validation (start before end) happens once, at creation, so no invalid slot can exist anywhere. |
+
+Strategy would also fit for "which free room to pick" (best fit, nearest floor, has a projector). We hard-code best fit and name it as the extension point — don't add patterns the requirements didn't ask for (see [machine-coding strategy](/learn/notes/machine-coding-strategy/)).
+
+## Solution walkthrough
+
+### Step 1 — half-open time slots
+
+`TimeSlot(start, end)` rejects `start >= end`. Two slots overlap exactly when **each starts before the other ends**:
+
+```
+overlaps(a, b)  ⇔  a.start < b.end  &&  b.start < a.end
+
+ a: [10:00 ──────── 11:00)
+ b:                [11:00 ── 11:30)     11:00 < 11:00 is false → no overlap (back-to-back OK)
+ c:          [10:30 ───────── 11:30)    10:00 < 11:30 and 10:30 < 11:00 → overlap
+```
+
+Half-open intervals are the standard choice for time ranges: back-to-back meetings don't clash, and splitting a day into slots never double-counts the boundary minute. PostgreSQL's range types use the same `[)` form by default.
+
+### Step 2 — the per-room calendar and O(log n) conflict check
+
+The naive check scans every booking in the room: O(n). Instead, each `RoomCalendar` keeps a `TreeMap` from start time to booking. Because the calendar's bookings **never overlap each other**, a new slot can only clash with its two neighbours:
+
+```
+ existing:  [9:00-9:30)   [10:00-11:00)   [12:00-13:00)
+ new slot:                       [10:45 ─────── 12:15)
+                      floorEntry(10:45) = 10:00 booking → ends 11:00 > 10:45 → CLASH
+                      ceilingEntry(10:45) = 12:00 booking → starts 12:00 < 12:15 → CLASH
+```
+
+- `floorEntry(start)` — the booking with the greatest start ≤ new start. Clash if it **ends after** the new start.
+- `ceilingEntry(start)` — the booking with the smallest start ≥ new start. Clash if it **starts before** the new end.
+
+`TreeMap` is a red-black tree: its Javadoc guarantees O(log n) for `get`/`put`/`remove`, and the navigation lookups are the same O(log n) tree walk, so booking is O(log n). Why is checking two neighbours enough? Any booking further left ends before the floor booking starts; any booking further right starts after the ceiling booking. If neither neighbour overlaps, nothing does.
+
+### Step 3 — making check-and-insert atomic
+
+"Is it free? → then insert" is a classic **check-then-act** race: two threads can both see the slot free and both insert. `RoomCalendar.add` does the check and the insert **under the room's own `ReentrantLock`**, so they are one atomic step.
+
+Why a lock **per room**, not one global lock? Bookings in different rooms never conflict, so they shouldn't wait for each other. Why not just `ConcurrentHashMap` or `ConcurrentSkipListMap`? Those make single operations thread-safe, but our invariant spans **two lookups and one insert** — that compound action still needs a lock. (Details in [Java locks](/learn/notes/java-concurrency-locks/) and [Java collections](/learn/notes/java-collections-hashmap/).)
+
+### Step 4 — finding and grabbing a free room
+
+`findAvailableRooms` filters rooms by capacity, checks `isFree` on each, and sorts by capacity (best fit). The result is a **snapshot** — by the time you book, another thread may have taken the room. So `bookAnyRoom` tries candidates in order and treats a `BookingConflictException` as "lost the race, try the next room". This is optimistic: no lock is held across rooms, and correctness still comes from the atomic `add`.
+
+### Step 5 — recurring meetings, all-or-nothing
+
+`bookSeries` expands the recurrence into N concrete bookings (start + i × 1 day or 7 days), all sharing a `seriesId`. They all go to **one room**, so `RoomCalendar.add(list)` checks every occurrence first and inserts only if all are free — under the same lock. No partial series is ever visible. We reject a meeting longer than its repeat step (a 2-day meeting repeating daily would overlap itself).
+
+Storing each occurrence as its own booking keeps conflict detection trivial. The trade-off: an "every week forever" series needs a cap (or the RRULE-style lazy expansion mentioned in the extensions).
+
+### Step 6 — notifications (Observer)
+
+After a successful insert, the scheduler calls `onBooked` on every listener; after cancel, `onCancelled`. Two deliberate choices:
+
+- **Notify outside the room lock.** A slow email listener must not block other bookings for that room.
+- **`CopyOnWriteArrayList` for listeners** — iteration is safe while someone subscribes, and subscriptions are rare.
+
+### Step 7 — undo (Command)
+
+`BookCommand.execute()` books and remembers the result; `undo()` cancels it. `CancelCommand.execute()` cancels and remembers the booking; `undo()` restores it. `CommandHistory.run` pushes a command **only if `execute` succeeded**, so a failed booking can't be "undone".
+
+Undo of a cancel can fail: someone may have taken the slot in between. The restore goes through the same atomic conflict check, so it throws a `BookingConflictException` instead of silently double-booking. Say this in the interview — it shows you know undo isn't always possible in a shared system.
+
+## Full solution code
+
+One file, Java 21. Save as `Main.java`, run `javac Main.java && java Main`.
+
+```java
+import java.time.Duration;
+import java.time.LocalDateTime;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
+
+// ---------- Value objects ----------
+record User(String id, String name) { }
+
+record Room(String id, String name, int capacity) {
+    Room {
+        if (capacity <= 0) throw new IllegalArgumentException("capacity must be positive");
+    }
+}
+
+/** Half-open interval [start, end): a meeting ending at 10:00 does not clash with one starting at 10:00. */
+record TimeSlot(LocalDateTime start, LocalDateTime end) {
+    TimeSlot {
+        Objects.requireNonNull(start); Objects.requireNonNull(end);
+        if (!start.isBefore(end)) throw new IllegalArgumentException("start must be before end");
+    }
+    boolean overlaps(TimeSlot o) { return start.isBefore(o.end) && o.start.isBefore(end); }
+    TimeSlot plus(Duration d) { return new TimeSlot(start.plus(d), end.plus(d)); }
+    @Override public String toString() { return start.toLocalTime() + "-" + end.toLocalTime() + " " + start.toLocalDate(); }
+}
+
+record Booking(String id, Room room, TimeSlot slot, User organizer, Set<User> attendees,
+               String title, String seriesId) {
+    Booking { attendees = Set.copyOf(attendees); }
+}
+
+enum Frequency { DAILY, WEEKLY }
+record Recurrence(Frequency frequency, int occurrences) {
+    Recurrence {
+        if (occurrences < 1) throw new IllegalArgumentException("occurrences must be at least 1");
+    }
+    Duration step() { return frequency == Frequency.DAILY ? Duration.ofDays(1) : Duration.ofDays(7); }
+}
+
+class BookingConflictException extends RuntimeException {
+    private static final long serialVersionUID = 1L;
+    BookingConflictException(String msg) { super(msg); }
+}
+
+// ---------- Per-room calendar: sorted by start, guarded by its own lock ----------
+final class RoomCalendar {
+    private final Room room;
+    private final TreeMap<LocalDateTime, Booking> byStart = new TreeMap<>();
+    private final ReentrantLock lock = new ReentrantLock();
+
+    RoomCalendar(Room room) { this.room = room; }
+
+    /** O(log n): bookings never overlap each other, so only the two neighbours of 'start' can clash. */
+    private Optional<Booking> conflictLocked(TimeSlot slot) {
+        Map.Entry<LocalDateTime, Booking> prev = byStart.floorEntry(slot.start());
+        if (prev != null && prev.getValue().slot().end().isAfter(slot.start())) return Optional.of(prev.getValue());
+        Map.Entry<LocalDateTime, Booking> next = byStart.ceilingEntry(slot.start());
+        if (next != null && next.getKey().isBefore(slot.end())) return Optional.of(next.getValue());
+        return Optional.empty();
+    }
+
+    boolean isFree(TimeSlot slot) {
+        lock.lock();
+        try { return conflictLocked(slot).isEmpty(); } finally { lock.unlock(); }
+    }
+
+    /** Check-and-insert is atomic: this is what prevents double booking. */
+    void add(List<Booking> bookings) {
+        lock.lock();
+        try {
+            for (Booking b : bookings) {
+                Optional<Booking> clash = conflictLocked(b.slot());
+                if (clash.isPresent())
+                    throw new BookingConflictException(room.name() + " is taken " + b.slot()
+                            + " by '" + clash.get().title() + "'");
+            }
+            // occurrences of one series never overlap each other (step is at least 1 day, slot is shorter)
+            for (Booking b : bookings) byStart.put(b.slot().start(), b);
+        } finally { lock.unlock(); }
+    }
+
+    boolean remove(Booking b) {
+        lock.lock();
+        try { return byStart.remove(b.slot().start(), b); } finally { lock.unlock(); }
+    }
+
+    List<Booking> bookingsBetween(LocalDateTime from, LocalDateTime to) {
+        lock.lock();
+        try {
+            List<Booking> out = new ArrayList<>();
+            Map.Entry<LocalDateTime, Booking> first = byStart.lowerEntry(from);   // may straddle 'from'
+            if (first != null && first.getValue().slot().end().isAfter(from)) out.add(first.getValue());
+            out.addAll(byStart.subMap(from, true, to, false).values());
+            return out;
+        } finally { lock.unlock(); }
+    }
+}
+
+// ---------- Observer ----------
+interface BookingListener {
+    void onBooked(Booking b);
+    void onCancelled(Booking b);
+}
+
+final class AttendeeNotifier implements BookingListener {
+    public void onBooked(Booking b) {
+        for (User u : sorted(b.attendees()))
+            System.out.println("  notify " + u.name() + ": invited to '" + b.title() + "' in " + b.room().name() + " " + b.slot());
+    }
+    public void onCancelled(Booking b) {
+        for (User u : sorted(b.attendees()))
+            System.out.println("  notify " + u.name() + ": '" + b.title() + "' on " + b.slot() + " was cancelled");
+    }
+    private static List<User> sorted(Set<User> s) {
+        return s.stream().sorted(Comparator.comparing(User::name)).toList();   // stable demo output
+    }
+}
+
+// ---------- Service ----------
+final class MeetingScheduler {
+    private final Map<String, Room> rooms = new ConcurrentHashMap<>();
+    private final Map<String, RoomCalendar> calendars = new ConcurrentHashMap<>();
+    private final Map<String, Booking> bookings = new ConcurrentHashMap<>();
+    private final List<BookingListener> listeners = new CopyOnWriteArrayList<>();
+    private final AtomicLong ids = new AtomicLong();
+
+    void addRoom(Room r) {
+        if (rooms.putIfAbsent(r.id(), r) != null) throw new IllegalArgumentException("duplicate room " + r.id());
+        calendars.put(r.id(), new RoomCalendar(r));
+    }
+    void subscribe(BookingListener l) { listeners.add(l); }
+
+    Booking book(String roomId, TimeSlot slot, User organizer, Set<User> invitees, String title) {
+        return bookSeries(roomId, slot, new Recurrence(Frequency.DAILY, 1), organizer, invitees, title).get(0);
+    }
+
+    /** All-or-nothing: if any occurrence clashes, nothing is booked. */
+    List<Booking> bookSeries(String roomId, TimeSlot first, Recurrence rec, User organizer,
+                             Set<User> invitees, String title) {
+        Room room = Optional.ofNullable(rooms.get(roomId))
+                .orElseThrow(() -> new NoSuchElementException("no room " + roomId));
+        Set<User> people = new HashSet<>(invitees);
+        people.add(organizer);
+        if (people.size() > room.capacity())
+            throw new IllegalArgumentException(room.name() + " seats " + room.capacity() + ", need " + people.size());
+        if (rec.occurrences() > 1 && first.end().isAfter(first.start().plus(rec.step())))
+            throw new IllegalArgumentException("meeting is longer than its repeat interval");
+
+        String seriesId = rec.occurrences() > 1 ? "S" + ids.incrementAndGet() : null;
+        List<Booking> created = new ArrayList<>();
+        for (int i = 0; i < rec.occurrences(); i++) {
+            TimeSlot s = first.plus(rec.step().multipliedBy(i));
+            created.add(new Booking("B" + ids.incrementAndGet(), room, s, organizer, people, title, seriesId));
+        }
+        calendars.get(roomId).add(created);          // throws BookingConflictException, atomically per room
+        created.forEach(b -> bookings.put(b.id(), b));
+        created.forEach(b -> listeners.forEach(l -> l.onBooked(b)));   // notify outside the room lock
+        return created;
+    }
+
+    /** Smallest room that fits, so big rooms stay free for big meetings (best fit). */
+    List<Room> findAvailableRooms(TimeSlot slot, int headcount) {
+        return rooms.values().stream()
+                .filter(r -> r.capacity() >= headcount)
+                .filter(r -> calendars.get(r.id()).isFree(slot))
+                .sorted(Comparator.comparingInt(Room::capacity).thenComparing(Room::id))
+                .toList();
+    }
+
+    /** Tries candidates in order; a room grabbed by another thread in between is simply skipped. */
+    Booking bookAnyRoom(TimeSlot slot, User organizer, Set<User> invitees, String title) {
+        int headcount = invitees.size() + (invitees.contains(organizer) ? 0 : 1);
+        for (Room r : findAvailableRooms(slot, headcount)) {
+            try { return book(r.id(), slot, organizer, invitees, title); }
+            catch (BookingConflictException lostRace) { /* try the next room */ }
+        }
+        throw new BookingConflictException("no room for " + headcount + " people at " + slot);
+    }
+
+    Booking cancel(String bookingId) {
+        Booking b = bookings.remove(bookingId);
+        if (b == null) throw new NoSuchElementException("no booking " + bookingId);
+        calendars.get(b.room().id()).remove(b);
+        listeners.forEach(l -> l.onCancelled(b));
+        return b;
+    }
+
+    /** Re-insert an existing booking (used by undo of a cancel). */
+    void restore(Booking b) {
+        calendars.get(b.room().id()).add(List.of(b));
+        bookings.put(b.id(), b);
+        listeners.forEach(l -> l.onBooked(b));
+    }
+
+    List<Booking> schedule(String roomId, LocalDateTime from, LocalDateTime to) {
+        return calendars.get(roomId).bookingsBetween(from, to);
+    }
+}
+
+// ---------- Command: book/cancel as objects, with undo ----------
+interface Command {
+    void execute();
+    void undo();
+}
+
+final class BookCommand implements Command {
+    private final MeetingScheduler s; private final String roomId; private final TimeSlot slot;
+    private final User organizer; private final Set<User> invitees; private final String title;
+    private Booking result;
+    BookCommand(MeetingScheduler s, String roomId, TimeSlot slot, User organizer, Set<User> invitees, String title) {
+        this.s = s; this.roomId = roomId; this.slot = slot; this.organizer = organizer; this.invitees = invitees; this.title = title;
+    }
+    public void execute() { result = s.book(roomId, slot, organizer, invitees, title); }
+    public void undo() { s.cancel(result.id()); }
+    Booking result() { return result; }
+}
+
+final class CancelCommand implements Command {
+    private final MeetingScheduler s; private final String bookingId;
+    private Booking cancelled;
+    CancelCommand(MeetingScheduler s, String bookingId) { this.s = s; this.bookingId = bookingId; }
+    public void execute() { cancelled = s.cancel(bookingId); }
+    public void undo() { s.restore(cancelled); }     // may throw if someone took the slot meanwhile
+}
+
+final class CommandHistory {
+    private final Deque<Command> done = new ArrayDeque<>();
+    synchronized void run(Command c) { c.execute(); done.push(c); }   // only successful commands are undoable
+    synchronized void undoLast() {
+        Command c = done.poll();
+        if (c == null) throw new IllegalStateException("nothing to undo");
+        c.undo();
+    }
+}
+
+public class Main {
+    static LocalDateTime at(int day, int h, int m) { return LocalDateTime.of(2026, 3, day, h, m); }
+
+    public static void main(String[] args) {
+        MeetingScheduler s = new MeetingScheduler();
+        s.addRoom(new Room("R1", "Focus", 2));
+        s.addRoom(new Room("R2", "Huddle", 4));
+        s.addRoom(new Room("R3", "Board", 12));
+        s.subscribe(new AttendeeNotifier());
+
+        User alice = new User("u1", "alice"), bob = new User("u2", "bob"), cara = new User("u3", "cara");
+        CommandHistory history = new CommandHistory();
+
+        System.out.println("== book Huddle 10:00-11:00 ==");
+        TimeSlot tenToEleven = new TimeSlot(at(2, 10, 0), at(2, 11, 0));
+        BookCommand standup = new BookCommand(s, "R2", tenToEleven, alice, Set.of(bob, cara), "Design review");
+        history.run(standup);
+
+        System.out.println("== overlapping 10:30-11:30 in Huddle ==");
+        try { s.book("R2", new TimeSlot(at(2, 10, 30), at(2, 11, 30)), bob, Set.of(), "1:1"); }
+        catch (BookingConflictException e) { System.out.println("  rejected: " + e.getMessage()); }
+
+        System.out.println("== back-to-back 11:00-11:30 is fine (half-open) ==");
+        s.book("R2", new TimeSlot(at(2, 11, 0), at(2, 11, 30)), bob, Set.of(), "1:1");
+
+        System.out.println("== find a room for 3 people 10:15-10:45 ==");
+        TimeSlot q = new TimeSlot(at(2, 10, 15), at(2, 10, 45));
+        System.out.println("  available: " + s.findAvailableRooms(q, 3).stream().map(Room::name).toList());
+        Booking any = s.bookAnyRoom(q, cara, Set.of(alice, bob), "Sync");
+        System.out.println("  booked " + any.room().name());
+
+        System.out.println("== weekly series, 3 occurrences, Focus 09:00-09:30 ==");
+        List<Booking> series = s.bookSeries("R1", new TimeSlot(at(2, 9, 0), at(2, 9, 30)),
+                new Recurrence(Frequency.WEEKLY, 3), alice, Set.of(bob), "Weekly 1:1");
+        System.out.println("  series " + series.get(0).seriesId() + " -> " + series.size() + " bookings");
+        try {
+            s.bookSeries("R1", new TimeSlot(at(1, 9, 0), at(1, 9, 30)),
+                    new Recurrence(Frequency.DAILY, 3), bob, Set.of(), "Daily check-in");
+        } catch (BookingConflictException e) { System.out.println("  daily series rejected: " + e.getMessage()); }
+
+        System.out.println("== undo the design review booking ==");
+        history.undoLast();
+        System.out.println("  Huddle free 10:00-11:00 again? " + s.findAvailableRooms(tenToEleven, 4).stream()
+                .anyMatch(r -> r.id().equals("R2")));
+
+        System.out.println("== cancel the 1:1 then undo the cancel ==");
+        Booking oneOnOne = s.schedule("R2", at(2, 0, 0), at(3, 0, 0)).get(0);
+        history.run(new CancelCommand(s, oneOnOne.id()));
+        history.undoLast();
+        System.out.println("  Huddle on day 2: " + s.schedule("R2", at(2, 0, 0), at(3, 0, 0)).stream().map(Booking::title).toList());
+    }
+}
+```
+
+## Concurrency and edge cases
+
+**Thread-safety map**
+
+| Shared state | Protection | Reason |
+|---|---|---|
+| A room's `TreeMap` | that room's `ReentrantLock` | Conflict check + insert must be atomic; rooms independent. |
+| `rooms`, `calendars`, `bookings` | `ConcurrentHashMap` | Single-key reads and writes from many threads. |
+| listeners | `CopyOnWriteArrayList` | Read on every booking, written rarely. |
+| ids | `AtomicLong` | No lost increments. |
+| `CommandHistory` | `synchronized` | One user's undo stack; low contention. |
+| records | immutable | Safe to share across threads and with listeners. |
+
+**The race we must prevent.** Thread 1 and thread 2 both book Huddle 10:00–11:00. Without the lock, both run `floorEntry`/`ceilingEntry`, both see nothing, both `put`. With the lock, the second thread sees the first booking and gets a conflict. The test below runs this race 2,000 times; when we deliberately broke the lock (each call got its own new lock), the test failed — so it really does detect double booking.
+
+**Cancel vs book on the same room.** Both take the room lock, so a cancel and a re-book of that slot are serialized. `cancel` removes from the global index first (`bookings.remove` returns the booking to exactly one caller), so two concurrent cancels of the same id can't both succeed.
+
+**Deadlock?** Every operation holds **at most one room lock** at a time and calls no other lock while holding it, so there is no lock-ordering cycle. If you add "move a meeting from room A to room B atomically", you'd need two locks — acquire them in a fixed order (for example, by room id) to stay deadlock-free.
+
+**Edge cases handled**
+
+- Start equal to or after end → rejected when the `TimeSlot` is created.
+- Back-to-back meetings allowed; identical, contained, containing and partial overlaps rejected.
+- Headcount above capacity (organizer included) → rejected.
+- Unknown room, unknown booking id, duplicate room id → clear exceptions.
+- Recurring series where any occurrence clashes → nothing booked, no notifications sent.
+- Meeting longer than its repeat interval → rejected.
+- Range query (`schedule`) includes a meeting that started before the window but runs into it (`lowerEntry` check).
+
+**Limits we accept:** `LocalDateTime` ignores daylight-saving gaps; a "weekly at 09:00" series across a DST change needs `ZonedDateTime` with a zone. Notifications run on the caller's thread; in production you'd publish to a queue.
+
+## Testing it
+
+The harness (plain Java, no JUnit) covers 29 checks. The key ones, as they'd look in JUnit:
+
+```java
+@Test void backToBackMeetingsDoNotConflict() {
+    s.book("R2", slot(10, 0, 11, 0), alice, Set.of(), "a");
+    s.book("R2", slot(11, 0, 12, 0), bob, Set.of(), "b");   // no exception
+}
+
+@Test void clashWithPreviousBookingIsCaughtByFloorEntry() {
+    s.book("R2", slot(10, 0, 11, 0), alice, Set.of(), "a");
+    assertThrows(BookingConflictException.class,
+        () -> s.book("R2", slot(10, 59, 11, 30), bob, Set.of(), "b"));
+}
+
+@Test void recurringSeriesIsAllOrNothing() {
+    s.book("R1", slot(9, 0, 9, 30).plus(Duration.ofDays(14)), alice, Set.of(), "blocker");
+    assertThrows(BookingConflictException.class, () -> s.bookSeries("R1",
+        slot(9, 0, 9, 30), new Recurrence(Frequency.WEEKLY, 4), bob, Set.of(), "weekly"));
+    assertEquals(1, s.schedule("R1", day0, day0.plusDays(40)).size());
+}
+
+@Test void twoThreadsCannotDoubleBook() throws Exception {
+    for (int round = 0; round < 2000; round++) {
+        var m = freshScheduler();
+        var go = new CountDownLatch(1);
+        Callable<Boolean> task = () -> {
+            go.await();
+            try { m.book("R2", slot(10, 0, 11, 0), alice, Set.of(), "race"); return true; }
+            catch (BookingConflictException e) { return false; }
+        };
+        Future<Boolean> f1 = pool.submit(task), f2 = pool.submit(task);
+        go.countDown();
+        assertTrue(f1.get() ^ f2.get());          // exactly one winner
+    }
+}
+```
+
+Other checks: overlap maths for touching/contained/containing/partial/identical slots, a slot spanning several bookings, best-fit ordering, `bookAnyRoom` skipping a busy room, capacity and validation errors, undo of book, undo of cancel failing when the slot was taken, failed commands not entering history, 16 threads booking random overlapping slots in one room (result checked for zero overlaps), and 20 threads calling `bookAnyRoom` for the same slot (exactly 3 succeed, in 3 different rooms).
+
+```
+PASS touching intervals do not overlap
+PASS contained, containing, partial and identical overlap
+...
+PASS two threads never double-book (2000 rounds)
+PASS 16 threads, random slots: calendar has no overlaps (96 bookings)
+PASS 20 concurrent bookAnyRoom calls fill exactly 3 distinct rooms
+
+ALL 29 CHECKS PASSED
+```
+
+(The booking count in the 16-thread test varies run to run because the slots are random; the "no overlaps" result does not.)
+
+Real output of `java Main`:
+
+```
+== book Huddle 10:00-11:00 ==
+  notify alice: invited to 'Design review' in Huddle 10:00-11:00 2026-03-02
+  notify bob: invited to 'Design review' in Huddle 10:00-11:00 2026-03-02
+  notify cara: invited to 'Design review' in Huddle 10:00-11:00 2026-03-02
+== overlapping 10:30-11:30 in Huddle ==
+  rejected: Huddle is taken 10:30-11:30 2026-03-02 by 'Design review'
+== back-to-back 11:00-11:30 is fine (half-open) ==
+  notify bob: invited to '1:1' in Huddle 11:00-11:30 2026-03-02
+== find a room for 3 people 10:15-10:45 ==
+  available: [Board]
+  notify alice: invited to 'Sync' in Board 10:15-10:45 2026-03-02
+  notify bob: invited to 'Sync' in Board 10:15-10:45 2026-03-02
+  notify cara: invited to 'Sync' in Board 10:15-10:45 2026-03-02
+  booked Board
+== weekly series, 3 occurrences, Focus 09:00-09:30 ==
+  notify alice: invited to 'Weekly 1:1' in Focus 09:00-09:30 2026-03-02
+  notify bob: invited to 'Weekly 1:1' in Focus 09:00-09:30 2026-03-02
+  notify alice: invited to 'Weekly 1:1' in Focus 09:00-09:30 2026-03-09
+  notify bob: invited to 'Weekly 1:1' in Focus 09:00-09:30 2026-03-09
+  notify alice: invited to 'Weekly 1:1' in Focus 09:00-09:30 2026-03-16
+  notify bob: invited to 'Weekly 1:1' in Focus 09:00-09:30 2026-03-16
+  series S5 -> 3 bookings
+  daily series rejected: Focus is taken 09:00-09:30 2026-03-02 by 'Weekly 1:1'
+== undo the design review booking ==
+  notify alice: 'Design review' on 10:00-11:00 2026-03-02 was cancelled
+  notify bob: 'Design review' on 10:00-11:00 2026-03-02 was cancelled
+  notify cara: 'Design review' on 10:00-11:00 2026-03-02 was cancelled
+  Huddle free 10:00-11:00 again? true
+== cancel the 1:1 then undo the cancel ==
+  notify bob: '1:1' on 11:00-11:30 2026-03-02 was cancelled
+  notify bob: invited to '1:1' in Huddle 11:00-11:30 2026-03-02
+  Huddle on day 2: [1:1]
+```
+
+## Extensions interviewers ask for
+
+| Ask | How the design absorbs it |
+|---|---|
+| "Pick rooms by floor / equipment, not just size." | Add fields to `Room`; make room choice a `RoomSelectionStrategy` passed to the scheduler. |
+| "Don't double-book **people**, either." | Keep a calendar per user too (same `TreeMap` + lock). Booking then needs the room lock and every attendee's lock — take them in a fixed order (sorted ids) to avoid deadlock. |
+| "Find the earliest free 30-minute slot today in any room." | Walk each room's `TreeMap` in order looking for a gap of 30 minutes or more; take the earliest across rooms. O(n) per room. |
+| "How many rooms do we need for this list of meetings?" | That's the DSA problem: sort starts and ends, or a min-heap of end times (see the [greedy cheatsheet](/learn/dsa/greedy-cheatsheet/)). |
+| "Real recurrence rules: every 2nd Tuesday, skip holidays, edit one occurrence." | Store an RRULE (RFC 5545 iCalendar) on a series, expand lazily within a horizon, keep per-occurrence exceptions. Conflict checks still run on expanded occurrences. |
+| "Persist to a database." | PostgreSQL can enforce no-overlap itself: a `tsrange` column with `EXCLUDE USING GIST (room WITH =, during WITH &&)` (needs `btree_gist`). The database then rejects the second of two racing inserts, even across app servers. |
+| "Run on several app servers." | The in-process lock no longer helps. Use the DB constraint above, or `SELECT ... FOR UPDATE` on the room row, or a per-room distributed lock. |
+| "Hold a room for 5 minutes while the user fills in details." | A `HOLD` booking with an expiry; a sweeper or lazy check releases expired holds. |
+| "Send reminders 10 minutes before." | Another listener that schedules a task on a `ScheduledExecutorService` when a booking is created and cancels it on cancellation. |
+
+## Common mistakes
+
+- **Closed intervals** (`end >= other.start`) — back-to-back meetings become conflicts.
+- **Wrong overlap test**, e.g. only checking whether the new start falls inside an existing meeting. It misses a new meeting that *contains* an existing one.
+- **Linear scan of all bookings** when the interviewer asked for efficient lookups. Use a sorted structure per room.
+- **Check-then-act without a lock** — "is free?" in one call and "insert" in another. Two threads double-book.
+- **One global lock** — correct but needlessly serializes unrelated rooms. Mention the trade-off if you choose it.
+- **Notifying inside the lock** — a slow listener stalls every booking for that room.
+- **Recurring meetings booked one by one** with no rollback, leaving half a series when occurrence 3 clashes.
+- **Trusting `findAvailableRooms` as a reservation.** It's a snapshot; the actual booking must re-check.
+- **Undo that skips validation** — restoring a cancelled booking by writing directly into the map can create a double booking.
+- **Mutable `Booking` objects shared with listeners**, which can then change a meeting's time without any conflict check.
+
+## Practice questions
+
+<Practice>
+
+<QA q="Why use half-open intervals [start, end) for bookings?" level="easy">
+
+So that a meeting ending at 10:00 and one starting at 10:00 don't conflict, which is what everyone expects of a calendar. Half-open intervals also tile cleanly: splitting a day into slots never counts a boundary minute twice, and the duration is simply `end - start`. The overlap test becomes `a.start < b.end && b.start < a.end`. PostgreSQL range types default to the same `[)` form.
+
+</QA>
+
+<QA q="State the overlap condition for two intervals and show it covers containment." level="easy">
+
+Two half-open intervals overlap iff `a.start < b.end && b.start < a.end`. Containment example: a = [9:00, 12:00), b = [10:00, 11:00). 9:00 is before 11:00 and 10:00 is before 12:00, so they overlap. A common wrong test — "does b.start fall inside a?" — handles this case but fails when the *new* interval contains the existing one, which is why you should use the symmetric form.
+
+</QA>
+
+<QA q="How does TreeMap floorEntry and ceilingEntry give an O(log n) conflict check?" level="medium">
+
+Bookings in one room are kept non-overlapping and sorted by start. For a new slot only two neighbours can clash: `floorEntry(start)` (latest booking starting at or before the new start) clashes if it ends after the new start; `ceilingEntry(start)` (earliest booking starting at or after the new start) clashes if it starts before the new end. Anything further away is separated by one of these neighbours. `TreeMap` is a red-black tree, so both lookups and the insert are O(log n).
+
+</QA>
+
+<QA q="Two users click Book on the same room and slot at the same instant. Walk through what happens in your design." level="scenario">
+
+Both calls reach `RoomCalendar.add` for that room. The room's `ReentrantLock` lets one in; it runs the floor/ceiling check, finds nothing, inserts, releases. The second thread then acquires the lock, its check finds the first booking via `floorEntry`, and it throws `BookingConflictException`. The second user sees "Huddle is taken by 'Design review'". Only the winner's attendees are notified, because notification happens after a successful insert. The test runs this race 2,000 times and never sees two winners.
+
+</QA>
+
+<QA q="Why lock per room instead of one global lock or a ConcurrentSkipListMap?" level="medium">
+
+A **global lock** is correct but makes bookings for unrelated rooms wait for each other. A **lock per room** matches the invariant: conflicts only exist within a room, so rooms can be booked in parallel. A **`ConcurrentSkipListMap`** makes each individual call thread-safe, but our critical section is a compound action (two lookups then an insert). Two threads can still both pass the check before either inserts. The compound action needs mutual exclusion.
+
+</QA>
+
+<QA q="findAvailableRooms said Huddle was free, but booking it failed. Is that a bug?" level="scenario">
+
+No. The search is a snapshot taken without holding locks across rooms; another thread may book Huddle between the search and the booking. The booking re-checks atomically, so correctness is preserved. `bookAnyRoom` handles this by catching the conflict and trying the next candidate. If you need "what I saw is what I get", add a short-lived **hold** (a tentative booking with an expiry) at search time.
+
+</QA>
+
+<QA q="How do you make a weekly series all-or-nothing, and why is that easy here?" level="medium">
+
+Expand the series into concrete occurrences and hand the whole list to `RoomCalendar.add`. Under the room lock it checks every occurrence first and inserts only if all are free; otherwise it throws and inserts nothing. It's easy because a series lives in **one room**, so one lock covers it. A series spanning rooms (or per-user calendars) would need several locks, taken in a fixed order.
+
+</QA>
+
+<QA q="Where does Observer fit, and why notify outside the lock?" level="easy">
+
+`BookingListener` with `onBooked` and `onCancelled`; `AttendeeNotifier` is one implementation, and email, Slack or calendar-sync would be others. The scheduler doesn't know who is listening (Open/Closed). Notification runs after the lock is released so a slow or failing listener can't block other bookings for that room, and listeners only ever see bookings that actually committed.
+
+</QA>
+
+<QA q="How does Command give you undo, and when can undo fail?" level="medium">
+
+Each action is an object with `execute()` and `undo()`. `BookCommand` remembers the booking it created and cancels it on undo; `CancelCommand` remembers the cancelled booking and restores it on undo. `CommandHistory` pushes only successful commands onto a stack. Undo of a cancel can fail if another user booked that slot in between — the restore goes through the same conflict check and throws instead of double-booking. In a shared system, undo is a new operation that can be rejected, not time travel.
+
+</QA>
+
+<QA q="The interviewer adds: attendees must not be double-booked either. What changes, and what new risk appears?" level="hard">
+
+Keep a calendar per **user** (same `TreeMap` + lock) and check every attendee plus the room before inserting. Now one booking needs **several locks**, so two bookings that share people could lock them in opposite orders and deadlock. Fix: acquire all needed locks in a global order (for example, sorted by id), check everything, insert everywhere, release. Alternatively use `tryLock` with a timeout and retry. Also decide the policy: hard reject, or warn and let the organizer proceed.
+
+</QA>
+
+<QA q="How would you enforce no-overlap if bookings live in PostgreSQL and you run several app servers?" level="hard">
+
+In-process locks don't span servers. Let the database enforce the invariant: store the slot as `tsrange` and add `EXCLUDE USING GIST (room_id WITH =, during WITH &&)` (with the `btree_gist` extension for the equality part). Of two racing inserts, the second fails with an exclusion-constraint violation, which you map to a conflict error. Alternatives: lock the room row with `SELECT ... FOR UPDATE` before checking, or use a distributed lock per room — both are weaker than a constraint the database itself guarantees.
+
+</QA>
+
+<QA q="How do you find the earliest 30-minute gap in a room between 9:00 and 18:00?" level="medium">
+
+Walk the room's bookings in start order within the window (the `TreeMap` gives them sorted). Keep a cursor starting at 9:00. For each booking, if `booking.start - cursor` is at least 30 minutes, return [cursor, cursor + 30). Otherwise move the cursor to `max(cursor, booking.end)`. After the loop, check the gap from the cursor to 18:00. O(k) for k bookings in the window; across rooms, take the earliest result.
+
+</QA>
+
+<QA q="Your weekly 09:00 meeting shows up an hour off after the clocks change for daylight saving. What went wrong?" level="scenario">
+
+The series was expanded with fixed 7-day durations on a time representation that doesn't know about daylight saving — for example, `Instant` plus 168 hours, or local times converted with a fixed offset. Across a DST change, "7 × 24 hours later" is not "same wall-clock time next week". Fix: store the zone, expand with `ZonedDateTime.plusWeeks(1)` (calendar arithmetic that keeps local time), and convert to `Instant` per occurrence. Our demo uses `LocalDateTime` for one office, which sidesteps zones but is not enough for a multi-region product.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="With half-open intervals, which pair of meetings conflicts?" options={["[9:00, 10:00) and [10:00, 11:00)", "[9:00, 10:00) and [9:59, 10:30)", "[9:00, 9:30) and [9:30, 9:45)", "[14:00, 15:00) and [15:00, 16:00)"]} answer={1}>
+
+9:00 is before 10:30 and 9:59 is before 10:00, so they overlap by one minute. The others are back-to-back, which half-open intervals allow.
+
+</MCQ>
+
+<MCQ q="A room's bookings are non-overlapping and stored in a TreeMap by start. How many existing bookings must you check for a new slot?" options={["All of them", "Only the one returned by floorEntry", "The floorEntry and ceilingEntry neighbours of the new start", "Only bookings on the same day"]} answer={2}>
+
+Non-overlap means only the immediate neighbours of the new start can clash; anything further is separated by them.
+
+</MCQ>
+
+<MCQ q="Which is the correct overlap test for half-open intervals a and b?" options={["a.start <= b.end && b.start <= a.end", "a.start < b.end && b.start < a.end", "a.start < b.start && a.end > b.end", "b.start is between a.start and a.end"]} answer={1}>
+
+Strict less-than on both sides gives half-open semantics. Option A treats touching meetings as conflicts; C detects only containment; D misses the case where b contains a.
+
+</MCQ>
+
+<MCQ q="Why is ConcurrentSkipListMap alone not enough to prevent double booking?" options={["It does not keep keys sorted", "It has no floor or ceiling methods", "Check-then-insert is a compound action, and two threads can both pass the check before either inserts", "It is slower than TreeMap"]} answer={2}>
+
+Per-call thread safety doesn't make a sequence of calls atomic. The compound action needs a lock (or a single atomic operation that includes the check).
+
+</MCQ>
+
+<MCQ q="What is the main benefit of a lock per room rather than one global lock?" options={["It prevents deadlock that a global lock causes", "Bookings for different rooms can proceed in parallel", "It removes the need to check for conflicts", "It makes findAvailableRooms exact"]} answer={1}>
+
+Conflicts only exist within a room, so independent rooms shouldn't serialize. A single global lock can't deadlock either; it's just slower under load.
+
+</MCQ>
+
+<MCQ q="A weekly series of 4 clashes on its 3rd occurrence. What should happen?" options={["Book occurrences 1, 2 and 4", "Book 1 and 2, then stop", "Book nothing and report the clash", "Book all 4 and notify the other organizer"]} answer={2}>
+
+All-or-nothing avoids half-created series that the user then has to clean up. The design checks every occurrence under the room lock before inserting any.
+
+</MCQ>
+
+<MCQ q="Undo of a cancel fails with a conflict. What does that tell you?" options={["The Command pattern was implemented wrongly", "Another booking took the slot after the cancel, and restore correctly refused to double-book", "The history stack was empty", "The room was deleted"]} answer={1}>
+
+Undo in a shared system is a new operation that must pass the same checks. Failing safely is correct behaviour.
+
+</MCQ>
+
+<MCQ q="Which PostgreSQL feature can enforce no overlapping bookings per room at the database level?" options={["A UNIQUE index on (room_id, start_time)", "An exclusion constraint using GiST with room WITH = and during WITH &&", "A CHECK constraint on start_time", "SERIALIZABLE isolation alone, with no constraint"]} answer={1}>
+
+An exclusion constraint rejects any two rows with the same room and overlapping ranges. A UNIQUE index only blocks identical start times. SERIALIZABLE can also catch the race but needs retries and is not a declarative guarantee on the table.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **Slots are half-open** [start, end). Overlap iff `a.start < b.end && b.start < a.end`. Back-to-back is fine.
+- **Per room: `TreeMap` from start to booking**, kept non-overlapping. Conflict check = `floorEntry(start)` ends after start, or `ceilingEntry(start)` starts before end. O(log n).
+- **Atomic check-and-insert under a per-room lock** — the only thing that prevents double booking. Different rooms don't block each other.
+- **Find room = snapshot**; book with re-check; on conflict try the next best-fit room.
+- **Recurring** = expand to concrete bookings with a `seriesId`; insert all-or-nothing under the one room lock.
+- **Observer** for attendee notifications, fired after commit and outside the lock.
+- **Command** for book/cancel with undo; undo of cancel re-runs the conflict check and may fail.
+- **Production**: PostgreSQL exclusion constraint on (`room WITH =`, `during WITH &&`) enforces no-overlap across servers.
+- **Say in the interview**: "A room's bookings never overlap, so only the two TreeMap neighbours can clash; I do that check and the insert under the room's lock, so two threads can never both win."
+
+## Go deeper
+
+- [TreeMap (Java 21 API) — floorEntry, ceilingEntry, log(n) guarantee](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/TreeMap.html)
+- [PostgreSQL range types and exclusion constraints](https://www.postgresql.org/docs/current/rangetypes.html)
+- [RFC 5545 — iCalendar (RRULE recurrence rules)](https://datatracker.ietf.org/doc/html/rfc5545)
+- [Interval merging (DSA)](/learn/dsa/interval-scheduling/)

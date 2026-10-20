@@ -1,12 +1,13 @@
 ---
 title: "Delivery Semantics: At-Least, At-Most, Exactly-Once, Idempotency, DLQ"
 phase: "04-messaging-kafka"
-order: 19
+order: 34
 tags: ["messaging"]
 premium: false
 previewParagraphs: 4
 estimatedMinutes: 7
-prerequisites: []
+prerequisites: ["kafka-deep"]
+summary: "What at-most-once, at-least-once and exactly-once really mean, and how idempotency and DLQs make at-least-once safe."
 ---
 
 ## Definition (interview-ready)
@@ -67,6 +68,8 @@ Since Kafka 0.11+:
 - **Transactions**: atomic write to multiple partitions/topics + atomic commit of consumer offsets. Either all writes + offset commit succeed, or none. Within Kafka, this is "exactly-once."
 - **Outside Kafka** (writes to a DB, calling an external API): you still need application-level idempotency.
 
+The mechanics — coordinator, commit markers, zombie fencing, `read_committed` — are in [Kafka Transactions & EOS](/learn/notes/kafka-transactions-eos/).
+
 ### Idempotency in practice
 
 A handler is idempotent if `handle(msg)` produces the same outcome whether called once or 100 times.
@@ -81,13 +84,16 @@ Patterns:
 
 - **Commit before processing** = at-most-once (loss on crash before processing).
 - **Commit after processing** = at-least-once (duplicate on crash after processing, before commit).
-- **Auto-commit** is usually "after every N records or every X seconds" — easy to misconfigure. Prefer **manual commit after processing**.
+- **Auto-commit** in Kafka is time-based: during `poll()`, every `auto.commit.interval.ms` (default 5 s), it commits the offsets returned by earlier polls — it doesn't know whether processing finished. Prefer **manual commit after processing**.
+- **Offsets in your DB**: store the consumed offset in the same local transaction as the business change and `seek()` to it on startup — offset and effect become atomic. See [Consumers & rebalancing](/learn/notes/kafka-consumer-rebalancing/) for commit APIs, retries and rebalance-induced duplicates.
 
 ### Producer reliability
 
 - `acks=0`: at-most-once. Producer doesn't wait. Fast, lossy.
 - `acks=1`: leader-only. Loss possible on leader failure before replication.
 - `acks=all` + `enable.idempotence=true`: at-least-once with broker-side dedupe (effectively exactly-once into the broker).
+
+See [Producer deep dive](/learn/notes/kafka-producer/) for batching, retries, `delivery.timeout.ms` and ordering under retries.
 
 ### Dead-letter queue (DLQ)
 
@@ -128,10 +134,8 @@ On duplicate delivery: the `INSERT` fails on conflict; business effect not appli
 ## Real-world examples
 
 - **Stripe**: idempotency keys on every API mutation. Payments would otherwise duplicate-charge cards. Their public doc on idempotency is a classic.
-- **Square**: similar — every write API requires a client-generated idempotency key.
-- **Shopify Cart**: cart updates are idempotent; clients retry freely.
-- **Uber dispatch**: event-driven; consumers idempotent on `tripId` + state machine.
-- **Kafka Streams**: built on Kafka transactions; provides exactly-once processing semantics inside the Kafka world.
+- **Square**: similar — payment-creating endpoints such as CreatePayment require a client-generated idempotency key.
+- **Kafka Streams**: built on Kafka transactions; `processing.guarantee=exactly_once_v2` provides exactly-once processing semantics inside the Kafka world.
 
 ## Common pitfalls
 
@@ -143,38 +147,139 @@ On duplicate delivery: the `INSERT` fails on conflict; business effect not appli
 - **Auto-commit + processing in worker thread**: race condition — offset committed before work done, work fails, message lost.
 - **Mistaken "kafka exactly-once = no app work"**: only Kafka-to-Kafka. If you write to a DB or call an external service, you still need idempotency.
 
-## Interview questions
+## Practice questions
 
-### Q1 — Easy: What does at-least-once delivery mean?
-The system guarantees no message is lost, but the same message may be delivered (and processed) more than once. The consumer must be idempotent for this to be safe.
+<Practice>
 
-### Q2 — Easy: Why is exactly-once hard?
-Any acknowledgment between sender and receiver can be lost. The sender doesn't know whether to retry; if it retries, the receiver may get a duplicate; if it doesn't, the message may be lost. Solving this without help from the application requires a transactional boundary.
+<QA q="Name the three delivery guarantees and how you get each one with Kafka." level="easy">
 
-### Q3 — Medium: How would you make a payment-charging consumer idempotent?
-Use the payment intent ID (or a client-provided idempotency key) as a unique key. In the same DB transaction: (1) try to insert the key into a `processed` table with unique constraint, (2) if conflict → message already processed, no-op, (3) else perform the charge and commit. If the charge calls an external API, pass the same idempotency key to the provider.
+- **At-most-once:** may lose, never duplicates. Use `acks=0` or fire-and-forget on the producer, or commit offsets *before* processing. Fine for metrics and telemetry.
+- **At-least-once:** never loses, may duplicate. Use `acks=all` with retries on the producer, and commit *after* processing on the consumer. This is the practical default, and it needs idempotent consumers.
+- **Exactly-once:** each message affects state once. Inside Kafka you get it with the idempotent producer plus transactions. Across external systems you approximate it with at-least-once plus idempotency.
 
-### Q4 — Medium: When should you commit Kafka offsets — before or after processing?
-**After** processing. Committing before means a crash mid-processing loses the message. Committing after means a crash before commit may re-deliver — but that's safe with an idempotent consumer.
+</QA>
 
-### Q5 — Medium: What is a DLQ and when do you send a message there?
-A dead-letter queue holds messages the consumer couldn't process after some number of retries. Send a message to DLQ when: it can't be deserialized (poison pill), it fails validation persistently, or it has exceeded retry budget. The main pipeline keeps moving; DLQ items are reviewed manually or by a separate process.
+<QA q="What does at-least-once delivery mean?" level="easy">
 
-### Q6 — Hard: Kafka claims exactly-once. Why isn't that enough for your application?
-Kafka's exactly-once is **end-of-line within Kafka**: an atomic produce + offset commit within the broker, with idempotent producers. If your consumer writes to an external system (Postgres, an HTTP API), the external write isn't part of the Kafka transaction. So you still need application-level idempotency on the external side.
+The system guarantees no message is lost, but the same message may be delivered (and processed) more than once. The consumer must be idempotent for that to be safe.
 
-### Q7 — Hard: Design retry + DLQ topology for a payment-event consumer.
+</QA>
+
+<QA q="Why is exactly-once hard?" level="easy">
+
+Any acknowledgment between sender and receiver can be lost. Then the sender doesn't know whether to retry: if it retries, the receiver may get a duplicate, and if it doesn't, the message may be lost. Solving this without help from the application needs a transactional boundary.
+
+</QA>
+
+<QA q="How would you make a payment-charging consumer idempotent?" level="medium">
+
+Use the payment intent ID (or a client-provided idempotency key) as a unique key. In one DB transaction:
+
+1. Try to insert the key into a `processed` table that has a unique constraint.
+2. If it conflicts, the message was already processed, so do nothing.
+3. Otherwise perform the charge and commit.
+
+If the charge calls an external API, pass the same idempotency key to the provider. The full design is in [Transactions & EOS](/learn/notes/kafka-transactions-eos/).
+
+</QA>
+
+<QA q="When should you commit Kafka offsets — before or after processing?" level="medium">
+
+**After** processing. Committing before means a crash mid-processing loses the message. Committing after means a crash before the commit may redeliver it, which is safe with an idempotent consumer. Details are in [Consumers & rebalancing](/learn/notes/kafka-consumer-rebalancing/).
+
+</QA>
+
+<QA q="What is a DLQ and when do you send a message there?" level="medium">
+
+A dead-letter queue holds messages the consumer couldn't process after some number of retries. Send a message there when it can't be deserialized (a poison pill), when it fails validation every time, or when it has used up its retry budget.
+
+The main pipeline keeps moving, and DLQ items are reviewed manually or by a separate process. Alert on DLQ depth and have replay tooling.
+
+</QA>
+
+<QA q="Kafka claims exactly-once. Why isn't that enough for your application?" level="hard">
+
+Kafka's exactly-once only covers what happens **inside Kafka**: an atomic produce plus offset commit, with idempotent producers. If your consumer writes to an external system (Postgres, an HTTP API), that write isn't part of the Kafka transaction, and an aborted or retried transaction runs it again. You still need application-level idempotency on the external side.
+
+</QA>
+
+<QA q="Design retry + DLQ topology for a payment-event consumer." level="hard">
+
 - Main topic: `payment.events`.
-- On transient failure (DB timeout, 5xx from provider): publish to `payment.events.retry.1` (delay 30s).
-- After max retries on a tier: escalate to `payment.events.retry.5` (delay 5min), then `.retry.15`.
-- After all retries fail: publish to `payment.events.dlq` and alert.
-- Each retry topic has its own consumer (or one consumer using delay-aware logic).
-- DLQ is monitored; entries require human review with a runbook.
-- Idempotency on the main topic so retries are safe.
+- On a transient failure (DB timeout, 5xx from the provider), publish to `payment.events.retry.1` (30 s delay).
+- When a tier runs out of retries, escalate to `payment.events.retry.5` (5 min delay), then `.retry.15`.
+- When all retries fail, publish to `payment.events.dlq` and alert.
+- Each retry topic has its own consumer that waits until the delay has passed.
+- The DLQ is monitored, and entries need human review with a runbook.
+- The main consumer is idempotent, so retries are safe.
 
-### Q8 — Hard: A bug causes the producer to publish duplicates and the consumer is not idempotent. How do you recover?
-Short term: stop the duplicate-producing service. Audit damage — query the downstream system for duplicate records (e.g., orders with same external ID). Manually correct affected rows. Pause replays.
-Long term: fix the producer (likely missing idempotency config or a retry bug); add idempotency to the consumer using a natural unique key (order ID + event type); add a `processed_events` table with unique index; alert on DLQ.
+Caveat: retry topics break per-key ordering. If payment events for one ID must apply in order, use bounded blocking retries, or park the whole key.
+
+</QA>
+
+<QA q="A bug causes the producer to publish duplicates and the consumer is not idempotent. How do you recover?" level="hard">
+
+**Short term:** stop the service that's producing duplicates. Assess the damage by querying the downstream system for duplicate records (for example, orders with the same external ID). Correct the affected rows by hand, and pause any replays.
+
+**Long term:** fix the producer, which is likely missing idempotence config or has a retry bug. Make the consumer idempotent using a natural unique key (order ID + event type) and a `processed_events` table with a unique index. Alert on the DLQ.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="A consumer commits its offset and then processes the record. It crashes mid-processing. What guarantee does this give?" options={["At-least-once", "At-most-once: the record is skipped after restart", "Exactly-once", "No guarantee; the record is processed twice"]} answer={1}>
+
+Committing before processing means the restarted consumer resumes after the record, so it is lost but never duplicated. Process-then-commit gives at-least-once.
+
+</MCQ>
+
+<MCQ q="How does Kafka's auto-commit decide when to commit offsets?" options={["After every N records", "After each record is processed successfully", "Only on consumer shutdown", "Time-based: during poll(), every auto.commit.interval.ms (default 5 s)"]} answer={3}>
+
+Auto-commit runs inside poll() on a timer and commits offsets returned by earlier polls without knowing whether processing finished. There is no record-count trigger.
+
+</MCQ>
+
+<MCQ q="Kafka transactions give exactly-once for which scope?" options={["Read-process-write flows that stay inside Kafka: produced records and consumed offsets commit atomically", "Any database write made by the consumer", "HTTP calls made by the consumer", "Emails sent by the consumer"]} answer={0}>
+
+Kafka EOS covers records and offsets within Kafka. Side effects in external systems are outside the transaction and still need idempotency.
+
+</MCQ>
+
+<MCQ q="Which mechanism dedupes producer retries on the broker?" options={["Consumer group offsets", "Log compaction", "Producer ID plus per-partition sequence numbers from the idempotent producer", "The DLQ"]} answer={2}>
+
+The idempotent producer stamps batches with a PID and sequence numbers so the broker can ack duplicates without rewriting them. Compaction keeps the latest value per key and is unrelated to retries.
+
+</MCQ>
+
+<MCQ q="An idempotency store keeps processed IDs with a 1-hour TTL, but clients may retry for up to 24 hours. What goes wrong?" options={["Nothing, TTLs do not affect dedup", "Retries arriving after the TTL are processed again as duplicates", "The store rejects all retries", "Messages go to the DLQ"]} answer={1}>
+
+Once the ID expires, a late retry looks new. The dedup window must exceed every retry window in the system.
+
+</MCQ>
+
+<MCQ q="Why is exactly-once hard in general between two unreliable parties?" options={["Disks are too slow", "Brokers cannot store message IDs", "TCP does not support acknowledgements", "A lost acknowledgement leaves the sender unable to tell whether to retry, risking either a duplicate or a loss"]} answer={3}>
+
+This is the two-generals problem: without a transactional boundary or idempotent receiver, the sender must choose between possible duplicates and possible loss.
+
+</MCQ>
+
+<MCQ q="What is the main risk of auto-commit when records are processed on a separate worker thread?" options={["Offsets can be committed before the worker finishes, so a crash loses those records", "Records are processed twice in every case", "The consumer cannot join a group", "Auto-commit is disabled for worker threads"]} answer={0}>
+
+poll() keeps committing on its timer regardless of worker progress, so a crash can skip unfinished records. That is why manual commit after processing is preferred.
+
+</MCQ>
+
+<MCQ q="For most production designs, what is the recommended default combination?" options={["At-most-once with no retries", "Exactly-once transactions for every external side effect", "At-least-once delivery with idempotent consumers and a monitored DLQ", "Auto-commit with acks=0"]} answer={2}>
+
+At-least-once never loses data, idempotency makes duplicates harmless, and a DLQ isolates poison messages. Kafka transactions do not cover external side effects, and the other options lose data.
+
+</MCQ>
+
+</Quiz>
 
 ## TL;DR cheat sheet
 
@@ -191,7 +296,7 @@ Long term: fix the producer (likely missing idempotency config or a retry bug); 
 
 - **Confluent**: ["Exactly-Once Semantics Are Possible: Here's How Kafka Does It"](https://www.confluent.io/blog/exactly-once-semantics-are-possible-heres-how-apache-kafka-does-it/).
 - **Stripe**: ["Designing robust and predictable APIs with idempotency"](https://stripe.com/blog/idempotency) — the canonical post.
-- **Martin Kleppmann**: ["Online Event Processing"](https://queue.acm.org/detail.cfm?id=3321612) — exactly-once realities.
+- **Martin Kleppmann et al.**: ["Online Event Processing"](https://martin.kleppmann.com/2019/05/01/olep-cacm.html) (CACM, 2019) — consistency via event logs instead of distributed transactions.
 - **DDIA Chapter 11** — Stream Processing.
-- **Confluent docs**: [Kafka transactions](https://docs.confluent.io/platform/current/streams/concepts.html#streams-developer-guide-processing-guarantees).
+- **Confluent docs**: [Kafka Streams processing guarantees](https://docs.confluent.io/platform/current/streams/concepts.html#processing-guarantees).
 - **AWS**: [SQS retry/DLQ patterns](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html).

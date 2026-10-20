@@ -1,7 +1,7 @@
 ---
 title: "Lakehouse: Iceberg, Delta Lake, Hudi"
 phase: "08-data-engineering"
-order: 54
+order: 81
 tags: []
 premium: false
 previewParagraphs: 4
@@ -79,7 +79,7 @@ Key features added:
 - **Hidden partitioning**: query layer derives partition from a function of timestamp; no manual `year=`/`month=` columns.
 - **Schema evolution**: by **field ID** (not by name) — safe rename, add, drop.
 - Catalogs: REST catalog, Hive metastore, AWS Glue, Snowflake — pluggable.
-- Query engine support: Spark, Trino/Presto, Flink, Snowflake (read), Athena, Databricks SQL.
+- Query engine support: Spark, Trino/Presto, Flink, Snowflake (read/write for Snowflake-managed Iceberg tables), Athena, Databricks SQL.
 
 ### Delta Lake
 
@@ -106,8 +106,8 @@ Key features added:
 | | Iceberg | Delta Lake | Hudi |
 |---|---|---|---|
 | Origin | Netflix | Databricks | Uber |
-| Engine support | broadest (Spark, Trino, Flink, Snowflake, Athena, ...) | best in Spark/Databricks | Spark, Hive, Presto |
-| Schema evolution | by field ID (safest) | by name | by name |
+| Engine support | broadest (Spark, Trino, Flink, Snowflake, Athena, ...) | best in Spark/Databricks | Spark, Flink, Hive, Presto/Trino |
+| Schema evolution | by field ID (safest) | by name (column mapping enables safe rename/drop) | by name |
 | Updates | snapshot-based | snapshot-based | CoW or MoR with indexes |
 | Time travel | yes | yes | yes |
 | CDC | recent additions | yes (CDF) | yes (built-in incremental queries) |
@@ -134,7 +134,7 @@ Delta: `OPTIMIZE table`. Iceberg: `RewriteDataFiles`. Hudi: clustering / compact
 
 ### Vacuum / garbage collection
 
-Old snapshot files accumulate. Vacuum cleans them up — but respect retention to preserve time travel.
+Old snapshot files accumulate. Vacuum (Delta `VACUUM`; Iceberg `expire_snapshots` + `remove_orphan_files`; Hudi cleaner) cleans them up — but respect retention to preserve time travel.
 
 ### Concurrency
 
@@ -170,7 +170,7 @@ Reader:
 - **Adobe**: Iceberg.
 - **Databricks customers**: Delta everywhere.
 - **Uber**: Hudi origin; ingestion-heavy use cases.
-- **Snowflake**: read Iceberg natively (since 2023).
+- **Snowflake**: native Iceberg tables (GA 2024).
 
 ## Common pitfalls
 
@@ -182,31 +182,137 @@ Reader:
 - **Querying without partition predicates**: scans whole table — defeats partitioning.
 - **Reusing partition columns as primary keys**: locked into bad design.
 
-## Interview questions
+## Practice questions
 
-### Q1: What problem does a lakehouse solve?
-The two-tier "data lake + warehouse" problem. Lakes (S3 Parquet) are cheap and open but lack ACID, schema enforcement, upserts. Warehouses solve those but are expensive and proprietary. Lakehouses add warehouse semantics (ACID, schema, upserts, time travel) on top of cheap object storage via a metadata layer.
+<Practice>
 
-### Q2: How does Iceberg achieve atomic commits?
-Each table version is a snapshot. Writer writes new Parquet files + new manifest, then atomically updates the table's snapshot pointer in the catalog. Readers see the old snapshot until the pointer flips. No partial state visible.
+<QA q="What problem does a lakehouse solve?" level="easy">
 
-### Q3: What is time travel in Delta/Iceberg?
-Each table version is preserved in metadata (and underlying files). Query as of a past version or timestamp. Useful for audit, reproducible ML, recovery from accidental writes. Bounded by vacuum retention.
+The two-tier 'data lake plus warehouse' problem. Lakes (Parquet on S3) are cheap and open but lack ACID, schema enforcement, and upserts. Warehouses have those but are expensive, proprietary, and duplicate data from the lake. A lakehouse adds warehouse semantics (ACID, schema, upserts, time travel) on top of cheap object storage through a metadata layer.
 
-### Q4: Iceberg vs Delta — when to pick which?
-Iceberg: broadest engine support (Trino, Snowflake, Spark, Flink, Athena), open governance, schema evolution by field ID. Pick if engine variety matters. Delta: best in Databricks/Spark world, mature, strong feature set, Delta Sharing for cross-org. Pick if you're in Databricks land. Both are excellent.
+</QA>
 
-### Q5: Hudi's Copy-on-Write vs Merge-on-Read.
-CoW: updates rewrite the entire Parquet file → slower writes, but reads are fast (just read Parquet). MoR: updates appended as delta logs → fast writes, reads must merge logs at query time (until compaction merges them). MoR for write-heavy, low-latency ingestion (CDC); CoW for read-heavy.
+<QA q="What is time travel in Delta/Iceberg?" level="easy">
 
-### Q6: How would you handle GDPR delete on a lakehouse table?
-Use the format's `DELETE` (Delta/Iceberg/Hudi all support row-level deletes). The format rewrites affected files / writes delete markers. Old snapshots still contain the row — run `VACUUM` to actually remove. Set retention carefully to balance time-travel vs compliance.
+Every table version stays in metadata, along with its underlying files, so you can query the table as of a past version or timestamp (`VERSION AS OF`, `TIMESTAMP AS OF`). It's useful for audits, reproducible ML, and recovering from bad writes. It only reaches back as far as vacuum/snapshot-expiry retention allows.
 
-### Q7: Concurrent streaming writers to one Iceberg table — what happens?
-Optimistic concurrency: each writer commits as a new snapshot; if the snapshot it based on isn't current, conflict → retry. For non-overlapping partitions, conflicts are rare. For high write-rate streaming, tune compaction and use a dedicated commit thread.
+</QA>
 
-### Q8: How would you compact small files in a lakehouse?
-Delta: `OPTIMIZE table` (optionally `ZORDER BY (col)`). Iceberg: `RewriteDataFiles` procedure. Schedule daily/hourly. Be aware of file rewrite cost (heavy I/O); run during low-traffic windows.
+<QA q="How does Iceberg achieve atomic commits?" level="medium">
+
+Each table version is an immutable snapshot. A writer writes new Parquet files, new manifests, a new manifest list and a new table metadata file, then atomically swaps the catalog's pointer to that metadata file (which names the current snapshot). Readers keep seeing the old snapshot until the pointer flips, so no partial state is ever visible.
+
+</QA>
+
+<QA q="What is Iceberg's hidden partitioning?" level="medium">
+
+The table declares partitioning as a transform of a column (for example the day of a timestamp), and Iceberg derives partition values itself. Users filter on the real column and the engine prunes partitions automatically; nobody maintains separate `year=`/`month=` columns or needs to know the layout. Delta has no direct equivalent: partition columns are explicit, though a partition column defined as a generated column (such as `CAST(event_time AS DATE)`) lets Delta add the partition filter for you.
+
+</QA>
+
+<QA q="Why does Iceberg track columns by field ID?" level="medium">
+
+Each column gets a permanent ID, and data files reference IDs, not names. Renames, adds, and drops just update the schema; old files are still read correctly. Formats that match by name can silently break readers on a rename. Delta needs column mapping enabled for safe rename/drop.
+
+</QA>
+
+<QA q="Hudi's Copy-on-Write vs Merge-on-Read." level="medium">
+
+CoW: updates rewrite the affected Parquet files, so writes are slower but reads are fast (plain Parquet). MoR: updates go to delta logs, so writes are fast, but reads must merge logs at query time until compaction. Use MoR for write-heavy, low-latency ingestion such as CDC; CoW for read-heavy tables.
+
+</QA>
+
+<QA q="Iceberg vs Delta — when to pick which?" level="medium">
+
+Iceberg: broadest engine support (Spark, Trino, Flink, Snowflake, Athena), open governance, field-ID schema evolution, hidden partitioning. Pick it when engine variety matters. Delta: best in Databricks/Spark, mature, with `MERGE INTO`, Z-ORDER, and Delta Sharing. Pick it if you're a Databricks shop. Both are excellent.
+
+</QA>
+
+<QA q="How do vacuum and time travel interact?" level="medium">
+
+Old snapshots keep their files around, so storage grows until you clean up: Delta `VACUUM`, Iceberg `expire_snapshots` plus `remove_orphan_files`, the Hudi cleaner. Cleanup deletes files older than the retention window, and time travel to those versions stops working. Too aggressive a vacuum breaks audits and recovery; too lax keeps data, including deleted PII, around too long.
+
+</QA>
+
+<QA q="How would you compact small files in a lakehouse?" level="medium">
+
+Delta: `OPTIMIZE table`, optionally `ZORDER BY (col)`. Iceberg: the `RewriteDataFiles` procedure. Hudi: clustering/compaction. The rewrite commits atomically like any other write. Schedule it hourly or daily, and because it's I/O-heavy, run it in low-traffic windows.
+
+</QA>
+
+<QA q="Concurrent streaming writers to one Iceberg table — what happens?" level="hard">
+
+Optimistic concurrency: each writer tries to commit a new snapshot. If the snapshot it started from is no longer current, the commit conflicts and retries against the new state. Writers touching different partitions rarely conflict. At high write rates, contention causes retries, so tune compaction and funnel commits through a dedicated committer.
+
+</QA>
+
+<QA q="How would you handle GDPR delete on a lakehouse table?" level="scenario">
+
+Run the format's `DELETE` (Delta, Iceberg, and Hudi all support row-level deletes); it rewrites affected files or writes delete markers. Old snapshots still contain the row, so you must also run `VACUUM` (Delta), `expire_snapshots` (Iceberg), or the cleaner (Hudi) to physically remove it. Set retention to balance time travel against the compliance deadline.
+
+</QA>
+
+<QA q="Spark writes an Iceberg table, but Trino doesn't see the new data. What do you check?" level="scenario">
+
+Most likely the engines use different catalogs, so Trino is resolving a different (or stale) current-snapshot pointer. All engines reading and writing a table must share one catalog: Glue, Hive metastore, or a REST catalog. Also confirm the Spark commit actually succeeded, since files written without a commit are invisible.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="When does a reader see the files written by an in-progress Iceberg write?" options={["As soon as each Parquet file lands in S3", "After the writer atomically swaps the snapshot pointer in the catalog", "After the next compaction", "After vacuum runs"]} answer={1}>
+
+Readers resolve the current snapshot from the catalog. New files are invisible until the pointer flips, which is what makes commits atomic.
+
+</MCQ>
+
+<MCQ q="A team must ingest high-rate CDC updates with low write latency. Which Hudi table type fits?" options={["Copy-on-Write", "Either; they behave the same", "Merge-on-Read", "Neither; Hudi is append-only"]} answer={2}>
+
+MoR appends updates to delta logs for fast writes and merges at read time or compaction. CoW rewrites files on every update.
+
+</MCQ>
+
+<MCQ q="After a GDPR DELETE on a Delta table, the row can still be read with time travel. What else is needed?" options={["Run VACUUM so old files past retention are physically removed", "Run OPTIMIZE", "Re-run the DELETE", "Nothing; time travel ignores deletes"]} answer={0}>
+
+DELETE creates a new version, but old versions still reference files with the row. VACUUM removes those files. OPTIMIZE only compacts.
+
+</MCQ>
+
+<MCQ q="Why can Iceberg rename a column safely?" options={["It rewrites all data files on rename", "It disallows renames", "It stores schemas in Parquet footers only", "Columns are tracked by permanent field IDs, not names"]} answer={3}>
+
+Data files reference field IDs, so a rename is a metadata change. No rewrite is needed.
+
+</MCQ>
+
+<MCQ q="What does Iceberg hidden partitioning give users?" options={["Partitions are encrypted", "Partition pruning from filters on the real column, with no manual partition columns", "No need for a catalog", "Automatic compaction"]} answer={1}>
+
+Iceberg derives partitions from transforms like day of a timestamp, so queries on the timestamp prune automatically.
+
+</MCQ>
+
+<MCQ q="A vacuum with very short retention runs nightly. What breaks?" options={["Atomic commits", "Schema evolution", "Time travel to older versions", "Hidden partitioning"]} answer={2}>
+
+Vacuum deletes files from versions older than retention, so those versions can't be queried any more. Commits and schema evolution are unaffected.
+
+</MCQ>
+
+<MCQ q="Two writers commit to the same Iceberg table at once. What happens to the one whose base snapshot is stale?" options={["Its commit conflicts and it retries against the new snapshot", "Both commits are merged automatically with no check", "The table is locked until an admin intervenes", "Its files are discarded silently"]} answer={0}>
+
+Iceberg uses optimistic concurrency: conflicts are detected at commit time and the losing writer retries.
+
+</MCQ>
+
+<MCQ q="A company uses Spark, Trino, Flink and Snowflake on the same tables. Which format is usually the safest pick?" options={["Delta Lake, because of Z-ORDER", "Hudi, because of indexes", "Plain Parquet with Hive partitions", "Iceberg, because of the broadest engine support"]} answer={3}>
+
+Iceberg has the widest multi-engine support and open governance. Delta fits best in Databricks; plain Parquet lacks ACID.
+
+</MCQ>
+
+</Quiz>
 
 ## TL;DR cheat sheet
 
@@ -222,7 +328,7 @@ Delta: `OPTIMIZE table` (optionally `ZORDER BY (col)`). Iceberg: `RewriteDataFil
 ## Go deeper
 
 - **Iceberg docs**: [iceberg.apache.org](https://iceberg.apache.org/docs/).
-- **Delta Lake docs**: [delta.io/docs](https://delta.io/docs/).
+- **Delta Lake docs**: [docs.delta.io](https://docs.delta.io/).
 - **Hudi docs**: [hudi.apache.org/docs](https://hudi.apache.org/docs/overview).
 - **Databricks blog**: many Delta and lakehouse posts.
 - **Netflix tech blog**: Iceberg origin story.

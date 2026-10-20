@@ -1,0 +1,558 @@
+---
+title: "Java Executors, CompletableFuture and Virtual Threads"
+phase: "13-java-spring"
+order: 129
+tags: ["java", "concurrency", "executors", "virtual-threads"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 22
+prerequisites: ["java-concurrency-locks", "os-processes-threads"]
+summary: "How Java runs tasks on threads: ThreadPoolExecutor internals and gotchas, pool sizing, CompletableFuture pipelines, ForkJoinPool work stealing, graceful shutdown, and when Java 21 virtual threads replace all of it."
+---
+
+## Definition (interview-ready)
+
+An **executor** separates *what* to run (a `Runnable` or `Callable` task) from *how* it runs (which thread, when, how many at once). The main implementation is `ThreadPoolExecutor`: a set of reusable **worker threads** plus a **work queue**. Tasks that can't run right away wait in the queue, and when both the threads and the queue are full, a **rejection policy** decides what happens.
+
+`CompletableFuture` (Java 8) lets you chain asynchronous steps (`thenApply`, `thenCompose`, `thenCombine`, `allOf`) and handle errors without blocking a thread to wait.
+
+**Virtual threads** (final in Java 21, JEP 444) are threads managed by the JVM instead of the OS. They are cheap enough to create millions of. When a virtual thread blocks on I/O, the JVM **unmounts** it from the OS thread it was running on (its **carrier**), so the carrier can run another virtual thread. That gives you the scalability of async code while you keep writing plain blocking code.
+
+How to say it in an interview: "Platform threads are expensive, so we pool them and size the pool carefully. Virtual threads are cheap, so we create one per task and never pool them. They help when tasks spend most of their time waiting on I/O, not when they're CPU-bound."
+
+## Why it matters
+
+Almost every Java backend runs on thread pools: the web server's request threads, the database connection pool's callers, `@Async` methods, Kafka consumers, schedulers. Many production incidents trace back to them:
+
+- An unbounded queue silently grows until the JVM runs out of memory.
+- A pool that never grows past its core size, because the queue never fills.
+- `CompletableFuture` chains that all run on the shared common pool and starve each other.
+- A shutdown that drops in-flight work.
+- Virtual threads adopted for a CPU-heavy job, with no gain.
+
+Interviewers ask about these because they show whether you've run Java services under real load.
+
+## Core concepts
+
+### Why thread pools
+
+Creating a platform thread (a Java thread backed one-to-one by an OS thread) is expensive. It needs a kernel call and reserves a stack (typically about 1 MB of address space by default on 64-bit Linux). Thousands of them cost memory and context switching. A pool:
+
+- **reuses** threads, so you don't pay creation cost per task,
+- **bounds** concurrency, so a traffic spike can't create unlimited threads,
+- gives you one place to apply **back-pressure** (queue limits and rejection), naming, and monitoring.
+
+### `ThreadPoolExecutor` parameters
+
+```java
+ThreadPoolExecutor pool = new ThreadPoolExecutor(
+    8,                                  // corePoolSize
+    32,                                 // maximumPoolSize
+    60, TimeUnit.SECONDS,               // keepAliveTime for threads above core
+    new ArrayBlockingQueue<>(1_000),    // bounded work queue
+    namedThreadFactory("orders-worker"),// name threads so dumps are readable
+    new ThreadPoolExecutor.CallerRunsPolicy()); // what to do when saturated
+```
+
+| Parameter | What it means |
+|---|---|
+| `corePoolSize` | Threads kept alive even when idle (unless `allowCoreThreadTimeOut(true)`). Created lazily as tasks arrive, unless you call `prestartAllCoreThreads()`. |
+| `maximumPoolSize` | Upper limit on threads. Extra threads above core are only created when the queue is full (see the gotcha below). |
+| `keepAliveTime` | How long a thread above core can sit idle before it's stopped. |
+| `workQueue` | Where tasks wait. Its type changes the pool's behaviour completely. |
+| `ThreadFactory` | Creates threads; use it to set names, daemon status and an uncaught exception handler. |
+| `RejectedExecutionHandler` | What happens when the pool is saturated or shut down. |
+
+### The "max only grows when the queue is full" gotcha
+
+`execute(task)` follows these steps, in this order:
+
+```
+ submit task
+     │
+     ▼
+ running threads less than core? ──yes──► start a NEW thread for this task
+     │ no                               (even if other threads are idle)
+     ▼
+ queue.offer(task) succeeds? ──yes──► task waits in the queue
+     │ no (queue full)
+     ▼
+ running threads less than max? ──yes──► start a NEW thread (above core)
+     │ no
+     ▼
+ REJECT → RejectedExecutionHandler
+```
+
+The surprise: **the pool prefers queuing to adding threads beyond core.** With an unbounded `LinkedBlockingQueue`, the queue is never full, so the pool **never grows past `corePoolSize`** and `maximumPoolSize` does nothing. People set core=10, max=100 with an unbounded queue and wonder why only 10 threads ever run while latency climbs.
+
+### Queue types
+
+| Queue | Behaviour | Typical use |
+|---|---|---|
+| `SynchronousQueue` | Holds nothing; hands each task directly to a free thread, or the offer fails. So the pool grows to max quickly, then rejects. | `newCachedThreadPool` (with max = `Integer.MAX_VALUE`, so threads are effectively unbounded) |
+| `LinkedBlockingQueue` (no capacity) | Unbounded. Pool stays at core size; queue grows without limit. | `newFixedThreadPool`, `newSingleThreadExecutor` |
+| `ArrayBlockingQueue` / bounded `LinkedBlockingQueue` | Bounded. Pool grows to max once the queue fills, then rejects. | Production services where you want back-pressure |
+| `PriorityBlockingQueue` | Unbounded, ordered by priority. | Priority work; watch for starvation |
+| `DelayedWorkQueue` (internal) | Ordered by scheduled time. | `ScheduledThreadPoolExecutor` |
+
+### Rejection policies
+
+| Policy | On saturation |
+|---|---|
+| `AbortPolicy` (**default**) | Throws `RejectedExecutionException`. |
+| `CallerRunsPolicy` | The submitting thread runs the task itself. This slows the producer down: natural back-pressure. |
+| `DiscardPolicy` | Silently drops the new task. |
+| `DiscardOldestPolicy` | Drops the oldest queued task and retries the submit. |
+
+Silent discard policies are rarely acceptable: anyone waiting on a dropped task's `Future` waits forever. If you use them, log and count every drop.
+
+### `Executors` factory pitfalls
+
+The `Executors` helpers are convenient but hide unbounded resources:
+
+| Factory | Hidden setup | Risk |
+|---|---|---|
+| `newFixedThreadPool(n)` | n threads, **unbounded** `LinkedBlockingQueue` | Queue grows until OutOfMemoryError when producers outpace workers |
+| `newSingleThreadExecutor()` | 1 thread, **unbounded** queue | Same |
+| `newCachedThreadPool()` | 0 core, `Integer.MAX_VALUE` max, `SynchronousQueue`, 60 s idle timeout | Unbounded **threads** under a burst of slow tasks |
+| `newScheduledThreadPool(n)` | n core threads, unbounded delay queue | Unbounded queue of scheduled tasks |
+| `newWorkStealingPool()` | A `ForkJoinPool` with parallelism = CPU count | Not for blocking I/O tasks |
+| `newVirtualThreadPerTaskExecutor()` (Java 21) | A new virtual thread per task, no queue | No built-in concurrency limit; add a `Semaphore` around scarce resources |
+
+For production services, build a `ThreadPoolExecutor` directly with a **bounded queue**, a **named thread factory**, and an explicit rejection policy.
+
+### Sizing a pool
+
+*Java Concurrency in Practice* gives the classic formula:
+
+```
+threads ≈ N_cpu × U_cpu × (1 + W / C)
+
+N_cpu  = number of cores (Runtime.getRuntime().availableProcessors())
+U_cpu  = target CPU utilization, 0..1
+W / C  = ratio of time a task spends waiting to time it spends computing
+```
+
+- **CPU-bound** work (W/C close to 0): about `N_cpu` threads, or `N_cpu + 1` to cover the odd page fault. More threads just add context switching.
+- **I/O-bound** work: if a task waits 90 ms on a database for every 10 ms of CPU, W/C = 9, so on 8 cores at full use you'd want about 8 × 10 = 80 threads.
+- **The real limit is often downstream**: a pool of 200 threads calling a database with a 20-connection pool just makes 180 threads queue for connections. Size to the bottleneck.
+- Measure with load tests: watch CPU, queue depth, active thread count and latency percentiles.
+- Use **separate pools (bulkheads)** for different kinds of work so a slow dependency can't eat every thread.
+
+### `Future` vs `CompletableFuture`
+
+`Future<T>` (Java 5) is a handle to a result you can only **block** for (`get()`), poll (`isDone()`), or cancel. You can't attach "then do this" or combine futures without tying up a thread.
+
+`CompletableFuture<T>` (Java 8) is both a `Future` and a `CompletionStage`: you build a pipeline of steps that run when earlier steps finish.
+
+```java
+CompletableFuture<User> userF =
+    CompletableFuture.supplyAsync(() -> userClient.get(id), ioPool);
+
+CompletableFuture<List<Order>> ordersF =
+    CompletableFuture.supplyAsync(() -> orderClient.list(id), ioPool);
+
+CompletableFuture<Profile> profileF = userF
+    .thenApply(user -> user.withMaskedEmail())                // map: T -> U
+    .thenCompose(user -> prefsClient.getAsync(user.id()))     // flatMap: T -> CompletableFuture<U>
+    .thenCombine(ordersF, (prefs, orders) -> new Profile(prefs, orders)) // join two independent futures
+    .orTimeout(2, TimeUnit.SECONDS)                           // Java 9+
+    .exceptionally(ex -> Profile.empty());                    // fallback value on any failure
+```
+
+| Method | Use it when |
+|---|---|
+| `thenApply(fn)` | Transform the result (like `map`). |
+| `thenAccept(consumer)` / `thenRun(r)` | Side effect, no new value. |
+| `thenCompose(fn)` | The next step itself returns a `CompletableFuture`; avoids a nested `CompletableFuture<CompletableFuture<U>>` (like `flatMap`). |
+| `thenCombine(other, fn)` | Merge two independent results once both are done. |
+| `allOf(f1, f2, ...)` | Wait for all; returns `CompletableFuture<Void>`, so read results from the original futures (with `join()`) afterwards. |
+| `anyOf(...)` | Complete when the first one does. |
+| `exceptionally(fn)` | Recover from an exception with a fallback value. |
+| `handle((value, ex) -> ...)` | Runs on success or failure; returns a new value. |
+| `whenComplete((value, ex) -> ...)` | Runs on success or failure for side effects (logging); keeps the original result or exception. |
+| `orTimeout` / `completeOnTimeout` (Java 9+) | Fail with `TimeoutException`, or complete with a default, after a deadline. |
+
+**Exception handling details:**
+
+- An exception in any stage skips the following `thenApply` / `thenCompose` steps and flows down to the first `exceptionally`, `handle` or `whenComplete`.
+- Inside those handlers the exception is often wrapped in a `CompletionException`; unwrap with `getCause()`.
+- `join()` throws an unchecked `CompletionException`; `get()` throws a checked `ExecutionException`. Both wrap the original cause.
+- `cancel(true)` does **not** interrupt the running task. It just completes the future with a `CancellationException`. The work keeps running unless you stop it yourself.
+
+**The common pool caveat:** every `*Async` method without an executor argument (`supplyAsync(supplier)`, `thenApplyAsync(fn)`) runs on `ForkJoinPool.commonPool()`. That pool is shared by the whole JVM (parallel streams use it too) and by default has `availableProcessors() - 1` threads. If the common pool's parallelism is below 2 (for example in a 1- or 2-CPU container) `CompletableFuture` creates a **new thread per task** instead. Blocking I/O on the common pool starves everyone else. **Always pass your own executor for blocking work.**
+
+Also note: non-async steps like `thenApply` run on whichever thread completes the previous stage, or on the calling thread if it's already done. Don't put slow work there unless you know which thread that is.
+
+### `ForkJoinPool` and work stealing
+
+`ForkJoinPool` is built for splitting a big job into many small sub-tasks (divide and conquer) and for many short tasks.
+
+```
+ worker 1 deque           worker 2 deque           worker 3 deque
+ ┌───────────────┐        ┌───────────────┐        ┌───────────────┐
+ │ t1 t2 t3 t4 ◄─┼ owner  │ t9            │        │ (empty)       │
+ └──▲────────────┘ pushes └───────────────┘        └───────────────┘
+    │ and pops at the top                                  │
+    └────────────── idle worker 3 steals from the OTHER end ┘
+```
+
+- Each worker has its **own deque** (double-ended queue). It pushes forked sub-tasks onto it and pops them from the same end, so it works on recent, cache-warm tasks with almost no contention.
+- An **idle worker steals** from the opposite end of another worker's deque, where the older, usually larger, tasks are.
+- When a task calls `join()` on a sub-task, the worker helps run other tasks instead of just sleeping.
+- Use `RecursiveTask<V>` (returns a value) or `RecursiveAction` (doesn't). It's the engine behind parallel streams and the default `CompletableFuture` executor.
+- It's designed for **non-blocking, CPU-bound** work. Blocking tasks waste its small number of threads (`ForkJoinPool.ManagedBlocker` exists for the rare case where you must block).
+
+### Graceful shutdown
+
+Executor threads are usually non-daemon, so a pool you forget to shut down can keep the JVM alive. The pattern from the `ExecutorService` Javadoc:
+
+```java
+void shutdownAndAwait(ExecutorService pool) {
+    pool.shutdown();                       // stop accepting new tasks; queued ones still run
+    try {
+        if (!pool.awaitTermination(30, TimeUnit.SECONDS)) {
+            pool.shutdownNow();            // interrupt running tasks, return never-started ones
+            if (!pool.awaitTermination(30, TimeUnit.SECONDS)) {
+                log.error("pool did not terminate");
+            }
+        }
+    } catch (InterruptedException e) {
+        pool.shutdownNow();
+        Thread.currentThread().interrupt(); // preserve the interrupt status
+    }
+}
+```
+
+- `shutdown()`: no new tasks, finish queued and running ones.
+- `shutdownNow()`: interrupts running tasks and returns the list of tasks that never started. Tasks that ignore interrupts keep running.
+- Since Java 19, `ExecutorService` is `AutoCloseable`: `close()` shuts down and waits for tasks to finish, so you can use try-with-resources.
+- Hook this into the app's lifecycle (a Spring `@PreDestroy`, a JVM shutdown hook) and keep the total under your orchestrator's grace period (for example Kubernetes' `terminationGracePeriodSeconds`).
+
+### Virtual threads (JEP 444, Java 21)
+
+A **virtual thread** is a `java.lang.Thread` that the JVM schedules, rather than one tied to an OS thread for its whole life. Its stack lives on the heap as an object that grows and shrinks as needed, so it costs very little memory while idle.
+
+```java
+// One virtual thread per task: the recommended style
+try (ExecutorService exec = Executors.newVirtualThreadPerTaskExecutor()) {
+    for (Request r : requests) {
+        exec.submit(() -> handle(r));      // plain blocking code inside
+    }
+}   // close() waits for all tasks
+
+Thread.startVirtualThread(() -> work());
+Thread vt = Thread.ofVirtual().name("worker-", 0).start(() -> work());
+```
+
+**Mounting and unmounting:**
+
+```
+ carrier threads (ForkJoinPool, about one per core)
+ ┌────────────┐   ┌────────────┐
+ │ carrier #1 │   │ carrier #2 │
+ └─────┬──────┘   └─────┬──────┘
+   runs VT-A          runs VT-C
+       │
+ VT-A calls socket.read() → no data yet
+       │
+ JVM copies VT-A's stack frames to the heap, UNMOUNTS it,
+ carrier #1 picks up VT-B immediately.
+       │
+ data arrives → VT-A is scheduled again, MOUNTS on any free carrier
+```
+
+- The scheduler is a dedicated work-stealing `ForkJoinPool` in FIFO mode (separate from the common pool). Its parallelism defaults to the number of available processors, tunable with `jdk.virtualThreadScheduler.parallelism`.
+- Most blocking operations in the JDK (sockets, `Thread.sleep`, `BlockingQueue.take`, `java.util.concurrent` locks) were reworked to unmount instead of blocking the carrier.
+- Virtual threads are always daemon threads and always have normal priority.
+
+**When they help:** high-concurrency, **I/O-bound** work where each task spends most of its time waiting: HTTP handlers calling databases and other services, fan-out calls, message consumers that call APIs. You get thread-per-request code with throughput close to async frameworks, plus readable stack traces and normal debugging.
+
+**When they don't:**
+
+- **CPU-bound work.** There are still only about as many carriers as cores. Virtual threads don't make computation faster; they make waiting cheaper.
+- **When the real limit is elsewhere.** A million virtual threads sharing a 50-connection DB pool still do 50 queries at a time. They will just queue in the pool.
+- Latency per request doesn't improve; throughput under concurrency does.
+
+### Pinning
+
+A virtual thread is **pinned** when it can't unmount while blocking, so it holds its carrier hostage. Enough pinned threads and the carriers run out.
+
+- **Java 21 to 23:** blocking inside a `synchronized` block or method pinned the carrier, as did blocking inside native code. The standard advice was to replace `synchronized` around long I/O with `ReentrantLock`, and to find pinning with `-Djdk.tracePinnedThreads` or the JFR event `jdk.VirtualThreadPinned`.
+- **Java 24+ (JEP 491):** virtual threads can now acquire, hold and release monitors independently of their carrier, so blocking inside `synchronized`, and `Object.wait()`, no longer pin. The `jdk.tracePinnedThreads` property was removed.
+- **Still pinned after JEP 491:** native frames (a native method or a Foreign Function and Memory API call that calls back into Java and then blocks), blocking during class loading, and blocking inside a class initializer or while waiting for another thread to initialize a class. The `jdk.VirtualThreadPinned` JFR event still reports these.
+
+How to say it in an interview: "On Java 21 the main pinning risk was `synchronized` around I/O, which JEP 491 fixed in JDK 24. If you're on 21 LTS, prefer `ReentrantLock` in hot blocking paths or upgrade."
+
+### Don't pool virtual threads
+
+A pool exists to share an expensive resource. Virtual threads aren't expensive, so pooling them only adds a queue and a limit you didn't want. Create **one virtual thread per task**.
+
+If you need to cap concurrency (for example, at most 20 calls to a rate-limited API), limit the **resource**, not the threads:
+
+```java
+private final Semaphore apiPermits = new Semaphore(20);
+
+Response call(Request r) throws InterruptedException {
+    apiPermits.acquire();
+    try {
+        return api.send(r);
+    } finally {
+        apiPermits.release();
+    }
+}
+```
+
+### `ThreadLocal` caveats
+
+Virtual threads support `ThreadLocal`, but the habits built around pools break:
+
+- **Per-thread caches don't work.** Code that caches an expensive object (a formatter, a buffer) in a `ThreadLocal` assumed a few hundred long-lived pool threads. With a new virtual thread per task, every task builds its own copy and throws it away: lots of allocation and no reuse.
+- **Memory**: a million virtual threads each holding a large thread-local value is a lot of heap.
+- **Prefer** passing context explicitly or using **`ScopedValue`** (final in JDK 25, JEP 506), which shares immutable data with a bounded lifetime and works well with child threads.
+
+### Structured concurrency (status)
+
+**Structured concurrency** treats a group of related subtasks as one unit: they start in a scope, the scope waits for them, and if one fails the others are cancelled, so no thread is left running in the background. The API is `StructuredTaskScope`.
+
+It is **still a preview API** (needs `--enable-preview`). It first previewed in JDK 21, was re-previewed in every release since, had its sixth preview in JDK 26 (JEP 525), and its seventh preview is delivered for JDK 27 (JEP 533), which reworks how `join()` reports failures. Because the API keeps changing between previews, check the JEP for your JDK version before relying on exact method names.
+
+The shape of the idea (JDK 27 preview style, illustrative):
+
+```java
+try (var scope = StructuredTaskScope.open()) {         // default: fail if any subtask fails
+    var user   = scope.fork(() -> userClient.get(id)); // each fork runs in a new virtual thread
+    var orders = scope.fork(() -> orderClient.list(id));
+    scope.join();                                      // wait; on failure, cancel the rest and throw
+    return new Profile(user.get(), orders.get());
+}
+```
+
+## How it works
+
+### Inside `ThreadPoolExecutor`
+
+- One `AtomicInteger` called `ctl` packs both the **run state** (RUNNING, SHUTDOWN, STOP, TIDYING, TERMINATED) and the **worker count**, so both can be checked and updated together with CAS.
+- Each `Worker` wraps a thread and runs a loop: take the first task, then repeatedly `getTask()` from the queue. Threads above core use `poll(keepAliveTime)`; if that times out, the worker exits.
+- `beforeExecute` / `afterExecute` hooks let subclasses add timing, MDC context or metrics.
+- If a task throws from `execute()`, the worker thread dies and is replaced. With `submit()`, the exception is captured in the returned `Future` and **nothing is logged unless someone calls `get()`**: a classic "silently failing task" bug.
+
+### Inside virtual threads
+
+- A virtual thread is a **continuation** (a resumable piece of code with its own stack) plus a scheduler. When it blocks, the JVM *yields* the continuation, saving its frames to the heap, and the carrier returns to the scheduler for other work.
+- Blocking I/O APIs were reimplemented to register interest with an OS readiness mechanism (epoll on Linux, kqueue on macOS) and park the virtual thread, then unpark it when the socket is ready.
+- Thread dumps from `jcmd <pid> Thread.dump_to_file -format=json <file>` include virtual threads; the classic `jstack` output does not list them.
+
+## Real-world examples
+
+- **Spring Boot 3.2+**: setting `spring.threads.virtual.enabled=true` (on Java 21+) makes embedded Tomcat and Jetty handle requests on virtual threads, and switches Spring's task executor for `@Async` to virtual threads too.
+- **JDK `HttpClient`**, JDBC drivers and most blocking libraries work unchanged on virtual threads; the gains show up when a service spends most of its time waiting on downstream calls.
+- **Parallel streams and `CompletableFuture.supplyAsync`** without an executor share `ForkJoinPool.commonPool()`, which is why blocking calls there can stall unrelated parts of the same JVM.
+
+## Common pitfalls
+
+- **`newFixedThreadPool` in production**: its unbounded queue hides overload until memory runs out. Use a bounded queue and a rejection policy.
+- **Setting max above core with an unbounded queue** and expecting growth. It never happens.
+- **`newCachedThreadPool` with slow tasks**: under a burst it can create thousands of threads.
+- **Blocking I/O on `ForkJoinPool.commonPool()`** via default `*Async` methods or parallel streams.
+- **Swallowed exceptions from `submit()`**: always `get()` the future, or wrap tasks to log failures, or handle them in a `CompletableFuture` stage.
+- **`allOf(...).join()` then forgetting that one failure** fails the whole thing: inspect each future, or handle per-future errors before combining.
+- **No timeouts**: a `CompletableFuture` waiting on a hung remote call never completes. Use `orTimeout` and client-side timeouts.
+- **Forgetting shutdown**: non-daemon pool threads keep the JVM alive, or a redeploy drops queued work.
+- **Pooling virtual threads** or using them for CPU-bound jobs.
+- **Relying on `ThreadLocal` caches** after switching to virtual threads.
+- **`synchronized` around I/O on Java 21 to 23** with virtual threads: pins carriers and can stall the app.
+- **Unbounded fan-out** with virtual threads: they are cheap, your database is not. Add a `Semaphore` or bounded connection pool.
+
+## Practice questions
+
+<Practice>
+
+<QA q="Why use a thread pool instead of creating a new thread per task?" level="easy">
+
+Platform threads map one-to-one to OS threads, which are expensive to create and each reserve a stack, and too many of them cause heavy context switching. A pool reuses a fixed set of threads, bounds concurrency so spikes can't create unlimited threads, and gives you one place to apply queue limits, rejection, naming and metrics. (Virtual threads change this: they're cheap enough to create per task.)
+
+</QA>
+
+<QA q="What's the difference between `execute()` and `submit()`?" level="easy">
+
+`execute(Runnable)` returns nothing; if the task throws, the exception goes to the thread's uncaught exception handler (usually printed) and the worker thread is replaced. `submit()` accepts a `Runnable` or `Callable` and returns a `Future`; exceptions are captured inside the `Future` and only surface when you call `get()`. So with `submit`, an ignored future means a silently failing task.
+
+</QA>
+
+<QA q="What are the built-in rejection policies and which is the default?" level="easy">
+
+`AbortPolicy` (default) throws `RejectedExecutionException`; `CallerRunsPolicy` runs the task on the submitting thread, which slows the producer and gives back-pressure; `DiscardPolicy` drops the new task silently; `DiscardOldestPolicy` drops the oldest queued task and retries. Silent drops are dangerous because anyone waiting on those tasks waits forever, so log and count them if you use them.
+
+</QA>
+
+<QA q="A pool has core 10, max 100 and an unbounded `LinkedBlockingQueue`. How many threads will it ever run?" level="medium">
+
+Ten. After the core threads exist, `ThreadPoolExecutor` always tries to queue before adding threads, and only adds threads beyond core when the queue rejects the offer. An unbounded queue never rejects, so the pool never grows and `maximumPoolSize` has no effect. To get growth, use a bounded queue (or a `SynchronousQueue`); or set core equal to the size you actually want and enable `allowCoreThreadTimeOut`.
+
+</QA>
+
+<QA q="Why are `Executors.newFixedThreadPool` and `newCachedThreadPool` considered risky in production?" level="medium">
+
+`newFixedThreadPool` (and `newSingleThreadExecutor`) use an unbounded `LinkedBlockingQueue`, so if tasks arrive faster than they're processed, the queue grows until OutOfMemoryError and latency grows with it. `newCachedThreadPool` uses a `SynchronousQueue` with max `Integer.MAX_VALUE`, so a burst of slow tasks creates an unbounded number of threads. Prefer a hand-built `ThreadPoolExecutor` with a bounded queue, a named `ThreadFactory` and an explicit rejection policy.
+
+</QA>
+
+<QA q="How do you size a thread pool for CPU-bound vs I/O-bound work?" level="medium">
+
+Use threads ≈ cores × target utilization × (1 + wait time / compute time). CPU-bound: about the number of cores (or cores + 1). I/O-bound: more, in proportion to the wait ratio; for example 8 cores with tasks waiting 90 ms per 10 ms of CPU gives about 80. Then cap by the real bottleneck, such as the DB connection pool or a downstream rate limit, use separate pools per dependency (bulkheads), and confirm with load tests watching CPU, queue depth and p99 latency.
+
+</QA>
+
+<QA q="Explain `thenApply` vs `thenCompose` vs `thenCombine`." level="medium">
+
+`thenApply` transforms the result with a plain function (map). `thenCompose` is for when the next step itself returns a `CompletableFuture`; it flattens the result so you don't get a future of a future (flatMap), which is how you chain dependent async calls. `thenCombine` waits for two independent futures and merges their results with a function, which is how you run calls in parallel and join them.
+
+</QA>
+
+<QA q="How does exception handling work in a `CompletableFuture` chain?" level="medium">
+
+A failure in any stage skips the following normal stages and propagates to the first handler: `exceptionally` (recover with a fallback value), `handle` (gets value or exception, returns a new value) or `whenComplete` (side effects, keeps the original outcome). Exceptions are often wrapped in `CompletionException`, so unwrap with `getCause()`. `join()` throws `CompletionException`; `get()` throws checked `ExecutionException`. Add `orTimeout` (Java 9+) so a hung dependency doesn't leave the future incomplete forever.
+
+</QA>
+
+<QA q="What is the problem with using `CompletableFuture.supplyAsync` without an executor?" level="medium">
+
+It runs on `ForkJoinPool.commonPool()`, which is shared by the whole JVM including parallel streams, and by default has `availableProcessors() - 1` threads. Blocking I/O there ties up those few threads and starves every other user of the pool. In small containers where parallelism would be below 2, `CompletableFuture` falls back to creating a new thread per task. For blocking calls, always pass a dedicated, bounded executor (or a virtual-thread executor).
+
+</QA>
+
+<QA q="How does work stealing in `ForkJoinPool` work?" level="hard">
+
+Each worker has its own deque. It pushes the sub-tasks it forks and pops from the same end, which keeps it on recent, cache-friendly work with little contention. When a worker runs out of tasks it steals from the other end of another worker's deque, taking older tasks, which tend to be bigger chunks of work. Joining a sub-task makes the worker help run other tasks instead of idling. This suits recursive divide-and-conquer and short CPU-bound tasks, not blocking I/O.
+
+</QA>
+
+<QA q="What are virtual threads and how do mounting and unmounting work?" level="hard">
+
+Virtual threads (final in Java 21, JEP 444) are `Thread` objects scheduled by the JVM onto a small pool of platform carrier threads (a FIFO work-stealing `ForkJoinPool`, about one per core). When a virtual thread hits a blocking operation such as a socket read, the JVM saves its stack frames to the heap and unmounts it, freeing the carrier to run another virtual thread. When the I/O is ready, the virtual thread is scheduled and mounts on any free carrier to continue. This makes blocking cheap, so you can have one virtual thread per request.
+
+</QA>
+
+<QA q="What is pinning, and what changed in JDK 24?" level="hard">
+
+Pinning is when a virtual thread can't unmount during a blocking operation, so it occupies its carrier. In Java 21 to 23 that happened when blocking inside `synchronized` or in native code, and enough of it could exhaust carriers; the advice was to use `ReentrantLock` instead and detect with `jdk.tracePinnedThreads` or the `jdk.VirtualThreadPinned` JFR event. JEP 491 (JDK 24) lets virtual threads hold monitors independently of their carrier, so `synchronized` and `Object.wait()` no longer pin. Pinning still happens for native frames that call back into Java and block, and for blocking during class loading or class initialization.
+
+</QA>
+
+<QA q="Why shouldn't you pool virtual threads, and how do you limit concurrency instead?" level="hard">
+
+Pools exist to share expensive resources, and virtual threads are cheap to create and discard; pooling adds a queue, a cap and stale `ThreadLocal` state with no benefit. Create one virtual thread per task (for example with `Executors.newVirtualThreadPerTaskExecutor()`). To protect a scarce resource, limit access to the resource itself with a `Semaphore`, a bounded connection pool or a rate limiter.
+
+</QA>
+
+<QA q="A service using `newFixedThreadPool(50)` for outbound calls slowly runs out of heap during a downstream outage, and latency climbs to minutes. Explain and fix." level="scenario">
+
+The downstream outage made each task block for a long time, so 50 workers were stuck while new tasks piled into the unbounded `LinkedBlockingQueue`. The queue grew without limit (heap) and every new task waited behind thousands of others (latency). Fix: a `ThreadPoolExecutor` with a bounded queue and an explicit rejection policy (fail fast or `CallerRunsPolicy`), timeouts on the outbound client, a circuit breaker to stop calling a dead dependency, and metrics plus alerts on queue depth and active threads.
+
+</QA>
+
+<QA q="You moved a Spring Boot service on Java 21 to virtual threads. Throughput went up, but under load it occasionally freezes completely. What do you check?" level="scenario">
+
+Suspect pinning: a JDBC driver, cache client or your own code doing blocking I/O inside `synchronized`, which on Java 21 to 23 pins carriers; once all carriers are pinned, nothing else runs. Check JFR `jdk.VirtualThreadPinned` events or run with `-Djdk.tracePinnedThreads=full`, and take a `jcmd Thread.dump_to_file` dump that includes virtual threads. Fixes: upgrade to JDK 24+ (JEP 491), upgrade libraries that replaced `synchronized` with `ReentrantLock`, or change hot paths yourself. Also check that the DB connection pool isn't the real bottleneck now that far more requests run at once, and cap fan-out with a `Semaphore`.
+
+</QA>
+
+<QA q="A batch job that resizes millions of images was moved to virtual threads and got no faster. Why?" level="scenario">
+
+Image resizing is CPU-bound. Virtual threads make waiting cheap, but they still run on about one carrier per core, so total compute capacity is unchanged; you just added scheduling overhead. Use a pool sized to the number of cores (or a `ForkJoinPool` or parallel stream for divide-and-conquer work). Keep virtual threads for parts that wait on I/O, such as downloading or uploading images.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="A ThreadPoolExecutor has core 4, max 16 and an ArrayBlockingQueue of capacity 100. Four tasks are running and 50 are queued. A new task arrives. What happens?" options={["A fifth thread is started", "The task is queued", "The task is rejected", "The task runs on the caller thread"]} answer={1}>
+
+At or above core size the executor prefers queuing, and the queue has room. A new thread above core is only created once the queue is full, and rejection only happens when the queue is full and max threads are running. CallerRuns only applies on rejection.
+
+</MCQ>
+
+<MCQ q="Which Executors factory method can create an effectively unbounded number of threads?" options={["newFixedThreadPool(10)", "newSingleThreadExecutor()", "newCachedThreadPool()", "newScheduledThreadPool(4)"]} answer={2}>
+
+newCachedThreadPool uses a SynchronousQueue with maximumPoolSize Integer.MAX_VALUE, so a burst of slow tasks keeps creating threads. The fixed and single-thread executors have bounded threads but unbounded queues; the scheduled pool has fixed core threads.
+
+</MCQ>
+
+<MCQ q="What does CallerRunsPolicy do when the pool is saturated?" options={["Throws RejectedExecutionException", "Runs the task on the thread that called execute, slowing down submission", "Drops the oldest queued task", "Creates a thread beyond maximumPoolSize"]} answer={1}>
+
+CallerRunsPolicy executes the rejected task on the submitting thread, which naturally throttles the producer. Throwing is AbortPolicy, dropping the oldest is DiscardOldestPolicy, and no policy exceeds max.
+
+</MCQ>
+
+<MCQ q="You have userFuture and need to call a method that returns a CompletableFuture of Orders using the user. Which method avoids a nested future?" options={["thenApply", "thenCompose", "thenAccept", "thenCombine"]} answer={1}>
+
+thenCompose flattens a function returning a CompletableFuture (flatMap). thenApply would give a future of a future, thenAccept returns no value, and thenCombine merges two already independent futures.
+
+</MCQ>
+
+<MCQ q="Where do CompletableFuture.supplyAsync(supplier) tasks run when no executor is given and the common pool parallelism is at least 2?" options={["A new platform thread per task", "The calling thread", "ForkJoinPool.commonPool()", "A virtual thread per task"]} answer={2}>
+
+The default async executor is ForkJoinPool.commonPool(). Only when its parallelism is below 2 does CompletableFuture fall back to a new thread per task. It never defaults to the caller or to virtual threads.
+
+</MCQ>
+
+<MCQ q="Which workload benefits most from switching to virtual threads?" options={["Matrix multiplication across all cores", "An HTTP service where each request waits on two database queries and a remote API call", "Video encoding", "A tight in-memory sorting loop"]} answer={1}>
+
+Virtual threads make blocking cheap, so they shine when tasks mostly wait on I/O. CPU-bound work like encoding, matrix math or sorting is limited by cores and gains nothing.
+
+</MCQ>
+
+<MCQ q="On JDK 24 or later, which of these can still pin a virtual thread to its carrier?" options={["Blocking on a socket read inside a synchronized block", "Calling Object.wait() inside synchronized", "Blocking inside a class's static initializer", "Blocking on ReentrantLock.lock()"]} answer={2}>
+
+JEP 491 (JDK 24) made synchronized and Object.wait unmount normally. Blocking during class initialization, class loading, or in native frames that call back into Java still pins. ReentrantLock never pinned.
+
+</MCQ>
+
+<MCQ q="What is the recommended way to limit a virtual-thread service to 20 concurrent calls to a partner API?" options={["Use Executors.newFixedThreadPool(20) of virtual threads", "Set jdk.virtualThreadScheduler.parallelism=20", "Guard the call with a Semaphore of 20 permits", "Use a ThreadLocal counter"]} answer={2}>
+
+Virtual threads shouldn't be pooled; limit the resource, not the threads, with a Semaphore (or a bounded client pool). Scheduler parallelism controls carrier threads, not API calls, and a ThreadLocal counter isn't shared between threads.
+
+</MCQ>
+
+<MCQ q="After pool.shutdown(), what happens to tasks already in the queue?" options={["They are discarded", "They are returned as a list", "They still run; only new submissions are rejected", "They are interrupted"]} answer={2}>
+
+shutdown stops accepting new tasks but lets queued and running tasks finish. shutdownNow interrupts running tasks and returns the never-started ones as a list.
+
+</MCQ>
+
+<MCQ q="What is the status of StructuredTaskScope (structured concurrency) as of JDK 26 and 27?" options={["Final since JDK 21", "Removed in JDK 25", "Still a preview API: sixth preview in JDK 26 and seventh in JDK 27", "Incubator module only"]} answer={2}>
+
+Structured concurrency first previewed in JDK 21 and has been re-previewed in every release since (JEP 525 in JDK 26, JEP 533 in JDK 27). It requires --enable-preview. Virtual threads, not structured concurrency, were finalized in JDK 21.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **Pool order**: below core → new thread; else queue; queue full → grow to max; else reject.
+- **Unbounded queue → pool never exceeds core**, and `maximumPoolSize` is ignored.
+- `newFixedThreadPool` / `newSingleThreadExecutor` = unbounded queue; `newCachedThreadPool` = unbounded threads. Build `ThreadPoolExecutor` yourself with a bounded queue, named threads and an explicit policy.
+- **Rejection**: Abort (default), CallerRuns (back-pressure), Discard, DiscardOldest.
+- **Sizing**: cores × utilization × (1 + W/C); CPU-bound ≈ cores; cap at the downstream bottleneck; bulkhead per dependency.
+- **`CompletableFuture`**: `thenApply` = map, `thenCompose` = flatMap, `thenCombine` = zip, `allOf` = wait for all. Handle errors with `exceptionally` / `handle`, set `orTimeout`, and **pass your own executor** for blocking work.
+- **`ForkJoinPool`**: per-worker deques, steal from the other end; CPU-bound divide and conquer.
+- **Shutdown**: `shutdown` → `awaitTermination` → `shutdownNow` → re-interrupt on `InterruptedException`. `ExecutorService` is `AutoCloseable` since Java 19.
+- **Virtual threads (Java 21)**: cheap, JVM-scheduled, unmount on blocking. Great for I/O-bound, useless for CPU-bound. **One per task, never pooled**; limit with a `Semaphore`.
+- **Pinning**: `synchronized` pinned on 21 to 23; fixed in **JDK 24 (JEP 491)**. Native frames and class initialization still pin.
+- Avoid `ThreadLocal` caches with virtual threads; consider `ScopedValue` (final in JDK 25).
+- **Structured concurrency**: still preview (JDK 26 JEP 525, JDK 27 JEP 533).
+
+## Go deeper
+
+- **JEP 444**: [Virtual Threads](https://openjdk.org/jeps/444).
+- **JEP 491**: [Synchronize Virtual Threads without Pinning](https://openjdk.org/jeps/491).
+- **JEP 533**: [Structured Concurrency (Seventh Preview)](https://openjdk.org/jeps/533).
+- **JEP 506**: [Scoped Values](https://openjdk.org/jeps/506).
+- **Javadoc**: [ThreadPoolExecutor](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ThreadPoolExecutor.html), [CompletableFuture](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CompletableFuture.html), [ExecutorService](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ExecutorService.html).
+- **Oracle guide**: [Virtual Threads (Java 21 core libraries)](https://docs.oracle.com/en/java/javase/21/core/virtual-threads.html).
+- **Book**: *Java Concurrency in Practice* (Goetz et al.), chapters 6 to 8 on task execution, cancellation and pool sizing.

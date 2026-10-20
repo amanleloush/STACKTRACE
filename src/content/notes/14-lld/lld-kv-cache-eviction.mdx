@@ -1,0 +1,854 @@
+---
+title: "LLD: In-Memory Key-Value Cache with Pluggable Eviction"
+phase: "14-lld"
+order: 146
+tags: ["lld", "machine-coding", "java", "caching", "design-patterns", "concurrency"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 40
+prerequisites: ["machine-coding-strategy", "behavioral-patterns", "structural-patterns", "java-concurrency-locks"]
+summary: "Build a thread-safe in-memory cache in Java 21 with swappable LRU, LFU (O(1) frequency buckets) and FIFO eviction, per-entry TTL with lazy and background expiry, and decorators for stats, logging and read-through loading."
+---
+
+## Problem statement
+
+> "Design and implement an in-memory key-value cache. It has a fixed capacity. When it is full and a new key arrives, one existing key must be evicted, and the eviction policy must be pluggable: support LRU, LFU and FIFO, and make it easy to add more. Entries can have a time-to-live. The cache will be used by many threads at once. We'd also like hit/miss metrics, optional logging, and a way to load missing values from the database automatically. Write working code and a demo."
+
+This is a classic 60–90 minute machine-coding round. It looks small, but it checks four things at once: **data-structure choice** (can you make every operation O(1)?), **pattern use** (Strategy and Decorator, used for the right reasons), **time handling** (TTL that can be tested without sleeping), and **thread safety** (the map and the eviction bookkeeping must never drift apart).
+
+If you have done the simpler [LRU cache and rate limiter](/learn/notes/lld-lru-cache-rate-limiter/) problem, this one is the "grown-up" version: the LRU logic becomes just one strategy among several.
+
+## Clarifying questions to ask
+
+Ask these in the first five minutes. The answers in brackets are sensible defaults to assume if the interviewer says "your call".
+
+| Question | Assumed answer |
+|---|---|
+| Is capacity counted in entries or in bytes? | **Entries.** Byte-weighing is an extension. |
+| Are keys and values any type? Can they be null? | Generic `K`, `V`. **Nulls rejected** — a null value would make "miss" and "cached null" look the same. |
+| Is TTL per cache or per entry? | **Both**: a default TTL for the cache, overridable per `put`. No TTL means "never expires". |
+| Does a read extend the TTL (sliding expiry)? | **No** — expire-after-write. Sliding expiry is an extension. |
+| Does overwriting a key count as an access? | **Yes** — it refreshes LRU recency and bumps LFU frequency. |
+| When full, should expired entries be freed before evicting a live one? | **Yes.** Throwing away a live entry while a dead one sits in memory is wasteful. |
+| Must expired entries be freed even if nobody reads them? | **Yes** — a background sweeper, otherwise memory leaks for write-once keys. |
+| Single-threaded or concurrent? | **Concurrent**, many readers and writers. |
+| Persistence, replication, distribution? | **Out of scope.** Single process, in memory. |
+| Callbacks when something is removed? | **Yes**, a removal listener with a cause (evicted, expired, replaced, explicit). |
+
+## Requirements
+
+**Functional (in scope)**
+
+- `get(key)`, `put(key, value)`, `put(key, value, ttl)`, `remove(key)`, `size()`.
+- Fixed capacity; on overflow, evict one entry chosen by the configured policy.
+- Policies: **LRU** (least recently used), **LFU** (least frequently used), **FIFO** (first in, first out). New policies must not require editing the cache class.
+- TTL: an entry is invisible from the moment it expires; memory is reclaimed lazily on read and periodically by a sweeper.
+- Removal listener notified with the cause.
+- Optional layers: hit/miss stats, logging, read-through loading from a backing store.
+
+**Non-functional**
+
+- O(1) `get`/`put` for every policy (amortised, excluding the occasional purge).
+- Thread-safe: no lost updates, size never above capacity, policy state always consistent with the map.
+- Testable time: no `Thread.sleep` in unit tests.
+
+**Out of scope:** persistence, clustering, size-in-bytes weighing, async refresh, off-heap storage.
+
+## Entities and relationships
+
+```
+               «interface»
+               Cache<K,V>  ◄───────────────────────────────┐
+         get / put / put(ttl) / remove / size               │ wraps (has-a)
+                  ▲                                         │
+      ┌───────────┴──────────────┐                 ┌────────┴─────────┐
+      │                          │                 │ ForwardingCache  │ (abstract decorator)
+ InMemoryCache<K,V>              │                 └──┬──────┬──────┬─┘
+  - capacity, defaultTtl         │                    │      │      │
+  - Map<K, Entry<V>>             │              StatsCache LoggingCache LoadingCache
+  - ReentrantLock                │              (hits/     (prints)   (loader +
+  - Clock  ────────────► java.time.Clock               misses)            in-flight map)
+  - RemovalListener ───► onRemoval(k, v, RemovalCause)
+  - EvictionPolicy<K> ─┐
+                       │      «interface» EvictionPolicy<K>
+                       └────► onInsert / onAccess / onRemove / evict
+                                   ▲         ▲          ▲
+                              LruPolicy  LfuPolicy  FifoPolicy
+
+ ExpirySweeper ──uses──► ScheduledExecutorService ──calls──► InMemoryCache.purgeExpired()
+ Entry<V> = record(value, expiresAtMillis)
+```
+
+Key relationships:
+
+- `InMemoryCache` **has-a** `EvictionPolicy` (composition, not inheritance) — that is the Strategy.
+- Every decorator **is-a** `Cache` and **has-a** `Cache` — that is the Decorator.
+- The policy only ever sees **keys**. The map owns values and expiry times. That separation keeps policies tiny.
+
+## Design patterns used and why
+
+| Pattern | Where | Why here |
+|---|---|---|
+| **Strategy** ([behavioral patterns](/learn/notes/behavioral-patterns/)) | `EvictionPolicy` with `LruPolicy`, `LfuPolicy`, `FifoPolicy` | The requirement literally says "pluggable". Each policy is a different *algorithm* for one decision: "who leaves?". Adding ARC or random eviction is a new class, no edits to the cache — the Open/Closed Principle from [SOLID](/learn/notes/solid-principles/). |
+| **Decorator** ([structural patterns](/learn/notes/structural-patterns/)) | `StatsCache`, `LoggingCache`, `LoadingCache` over `ForwardingCache` | Stats, logging and read-through are *cross-cutting* and optional. Decorators let you stack any subset in any order without a subclass explosion (`LoggingStatsLoadingLruCache`…). |
+| **Observer** (light) | `RemovalListener` | Callers react to evictions and expiries (metrics, write-behind, debugging) without the cache knowing who they are. |
+| **Dependency injection** of `Clock` | `InMemoryCache` constructor | Time becomes an input. Tests move a `ManualClock` forward instead of sleeping. |
+
+Why not Template Method for policies (an abstract `AbstractCache` with an abstract `evict()`)? Because then the cache *is* a policy, and you can't swap the policy at construction time or reuse it elsewhere. Composition wins.
+
+## Solution walkthrough
+
+### Step 1 — the API and the removal cause
+
+Start with the smallest interface the caller needs. `get` returns `Optional<V>` so a miss is explicit. `RemovalCause` makes the listener useful: an `EVICTED` spike means the cache is too small, an `EXPIRED` spike means TTLs are short.
+
+### Step 2 — the eviction Strategy
+
+The policy interface has four hooks: `onInsert`, `onAccess`, `onRemove`, `evict`. The cache calls them; the policy keeps whatever bookkeeping it needs.
+
+**LRU.** A `LinkedHashSet` keeps insertion order and supports O(1) remove and add. "Touching" a key is remove-then-add, which moves it to the tail. The head is the least recently used key. (Java's `LinkedHashMap` in access-order mode does the same thing internally; using it directly as the whole cache is the shortcut in the [LRU cache note](/learn/notes/lld-lru-cache-rate-limiter/).)
+
+**FIFO.** The same structure, but `onAccess` does nothing. Reads never save a key.
+
+**LFU in O(1).** The naive approach — a min-heap ordered by count — costs O(log n) per access. The O(1) version (described by Matani, Shah and Mitra) uses **frequency buckets**:
+
+```
+freq:     { a→3, b→1, c→1, d→2 }
+buckets:  1 → [b, c]      ← minFreq = 1   (oldest first inside a bucket)
+          2 → [d]
+          3 → [a]
+```
+
+- **Access** a key with count f: remove it from bucket f, add it to bucket f+1. If bucket f is now empty and f was `minFreq`, then `minFreq` becomes f+1 (the key we just moved is there).
+- **Insert**: count 1, bucket 1, `minFreq = 1`. A new key is always the least frequent.
+- **Evict**: take the first key of bucket `minFreq`. Because buckets are `LinkedHashSet`s, ties are broken by recency — the least recently touched key among the least frequent goes first.
+- **Explicit remove / expiry** is the one awkward case: if it empties the `minFreq` bucket, we recompute `minFreq` as the smallest remaining bucket key. That's O(number of distinct counts), but it only happens on removal, not on the hot `get` path. (You can note this trade-off in the interview.)
+
+### Step 3 — the core store
+
+`InMemoryCache` holds a `HashMap` of `Entry` records (`value`, `expiresAtMillis`) and **one** `ReentrantLock`. Why one lock and not a `ConcurrentHashMap`? Because every `get` in LRU and LFU **mutates the policy**. The map update and the policy update must happen together, atomically. Two separately thread-safe structures don't make the pair thread-safe — see the check-then-act discussion in [Java locks](/learn/notes/java-concurrency-locks/).
+
+`put` flow:
+
+1. Compute `expiresAt` from the injected `Clock` (or `Long.MAX_VALUE` for "no TTL").
+2. Put into the map. If the key existed, it's an overwrite: tell the policy it was accessed, fire `REPLACED`, done — size didn't change.
+3. If the map is now over capacity, first purge expired entries (they're dead anyway).
+4. Still over capacity? Ask the policy for a victim, remove it from the map, fire `EVICTED`.
+5. Tell the policy about the new key.
+
+`get` flow: look up; if missing return empty; **if expired, remove it now and return empty** (lazy expiry); otherwise tell the policy it was accessed and return the value.
+
+Expiry uses `now >= expiresAt`, so the entry's life is the half-open interval [writtenAt, writtenAt + ttl). At exactly `ttl` it's gone. Pick one rule and test it.
+
+### Step 4 — the background sweeper
+
+Lazy expiry alone leaks memory for keys that are written once and never read again. `ExpirySweeper` uses a single-thread `ScheduledExecutorService` with `scheduleAtFixedRate` to call `purgeExpired()`. Two details matter:
+
+- **Catch exceptions inside the task.** The JDK docs say that if a periodic task throws, *subsequent executions are suppressed* — your sweeper silently stops forever.
+- **Daemon thread + `AutoCloseable`.** The sweeper must not keep the JVM alive, and tests must be able to stop it.
+
+Also from the docs: a fixed-rate task that runs longer than its period is not run concurrently with itself; later runs just start late. So a slow sweep can't pile up.
+
+### Step 5 — the decorators
+
+`ForwardingCache` forwards every call to a delegate. Each concrete decorator overrides only what it cares about:
+
+- `StatsCache` — counts hits and misses in `LongAdder`s (cheap under contention).
+- `LoggingCache` — prints gets and puts.
+- `LoadingCache` — on a miss, calls the loader, stores the result, returns it. Concurrent misses for the **same** key share one load through a `ConcurrentHashMap` of in-flight `CompletableFuture`s, so 100 threads missing "hot-key" cause one database call, not 100 (this is the cache-stampede problem from [cache stampede and TTL](/learn/notes/cache-stampede-ttl/)).
+
+**Order matters.** In the demo, `StatsCache` wraps the core store directly, so it counts real store hits and misses. If you put `StatsCache` *outside* `LoadingCache`, every call would look like a hit, because the loader hides misses from the caller.
+
+## Full solution code
+
+One file, Java 21. Save as `Main.java`, run `javac Main.java && java Main`.
+
+```java
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.LongAdder;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Function;
+
+// ---------- Public API ----------
+interface Cache<K, V> {
+    Optional<V> get(K key);
+    void put(K key, V value);                 // uses the default TTL (may be "never expires")
+    void put(K key, V value, Duration ttl);
+    boolean remove(K key);
+    int size();
+}
+
+enum RemovalCause { EXPLICIT, REPLACED, EXPIRED, EVICTED }
+
+@FunctionalInterface
+interface RemovalListener<K, V> {
+    void onRemoval(K key, V value, RemovalCause cause);
+}
+
+// ---------- Strategy: which key leaves when the cache is full ----------
+interface EvictionPolicy<K> {
+    void onInsert(K key);   // a brand-new key was added
+    void onAccess(K key);   // an existing key was read or overwritten
+    void onRemove(K key);   // a key left for any reason other than eviction
+    K evict();              // choose a victim, stop tracking it, return it
+}
+
+/** Least Recently Used: LinkedHashSet keeps keys in recency order; move-to-tail is O(1). */
+final class LruPolicy<K> implements EvictionPolicy<K> {
+    private final LinkedHashSet<K> order = new LinkedHashSet<>();
+    public void onInsert(K key) { order.add(key); }
+    public void onAccess(K key) { order.remove(key); order.add(key); }
+    public void onRemove(K key) { order.remove(key); }
+    public K evict() {
+        Iterator<K> it = order.iterator();
+        K victim = it.next();             // head = least recently used
+        it.remove();
+        return victim;
+    }
+}
+
+/** First In First Out: reads do not change the order. */
+final class FifoPolicy<K> implements EvictionPolicy<K> {
+    private final LinkedHashSet<K> order = new LinkedHashSet<>();
+    public void onInsert(K key) { order.add(key); }
+    public void onAccess(K key) { /* FIFO ignores access */ }
+    public void onRemove(K key) { order.remove(key); }
+    public K evict() {
+        Iterator<K> it = order.iterator();
+        K victim = it.next();
+        it.remove();
+        return victim;
+    }
+}
+
+/**
+ * Least Frequently Used in O(1): keys live in frequency buckets.
+ * Ties inside a bucket are broken by recency (oldest first), because each bucket is a LinkedHashSet.
+ */
+final class LfuPolicy<K> implements EvictionPolicy<K> {
+    private final Map<K, Integer> freq = new HashMap<>();
+    private final Map<Integer, LinkedHashSet<K>> buckets = new HashMap<>();
+    private int minFreq = 0;
+
+    public void onInsert(K key) {
+        freq.put(key, 1);
+        buckets.computeIfAbsent(1, f -> new LinkedHashSet<>()).add(key);
+        minFreq = 1;                                       // a new key always has the lowest count
+    }
+    public void onAccess(K key) {
+        int f = freq.get(key);
+        LinkedHashSet<K> bucket = buckets.get(f);
+        bucket.remove(key);
+        if (bucket.isEmpty()) {
+            buckets.remove(f);
+            if (minFreq == f) minFreq = f + 1;             // the key we moved was the last at minFreq
+        }
+        freq.put(key, f + 1);
+        buckets.computeIfAbsent(f + 1, x -> new LinkedHashSet<>()).add(key);
+    }
+    public void onRemove(K key) {
+        Integer f = freq.remove(key);
+        if (f == null) return;
+        LinkedHashSet<K> bucket = buckets.get(f);
+        bucket.remove(key);
+        if (bucket.isEmpty()) {
+            buckets.remove(f);
+            // minFreq may now be stale; recompute lazily (rare path: explicit delete / expiry)
+            if (f == minFreq) minFreq = buckets.isEmpty() ? 0 : Collections.min(buckets.keySet());
+        }
+    }
+    public K evict() {
+        LinkedHashSet<K> bucket = buckets.get(minFreq);
+        Iterator<K> it = bucket.iterator();
+        K victim = it.next();
+        it.remove();
+        if (bucket.isEmpty()) buckets.remove(minFreq);
+        freq.remove(victim);
+        return victim;    // minFreq is reset by the onInsert that always follows an eviction
+    }
+}
+
+// ---------- Core store ----------
+final class InMemoryCache<K, V> implements Cache<K, V> {
+    private record Entry<V>(V value, long expiresAtMillis) {
+        boolean isExpired(long now) { return expiresAtMillis != Long.MAX_VALUE && now >= expiresAtMillis; }
+    }
+
+    private final int capacity;
+    private final Duration defaultTtl;     // null = entries never expire by default
+    private final EvictionPolicy<K> policy;
+    private final Clock clock;
+    private final RemovalListener<K, V> listener;
+    private final Map<K, Entry<V>> map = new HashMap<>();
+    private final ReentrantLock lock = new ReentrantLock(); // one lock: map + policy must change together
+
+    InMemoryCache(int capacity, Duration defaultTtl, EvictionPolicy<K> policy,
+                  Clock clock, RemovalListener<K, V> listener) {
+        if (capacity <= 0) throw new IllegalArgumentException("capacity must be positive");
+        this.capacity = capacity;
+        this.defaultTtl = defaultTtl;
+        this.policy = Objects.requireNonNull(policy);
+        this.clock = Objects.requireNonNull(clock);
+        this.listener = listener != null ? listener : (k, v, c) -> { };
+    }
+
+    @Override public Optional<V> get(K key) {
+        Objects.requireNonNull(key);
+        lock.lock();
+        try {
+            Entry<V> e = map.get(key);
+            if (e == null) return Optional.empty();
+            if (e.isExpired(clock.millis())) {             // lazy expiry on read
+                removeLocked(key, RemovalCause.EXPIRED);
+                return Optional.empty();
+            }
+            policy.onAccess(key);
+            return Optional.of(e.value());
+        } finally { lock.unlock(); }
+    }
+
+    @Override public void put(K key, V value) { put(key, value, defaultTtl); }
+
+    @Override public void put(K key, V value, Duration ttl) {
+        Objects.requireNonNull(key);
+        Objects.requireNonNull(value);
+        if (ttl != null && (ttl.isNegative() || ttl.isZero())) throw new IllegalArgumentException("ttl must be positive");
+        long expiresAt = ttl == null ? Long.MAX_VALUE : clock.millis() + ttl.toMillis();
+        lock.lock();
+        try {
+            Entry<V> old = map.put(key, new Entry<>(value, expiresAt));
+            if (old != null) {
+                policy.onAccess(key);
+                listener.onRemoval(key, old.value(), RemovalCause.REPLACED);
+                return;
+            }
+            if (map.size() > capacity) {
+                purgeExpiredLocked();                      // prefer dropping dead entries over live ones
+                if (!map.containsKey(key)) return;         // the new entry itself expired (sub-ms TTL): don't track it
+            }
+            if (map.size() > capacity) {
+                K victim = policy.evict();
+                Entry<V> gone = map.remove(victim);
+                listener.onRemoval(victim, gone.value(), RemovalCause.EVICTED);
+            }
+            policy.onInsert(key);
+        } finally { lock.unlock(); }
+    }
+
+    @Override public boolean remove(K key) {
+        lock.lock();
+        try { return removeLocked(key, RemovalCause.EXPLICIT); }
+        finally { lock.unlock(); }
+    }
+
+    @Override public int size() {
+        lock.lock();
+        try { return map.size(); } finally { lock.unlock(); }
+    }
+
+    /** Called by the background sweeper. Returns how many entries were dropped. */
+    int purgeExpired() {
+        lock.lock();
+        try { return purgeExpiredLocked(); } finally { lock.unlock(); }
+    }
+
+    private int purgeExpiredLocked() {
+        long now = clock.millis();
+        int removed = 0;
+        Iterator<Map.Entry<K, Entry<V>>> it = map.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<K, Entry<V>> me = it.next();
+            if (me.getValue().isExpired(now)) {
+                it.remove();
+                policy.onRemove(me.getKey());
+                listener.onRemoval(me.getKey(), me.getValue().value(), RemovalCause.EXPIRED);
+                removed++;
+            }
+        }
+        return removed;
+    }
+
+    private boolean removeLocked(K key, RemovalCause cause) {
+        Entry<V> e = map.remove(key);
+        if (e == null) return false;
+        policy.onRemove(key);
+        listener.onRemoval(key, e.value(), cause);
+        return true;
+    }
+}
+
+/** Periodic sweeper so keys nobody reads again still get freed. */
+final class ExpirySweeper implements AutoCloseable {
+    private final ScheduledExecutorService scheduler;
+
+    ExpirySweeper(InMemoryCache<?, ?> cache, Duration period) {
+        scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "cache-sweeper");
+            t.setDaemon(true);                             // never keeps the JVM alive
+            return t;
+        });
+        long ms = period.toMillis();
+        scheduler.scheduleAtFixedRate(() -> {
+            try { cache.purgeExpired(); }
+            catch (RuntimeException e) { /* swallow: an exception would cancel future runs */ }
+        }, ms, ms, TimeUnit.MILLISECONDS);
+    }
+
+    @Override public void close() { scheduler.shutdownNow(); }
+}
+
+// ---------- Decorators: cross-cutting concerns wrapped around any Cache ----------
+abstract class ForwardingCache<K, V> implements Cache<K, V> {
+    protected final Cache<K, V> delegate;
+    ForwardingCache(Cache<K, V> delegate) { this.delegate = delegate; }
+    public Optional<V> get(K key) { return delegate.get(key); }
+    public void put(K key, V value) { delegate.put(key, value); }
+    public void put(K key, V value, Duration ttl) { delegate.put(key, value, ttl); }
+    public boolean remove(K key) { return delegate.remove(key); }
+    public int size() { return delegate.size(); }
+}
+
+record CacheStats(long hits, long misses) {
+    double hitRate() { long t = hits + misses; return t == 0 ? 0.0 : (double) hits / t; }
+}
+
+final class StatsCache<K, V> extends ForwardingCache<K, V> {
+    private final LongAdder hits = new LongAdder(), misses = new LongAdder();
+    StatsCache(Cache<K, V> delegate) { super(delegate); }
+    @Override public Optional<V> get(K key) {
+        Optional<V> v = delegate.get(key);
+        (v.isPresent() ? hits : misses).increment();
+        return v;
+    }
+    CacheStats stats() { return new CacheStats(hits.sum(), misses.sum()); }
+}
+
+final class LoggingCache<K, V> extends ForwardingCache<K, V> {
+    private final String name;
+    LoggingCache(String name, Cache<K, V> delegate) { super(delegate); this.name = name; }
+    @Override public Optional<V> get(K key) {
+        Optional<V> v = delegate.get(key);
+        System.out.println("[" + name + "] get " + key + " -> " + v.orElse(null));
+        return v;
+    }
+    @Override public void put(K key, V value, Duration ttl) {
+        System.out.println("[" + name + "] put " + key + (ttl == null ? "" : " ttl=" + ttl.toMillis() + "ms"));
+        delegate.put(key, value, ttl);
+    }
+}
+
+/** Read-through: on a miss, load from the source of truth. Concurrent misses for one key share one load. */
+final class LoadingCache<K, V> extends ForwardingCache<K, V> {
+    private final Function<K, V> loader;
+    private final ConcurrentHashMap<K, CompletableFuture<V>> inFlight = new ConcurrentHashMap<>();
+
+    LoadingCache(Cache<K, V> delegate, Function<K, V> loader) { super(delegate); this.loader = loader; }
+
+    @Override public Optional<V> get(K key) {
+        Optional<V> cached = delegate.get(key);
+        if (cached.isPresent()) return cached;
+        CompletableFuture<V> mine = new CompletableFuture<>();
+        CompletableFuture<V> existing = inFlight.putIfAbsent(key, mine);
+        if (existing != null) return Optional.ofNullable(existing.join());   // someone else is loading
+        try {
+            V v = loader.apply(key);
+            if (v != null) delegate.put(key, v);
+            mine.complete(v);
+            return Optional.ofNullable(v);
+        } catch (RuntimeException e) {
+            mine.completeExceptionally(e);
+            throw e;
+        } finally {
+            inFlight.remove(key, mine);
+        }
+    }
+}
+
+// ---------- A Clock we can move by hand (tests and demo) ----------
+final class ManualClock extends Clock {
+    private volatile long millis;
+    ManualClock(long startMillis) { this.millis = startMillis; }
+    void advance(Duration d) { millis += d.toMillis(); }
+    @Override public long millis() { return millis; }
+    @Override public Instant instant() { return Instant.ofEpochMilli(millis); }
+    @Override public ZoneId getZone() { return ZoneOffset.UTC; }
+    @Override public Clock withZone(ZoneId zone) { return this; }
+}
+
+public class Main {
+    public static void main(String[] args) throws InterruptedException {
+        System.out.println("== LRU, capacity 2 ==");
+        Cache<String, Integer> lru = new InMemoryCache<>(2, null, new LruPolicy<>(), Clock.systemUTC(),
+                (k, v, cause) -> System.out.println("  removed " + k + " (" + cause + ")"));
+        lru.put("a", 1); lru.put("b", 2);
+        lru.get("a");                     // a is now most recent
+        lru.put("c", 3);                  // evicts b
+        System.out.println("  keys present: a=" + lru.get("a").isPresent()
+                + " b=" + lru.get("b").isPresent() + " c=" + lru.get("c").isPresent());
+
+        System.out.println("== LFU, capacity 2 ==");
+        Cache<String, Integer> lfu = new InMemoryCache<>(2, null, new LfuPolicy<>(), Clock.systemUTC(),
+                (k, v, cause) -> System.out.println("  removed " + k + " (" + cause + ")"));
+        lfu.put("x", 1); lfu.put("y", 2);
+        lfu.get("x"); lfu.get("x"); lfu.get("y");   // x: 3 uses, y: 2 uses
+        lfu.put("z", 3);                             // evicts y (lowest frequency)
+
+        System.out.println("== FIFO, capacity 2 ==");
+        Cache<String, Integer> fifo = new InMemoryCache<>(2, null, new FifoPolicy<>(), Clock.systemUTC(),
+                (k, v, cause) -> System.out.println("  removed " + k + " (" + cause + ")"));
+        fifo.put("p", 1); fifo.put("q", 2);
+        fifo.get("p");                               // reading does not save p
+        fifo.put("r", 3);                            // evicts p
+
+        System.out.println("== TTL with a manual clock ==");
+        ManualClock clock = new ManualClock(0);
+        InMemoryCache<String, String> ttl = new InMemoryCache<>(10, Duration.ofSeconds(30),
+                new LruPolicy<>(), clock, (k, v, cause) -> System.out.println("  removed " + k + " (" + cause + ")"));
+        ttl.put("session", "s-1");
+        ttl.put("otp", "4821", Duration.ofSeconds(5));
+        clock.advance(Duration.ofSeconds(6));
+        System.out.println("  otp after 6s: " + ttl.get("otp"));          // lazy expiry
+        clock.advance(Duration.ofSeconds(30));
+        System.out.println("  sweeper purged: " + ttl.purgeExpired());   // what the sweeper thread calls
+        System.out.println("  size now: " + ttl.size());
+
+        System.out.println("== Decorators: logging -> read-through -> stats -> core ==");
+        InMemoryCache<Integer, String> core = new InMemoryCache<>(100, Duration.ofMinutes(5),
+                new LruPolicy<>(), Clock.systemUTC(), null);
+        StatsCache<Integer, String> stats = new StatsCache<>(core);          // counts real store hits/misses
+        Cache<Integer, String> users = new LoggingCache<>("users",
+                new LoadingCache<>(stats, id -> "user-" + id));               // loads on a miss
+        users.get(42); users.get(42); users.get(7);
+        System.out.println("  " + stats.stats() + " hitRate=" + String.format("%.2f", stats.stats().hitRate()));
+
+        System.out.println("== Background sweeper (real clock) ==");
+        InMemoryCache<String, String> live = new InMemoryCache<>(10, Duration.ofMillis(100),
+                new LruPolicy<>(), Clock.systemUTC(), null);
+        try (ExpirySweeper ignored = new ExpirySweeper(live, Duration.ofMillis(50))) {
+            live.put("k1", "v1"); live.put("k2", "v2");
+            System.out.println("  size right after put: " + live.size());
+            Thread.sleep(400);                        // nobody reads; the sweeper cleans up
+            System.out.println("  size after 400ms, no reads: " + live.size());
+        }
+    }
+}
+```
+
+## Concurrency and edge cases
+
+**What is protected, and by what**
+
+| Shared state | Protection | Why |
+|---|---|---|
+| `map` + `policy` | one `ReentrantLock` in `InMemoryCache` | They must change together; LRU/LFU `get` writes to the policy. |
+| hit/miss counters | `LongAdder` | Many threads increment; `LongAdder` spreads contention across cells. |
+| in-flight loads | `ConcurrentHashMap.putIfAbsent` | Exactly one thread wins the right to load a key. |
+| `ManualClock.millis` | `volatile` | Test thread advances it; cache threads read it. |
+
+**Why not a `ReadWriteLock`?** Because in LRU and LFU, a read *is* a write to the policy. A read lock would let two readers reorder the same `LinkedHashSet` at once and corrupt it. A read-write lock only helps for FIFO (or a TTL-only cache). Saying this out loud is a strong interview signal.
+
+**Scaling past one lock.** One lock is correct and simple; at very high throughput it becomes the bottleneck. Options, in order of effort:
+
+1. **Striping/sharding** — N independent `InMemoryCache` segments, pick one by `hash(key) % N`. Each has capacity/N, so eviction becomes "approximately LRU" globally.
+2. **Buffer the access events** — record reads in a lock-free buffer and replay them into the policy in batches under the lock. This is the approach Caffeine documents.
+3. **Sampled eviction** — don't keep a global order at all; on eviction, sample a few keys and evict the oldest. Redis does this (see [Redis in production: eviction policies](/learn/notes/redis-operations/)).
+
+**Edge cases handled**
+
+- Capacity ≤ 0, zero or negative TTL → `IllegalArgumentException`.
+- Null key or value → `NullPointerException` (fail fast).
+- Overwriting an existing key never evicts anything (size doesn't change).
+- When full, expired entries are freed before any live entry is evicted.
+- A sweeper task exception is caught, so the schedule keeps running.
+- Failed loads are not cached; the next `get` retries. The in-flight future is completed exceptionally so waiters see the same error.
+
+**Known narrow window.** In `LoadingCache`, a thread that misses just *before* another thread finishes loading and clears its in-flight entry can start a second load. That's harmless (same value written twice) and rare. Caffeine closes it by loading inside the map's own atomic `compute`. Mention it; don't spend 10 minutes fixing it.
+
+**Listener runs under the lock.** It's simple and keeps events ordered, but a slow listener stalls the cache. In production you'd queue removal events and deliver them outside the lock.
+
+## Testing it
+
+The plain-Java test harness (no JUnit needed) below shows the important cases. In JUnit you'd name each as a method like `lfuEvictsLowestFrequency()`.
+
+```java
+ManualClock clock = new ManualClock(0);
+List<String> log = new ArrayList<>();
+
+// LRU: the least recently used key leaves
+var lru = new InMemoryCache<String, Integer>(2, null, new LruPolicy<>(), clock,
+        (k, v, cause) -> log.add(k + ":" + cause));
+lru.put("a", 1); lru.put("b", 2); lru.get("a"); lru.put("c", 3);
+assert lru.get("b").isEmpty() && lru.get("a").isPresent();
+
+// LFU: ties broken by recency, minFreq survives an explicit remove
+log.clear();
+var lfu = new InMemoryCache<String, Integer>(2, null, new LfuPolicy<>(), clock,
+        (k, v, cause) -> log.add(k + ":" + cause));
+lfu.put("a", 1); lfu.get("a"); lfu.put("b", 2); lfu.remove("b");
+lfu.put("c", 3); lfu.put("d", 4);
+assert log.equals(List.of("b:EXPLICIT", "c:EVICTED"));
+
+// TTL boundary: alive at ttl-1ms, gone at exactly ttl
+var ttl = new InMemoryCache<String, String>(10, null, new LruPolicy<>(), clock, null);
+ttl.put("otp", "4821", Duration.ofSeconds(5));
+clock.advance(Duration.ofMillis(4999)); assert ttl.get("otp").isPresent();
+clock.advance(Duration.ofMillis(1));    assert ttl.get("otp").isEmpty();
+
+// Concurrency: 8 threads x 20,000 random put/get/remove on capacity 100,
+// then 300 fresh puts force 200+ evictions. If map and policy had drifted
+// apart, evict() would throw or size would be wrong.
+assert cache.size() == 100;
+
+// Stampede: 16 threads miss the same key at once -> loader runs once
+assert loads.get() == 1;
+```
+
+The full harness has 28 checks: LRU/LFU/FIFO order, overwrite semantics, listener causes, LFU tie-break and `minFreq` after removal, TTL boundary, "expired before live" eviction, input validation, a real-clock sweeper test, the 8-thread stress test for each of the three policies, read-through de-duplication, stats consistency, and "failed load is not cached". Result:
+
+```
+PASS lru evicts least recently used
+PASS lru overwrite keeps size and updates value
+...
+PASS LfuPolicy concurrent: policy and map still in sync
+PASS read-through dedupes concurrent loads (loads=1)
+PASS failed load is not cached; next call retries
+
+ALL 28 CHECKS PASSED
+```
+
+Real output of `java Main`:
+
+```
+== LRU, capacity 2 ==
+  removed b (EVICTED)
+  keys present: a=true b=false c=true
+== LFU, capacity 2 ==
+  removed y (EVICTED)
+== FIFO, capacity 2 ==
+  removed p (EVICTED)
+== TTL with a manual clock ==
+  removed otp (EXPIRED)
+  otp after 6s: Optional.empty
+  removed session (EXPIRED)
+  sweeper purged: 1
+  size now: 0
+== Decorators: logging -> read-through -> stats -> core ==
+[users] get 42 -> user-42
+[users] get 42 -> user-42
+[users] get 7 -> user-7
+  CacheStats[hits=1, misses=2] hitRate=0.33
+== Background sweeper (real clock) ==
+  size right after put: 2
+  size after 400ms, no reads: 0
+```
+
+## Extensions interviewers ask for
+
+| Ask | How the design absorbs it |
+|---|---|
+| "Add random eviction / ARC / TinyLFU." | New `EvictionPolicy` class. Zero changes to `InMemoryCache`. |
+| "Expire-after-access (sliding TTL)." | In `get`, rewrite the entry with a new `expiresAt`. Make it a constructor flag or an `ExpiryPolicy` strategy. |
+| "Capacity in bytes, not entries." | Add a `Weigher` that returns the size of each value; track total weight; evict in a loop until under the limit. |
+| "Sweeper is O(n) — make it cheaper." | Keep a second index ordered by expiry (a `TreeMap` from `expiresAt` to keys, or a `PriorityQueue`) and pop only the expired head. Or sample like Redis: check a few random TTL keys per tick and repeat while many are expired. |
+| "Write-through / write-behind." | A `WritingCache` decorator: on `put`, write to the store (sync) or enqueue for a background writer (async). |
+| "Refresh-ahead: reload hot keys before they expire." | A decorator that, on a hit close to expiry, schedules an async reload. |
+| "Metrics to Prometheus." | `StatsCache` exposes counters; plus a `RemovalListener` that counts evictions by cause. |
+| "Make it distributed." | Out of LLD scope: consistent hashing across nodes, or just use Redis. Explain where your design stops. |
+| "Per-cache configuration." | A builder (`CacheBuilder.newBuilder().capacity(1000).policy(LFU).ttl(...).recordStats().build()`) that assembles core + decorators — see [creational patterns](/learn/notes/creational-patterns/). |
+
+## Common mistakes
+
+- **Using `ConcurrentHashMap` and calling it thread-safe.** The map is safe; the map *plus* the eviction list is not. Two threads can both see size == capacity and both evict, or the list can lose a node.
+- **LFU with a heap or a sort on eviction.** O(log n) or O(n). Interviewers asking for LFU almost always want the O(1) bucket design.
+- **Forgetting to update `minFreq`** when the last key leaves the minimum bucket on access. The next eviction then finds an empty bucket and crashes.
+- **Calling `System.currentTimeMillis()` directly.** Then TTL tests need `Thread.sleep` and become slow and flaky. Inject a `Clock`.
+- **Only lazy expiry.** Keys that are never read again leak memory until capacity eviction pushes them out — or forever if the cache never fills.
+- **Letting the sweeper task throw.** One exception and `scheduleAtFixedRate` stops running it, silently.
+- **Evicting a live entry while expired ones are still in the map.**
+- **Treating overwrite as insert** — growing size or evicting another key when the key already exists.
+- **Stats decorator in the wrong place** (outside the loader), reporting a 100% hit rate.
+- **One giant class** with `if (policy == LRU) ... else if (policy == LFU) ...` everywhere — the exact thing Strategy exists to remove.
+
+## Practice questions
+
+<Practice>
+
+<QA q="Why is eviction modelled as a Strategy rather than as subclasses of the cache?" level="easy">
+
+Because eviction is one *decision* that varies independently of everything else the cache does (storage, TTL, locking, listeners). With Strategy, the cache **has-a** policy: you choose LRU/LFU/FIFO at construction time, add new policies without editing the cache (Open/Closed), and unit-test a policy alone with no locking or time involved. Subclassing (`LruCache extends AbstractCache`) couples the two, duplicates the shared logic or hides it in a base class, and makes combinations (LFU + TTL + stats) explode into many classes.
+
+</QA>
+
+<QA q="What four hooks does the EvictionPolicy need, and why each?" level="easy">
+
+- `onInsert(key)` — a new key starts being tracked (LRU tail, LFU count 1).
+- `onAccess(key)` — a read or overwrite: LRU moves to tail, LFU bumps the count, FIFO ignores it.
+- `onRemove(key)` — the key left for a reason the policy didn't choose (explicit delete, expiry), so it must stop tracking it or it will later pick a key that no longer exists.
+- `evict()` — choose a victim and stop tracking it.
+
+The policy sees only keys; values and expiry live in the map.
+
+</QA>
+
+<QA q="Walk through the O(1) LFU design. What happens on access, insert and evict?" level="medium">
+
+Keep `freq: key → count`, `buckets: count → LinkedHashSet of keys`, and `minFreq`.
+
+- **Access**: move the key from bucket f to bucket f+1. If bucket f became empty and f == `minFreq`, set `minFreq = f + 1`.
+- **Insert**: count 1 into bucket 1; `minFreq = 1`.
+- **Evict**: remove the first (oldest) key from bucket `minFreq`.
+
+Each step is a constant number of hash-map and linked-set operations, so all are O(1). The linked set gives LRU tie-breaking within a frequency for free.
+
+</QA>
+
+<QA q="Why can you not protect the cache with a ReadWriteLock so reads run in parallel?" level="medium">
+
+In LRU and LFU, `get` **modifies** the policy (moves a node to the tail, moves a key between buckets). Under a read lock, two readers would mutate the same `LinkedHashSet` concurrently and corrupt it. A read-write lock only helps when reads are truly read-only — e.g. FIFO or a TTL-only cache. High-performance caches get read concurrency differently: they record accesses in a buffer and apply them to the policy in batches.
+
+</QA>
+
+<QA q="What is the difference between lazy expiry and active expiry, and why do you need both?" level="easy">
+
+**Lazy**: check `expiresAt` when the key is read; if expired, delete it and report a miss. Cheap and always correct from the caller's view. **Active**: a background task periodically scans and deletes expired entries. Lazy alone leaks memory for keys that are never read again; active alone would let a reader see an expired value between sweeps. Together, correctness comes from lazy, memory reclamation from active. Redis uses the same two-part approach.
+
+</QA>
+
+<QA q="Your sweeper silently stopped running after a week in production. What is the likely cause?" level="scenario">
+
+The scheduled task threw an exception once. The `ScheduledExecutorService` docs say that if any execution of a periodic task throws, **subsequent executions are suppressed** — no log, no restart, the future just completes exceptionally. Fix: wrap the task body in try/catch (log and continue), and add a metric such as "last sweep timestamp" so a stopped sweeper is visible.
+
+</QA>
+
+<QA q="How do you test TTL without Thread.sleep?" level="easy">
+
+Inject a `java.time.Clock` into the cache and compute expiry from `clock.millis()`. In tests, pass a `ManualClock` whose time you move forward with `advance(Duration)`. Tests become instant and deterministic, and you can hit exact boundaries (alive at ttl − 1 ms, gone at ttl). Production code passes `Clock.systemUTC()`.
+
+</QA>
+
+<QA q="Where should the stats decorator go relative to the read-through decorator, and why?" level="medium">
+
+**Inside** it — wrapping the core store — if you want the true store hit rate. The loader turns every miss into a returned value, so a stats layer *outside* it would see only "present" results and report ~100% hits. Decorator order defines semantics; state the order you chose and why.
+
+</QA>
+
+<QA q="100 threads miss the same hot key at the same moment. What happens in a naive read-through cache, and how does this design avoid it?" level="scenario">
+
+Naively, all 100 call the database — a **cache stampede** that can overload the DB exactly when the cache is cold. `LoadingCache` keeps a `ConcurrentHashMap` of in-flight `CompletableFuture`s. `putIfAbsent` lets exactly one thread become the loader; the rest `join()` its future and get the same value (or the same exception, wrapped in a `CompletionException`). The test with 16 threads confirms the loader runs once.
+
+</QA>
+
+<QA q="The single lock has become the bottleneck at high QPS. What are your options?" level="hard">
+
+1. **Lock striping / sharding**: N independent segments chosen by key hash, each with its own lock and capacity/N. Simple, near-linear scaling; eviction becomes approximately global LRU.
+2. **Buffered policy updates**: reads only append to a lock-free ring buffer; a maintenance step drains it into the policy under a `tryLock`. Reads stop contending on the policy (Caffeine's approach).
+3. **Sampled eviction**: drop the global ordering; on eviction sample k random keys and evict the oldest/least-used (Redis's approach). No list maintenance on reads at all.
+
+Mention the trade-off: each gives up exact LRU/LFU ordering for throughput.
+
+</QA>
+
+<QA q="When the cache is full, why purge expired entries before asking the policy for a victim?" level="medium">
+
+An expired entry is already logically gone; keeping it while evicting a live, possibly hot entry hurts the hit rate for nothing. In this design `put` purges first and only calls `policy.evict()` if still over capacity. The cost is an O(n) scan on the overflow path — fine for an interview, and replaceable with an expiry-ordered index (a `TreeMap` or `PriorityQueue` keyed by expiry) if needed.
+
+</QA>
+
+<QA q="Is LFU always better than LRU? When does each win?" level="medium">
+
+No. **LRU** adapts quickly to changing popularity and is a good default for "recent items are hot" workloads, but one big scan of cold keys flushes the hot set. **LFU** resists scans and keeps a stable popular set, but old popular keys can linger after they stop being used (frequency never decays in pure LFU), and new keys are evicted easily. Production caches blend them — Redis LFU decays its counters over time, and Caffeine uses Window TinyLFU (a small LRU window in front of a frequency-filtered main area). **FIFO** is the cheapest (reads don't touch the policy) and is fine when access is roughly uniform.
+
+</QA>
+
+<QA q="A value in the cache is a mutable object. A caller gets it and changes it. What problems does that cause?" level="hard">
+
+The change is visible to every other reader without going through `put`, so there's no listener event, no write-through, and a data race if two threads mutate it. The cache can also no longer reason about weight or staleness. Fixes: store immutable values (records), or defensive copies on `put`/`get` (costly), or document that values must not be mutated. Immutable values are the standard answer.
+
+</QA>
+
+<QA q="The interviewer says: now limit by memory, not entry count. What changes?" level="scenario">
+
+Add a `Weigher` strategy, e.g. `int weigh(K key, V value)`. The cache tracks `totalWeight` instead of `map.size()`. On `put`, add the new weight (and subtract the old one on overwrite), then **loop** `evict()` until `totalWeight` is at most the limit — one big value can push out several small ones. Reject a single entry heavier than the whole limit. The policies don't change at all, which shows the Strategy boundary was drawn correctly.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="Which data structures give O(1) get and put for LFU eviction?" options={["A min-heap ordered by access count", "A TreeMap from count to keys", "A key to count map plus a count to linked-set map plus a minFreq variable", "Sorting all keys by count at eviction time"]} answer={2}>
+
+Frequency buckets (count to linked set) with a tracked minimum make access, insert and evict constant time. A heap is O(log n) per access, a `TreeMap` O(log n), and sorting O(n log n).
+
+</MCQ>
+
+<MCQ q="In an LRU cache, why is a ReadWriteLock not enough to let gets run in parallel?" options={["ReadWriteLock is slower than synchronized", "A get moves the key to the most-recent end, so it writes shared state", "Gets never need a lock", "ReadWriteLock does not support Java 21"]} answer={1}>
+
+LRU reads reorder the recency list. Two readers mutating it under a shared read lock would corrupt it.
+
+</MCQ>
+
+<MCQ q="What happens if a task scheduled with scheduleAtFixedRate throws a RuntimeException?" options={["It is retried immediately", "It is logged and the schedule continues", "Subsequent executions are suppressed", "The executor shuts down"]} answer={2}>
+
+Per the JDK docs, an exception suppresses all later runs of that periodic task. Always catch inside the task.
+
+</MCQ>
+
+<MCQ q="Why inject a Clock into the cache?" options={["Clock is faster than System.currentTimeMillis", "So tests can control time and check TTL boundaries without sleeping", "Clock is required by HashMap", "To make the cache distributed"]} answer={1}>
+
+Injected time makes TTL logic deterministic and instant to test.
+
+</MCQ>
+
+<MCQ q="A cache stacks Stats outside a read-through LoadingCache. What will the hit rate show?" options={["The true store hit rate", "Close to 100%, because the loader hides misses", "Always 0%", "It depends on the eviction policy only"]} answer={1}>
+
+The loader returns a value for every miss, so the outer stats layer only sees hits. Put stats inside the loader to measure the store.
+
+</MCQ>
+
+<MCQ q="Which statement about FIFO eviction is true?" options={["Reads move a key to the back of the queue", "It is the same as LRU", "Reads do not change eviction order", "It needs frequency counts"]} answer={2}>
+
+FIFO evicts in insertion order; `onAccess` is a no-op. That also makes it the cheapest policy under concurrency.
+
+</MCQ>
+
+<MCQ q="Why do you need a background sweeper if you already expire lazily on read?" options={["Lazy expiry returns stale values", "Keys that are never read again would otherwise stay in memory", "The sweeper makes get O(1)", "Lazy expiry is not thread-safe"]} answer={1}>
+
+Lazy expiry keeps reads correct but never reclaims keys nobody reads. The sweeper frees that memory.
+
+</MCQ>
+
+<MCQ q="16 threads miss the same key at once in LoadingCache. How many times does the loader run (ignoring the narrow late-arrival window)?" options={["16", "Once, because putIfAbsent of an in-flight future picks one loader", "0, because misses are cached", "It depends on capacity"]} answer={1}>
+
+One thread wins `putIfAbsent` and loads; the others wait on its `CompletableFuture`.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **API**: `get` returns `Optional`, `put` with optional per-entry TTL, `remove`, `size`, plus a `RemovalListener(key, value, cause)`.
+- **Strategy** for eviction: `onInsert / onAccess / onRemove / evict`. LRU and FIFO = `LinkedHashSet` (FIFO ignores access). LFU = key→count + count→`LinkedHashSet` + `minFreq`, all O(1).
+- **TTL**: store `expiresAt`; expire **lazily on read** (`now >= expiresAt`) **and** with a **sweeper** (`scheduleAtFixedRate`, daemon thread, catch everything). Inject a `Clock`.
+- **put when full**: purge expired first, then evict one victim. Overwrite never evicts.
+- **Thread safety**: one lock around map + policy, because LRU/LFU reads write. No `ReadWriteLock`. Scale with striping, buffered access events, or sampling.
+- **Decorator** for stats (`LongAdder`), logging, read-through (one load per key via in-flight futures). Order matters: stats inside the loader.
+- **Say in the interview**: "The map and the eviction order are one invariant, so they share one lock; the policy is a Strategy so LFU vs LRU is a constructor argument; time is injected so TTL is testable."
+
+## Go deeper
+
+- [Caffeine wiki: Efficiency (Window TinyLFU)](https://github.com/ben-manes/caffeine/wiki/Efficiency)
+- [Guava: Caches explained (maintenance without a dedicated thread)](https://github.com/google/guava/wiki/CachesExplained)
+- [An O(1) algorithm for implementing the LFU cache eviction scheme (Matani, Shah, Mitra)](https://arxiv.org/abs/2110.11602)
+- [ScheduledExecutorService (Java 21 API)](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ScheduledExecutorService.html)
+- [LinkedHashMap (Java 21 API) — access order and removeEldestEntry](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/LinkedHashMap.html)
+- [Redis key eviction](https://redis.io/docs/latest/develop/reference/eviction/)

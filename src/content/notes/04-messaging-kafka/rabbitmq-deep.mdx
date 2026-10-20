@@ -1,0 +1,628 @@
+---
+title: "RabbitMQ Deep Dive: Exchanges, Acks, Prefetch, DLX"
+phase: "04-messaging-kafka"
+order: 42
+tags: ["messaging", "rabbitmq", "queues"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 18
+prerequisites: ["async-messaging-fundamentals", "delivery-semantics"]
+summary: "How RabbitMQ really routes, delivers and retries messages — exchanges and bindings, classic vs quorum queues vs streams, acks, prefetch, publisher confirms, DLX/TTL retry patterns and poison-message handling."
+---
+
+## Definition (interview-ready)
+
+**RabbitMQ** is a message broker. Producers never write to a queue directly. They publish to an **exchange**, and the exchange uses **bindings** (routing rules) to copy the message into zero or more **queues**. Consumers read from queues and **acknowledge** each message. Until a message is acked, the broker keeps it and redelivers it if the consumer dies.
+
+The broker is "smart": it handles routing, per-message acks, redelivery, dead-lettering and TTLs. Consumers are "simple". That's the opposite of Kafka, where the broker is a dumb log and consumers track their own position.
+
+Three queue types exist in RabbitMQ 4.x:
+
+- **Classic**: single-node, not replicated (mirroring was removed in 4.0).
+- **Quorum**: replicated with Raft. The default choice for anything that matters.
+- **Stream**: an append-only, replayable log, Kafka-style, inside RabbitMQ.
+
+## Why it matters
+
+Most RabbitMQ incidents come from the consumer side, not from the broker:
+
+- **auto-ack** turned on, so a consumer crash silently loses every message it had been sent,
+- **no prefetch limit**, so one consumer hoards thousands of messages and runs out of memory,
+- `nack` with `requeue=true` on a message that will always fail, an infinite **poison-message loop** at full CPU,
+- publishing without **publisher confirms** and assuming the broker has the message,
+- classic queues on one node, so losing that node loses the queue's data.
+
+If you can explain the publish → route → deliver → ack path and every failure point in it, you can answer nearly any RabbitMQ interview question. For how RabbitMQ compares with Kafka, Pulsar and SQS at a high level, see [Kafka vs RabbitMQ vs Pulsar vs SQS](/learn/notes/pulsar-rabbitmq-sqs/). This note goes one level deeper.
+
+```
+ producer ──publish(exchange="orders", routing_key="order.created.in")──▶ ┌──────────┐
+                                                                          │ EXCHANGE │
+            bindings (rules)                                              │  topic   │
+            ┌─────────────────────────────────────────────────────────────┴──────────┘
+            │ "order.created.*"  → q.billing
+            │ "order.#"          → q.audit
+            │ "*.*.in"           → q.india-ops
+            ▼
+     q.billing ──▶ consumer A   (prefetch 50, manual ack)
+     q.audit   ──▶ consumer B
+     q.india   ──▶ consumer C
+```
+
+## Core concepts
+
+### The AMQP 0-9-1 model in one minute
+
+AMQP 0-9-1 is the wire protocol RabbitMQ was built around. (RabbitMQ 4.0 also made AMQP 1.0 a core, always-on protocol, but most client code and interview questions still use the 0-9-1 vocabulary.)
+
+| Term | Plain meaning |
+|---|---|
+| **Connection** | One long-lived TCP connection from your app to the broker. Expensive to open. |
+| **Channel** | A lightweight virtual connection inside a connection. Most operations (publish, consume, ack) happen on a channel. Use one channel per thread. |
+| **Exchange** | A router. It has a type (direct, topic, fanout, headers) and never stores messages. |
+| **Queue** | An ordered buffer that holds messages until consumers ack them. |
+| **Binding** | A rule "exchange X sends messages matching K to queue Q". |
+| **Routing key** | A string the publisher attaches to each message. Exchanges match it against binding keys. |
+| **Virtual host (vhost)** | A namespace with its own exchanges, queues and permissions. Used for multi-tenancy. |
+
+Analogy: the exchange is a post office sorting room, bindings are the sorting rules on the wall, queues are the PO boxes, and the ack is the recipient signing for the parcel.
+
+### Exchange types with routing examples
+
+**Direct**: delivers to queues whose binding key **exactly equals** the routing key. If several queues are bound with the same key, each gets a copy.
+
+```
+exchange "payments" (direct)
+  binding "success" → q.ledger
+  binding "failed"  → q.alerts
+  binding "failed"  → q.retry-scheduler
+
+publish key="failed"  → q.alerts AND q.retry-scheduler
+publish key="refund"  → no match → dropped (or returned, if mandatory=true)
+```
+
+**The default exchange** is a nameless direct exchange (`""`). Every queue is automatically bound to it with a binding key equal to the queue's name. That's why `basicPublish("", "my-queue", ...)` looks like "send straight to a queue". It's still going through an exchange.
+
+**Topic**: routing keys are **dot-separated words** (up to 255 bytes), and binding keys can use two wildcards:
+
+- `*` matches **exactly one** word,
+- `#` matches **zero or more** words.
+
+```
+bindings:  Q1 ← "*.orange.*"      Q2 ← "*.*.rabbit"   Q2 ← "lazy.#"
+
+routing key                 → result
+quick.orange.rabbit         → Q1, Q2
+lazy.orange.elephant        → Q1, Q2
+quick.orange.fox            → Q1
+lazy.brown.fox              → Q2
+lazy.pink.rabbit            → Q2 (once, even though two of its bindings match)
+quick.orange.new.rabbit     → nothing (4 words; "*.orange.*" needs exactly 3)
+lazy.orange.new.rabbit      → Q2 (via "lazy.#")
+orange                      → nothing
+```
+
+Two edge cases interviewers like: a queue bound with just `#` receives **everything** (it behaves like fanout), and a topic binding with no wildcards behaves exactly like a direct binding.
+
+**Fanout**: ignores the routing key and copies the message to **every** bound queue. Use it for broadcast: cache invalidation to every instance, one event to many independent services.
+
+**Headers**: ignores the routing key and matches on **message header values**. The binding argument `x-match` decides the rule:
+
+- `all`: every header listed in the binding must match (the default),
+- `any`: at least one must match,
+- `all-with-x` / `any-with-x`: same, but headers starting with `x-` are also compared (plain `all`/`any` ignore them).
+
+```
+binding to q.pdf-eu: { "x-match": "all", "format": "pdf", "region": "eu" }
+message headers { format: pdf, region: eu, size: big } → q.pdf-eu
+message headers { format: pdf, region: us }           → not routed there
+```
+
+Headers exchanges are flexible but slower and less common. If you can express the rule as a topic key, prefer topic.
+
+**Unroutable messages**: if no binding matches, the message is silently dropped unless the publisher sets `mandatory=true` (then the broker sends it back with `basic.return`) or the exchange has an **alternate exchange** configured to catch it.
+
+### Queue types: classic, quorum, stream
+
+| | Classic | Quorum | Stream |
+|---|---|---|---|
+| Storage | One node, not replicated (since 4.0) | Replicated with **Raft** across nodes (default 3 replicas) | Replicated, append-only log |
+| Read semantics | Destructive: acked = gone | Destructive | **Non-destructive**: many readers, replay from any offset |
+| Durability | Durable or transient | Always durable | Always durable |
+| Poison-message protection | None built in | **Delivery limit** (default 20 since 4.0) | Not applicable (no requeue) |
+| Dead-lettering / TTL | Yes | Yes (at-least-once dead-lettering available) | No DLX, no TTL |
+| Exclusive / temporary queues | Yes | No | No |
+| Best for | Temporary, exclusive or reply queues; data you can lose | Work queues that must not lose data | Large fan-out, replay, huge backlogs |
+
+**Quorum queues** are the modern default. A queue has a **leader** and **followers** on different nodes. A publish is confirmed only after a **majority** of replicas have it, so a 3-replica queue survives one node failure and a 5-replica queue survives two. An odd replica count is recommended, and the docs advise against more than 7.
+
+**Classic mirrored queues are gone.** They were deprecated for years and removed in RabbitMQ 4.0. Classic queues still exist, but they now have exactly one copy. If an interviewer asks "how do you make a RabbitMQ queue highly available", the 2026 answer is "quorum queue", not "mirroring policy".
+
+**Streams** are RabbitMQ's answer to "I want a log". Messages stay until retention (`max-age` or `max-length-bytes`) removes them. A consumer chooses where to start with the `x-stream-offset` argument: `first`, `last`, `next` (the default), a numeric offset, or a timestamp. Streams don't support DLX, TTL, priorities or exclusive consumers. For best throughput use the dedicated stream protocol plugin. **Super streams** (3.11+) partition one logical stream across nodes, similar to Kafka topic partitions.
+
+Rule of thumb: tasks that are done once and then forgotten → quorum queue. Facts that many readers need, possibly replayed → stream (or Kafka). Throwaway reply or per-connection queues → classic.
+
+### Consumer acknowledgements
+
+When the broker pushes a message to a consumer, it stamps it with a **delivery tag**: a positive integer that increases on that **channel**. You must ack on the **same channel**, or the broker closes the channel with an "unknown delivery tag" error.
+
+| Method | Meaning | Batch? |
+|---|---|---|
+| `basic.ack(tag, multiple)` | Done; delete the message | `multiple=true` acks every outstanding tag up to and including this one |
+| `basic.nack(tag, multiple, requeue)` | Failed (RabbitMQ extension to the protocol) | Yes |
+| `basic.reject(tag, requeue)` | Failed (original protocol method) | No, one message only |
+
+What happens on a negative ack:
+
+- `requeue=true` → the message goes back to the queue, to its original position if possible, otherwise nearer the head. It will be delivered again, with the **`redelivered` flag** set to true.
+- `requeue=false` → the message is **dead-lettered** if the queue has a DLX, otherwise **discarded**.
+
+The `redelivered` flag means "this message may have been seen before". It doesn't say how many times or whether processing actually happened, so it is a hint to check your idempotency store, not proof of a duplicate.
+
+**Auto-ack vs manual ack.** In auto-ack mode, the broker considers the message delivered the moment it's written to the socket. If the consumer crashes a millisecond later, the message is lost. The RabbitMQ docs call this mode unsafe, and it also ignores prefetch, so a fast broker can flood a slow consumer. With manual ack, every unacked message is automatically requeued when the channel or connection closes. That is what gives you **at-least-once** delivery.
+
+**Consumer timeout.** If a consumer holds an unacked message too long (default 30 minutes), RabbitMQ assumes it's stuck. Before 4.3 it closes the channel with `PRECONDITION_FAILED`. In 4.3+ the timeout applies to quorum queues only: the timed-out messages are returned and only the stuck consumer is cancelled (via `basic.cancel`, if the client supports consumer cancel notifications; otherwise the channel is still closed). Long jobs need either a higher `consumer-timeout` or a different design (ack early and track the job elsewhere).
+
+### Prefetch (QoS)
+
+**Prefetch** (`basic.qos(prefetch_count)`) caps how many **unacked** messages the broker will push to a consumer at once. It's the main flow-control knob.
+
+```
+prefetch = 1    → send 1, wait for ack, send next      (fair, slow: a round trip per message)
+prefetch = 100  → keep up to 100 in flight per consumer (fast, the usual sweet spot)
+prefetch = 0    → unlimited                             (dangerous: memory blow-up, unfair)
+```
+
+- **Too low**: the consumer sits idle while waiting for the next message to cross the network. Throughput collapses.
+- **Too high**: one consumer grabs a huge chunk of the queue. Other consumers starve, the greedy one may run out of memory, and if it crashes all of those messages get redelivered at once.
+- The docs suggest **100–300** as a good throughput range. Use **1** (or very low values) when each message is slow and expensive (for example, 30-second image jobs) so work spreads evenly.
+- Quorum queues cap a consumer's prefetch at 2,000.
+
+**A RabbitMQ quirk worth knowing:** in the AMQP spec, prefetch is shared by all consumers on a channel. RabbitMQ redefines `global=false` (the default) as **per consumer** and `global=true` as **per channel**. Quorum queues and streams don't support the global (per-channel) form.
+
+Back-of-envelope sizing: if a round trip is 5 ms and processing takes 1 ms, a consumer needs about 5–6 messages in flight to never wait. Prefetch slightly above "round-trip time ÷ processing time" keeps it busy.
+
+### Publisher confirms
+
+Acks protect the broker → consumer leg. **Publisher confirms** protect the producer → broker leg.
+
+1. The producer calls `confirm.select` on a channel. From then on, each publish gets a sequence number starting at 1.
+2. The broker replies `basic.ack` (with `multiple` meaning "everything up to here") once it has taken responsibility for the message.
+3. A `basic.nack` from the broker means it could not handle the message (an internal error in a queue process). Republish it.
+
+When is the confirm sent?
+
+- **Routable message**: after **all** target queues have accepted it.
+- **Persistent message to a durable classic queue**: after it is written to disk (this can take a few hundred ms under load, because the broker batches fsyncs).
+- **Quorum queue**: after a **majority** of replicas have it.
+- **Unroutable message**: confirmed immediately (if `mandatory=true`, the `basic.return` comes first). A confirm does not mean "someone will process this".
+
+Confirms can arrive out of order, so track outstanding sequence numbers in a map rather than assuming FIFO. Publishing synchronously and waiting for each confirm is simple but slow. The normal approach is to publish in a stream and handle confirms asynchronously, or wait for a batch at a time.
+
+Confirms and AMQP transactions (`tx.select`) are mutually exclusive on a channel. Transactions are much slower, so use confirms.
+
+### Dead-letter exchanges (DLX)
+
+A queue can name a **dead-letter exchange**. A message is dead-lettered (republished to the DLX) when:
+
+1. a consumer rejects or nacks it with `requeue=false`,
+2. its **TTL** expires,
+3. the queue's **length limit** is exceeded,
+4. a quorum queue's **delivery limit** is exceeded.
+
+Configure it with a **policy** (`dead-letter-exchange`, optionally `dead-letter-routing-key`), not with hard-coded `x-dead-letter-exchange` queue arguments. Policies can be changed later without deleting the queue.
+
+Each dead-lettered message gets an **`x-death` header**: a list with the queue, reason (`rejected`, `expired`, `maxlen`, `delivery_limit`), a count, and timestamps. Your retry logic can read `x-death` to see how many times a message has bounced.
+
+Two safety details:
+
+- If the DLX doesn't exist when a message needs dead-lettering, the message is **silently dropped**.
+- Classic queues dead-letter **without internal confirms** (at-most-once). Quorum queues can do **at-least-once dead-lettering** (`dead-letter-strategy=at-least-once`, which also needs `overflow=reject-publish`).
+
+### TTL
+
+- **Per-queue message TTL**: `x-message-ttl` (or the `message-ttl` policy), in milliseconds.
+- **Per-message TTL**: the publisher sets the `expiration` property (a string, in ms). If both apply, the lower wins.
+- **Queue TTL**: `x-expires` deletes the **whole queue** after it has been unused for that long. Messages are *not* dead-lettered when the queue itself expires.
+
+The trap: expired messages are removed (and dead-lettered) only when they reach the **head of the queue**. With per-message TTL, a message with a 5-second TTL stuck behind one with a 1-hour TTL will wait the full hour. This "head-of-line blocking" breaks naive delay queues.
+
+### Delayed retry patterns
+
+Requeueing a failed message immediately just hammers a broken dependency. You want "retry in 10 seconds, then 1 minute, then 10 minutes, then give up".
+
+**Pattern 1: TTL + DLX retry queues (the classic pattern)**
+
+```
+               ┌────────── consumer republishes, then acks ─────────┐
+               │                                                    ▼
+ work.exchange ─▶ q.work ──▶ consumer                    retry.exchange
+       ▲                                                   │  routes by tier key
+       │                                    ┌──────────────┼──────────────┐
+       │                                    ▼              ▼              ▼
+       │                              q.retry.10s     q.retry.1m     q.retry.10m
+       │                              ttl=10000       ttl=60000      ttl=600000
+       │                              DLX=work.ex     DLX=work.ex    DLX=work.ex
+       └──────────── message expires → dead-lettered back to work ─────────┘
+
+ attempt > 3 → publish to q.parking-lot (a final DLQ for humans)
+```
+
+- Use **one queue per delay tier** with a **queue-level** TTL, so every message in a tier has the same TTL and head-of-line blocking can't happen.
+- No consumers read the retry queues. They are waiting rooms. Each one also sets a `dead-letter-routing-key` that matches the work queue's binding; otherwise the expired message keeps the tier's routing key and matches nothing on the way back.
+- The consumer counts attempts (its own retry header, or `x-death` entries if you route through a DLX) and republishes to the right tier with confirms, then acks the original. A DLX alone can't pick a tier by attempt count, because its routing key is fixed.
+- Retry queues are ordinary quorum queues, so they're replicated and visible in the management UI. You can see and purge what's waiting.
+
+**Pattern 2: the delayed-message-exchange plugin.** It adds an exchange type (`x-delayed-message`) that holds a message for the `x-delay` header's milliseconds before routing it. Convenient, but know the caveats:
+
+- Delayed messages are stored on **one node only**, not replicated. Lose that node and you lose them.
+- It's not designed for large volumes (hundreds of thousands or millions of delayed messages) or delays of days.
+- `mandatory` is not supported, because routing happens later.
+- The plugin is **no longer maintained** (its repository is archived) and depends on Mnesia, which RabbitMQ 4.3 removed. Treat it as legacy. Its README points to quorum queues instead: since **4.4** they support native delayed delivery via an `x-opt-delivery-time` header/annotation.
+
+**Pattern 3: quorum-queue delayed retries (RabbitMQ 4.3+).** Quorum queues can now hold a failed message internally and make it available again after a delay, set with the `delayed-retry-type` (`all`, `failed` or `returned`), `delayed-retry-min` and `delayed-retry-max` policy keys. The delay is `min(min × delivery-count, max)`, so it grows linearly with the delivery count, which only rises on genuine failures (a plain `basic.nack` stays at the minimum delay). No extra queues and no republishing. If you're on 4.3+, prefer this for simple backoff.
+
+For delays of hours or days, use a real scheduler (a database table polled by a job, or a cloud scheduler), not the broker.
+
+### Poison messages and the delivery limit
+
+A **poison message** is one that will never process successfully: bad JSON, a bug triggered by one field, a reference to a deleted record. With `requeue=true` it loops forever.
+
+Quorum queues track a **delivery count** in the `x-delivery-count` header. Once it exceeds the **delivery limit** (default **20** since RabbitMQ 4.0; set with the `delivery-limit` policy), the message is dead-lettered if a DLX is configured, or dropped otherwise. That's why you should always pair a quorum queue with a DLX.
+
+RabbitMQ 4.3 refined the counting: only genuine failures (`basic.reject`, a channel/connection crash, or an AMQP 1.0 `rejected`/`modified` with `delivery-failed=true`) increase `delivery-count`. Every return, including `basic.nack` and consumer timeouts, increases a separate `x-acquired-count`. So on 4.3+ a consumer looping on `basic.nack(requeue=true)` is **not** stopped by the delivery limit; signal failures with `basic.reject` (or requeue=false). If you're on 4.0–4.2, every return counts.
+
+Classic queues have no delivery limit. You must count retries yourself (with a header or `x-death`) and reject with `requeue=false` after N attempts.
+
+### Ordering guarantees
+
+RabbitMQ guarantees order only along one path: messages **published on one channel, through one exchange, into one queue, delivered on one channel** arrive in the order they were sent.
+
+Things that break it in practice:
+
+- **Competing consumers**: with two consumers on a queue, message 1 goes to A and message 2 to B. B may finish first.
+- **Requeues**: the queue keeps messages in publication order, but a requeued message is delivered again *after* later messages were already handed to other consumers.
+- **Priorities**: higher-priority messages jump ahead.
+- **Multiple publishers or channels**: no ordering between them.
+- **Concurrent processing inside one consumer**: the client delivers in order, but a thread pool can finish out of order.
+
+If you need strict order, use **Single Active Consumer** (`x-single-active-consumer`, set at declaration): many consumers register, only one receives at a time, and another takes over automatically if it dies. To scale ordered processing, split by key across several queues (consistent-hash exchange or one queue per shard), or use streams/super streams with single active consumer.
+
+### Clustering basics
+
+- A **cluster** is a group of RabbitMQ nodes (Erlang VMs) that share **metadata**: users, vhosts, exchanges, bindings, queue definitions. RabbitMQ 4.x stores this in **Khepri**, a Raft-based store. It was experimental in 3.13, became the default for new clusters in 4.2, and is the only option from 4.3, which removed the old Mnesia store.
+- **Message data** lives with the queue, not everywhere. A classic queue lives on one node. A quorum queue or stream has replicas on several nodes, with one leader.
+- A client can connect to **any** node. If the queue's leader is elsewhere, the node forwards traffic internally. That works but adds a hop, so client libraries and load balancers that spread connections help.
+- Use an **odd number of nodes** (3 or 5) so Raft majorities survive failures. A 3-node cluster tolerates one node down for quorum queues.
+- Clustering is for nodes on a **reliable LAN**. For links between data centers or regions, use **federation** or **shovel**, which move messages between independent brokers asynchronously.
+
+## How it works (a resilient order consumer)
+
+The walk-through: publish with confirms → quorum queue with DLX and delivery limit → manual ack with bounded retries.
+
+```text
+# Topology (declare once, ideally via policies + definitions file)
+exchange  orders            type=topic,  durable
+exchange  orders.dlx        type=fanout, durable
+
+queue q.billing     x-queue-type=quorum
+  policy: dead-letter-exchange=orders.dlx, delivery-limit=10
+  bind orders  "order.created.*"
+
+queue q.billing.retry.30s   x-queue-type=quorum, no consumers
+  policy: message-ttl=30000,
+          dead-letter-exchange="",                 # the default exchange
+          dead-letter-routing-key=q.billing        # expires → straight back to q.billing
+
+queue q.billing.dlq x-queue-type=quorum           # parking lot, alert on depth > 0
+  bind orders.dlx
+```
+
+```python
+# Consumer (pika-style pseudocode)
+channel.basic_qos(prefetch_count=50)          # per consumer in RabbitMQ
+
+def on_message(ch, method, props, body):
+    attempts = int((props.headers or {}).get("x-retry", 0))
+    try:
+        msg = parse(body)                      # may raise -> poison
+        if already_processed(msg.id):          # idempotency check
+            ch.basic_ack(method.delivery_tag); return
+        charge(msg)                            # side effect + record msg.id in same txn
+        ch.basic_ack(method.delivery_tag)
+    except PermanentError:
+        ch.basic_nack(method.delivery_tag, requeue=False)   # → DLX → q.billing.dlq
+    except TransientError:
+        if attempts >= 5:
+            ch.basic_nack(method.delivery_tag, requeue=False)  # give up → parking lot
+        else:
+            # publish a copy to the retry waiting room (with confirms), then ack the original
+            publish_confirmed("", "q.billing.retry.30s", body, headers={"x-retry": attempts + 1})
+            ch.basic_ack(method.delivery_tag)
+
+channel.basic_consume("q.billing", on_message, auto_ack=False)
+```
+
+```python
+# Producer with confirms (async style)
+channel.confirm_delivery()
+outstanding = {}                               # seq_no → message
+def publish(msg):
+    seq = channel.next_publish_seq_no
+    outstanding[seq] = msg
+    channel.basic_publish("orders", "order.created.in", msg.bytes,
+                          properties=BasicProperties(delivery_mode=2, message_id=msg.id),
+                          mandatory=True)
+def on_ack(seq, multiple):   remove seq (and all lower if multiple)
+def on_nack(seq, multiple):  republish those messages
+def on_return(msg):          unroutable → alert, the topology is wrong
+```
+
+Why each piece is there:
+
+- **Confirms + `mandatory`**: the producer knows the broker owns the message and that it was routed somewhere.
+- **Quorum queue**: survives the loss of one node out of three.
+- **Prefetch 50**: keeps the consumer busy without hoarding.
+- **Manual ack after the side effect**: at-least-once delivery. A crash before the ack means redelivery, so the **idempotency check** is mandatory.
+- **Republish to a TTL queue, then ack**: delayed retry without busy loops. If the consumer dies between the republish and the ack, you get one extra copy, which the idempotency check absorbs.
+- **The DLX is the parking lot, not the retry path**: rejects and delivery-limit overflows both land in `q.billing.dlq`. If the DLX fed the retry queue instead, a message that hit the delivery limit would cycle back forever.
+- **Delivery limit**: a safety net if the consumer process itself crashes on a message (it never reaches the `except`).
+
+## Real-world examples
+
+- **Celery** (Python task queue) commonly uses RabbitMQ as its broker. Its docs describe late acks (`acks_late`) and prefetch multipliers, which are exactly the ack and prefetch trade-offs above.
+- **Spring AMQP** (`spring-rabbit`) exposes `prefetchCount`, manual/auto acknowledge modes, publisher confirms and returns, and a `RepublishMessageRecoverer` for sending failed messages to a DLX.
+- **NServiceBus** builds its delayed-retry topology on RabbitMQ using TTL and dead-lettering. The delayed-message-exchange plugin's own README points to it as an example.
+- **Amazon MQ** offers managed RabbitMQ, and AWS announced support for RabbitMQ 4.3 in 2026.
+
+## Common pitfalls
+
+- **Auto-ack in production.** A crash loses everything in flight. Use manual ack and ack *after* the work is done.
+- **Forgetting to ack** in some code path (an early `return`, a swallowed exception). Unacked messages pile up until the consumer hits its prefetch limit and stops receiving, then the consumer timeout fires (channel closed before 4.3; on 4.3+ quorum queues the consumer is cancelled).
+- **`nack(requeue=true)` on permanent errors.** An infinite hot loop. Send permanent failures to a DLQ.
+- **No DLX on a quorum queue.** When the delivery limit is hit, the message is simply dropped.
+- **Prefetch 0 or very high** with slow consumers: memory spikes, unfair distribution, mass redelivery on crash.
+- **Per-message TTL for delays.** Head-of-line blocking makes short delays wait for long ones. Use one queue per delay tier.
+- **Relying on the delayed-message plugin for critical data.** It's single-node, unreplicated and unmaintained.
+- **Publishing without confirms** and assuming success. A broker crash or a full disk alarm silently drops messages.
+- **Opening a connection per publish.** Connections are expensive. Reuse a connection; use channels per thread.
+- **Sharing a channel across threads.** Channels aren't thread-safe in most clients, and delivery tags are per channel.
+- **Expecting ordering with multiple consumers.** Use single active consumer or shard by key.
+- **Still configuring `ha-mode` mirroring policies.** They do nothing on 4.x classic queues. Migrate to quorum queues.
+- **Long jobs with default consumer timeout.** A job taking longer than 30 minutes is timed out (channel closed, or consumer cancelled on 4.3+ quorum queues) and the message redelivered, possibly creating a second copy of the work.
+
+## Practice questions
+
+<Practice>
+
+<QA q="What is the difference between an exchange and a queue in RabbitMQ?" level="easy">
+
+An **exchange** is a router. It receives every publish, applies its type's rules (direct, topic, fanout, headers) against the **bindings**, and copies the message into matching queues. It stores nothing.
+
+A **queue** is the buffer that actually holds messages until a consumer acks them. Producers publish to exchanges; consumers read from queues. Even "publishing to a queue" goes through the default exchange, which binds every queue under its own name.
+
+</QA>
+
+<QA q="Explain the four exchange types with one use case each." level="easy">
+
+- **Direct**: exact match of routing key to binding key. Use: route `payment.failed` vs `payment.success` to different handlers.
+- **Topic**: dot-separated keys with `*` (one word) and `#` (zero or more words). Use: `order.*.in` for India orders, `order.#` for an audit queue.
+- **Fanout**: copy to every bound queue, key ignored. Use: broadcast cache invalidation or one event to many services.
+- **Headers**: match on header values with `x-match=all` or `any`. Use: routing on several attributes that don't fit a single key, like format plus region.
+
+</QA>
+
+<QA q="A topic exchange has bindings `*.error` and `app.#`. Which queues receive `app.error`, `app.db.error` and `error`?" level="easy">
+
+- `app.error` → both. `*.error` matches (two words, first is anything) and `app.#` matches.
+- `app.db.error` → only `app.#`. `*` matches exactly one word, so `*.error` needs exactly two words.
+- `error` → neither. `*.error` needs two words, and `app.#` needs the first word to be `app`.
+
+</QA>
+
+<QA q="What's the difference between `basic.ack`, `basic.nack` and `basic.reject`?" level="easy">
+
+- `basic.ack`: success; the broker deletes the message. `multiple=true` acks every outstanding delivery tag up to this one on the channel.
+- `basic.nack`: failure. Has both `multiple` and `requeue`. It's a RabbitMQ extension.
+- `basic.reject`: failure for a single message, with `requeue` but no `multiple`. It's the original AMQP method.
+
+For both negative forms, `requeue=true` puts the message back (redelivered flag set) and `requeue=false` dead-letters it if a DLX exists, otherwise drops it.
+
+</QA>
+
+<QA q="What does prefetch do and how do you choose a value?" level="medium">
+
+Prefetch (`basic.qos`) limits how many unacked messages the broker pushes to a consumer. It's flow control.
+
+- Too low (1): a network round trip per message, low throughput. But it's the fairest when each message takes long.
+- Too high or 0 (unlimited): one consumer hoards the queue, uses lots of memory, starves others, and causes a mass redelivery when it crashes.
+- Start around 100–300 for fast messages (the docs' suggested range) and low single digits for slow, heavy jobs. Tune using consumer utilisation: if consumers wait idle, raise it; if memory or unfairness hurts, lower it.
+
+In RabbitMQ, the default (`global=false`) applies per consumer, not per channel as in the AMQP spec.
+
+</QA>
+
+<QA q="Why are classic mirrored queues no longer the answer for high availability?" level="medium">
+
+They were removed in **RabbitMQ 4.0** after years of deprecation. Classic queues now have one copy only. The replacement is **quorum queues**, which use Raft: a leader plus followers, writes confirmed after a majority persists them, automatic leader election on failure, and a delivery limit for poison messages. For replayable or large fan-out data, **streams** are the other replicated type.
+
+</QA>
+
+<QA q="When would you choose a quorum queue, a stream, or a classic queue?" level="medium">
+
+- **Quorum queue**: work that must not be lost and is processed once (orders, payments, jobs). Replicated, always durable, poison-message protection.
+- **Stream**: many consumers need the same data, replay from an offset or timestamp, very large backlogs. Non-destructive reads, retention by age or size.
+- **Classic queue**: temporary or exclusive queues (RPC reply queues, per-connection queues) and data that's fine to lose if a node dies.
+
+</QA>
+
+<QA q="What do publisher confirms guarantee, and when exactly does the broker send the ack?" level="medium">
+
+After `confirm.select`, each publish gets a sequence number, and the broker acks once it has **taken responsibility**:
+
+- routable messages: after all target queues accepted it,
+- persistent messages in durable classic queues: after the write to disk,
+- quorum queues: after a majority of replicas have it,
+- unroutable messages: immediately (after a `basic.return` if `mandatory` was set).
+
+So a confirm does **not** mean a consumer processed it, and for unroutable messages it doesn't even mean it's stored. Use `mandatory=true` (or an alternate exchange) to detect routing gaps, and handle confirms asynchronously since they can arrive out of order.
+
+</QA>
+
+<QA q="Which events cause a message to be dead-lettered?" level="medium">
+
+Four:
+
+1. A consumer rejects or nacks it with `requeue=false`.
+2. Its message TTL expires.
+3. The queue's length limit is exceeded (with the default drop-head overflow).
+4. A quorum queue's delivery limit is exceeded.
+
+The message is republished to the queue's DLX with an `x-death` header recording the queue, reason, count and time. Expiry of the whole queue (`x-expires`) does not dead-letter its messages.
+
+</QA>
+
+<QA q="Design a retry-with-backoff mechanism in RabbitMQ: 10s, 1m, 10m, then park." level="hard">
+
+- Main quorum queue `q.work` with a DLX pointing to the **parking-lot** exchange (catches rejects and delivery-limit overflows). Don't point the DLX at the retry tiers, or delivery-limit overflows would cycle back forever.
+- Three retry queues, `q.retry.10s`, `q.retry.1m`, `q.retry.10m`, each with a **queue-level** TTL and a DLX pointing back to the work exchange. No consumers read them.
+- On a transient failure the consumer counts previous attempts (its own retry header) and republishes the message to the right tier with publisher confirms, then acks the original. Each retry queue's dead-letter routing key points back at the work queue.
+- After the third attempt it nacks with `requeue=false`, so the DLX moves it to `q.parking-lot`. Alert on parking-lot depth.
+- Permanent errors (bad payload) go straight to the parking lot the same way.
+
+Why queue-level TTL per tier: per-message TTL suffers head-of-line blocking, because expiry only happens at the queue head. On RabbitMQ 4.3+, quorum-queue **delayed retries** (`delayed-retry-type`, `delayed-retry-min`, `delayed-retry-max`) can replace the tiers for simple linear backoff. Avoid the delayed-message plugin for critical flows: it's single-node, unreplicated and unmaintained.
+
+</QA>
+
+<QA q="What is a poison message and how do quorum queues protect against it?" level="hard">
+
+A message that fails every time (malformed data, a bug for one input). With `requeue=true` it loops forever, burning CPU and blocking ordered processing.
+
+Quorum queues count deliveries (`x-delivery-count`). When the count exceeds the **delivery limit** (default 20 since 4.0), the message is dead-lettered if a DLX is set, otherwise dropped, so always configure a DLX. From 4.3 only genuine failures (`basic.reject`, a consumer crash) increase the count; `basic.nack` and other returns only increment a separate acquired count, so a nack-requeue loop is no longer caught by the limit. Classic queues have no limit, so the app must count retries and reject with `requeue=false` after N.
+
+</QA>
+
+<QA q="What ordering guarantees does RabbitMQ give, and how do you get strict per-key ordering?" level="hard">
+
+Guaranteed only for messages published on **one channel, through one exchange, into one queue, delivered on one channel**. It breaks with competing consumers, requeues (a redelivered message arrives after later ones went to other consumers), priorities, multiple publishers, and multi-threaded processing in a consumer.
+
+For strict order:
+
+- **Single Active Consumer** on the queue: only one consumer at a time, automatic failover.
+- To scale, **shard by key**: N queues, each with single active consumer, using a consistent-hash exchange or a key → queue mapping in the publisher.
+- Or use **streams / super streams** with single active consumer, which is the Kafka-like partitioned model.
+
+</QA>
+
+<QA q="Your consumers' memory keeps growing and one consumer gets most of the messages. What's going on?" level="scenario">
+
+Almost certainly **prefetch is 0 (unlimited) or very high**. The broker pushes as fast as it can to whichever consumer subscribed first, so that consumer buffers thousands of unacked messages in memory while others sit idle. If it crashes, all of them are redelivered at once.
+
+Fix: set a bounded per-consumer prefetch (start around 100 for fast work, a low value for slow jobs), make sure every code path acks or nacks, and check the management UI's unacked count per consumer. Also confirm you aren't using auto-ack, which ignores prefetch entirely.
+
+</QA>
+
+<QA q="After a deploy, a queue's CPU usage spikes to 100 percent and the same few messages show up in logs thousands of times per second. Diagnose and fix." level="scenario">
+
+A **poison-message loop**: the new code throws on certain messages and the error handler does `nack(requeue=true)`. The broker immediately redelivers, the consumer fails again, and so on.
+
+Immediate fix: change the handler to `requeue=false` for permanent errors, or roll back the deploy. Make sure the queue has a DLX so those messages are kept. Structural fix: move to a quorum queue with a delivery limit and DLX (on 4.3+ only `basic.reject` or crashes count toward the limit, not `basic.nack`), separate permanent from transient errors, add delayed retries for transient ones, and alert on DLQ depth.
+
+</QA>
+
+<QA q="Messages are 'lost': the producer logs success but consumers never see them. Walk through the checks." level="scenario">
+
+1. **Routing**: was the message unroutable? Without `mandatory=true` or an alternate exchange it's silently dropped. Check the binding keys against the routing key (a classic topic-wildcard mistake: `*` is one word, not many).
+2. **Confirms**: does "success" mean a publisher confirm, or just that `basicPublish` returned? Without confirms, a broker restart or resource alarm can drop messages.
+3. **Durability**: a non-persistent message in a classic queue, or a classic queue on a node that died, loses data. Use quorum queues.
+4. **Consumer side**: auto-ack with consumer crashes, or a consumer that acks before processing and then fails.
+5. **TTL or length limits**: messages expired or were dropped at `max-length`, with no DLX configured.
+6. **DLX missing**: dead-lettering to a non-existent exchange silently drops messages.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="A topic exchange has a binding `stock.*`. Which routing key reaches the bound queue?" options={["stock", "stock.usd.nyse", "stock.usd", "usd.stock"]} answer={2}>
+
+`*` matches exactly one word, so `stock.*` matches only two-word keys starting with `stock`. `stock` has one word, `stock.usd.nyse` has three, and `usd.stock` starts with the wrong word. To match `stock` followed by any number of words you would bind `stock.#`.
+
+</MCQ>
+
+<MCQ q="A consumer calls `basic.nack` with requeue=false and the queue has no dead-letter exchange. What happens to the message?" options={["It is requeued at the back of the queue", "It is discarded", "It is returned to the publisher with basic.return", "It stays unacked until the channel closes"]} answer={1}>
+
+With `requeue=false` the message is dead-lettered if a DLX is configured and otherwise discarded. `basic.return` is only for unroutable mandatory publishes, and the nack itself settles the delivery, so it is not left unacked.
+
+</MCQ>
+
+<MCQ q="What does the default `global=false` prefetch setting mean in RabbitMQ?" options={["The limit is shared by all consumers on the channel", "The limit applies to the whole connection", "The limit applies separately to each consumer", "Prefetch is disabled"]} answer={2}>
+
+RabbitMQ reinterprets the AMQP flag: `global=false` is a per-consumer limit and `global=true` is per-channel. The AMQP spec says the per-channel meaning, which is a common source of confusion.
+
+</MCQ>
+
+<MCQ q="Which statement about RabbitMQ 4.x high availability is correct?" options={["Classic mirrored queues are the recommended way to replicate", "Quorum queues replicate with Raft and confirm writes after a majority has them", "Streams cannot be replicated", "Classic queues are replicated to every node by default"]} answer={1}>
+
+Classic queue mirroring was removed in RabbitMQ 4.0, so classic queues have one copy. Quorum queues (and streams) are the replicated types, and quorum queue publishes are confirmed after a majority of replicas accept them.
+
+</MCQ>
+
+<MCQ q="Why does a delay queue built with per-message TTL sometimes hold short-delay messages far too long?" options={["Per-message TTL is rounded up to the nearest minute", "Expired messages are only removed when they reach the head of the queue", "TTL only starts counting after the first delivery attempt", "Quorum queues ignore per-message TTL"]} answer={1}>
+
+Expired messages are dead-lettered when they reach the head of the queue. A 5-second message behind a 1-hour message waits for the 1-hour one. Using one queue per delay tier with a queue-level TTL avoids this head-of-line blocking.
+
+</MCQ>
+
+<MCQ q="On a quorum queue running RabbitMQ 4.0 with default settings, what stops a message that always fails from looping forever?" options={["Nothing; you must count retries yourself", "The consumer timeout of 30 seconds", "The delivery limit, which defaults to 20, after which the message is dead-lettered or dropped", "The redelivered flag automatically rejects after 3 deliveries"]} answer={2}>
+
+Since 4.0 quorum queues have a default delivery limit of 20. Past it the message is dead-lettered if a DLX exists, otherwise dropped. Classic queues are the ones with no built-in limit, and the redelivered flag is only a hint.
+
+</MCQ>
+
+<MCQ q="A producer publishes with confirms enabled but without the mandatory flag, and no binding matches. What does it receive?" options={["A basic.nack because the message was not stored", "A basic.ack, even though the message was dropped", "A basic.return followed by basic.ack", "No response until a matching binding is created"]} answer={1}>
+
+Unroutable messages are confirmed as soon as the exchange finds no matching queue. With `mandatory=true` a `basic.return` would come first. Broker nacks only signal internal errors. So confirms alone do not detect routing mistakes.
+
+</MCQ>
+
+<MCQ q="Which is a documented caveat of the rabbitmq-delayed-message-exchange plugin?" options={["Delayed messages are stored on a single node and are not replicated", "It only supports delays under one second", "It requires quorum queues", "It doubles message size"]} answer={0}>
+
+The plugin stores delayed messages in a single-node table that is not replicated, isn't designed for large volumes or very long delays, doesn't support `mandatory`, and is no longer maintained by the RabbitMQ team.
+
+</MCQ>
+
+<MCQ q="Two consumers share one queue with manual acks. Under what condition does RabbitMQ guarantee they process messages in publish order?" options={["Always, because queues are FIFO", "When prefetch is set to 1", "Never across competing consumers; use single active consumer for strict order", "Only if the exchange type is direct"]} answer={2}>
+
+Ordering is guaranteed only along one channel, one exchange, one queue and one outgoing channel. With competing consumers, one may finish before the other, and requeues interleave too. Even prefetch 1 does not stop two consumers working in parallel. Single active consumer gives strict order.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **Model**: producer → **exchange** → (bindings) → **queue** → consumer → **ack**. The default exchange routes by queue name.
+- **Exchanges**: direct (exact key) · topic (`*` = one word, `#` = zero or more) · fanout (everyone) · headers (`x-match` all/any).
+- **Unroutable** = silently dropped unless `mandatory=true` or an alternate exchange.
+- **Queue types**: quorum (Raft, default choice) · stream (replayable log) · classic (single node, mirroring removed in 4.0).
+- **Acks**: manual ack after work. `nack/reject` with requeue → redelivered flag; without requeue → DLX or drop. Delivery tags are per channel.
+- **Prefetch**: bounded per consumer; around 100–300 for fast work, low for slow jobs; never 0.
+- **Publisher confirms**: ack after queues accept (disk for durable classic, majority for quorum). Async, out of order.
+- **DLX triggers**: reject without requeue · TTL expiry · length limit · delivery limit.
+- **Delayed retry**: one TTL queue per tier → DLX back to work; 4.3+ quorum delayed retries; avoid the unmaintained delayed-message plugin for critical data.
+- **Poison messages**: quorum delivery limit (default 20) + always a DLX.
+- **Ordering**: one channel → one exchange → one queue → one consumer. Use single active consumer or shard by key.
+- **Cluster**: odd node count, metadata in Khepri (Raft), federation/shovel across regions.
+
+## Go deeper
+
+- **RabbitMQ docs**: [Consumer Acknowledgements and Publisher Confirms](https://www.rabbitmq.com/docs/confirms).
+- **RabbitMQ docs**: [Quorum Queues](https://www.rabbitmq.com/docs/quorum-queues) and [Streams](https://www.rabbitmq.com/docs/streams).
+- **RabbitMQ docs**: [Dead Letter Exchanges](https://www.rabbitmq.com/docs/dlx) and [TTL](https://www.rabbitmq.com/docs/ttl).
+- **RabbitMQ docs**: [Consumer Prefetch](https://www.rabbitmq.com/docs/consumer-prefetch) and [Consumers](https://www.rabbitmq.com/docs/consumers).
+- **RabbitMQ tutorial**: [Topics](https://www.rabbitmq.com/tutorials/tutorial-five-python) — the wildcard rules with examples.
+- **RabbitMQ blog**: [RabbitMQ 4.3 highlights](https://www.rabbitmq.com/blog/2026/04/23/rabbitmq-4.3-release) — delayed retries, consumer timeouts, Khepri-only metadata.
+- **Plugin README**: [rabbitmq-delayed-message-exchange](https://github.com/rabbitmq/rabbitmq-delayed-message-exchange) — read the limitations section.

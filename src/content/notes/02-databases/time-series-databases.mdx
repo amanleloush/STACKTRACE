@@ -1,0 +1,515 @@
+---
+title: "Time-Series Databases: Workloads, Compression, Cardinality"
+phase: "02-databases"
+order: 17
+tags: ["db", "time-series", "observability"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 16
+prerequisites: ["storage-fundamentals", "mysql-postgres-internals"]
+summary: "What makes time-series workloads special, how TSDBs squeeze a data point into about a byte, why high-cardinality labels break them, and how Prometheus, InfluxDB, TimescaleDB and ClickHouse compare."
+---
+
+## Definition (interview-ready)
+
+A **time-series database (TSDB)** stores measurements that are tagged with a timestamp — CPU usage every 15 seconds, a stock price every tick, a sensor reading every minute. One **series** is the stream of points for one thing being measured, identified by a metric name plus a set of **labels** (also called **tags**), for example `cpu_usage{host="web-1", core="0"}`. A TSDB is built for a very specific workload: a firehose of small appends, almost no updates, reads that care about recent time ranges, and old data that is summarized (**downsampled**) or deleted (**retention**). To make that cheap, TSDBs group points by series and by time window, and compress them with tricks like **delta-of-delta** timestamps and **XOR** float encoding, which can shrink a 16-byte point to around 1–2 bytes.
+
+## Why it matters
+
+- **Observability is a time-series problem.** Every metrics system you'll be asked about (Prometheus, Grafana Mimir, Datadog-style backends, InfluxDB) is a TSDB. Designing "a metrics and monitoring system" is a common HLD round.
+- **The volumes are huge.** Facebook's Gorilla paper (VLDB 2015) reported over 2 billion unique series and about 12 million points per second in 2015 — over a trillion points a day. Storing those at 16 bytes each in RAM was not practical; compression made it possible.
+- **The classic production failure is cardinality.** Someone adds `user_id` as a label, the series count explodes, and the metrics server runs out of memory. Interviewers love asking why that happens and how you prevent it.
+- **"Just use Postgres/MySQL" works until it doesn't.** Knowing exactly where a general-purpose B-tree database struggles with this workload (index bloat, deleting old rows, scanning wide time ranges) is what lets you justify a TSDB — or justify *not* adding one.
+
+## Core concepts
+
+### What makes the workload different
+
+| Trait | What it means | Design consequence |
+|---|---|---|
+| **Append-mostly** | New points arrive with "now" timestamps; old points are rarely changed | Optimize for sequential writes; no in-place updates needed |
+| **Time-ordered** | Points for a series arrive roughly in time order | Store points of one series next to each other, sorted by time, so they compress well |
+| **High write rate, tiny records** | Millions of 16-byte points per second | Batch in memory, write in large blocks, compress |
+| **Recent-heavy reads** | Dashboards and alerts read the last minutes or hours | Keep the newest window in memory; older data can be on disk or object storage |
+| **Range scans + aggregation** | "Average CPU per host over 1h in 1-minute buckets" | Scan contiguous blocks, not random rows; columnar layouts help |
+| **Downsampling** | Keep 1-minute resolution for a week, 1-hour resolution for a year | Background jobs or materialized views that roll data up |
+| **Retention** | Delete everything older than N days | Partition by time, so deleting old data means dropping a whole file/partition instead of deleting rows one by one |
+
+**Intuition:** a TSDB is like a ship's log. You only ever write on the newest page, you mostly read the last few pages, and when the book is full you throw away the oldest volume — you never cross out individual lines.
+
+### The data model: series, labels, samples
+
+```
+metric name     labels (tags)                         samples (timestamp, value)
+─────────────   ────────────────────────────────────  ─────────────────────────────
+http_requests   {method="GET", status="200", pod="a"} (t1, 1027) (t2, 1031) (t3, 1040) …
+http_requests   {method="GET", status="500", pod="a"} (t1, 3)    (t2, 3)    (t3, 4)    …
+http_requests   {method="POST",status="200", pod="b"} (t1, 88)   (t2, 90)   (t3, 95)   …
+```
+
+- **Series** = metric name + one exact combination of label values. The Prometheus docs put it directly: every unique combination of key-value label pairs is a new time series.
+- **Sample** (or point) = one (timestamp, value) pair.
+- **Series cardinality** = how many distinct series exist. This number — not the number of samples — drives index size and memory.
+
+InfluxDB uses slightly different words: a **measurement** (like a table), **tags** (indexed string metadata, part of the series key) and **fields** (the actual values, not indexed in 1.x/2.x).
+
+### Storage layouts
+
+There are three common ways to lay out time-series data on disk.
+
+**1. Row per point in a general-purpose table (plain Postgres/MySQL)**
+
+```sql
+CREATE TABLE metrics (ts timestamptz, host text, metric text, value double precision);
+CREATE INDEX ON metrics (host, metric, ts);
+```
+
+Works fine at small scale. Problems at large scale: each row carries ~20+ bytes of row overhead plus repeated `host`/`metric` strings, the B-tree index grows as large as the data, and `DELETE WHERE ts older than 30 days` creates huge amounts of dead rows and I/O.
+
+**2. Series-oriented blocks (Gorilla, Prometheus, InfluxDB 1.x/2.x)**
+
+```
+ ┌──────────── block: 2h window ───────────┐
+ │ series 1: [compressed chunk of samples] │
+ │ series 2: [compressed chunk of samples] │
+ │ ...                                     │
+ │ index: label pair → list of series IDs  │
+ └─────────────────────────────────────────┘
+```
+
+Points for one series over a time window are packed into a compressed **chunk**. Each block covers a fixed time window, so retention = delete whole old blocks. An **inverted index** (the same idea as a search engine's — see [Elasticsearch](/learn/notes/elasticsearch/)) maps each label pair, like `status="500"`, to the list of series that have it.
+
+**3. Columnar, time-partitioned tables (ClickHouse, TimescaleDB columnstore, InfluxDB 3)**
+
+```
+ partition 2026-10-20 ─┬─ column ts:    [compressed]
+                       ├─ column host:  [dictionary-encoded]
+                       ├─ column value: [compressed]
+                       └─ ...
+```
+
+Each column is stored separately and sorted by something like `(series key, time)`. Compression is excellent because each column holds similar values, and queries read only the columns they need. Columnar formats (see [Parquet/ORC](/learn/notes/file-formats-parquet-orc-avro/)) also handle high cardinality better, because a label is just another column, not a key in a per-series index.
+
+Under the hood, most TSDBs are **log-structured**: buffer recent writes in memory (protected by a write-ahead log), flush immutable files, and merge (compact) them later. That's the LSM idea from [Storage Fundamentals](/learn/notes/storage-fundamentals/), and it's why TSDBs handle high write rates well.
+
+### Compressing timestamps: delta and delta-of-delta
+
+Raw timestamps are 64-bit numbers, but consecutive ones are very similar.
+
+- **Delta encoding**: store the difference from the previous value instead of the value itself.
+- **Delta-of-delta**: store the difference between consecutive *deltas*. For data scraped at a fixed interval, the delta is almost always the same, so the delta-of-delta is almost always **0**.
+
+```
+timestamps:      1000   1060   1120   1179   1240
+deltas:                  60     60     59     61
+delta-of-delta:                  0     -1     +2
+```
+
+The Gorilla paper then uses a variable-length code, so small values take very few bits:
+
+| Delta-of-delta D | Bits written |
+|---|---|
+| 0 | `0` (1 bit) |
+| between -63 and 64 | `10` + 7 bits |
+| between -255 and 256 | `110` + 9 bits |
+| between -2047 and 2048 | `1110` + 12 bits |
+| anything else | `1111` + 32 bits |
+
+Each block header stores a starting timestamp aligned to a two-hour window. Facebook found that about **96% of timestamps compressed to a single bit**. Prometheus's chunk format uses the same delta-of-delta idea for timestamps.
+
+### Compressing values: XOR float compression (Gorilla)
+
+Metric values usually change slowly, and many are actually integers stored as floats. If two IEEE-754 doubles are close, their sign, exponent and first mantissa bits are identical. **XOR** the current value with the previous one and you get a number that is mostly zeros.
+
+```
+12.0  = 0x4028000000000000
+24.0  = 0x4038000000000000
+XOR   = 0x0010000000000000   → 11 leading zeros, 1 meaningful bit, 52 trailing zeros
+```
+
+Encoding rules from the paper:
+
+1. The first value is stored uncompressed (64 bits).
+2. XOR is zero (same value as before) → write a single `0` bit.
+3. XOR is non-zero → write `1`, then either:
+   - `0` + just the meaningful bits, if they fit inside the same leading/trailing-zero window as the previous value, or
+   - `1` + 5 bits for the number of leading zeros + 6 bits for the length of the meaningful bits + the meaningful bits themselves.
+
+In Facebook's data, roughly **51% of values compressed to one bit** (unchanged value), about 30% used the "reuse the window" path (average 26.6 bits), and about 19% needed the full header (average 36.9 bits).
+
+**Result:** a 16-byte (timestamp, value) pair compressed to an average of **1.37 bytes**, about a **12x** reduction, with two-hour blocks. Larger blocks gave diminishing returns. The Prometheus docs say Prometheus stores on average **1–2 bytes per sample** using a similar XOR chunk encoding, and ClickHouse exposes the same ideas as column codecs named `DoubleDelta` and `Gorilla`.
+
+**Why this matters for design:** at about 1.4 bytes per point, 12 million points per second is about 17 MB/s — small enough that Gorilla could keep 26 hours of data in memory and serve queries from RAM. The paper reports query latency improvements of 73x or more over the previous disk-based store.
+
+**How to say it in an interview:** "Timestamps arrive at regular intervals, so delta-of-delta is usually zero and costs one bit. Values change slowly, so XOR with the previous value is mostly zeros, and we only store the few meaningful bits. That's how Gorilla got from 16 bytes to about 1.37 bytes per point."
+
+### Other compression tricks you should know
+
+- **Dictionary encoding** for repeated strings (hostnames, regions): store each distinct string once and refer to it by a small integer.
+- **Run-length encoding** for long runs of the same value.
+- **Bit-packing / T64**: if all integers in a block fit in 12 bits, don't store 64.
+- **General-purpose codecs** (LZ4, ZSTD) layered on top of the specialised encodings. In ClickHouse you chain them, for example `CODEC(Delta, ZSTD)`.
+
+### The high-cardinality problem
+
+**Cardinality** is the number of distinct series. It multiplies across labels:
+
+```
+http_requests_total
+  method    ×  5 values
+  status    × 10 values
+  endpoint  × 50 values
+  pod       × 100 values
+  ──────────────────────
+  up to 250,000 series            ← fine
+
+  + user_id × 1,000,000 values
+  ──────────────────────
+  up to 250,000,000,000 series    ← the server dies
+```
+
+**Why it hurts:**
+
+1. **The index grows with series, not samples.** Every new series adds entries to the inverted index (label pair → series list) and to the symbol table of label strings. In Prometheus, every active series also lives in the in-memory **head block** with its own open chunk and metadata. More series means more RAM, roughly linearly.
+2. **Queries fan out.** `sum by (status) (rate(http_requests_total[5m]))` has to touch every matching series. If that's millions of series, it's slow no matter how well each series is compressed.
+3. **Compression gets worse.** A series with three points can't benefit from delta-of-delta. High-cardinality data tends to be sparse.
+4. **Churn.** Labels like `pod` or `container_id` change on every deploy. Old series stop, new ones start. Even if only 10,000 series are active at once, a block that covers many deploys might index hundreds of thousands. Cardinality counts what's live; **churn** is how fast that set changes, and both hurt.
+
+InfluxDB's own docs (1.x/2.x) name high series cardinality as a primary driver of high memory usage, and list the usual culprits: log messages, timestamps, and unique IDs stored as tags.
+
+**Mitigations:**
+
+- **Don't put unbounded values in labels.** User IDs, emails, request IDs, full URLs, and error messages belong in logs or traces, not metric labels. The Prometheus naming guide says exactly this.
+- **Normalize values.** Use the route template `/users/:id` instead of the raw path `/users/48213`. Bucket status codes into `2xx`, `4xx`, `5xx` if you don't need the exact code.
+- **Drop or relabel at ingest.** Prometheus `metric_relabel_configs` can drop a label or a whole metric before it is stored. Set per-scrape `sample_limit` so one bad target can't take down the server.
+- **Pre-aggregate.** Recording rules (Prometheus) or continuous aggregates (TimescaleDB) store the rolled-up series you actually query.
+- **Use the right tool for per-entity data.** If you truly need per-user analytics, that's an OLAP/event workload: store raw events in a columnar store like ClickHouse and aggregate at query time.
+- **Shard.** Horizontally scalable backends (Thanos, Cortex, Grafana Mimir, VictoriaMetrics) spread series across nodes. This raises the ceiling but doesn't remove the cost.
+- **Measure it.** Prometheus exposes head stats at `/api/v1/status/tsdb`; InfluxQL has `SHOW SERIES CARDINALITY`.
+
+**How to say it in an interview:** "Cardinality is the product of label value counts. TSDBs index series, so memory scales with the number of series, not points. I'd keep labels bounded, move IDs to logs or traces, and put per-user analysis in a columnar event store."
+
+### Downsampling and retention
+
+- **Retention**: TSDBs partition by time, so expiring data means deleting whole blocks or dropping whole partitions — cheap and instant, with no row-by-row deletes and no dead tuples. Prometheus keeps 15 days by default (`--storage.tsdb.retention.time`). TimescaleDB has `add_retention_policy`. ClickHouse uses a `TTL` clause on the table.
+- **Downsampling**: keep raw data for a short time and rolled-up data (min/max/avg/count per 5 minutes or 1 hour) for longer. Prometheus itself doesn't downsample; Thanos's compactor does, and TimescaleDB uses continuous aggregates.
+- **Keep the right aggregates.** You can average averages only if you also keep counts. Percentiles can't be rebuilt from stored percentiles — keep histograms or sketches instead (see [Probabilistic Data Structures](/learn/notes/probabilistic-data-structures/)).
+
+## How it works
+
+### A write and a query in Prometheus
+
+```
+scrape every 15s
+      │
+      ▼
+ ┌─────────────── head block (memory) ───────────────┐
+ │ series lookup: labels → series ref (create if new)│
+ │ append (t, v) to that series' open XOR chunk      │
+ │ also appended to the WAL (128 MB segments on disk)│
+ └───────────────────────────────────────────────────┘
+      │ every 2h the head is cut into an immutable block
+      ▼
+ block dir: chunks/ + index (symbols, postings) + meta.json + tombstones
+      │ background compaction merges blocks into larger ones
+      │ (up to 10% of retention or 31 days, whichever is smaller)
+      ▼
+ retention: whole blocks older than 15d (default) are deleted
+```
+
+A query such as `rate(http_requests_total{status="500"}[5m])`:
+
+1. Look up the **postings** (sorted series IDs) for `__name__="http_requests_total"` and for `status="500"`, then intersect the two lists.
+2. For each matching series, find chunks overlapping the time range, in the head and in persisted blocks.
+3. Decode the chunks (delta-of-delta + XOR), compute `rate` per series, return the results.
+
+The Prometheus docs are explicit that local storage is **not clustered or replicated**. For durability and long-term storage you use **remote write** to a system such as Thanos, Cortex/Mimir or VictoriaMetrics, or run two identical Prometheus servers for HA.
+
+### Sizing a metrics store (back-of-envelope)
+
+Prometheus documents the formula `disk = retention_seconds × samples_per_second × bytes_per_sample`.
+
+```
+1,000,000 active series, scraped every 15 s → ~66,700 samples/s
+× 2 bytes/sample × 15 days (1,296,000 s)
+≈ 173 GB on disk
+```
+
+RAM is driven by active series count (plus churn), not by retention. See [Back-of-Envelope Math](/learn/notes/back-of-envelope-math/).
+
+### Prometheus vs InfluxDB vs TimescaleDB vs ClickHouse
+
+| | **Prometheus** | **InfluxDB 3** | **TimescaleDB** | **ClickHouse** |
+|---|---|---|---|---|
+| What it is | Monitoring system with a built-in TSDB | Purpose-built TSDB, rewritten in Rust for v3 | Extension that turns PostgreSQL into a TSDB | General columnar OLAP database |
+| Data model | Metric name + labels → float samples (plus native histograms) | Databases → tables (measurements) with tag and field columns | Ordinary SQL tables (**hypertables**) auto-partitioned into time **chunks** | SQL tables, usually `MergeTree` ordered by `(key, time)` |
+| Ingest | **Pull**: scrapes HTTP `/metrics` endpoints; also accepts remote write | Push: line protocol; v1/v2 write APIs compatible | SQL `INSERT` / `COPY` | SQL `INSERT`, Kafka engine, many integrations |
+| Query language | PromQL | SQL and InfluxQL (Flux **not supported** in v3) | Full PostgreSQL SQL + time functions like `time_bucket()` | ClickHouse SQL |
+| Storage | 2h blocks, XOR chunks, inverted label index | Apache Arrow in memory, Parquet files, local disk or object storage | Row store for recent chunks, **columnstore** (hypercore) for older ones | Columnar parts merged in the background, per-column codecs |
+| Scaling | Single node; scale out with Thanos / Mimir / Cortex / VictoriaMetrics | Core: single node. Enterprise: multi-node, read replicas, HA | Scales up like Postgres; read replicas; managed cloud for more | Sharding + replication built in |
+| Cardinality | Sensitive — series live in memory | InfluxData markets v3 as removing the series-cardinality ceiling, since tags are just columns | Fine for many series if indexes are sane; it's still Postgres | Handles high cardinality well (columns, not per-series index) |
+| Best fit | Infrastructure and service metrics, alerting, Kubernetes | Dedicated metrics/IoT/sensor pipelines wanting a TSDB with SQL | Teams already on Postgres needing time series **plus** relational joins and transactions | Very large event/log/metric analytics, high-cardinality analysis |
+| Watch out | Not long-term storage by itself; no strong durability on one node | v3 is a different engine from 1.x/2.x; Flux tasks must be rewritten | Not a distributed database; heavy writes need tuning | Not OLTP — no row-level transactions; updates/deletes are expensive |
+
+Version notes worth knowing:
+
+- **InfluxDB 3** Core (open source, MIT/Apache 2) and Enterprise went GA in April 2025. The engine is built on Apache Arrow, DataFusion and Parquet. Core is positioned as a recent-data engine; long-range historical queries are an Enterprise focus. If you know InfluxDB 1.x/2.x (TSM storage engine, TSI index, Flux in 2.x), treat v3 as a new product.
+- **TimescaleDB** remains the name of the open-source extension, but the company behind it renamed itself from Timescale to **TigerData** in June 2025. Its hybrid row/column engine is called **hypercore**; the docs quote 90–98% compression in the columnstore.
+- **ClickHouse** codecs for time series: `DoubleDelta` (delta-of-delta, best for steady timestamps or counters), `Gorilla` (XOR, for slowly changing floats), `T64` (crops unused high bits of integers), plus `Delta`, `FPC`, and general-purpose `LZ4` (default when self-managed) and `ZSTD`.
+
+```sql
+-- ClickHouse: a metrics table with time-series codecs and TTL retention
+CREATE TABLE metrics
+(
+    ts     DateTime CODEC(DoubleDelta, ZSTD),
+    metric LowCardinality(String),
+    host   LowCardinality(String),
+    value  Float64  CODEC(Gorilla, ZSTD)
+)
+ENGINE = MergeTree
+PARTITION BY toDate(ts)
+ORDER BY (metric, host, ts)
+TTL ts + INTERVAL 30 DAY;
+```
+
+```sql
+-- TimescaleDB: hypertable + continuous aggregate + retention
+CREATE TABLE metrics (ts timestamptz NOT NULL, host text, value double precision);
+SELECT create_hypertable('metrics', 'ts');
+
+CREATE MATERIALIZED VIEW metrics_1h
+WITH (timescaledb.continuous) AS
+SELECT time_bucket('1 hour', ts) AS bucket, host, avg(value), max(value), count(*)
+FROM metrics GROUP BY bucket, host;
+
+SELECT add_retention_policy('metrics', INTERVAL '30 days');
+```
+
+### Choosing quickly
+
+- Kubernetes/service metrics with alerting → **Prometheus** (plus Thanos/Mimir for long-term and global view).
+- Already on Postgres, need time series joined with business tables, moderate scale → **TimescaleDB**.
+- Huge volumes, high-cardinality dimensions, ad-hoc analytics over events or logs → **ClickHouse**.
+- A dedicated TSDB with SQL for IoT or sensor data → **InfluxDB 3**.
+
+More on picking a database in general: [Choosing a Database](/learn/notes/database-selection-matrix/).
+
+## Real-world examples
+
+- **Facebook Gorilla (VLDB 2015)**: an in-memory TSDB used as a write-through cache for the most recent 26 hours of monitoring data in Facebook's ODS system. It introduced the delta-of-delta + XOR scheme (1.37 bytes per point) that Prometheus and many others adopted.
+- **Prometheus**: the CNCF monitoring system. Its TSDB uses 2-hour blocks, a WAL, XOR chunks and an inverted postings index — essentially Gorilla compression plus a label index.
+- **Thanos, Cortex and Grafana Mimir**: open-source projects that add long-term object-storage retention, global querying and horizontal scaling on top of the Prometheus data model.
+- **ClickHouse codecs**: `DoubleDelta` and `Gorilla` are named after and directly implement the techniques above.
+
+## Common pitfalls
+
+- **Unbounded labels** (user IDs, request IDs, raw URLs, error strings). The number one cause of TSDB outages.
+- **High churn** from labels like `pod` or `container_id` on very frequent deploys or short-lived jobs — the series count grows even if the active count looks fine.
+- **Treating a single Prometheus as durable long-term storage.** It's a single node with no replication; use remote write.
+- **Averaging averages or percentiles** after downsampling. Keep sums and counts, or histograms.
+- **Using a TSDB as a general database.** No joins (Prometheus), weak or no transactions, limited updates. Keep business data in an OLTP store.
+- **Deleting old data row by row** in a plain relational table. Partition by time and drop partitions instead.
+- **Tiny chunk/partition sizes.** Too many small chunks or parts add planning and metadata overhead; too large hurts retention granularity and memory. Follow the product's sizing guidance.
+- **Assuming InfluxDB 3 behaves like 2.x.** Different engine, different query languages (no Flux).
+
+## Practice questions
+
+<Practice>
+
+<QA q="What is a time series, and what is a series in Prometheus terms?" level="easy">
+
+A time series is a sequence of (timestamp, value) points for one thing being measured. In Prometheus a **series** is identified by the metric name plus one exact set of label values, for example `http_requests_total{method='GET', status='200'}`. Change any label value and it's a different series.
+
+</QA>
+
+<QA q="What workload traits make time-series data different from typical OLTP data?" level="easy">
+
+- **Append-mostly**: new points with current timestamps, almost no updates.
+- **Time-ordered** arrivals per series.
+- **Very high write rate** of tiny records.
+- **Recent-heavy reads**: dashboards and alerts look at the last minutes or hours.
+- **Range scans with aggregation** rather than point lookups.
+- **Downsampling and retention**: old data is rolled up or deleted in bulk.
+
+Those traits favour time-partitioned, log-structured, heavily compressed storage.
+
+</QA>
+
+<QA q="Explain delta-of-delta timestamp encoding with an example." level="easy">
+
+Store the difference between consecutive deltas instead of the raw timestamps. Timestamps 1000, 1060, 1120, 1179 have deltas 60, 60, 59 and delta-of-deltas 0, -1. With a regular scrape interval, the delta-of-delta is almost always 0, which Gorilla encodes as a single `0` bit. Small non-zero values use short prefixed codes (for example `10` + 7 bits for values between -63 and 64). Facebook found about 96% of timestamps compressed to one bit.
+
+</QA>
+
+<QA q="How does Gorilla's XOR float compression work?" level="medium">
+
+XOR each value with the previous one. Close values share sign, exponent and leading mantissa bits, so the XOR is mostly zeros.
+
+- XOR = 0 (same value) → write one `0` bit.
+- Otherwise write `1`, then either `0` + the meaningful bits (if they fit in the previous leading/trailing-zero window), or `1` + 5 bits of leading-zero count + 6 bits of meaningful-bit length + the meaningful bits.
+
+In Facebook's data about 51% of values took a single bit. Combined with delta-of-delta timestamps, points averaged 1.37 bytes instead of 16.
+
+</QA>
+
+<QA q="What is the high-cardinality problem and why does it hurt Prometheus?" level="medium">
+
+Cardinality is the number of distinct series, which is roughly the product of the number of values for each label. Prometheus keeps every active series in the in-memory head block, and indexes every label pair in an inverted index (postings) plus a symbol table. So memory and index size grow with the number of series, not samples. Adding an unbounded label like `user_id` multiplies series by millions, causing out-of-memory crashes, slow queries that fan out over huge postings lists, and poor compression because each series is sparse.
+
+</QA>
+
+<QA q="What is series churn and how is it different from cardinality?" level="medium">
+
+Cardinality is how many series exist at a point in time. Churn is how fast that set changes — old series stop and new ones start. Labels such as `pod` or `container_id` change on every deploy, so a system with only 50k active series may create hundreds of thousands of series per day. Each new series costs index entries and head memory, and a block covering that period must index all of them. You fix churn by dropping or aggregating away the volatile labels.
+
+</QA>
+
+<QA q="How do TSDBs make retention cheap compared with a plain relational table?" level="medium">
+
+They partition data by time: Prometheus 2-hour blocks compacted into larger ones, TimescaleDB chunks, ClickHouse partitions. Expiring data means deleting whole files or dropping whole partitions — a metadata operation. In a plain table, `DELETE WHERE ts older than X` touches every row, generates WAL/undo, leaves dead tuples or fragmentation, and needs vacuum or index cleanup.
+
+</QA>
+
+<QA q="Why can't you compute an accurate p99 by averaging stored per-minute p99 values?" level="medium">
+
+Percentiles aren't additive. The p99 of a day isn't the average (or max) of each minute's p99, because each minute has a different number of requests and distribution. To aggregate latency correctly you store histograms (bucket counts) or mergeable sketches such as t-digest or DDSketch, then compute the percentile from the merged distribution. Averages are only safe if you keep sum and count together.
+
+</QA>
+
+<QA q="Compare Prometheus, InfluxDB 3, TimescaleDB and ClickHouse in one line each." level="medium">
+
+- **Prometheus**: pull-based monitoring with PromQL and a single-node TSDB; best for infra/service metrics and alerting; scale out with Thanos/Mimir.
+- **InfluxDB 3**: purpose-built TSDB rewritten in Rust on Arrow/DataFusion/Parquet; SQL and InfluxQL (no Flux); good for IoT and metrics pipelines.
+- **TimescaleDB**: Postgres extension with hypertables, columnstore compression and continuous aggregates; best when you need time series plus relational SQL.
+- **ClickHouse**: distributed columnar OLAP; best for huge, high-cardinality event and log analytics.
+
+</QA>
+
+<QA q="Why is Prometheus local storage not enough for long-term metrics, and what do people do?" level="medium">
+
+The docs state local storage is not clustered or replicated: one disk, one node. Retention is bounded by that disk, and a lost node means lost history. You also can't query across many Prometheus servers in one place. Teams use remote write or sidecars to send data to Thanos, Cortex/Mimir or VictoriaMetrics, which store blocks in object storage, deduplicate HA pairs, downsample, and give a global query view.
+
+</QA>
+
+<QA q="When would you choose TimescaleDB over a dedicated TSDB like Prometheus or InfluxDB?" level="hard">
+
+When the time-series data must be joined with relational business data, needs transactions or standard SQL tooling, or the team already runs Postgres. Examples: IoT device readings joined to a device and customer table, or financial ticks next to account data. Hypertables give time partitioning and cheap retention, the columnstore gives strong compression, and continuous aggregates give downsampling. Trade-off: it scales like Postgres (mostly vertically, plus replicas), so at very large ingest or very high cardinality, ClickHouse or a horizontally scaled TSDB fits better.
+
+</QA>
+
+<QA q="Estimate disk for 2 million active series scraped every 30 seconds with 30-day retention." level="hard">
+
+Samples per second = 2,000,000 / 30 ≈ 66,700. Seconds in 30 days = 2,592,000. Using Prometheus's 1–2 bytes per sample: 66,700 × 2,592,000 × 2 ≈ 346 GB at the high end, about half that at 1 byte. Add headroom for the WAL, compaction (which temporarily needs extra space) and index. RAM is driven by the 2 million active series plus churn, which on a single Prometheus is already large — a sign to shard or move to Mimir/Thanos/VictoriaMetrics.
+
+</QA>
+
+<QA q="A team added a `customer_id` label to an API latency histogram and Prometheus started OOM-killing. Walk through your response." level="scenario">
+
+1. **Stop the bleeding**: add a `metric_relabel_configs` rule that drops the `customer_id` label (or the metric), set a `sample_limit` on the target, and restart with enough memory to replay the WAL.
+2. **Confirm**: check `/api/v1/status/tsdb` for top series by metric and label. Histograms multiply series per bucket, so this was a multiplier on a multiplier.
+3. **Fix the design**: keep the metric labelled by bounded dimensions (route, status class). Per-customer latency goes to traces or to request logs or events in a columnar store (ClickHouse) where `customer_id` is just a column. If a few big customers matter, label a bounded `tier` or top-N list instead.
+4. **Prevent recurrence**: cardinality checks in CI or at review time, and alerting on head series growth.
+
+</QA>
+
+<QA q="You must design storage for 5 million IoT devices sending 10 readings per minute each, kept raw for 7 days and hourly for 2 years. Outline it." level="scenario">
+
+- **Rate**: 5M × 10 / 60 ≈ 833k points/s. With good codecs (around 1–2 bytes per value plus timestamp), raw 7 days is roughly 0.5–1 TB, before replication.
+- **Ingest**: devices → a gateway → Kafka (buffer, replay) → batch inserts into the store.
+- **Store**: device ID is high cardinality, so prefer a columnar store such as ClickHouse (`ORDER BY (device_id, ts)`, `DoubleDelta`/`Gorilla` codecs, `PARTITION BY toDate(ts)`) or TimescaleDB with columnstore if scale allows on one primary.
+- **Downsampling**: a materialized view or continuous aggregate storing min/max/sum/count per device per hour.
+- **Retention**: TTL or a retention policy that drops raw partitions after 7 days; the hourly table keeps 2 years.
+- **Reads**: recent dashboards hit raw data; long-range queries hit the hourly table.
+
+</QA>
+
+<QA q="Your Grafana dashboard over 90 days is slow even though each series compresses well. Why, and what do you change?" level="scenario">
+
+Compression reduces bytes, but a 90-day query over raw 15-second data still decodes millions of points per series, often across thousands of series. Fixes: query a downsampled source (Thanos 5m/1h downsampling, a TimescaleDB continuous aggregate, a ClickHouse rollup table), pre-compute the expensive expression with recording rules, reduce the series matched (tighter label filters, aggregate away high-cardinality labels) and use an appropriate step so the panel doesn't request more points than it can draw.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="In Prometheus, what defines a distinct time series?" options={["The metric name alone", "The metric name plus one exact combination of label values", "Each scrape target", "Each 2-hour block"]} answer={1}>
+
+Every unique combination of name and label key-value pairs is a separate series. The metric name alone groups many series; targets and blocks are unrelated to series identity.
+
+</MCQ>
+
+<MCQ q="Timestamps arrive every 60 s with tiny jitter. Which encoding makes most of them cost about one bit?" options={["Dictionary encoding", "Run-length encoding of raw timestamps", "Delta-of-delta with a variable-length code", "ZSTD on raw 64-bit values"]} answer={2}>
+
+With a regular interval the delta-of-delta is usually 0, which Gorilla encodes as a single 0 bit (about 96% of timestamps in Facebook's data). Raw timestamps never repeat, so dictionary or RLE don't help, and ZSTD alone can't reach one bit per value.
+
+</MCQ>
+
+<MCQ q="In Gorilla's value compression, what is written when a value equals the previous value?" options={["A single 0 bit", "The full 64-bit value", "A 5-bit leading-zero count", "Nothing at all"]} answer={0}>
+
+Equal values XOR to zero, which is encoded as one 0 bit; about 51% of Facebook's values were like this. The full value is only stored for the first point, and the 5-bit count is part of the non-zero XOR path.
+
+</MCQ>
+
+<MCQ q="According to the Gorilla paper, what was the average compressed size per data point?" options={["16 bytes", "8 bytes", "4.2 bytes", "1.37 bytes"]} answer={3}>
+
+16-byte points compressed to about 1.37 bytes, a 12x reduction, using two-hour blocks. 16 bytes is the uncompressed size.
+
+</MCQ>
+
+<MCQ q="Which change is most likely to cause a cardinality explosion?" options={["Scraping every 10 s instead of every 30 s", "Adding a request_id label to a counter", "Increasing retention from 15 to 30 days", "Enabling remote write"]} answer={1}>
+
+Each request_id value creates a new series, so series count grows without bound. A faster scrape interval adds samples, not series; retention adds disk, not active series; remote write just copies data out.
+
+</MCQ>
+
+<MCQ q="Why is dropping old data cheap in a TSDB?" options={["Data is stored in a B-tree that supports fast deletes", "Old data is overwritten in place", "Data is partitioned by time, so whole blocks or partitions are removed at once", "TSDBs never delete data"]} answer={2}>
+
+Time partitioning turns retention into a file or partition drop. Row-by-row deletes in a B-tree are what TSDBs avoid, and TSDBs do not overwrite in place.
+
+</MCQ>
+
+<MCQ q="Which statement about InfluxDB 3 is correct?" options={["It still uses Flux as its main query language", "It queries with SQL and InfluxQL and stores data as Parquet", "It is a PostgreSQL extension", "It uses the same TSM engine as InfluxDB 2"]} answer={1}>
+
+InfluxDB 3 is built on Arrow, DataFusion and Parquet, supports SQL and InfluxQL, and does not support Flux. TSM was the 1.x/2.x engine, and the Postgres extension is TimescaleDB.
+
+</MCQ>
+
+<MCQ q="A team needs time-series sensor data joined with customer and device tables, with transactions, on a moderate scale. Best fit?" options={["Prometheus", "TimescaleDB", "Redis", "Elasticsearch"]} answer={1}>
+
+TimescaleDB is PostgreSQL, so you get hypertables and compression plus full SQL joins and transactions. Prometheus has no joins with business tables, Redis is not a time-series analytics store, and Elasticsearch is for search and logs.
+
+</MCQ>
+
+<MCQ q="What does the Prometheus documentation say about its local storage?" options={["It is replicated across three nodes by default", "It is not clustered or replicated", "It keeps data forever by default", "It stores about 16 bytes per sample"]} answer={1}>
+
+Local storage is a single-node store; durability and long-term retention come from remote write integrations. Default retention is 15 days and storage averages 1–2 bytes per sample.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **Workload**: append-mostly, time-ordered, recent-heavy reads, range aggregation, downsampling, retention.
+- **Series** = metric + exact label set. **Cardinality** = number of series = product of label value counts.
+- **Layout**: group points per series per time window; log-structured writes; time partitions make retention a file drop.
+- **Timestamps**: delta-of-delta, usually 0 → 1 bit (96% in Gorilla).
+- **Values**: XOR with previous; same value → 1 bit (51%); otherwise store only meaningful bits.
+- **Gorilla**: 16 bytes → 1.37 bytes per point (12x), 2-hour blocks, 26 hours in memory. Prometheus: 1–2 bytes per sample.
+- **Cardinality kills** via index and head memory. Keep labels bounded; IDs go to logs, traces or a columnar store; relabel, limit, pre-aggregate.
+- **Downsample** with sums, counts and histograms — never average percentiles.
+- **Prometheus** = pull + PromQL, single node, 2h blocks, 15d default retention; scale with Thanos/Mimir.
+- **InfluxDB 3** = Rust + Arrow + Parquet, SQL/InfluxQL, no Flux. **TimescaleDB** = Postgres + hypertables + columnstore + continuous aggregates. **ClickHouse** = columnar OLAP with `DoubleDelta`/`Gorilla` codecs, great at high cardinality.
+
+## Go deeper
+
+- **Paper**: [Gorilla: A Fast, Scalable, In-Memory Time Series Database](https://www.vldb.org/pvldb/vol8/p1816-teller.pdf) (VLDB 2015).
+- **Prometheus docs**: [Storage](https://prometheus.io/docs/prometheus/latest/storage/) and [Metric and label naming](https://prometheus.io/docs/practices/naming/).
+- **Prometheus source docs**: [TSDB chunk format](https://github.com/prometheus/prometheus/blob/main/tsdb/docs/format/chunks.md) and [index format](https://github.com/prometheus/prometheus/blob/main/tsdb/docs/format/index.md).
+- **InfluxDB docs**: [InfluxDB 3 Core](https://docs.influxdata.com/influxdb3/core/) and [Resolve high series cardinality (v2)](https://docs.influxdata.com/influxdb/v2/write-data/best-practices/resolve-high-cardinality/).
+- **TimescaleDB docs**: [Hypertables](https://www.tigerdata.com/docs/use-timescale/latest/hypertables) and [Continuous aggregates](https://www.tigerdata.com/docs/use-timescale/latest/continuous-aggregates).
+- **ClickHouse docs**: [Column compression codecs](https://clickhouse.com/docs/reference/statements/create/table/codec).
+- **Book**: *Designing Data-Intensive Applications* (Kleppmann), Chapter 3, for log-structured storage and column-oriented storage.

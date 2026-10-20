@@ -1,0 +1,588 @@
+---
+title: "Normalization: Functional Dependencies to BCNF and 4NF"
+phase: "11-sql-dbms"
+order: 114
+tags: ["sql", "dbms", "data-modeling"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 25
+prerequisites: ["keys-er-modeling"]
+summary: "Functional dependencies, closures and candidate keys, then 1NF through BCNF and 4NF with precise definitions, lossless and dependency-preserving decomposition, worked examples, and when to denormalize."
+---
+
+## Definition (interview-ready)
+
+**Normalization** is splitting a table into smaller tables so that **each fact is stored once**. This removes redundancy and the bugs it causes: insert, update and delete anomalies.
+
+It is driven by **functional dependencies** (FDs). An FD `X → Y` means "if two rows agree on X, they must agree on Y". For example, `customer_id → customer_city`.
+
+The normal forms are a ladder of stricter rules:
+
+- **1NF**: every column holds a single, atomic value. No lists, no repeating groups.
+- **2NF**: 1NF, and no non-prime column depends on only *part* of a candidate key.
+- **3NF**: for every non-trivial FD `X → A`, either X is a superkey or A is a prime attribute (part of some candidate key).
+- **BCNF**: for every non-trivial FD `X → Y`, X is a superkey. In short: *every determinant is a superkey*.
+- **4NF**: BCNF's rule applied to **multivalued dependencies** as well.
+
+Each form implies the ones before it. The splits must be **lossless** (joining the pieces gives back exactly the original table) and should ideally be **dependency-preserving** (every FD can still be checked inside a single table).
+
+## Why it matters
+
+- It is the standard DBMS interview topic. Expect "what normal form is this table in?" and "decompose it to BCNF".
+- Many online definitions are subtly wrong. A common one is "3NF means no transitive dependency on the primary key". The real definition talks about **all candidate keys** and allows an exception for **prime attributes**. Knowing the exact definitions is what separates a strong answer.
+- In real systems, normalized OLTP schemas are what stop data from drifting out of sync. Knowing *when to break the rules* (denormalize) is the follow-up question for senior roles.
+
+## Core concepts
+
+### Functional dependencies
+
+`X → Y` (read "X determines Y") holds if no two rows can have the same X values and different Y values. Like keys, FDs come from **business rules**, not from sample data.
+
+- **Trivial FD**: Y is a subset of X, like `(order_id, product_id) → order_id`. It is always true and tells you nothing.
+- **Key as an FD**: K is a superkey exactly when `K → (all columns)`.
+
+**Armstrong's axioms** let you derive every FD that follows from a given set. They are sound (derive only true FDs) and complete (derive all of them):
+
+1. **Reflexivity**: if Y is a subset of X, then `X → Y`.
+2. **Augmentation**: if `X → Y`, then `XZ → YZ`.
+3. **Transitivity**: if `X → Y` and `Y → Z`, then `X → Z`.
+
+Useful derived rules: **union** (`X → Y` and `X → Z` give `X → YZ`), **decomposition** (`X → YZ` gives `X → Y`), **pseudo-transitivity** (`X → Y` and `WY → Z` give `WX → Z`).
+
+The full set of FDs implied by a set F is written F⁺ (the closure of F).
+
+### Attribute closure: the one algorithm you need
+
+The **closure** of a set of attributes X, written `X+`, is everything X determines.
+
+```
+result = X
+repeat
+    for each FD  L → R  in F:
+        if L ⊆ result:  result = result ∪ R
+until result stops changing
+```
+
+Uses:
+
+- **Is X a superkey?** Yes if `X+` contains every attribute.
+- **Does `X → Y` follow from F?** Yes if Y is inside `X+`.
+- **Find candidate keys**: find minimal sets whose closure is everything.
+
+Worked example. R(A, B, C, D, E) with F = A → B, B → C, CD → E.
+
+```
+(A)+  = A → add B (A→B) → add C (B→C)          = ABC        not a key
+(AD)+ = AD → B → C → E (CD→E)                   = ABCDE      superkey
+(A)+ lacks D, (D)+ = D                                       so AD is minimal
+```
+
+### Finding candidate keys quickly
+
+A shortcut that works on nearly every exam problem:
+
+1. Attributes that appear on **no right-hand side** must be in **every** candidate key, since nothing else can determine them.
+2. Attributes that appear **only on right-hand sides** are in **no** candidate key.
+3. Start from the must-have set. If its closure is everything, it is the only candidate key. Otherwise add the remaining attributes one at a time (then pairs) and check closures, keeping only minimal results.
+
+Example. R(A, B, C, D) with F = A → B, B → C, C → A.
+
+- D is on no right-hand side, so D is in every key. `D+ = D`, not enough.
+- `AD+ = ABCD`, `BD+ = BCDA`, `CD+ = CABD`.
+- Candidate keys: **AD, BD, CD**. Prime attributes: A, B, C, D (all of them).
+
+### The anomalies normalization removes
+
+Here is a table in 1NF but nothing higher. It records order lines:
+
+```
+order_line
+order_id | order_date | customer_id | cust_name | cust_city | product_id | product_name | category | qty
+---------+------------+-------------+-----------+-----------+------------+--------------+----------+----
+  1001   | 2026-03-01 |    C1       | Asha      | Pune      |    P1      | Kettle       | Kitchen  |  2
+  1001   | 2026-03-01 |    C1       | Asha      | Pune      |    P7      | Mug          | Kitchen  |  4
+  1002   | 2026-03-02 |    C2       | Ravi      | Delhi     |    P1      | Kettle       | Kitchen  |  1
+  1003   | 2026-03-02 |    C1       | Asha      | Pune      |    P9      | Lamp         | Decor    |  1
+```
+
+Business rules (the FDs):
+
+```
+order_id              → order_date, customer_id
+customer_id           → cust_name, cust_city
+product_id            → product_name, category
+order_id, product_id  → qty
+```
+
+Candidate key: `(order_id, product_id)`. Both appear on no right-hand side, and together they determine everything.
+
+The anomalies:
+
+- **Update anomaly**: Asha moves to Mumbai. Her city is stored in three rows. Update two and miss one, and the database now says she lives in two cities.
+- **Insert anomaly**: you want to add a new product P12 to the catalog. You can't insert it without an order, because `order_id` is part of the primary key and can't be NULL.
+- **Delete anomaly**: order 1003 is cancelled and deleted. It was the only row mentioning P9, so the fact "P9 is a Lamp in Decor" disappears with it.
+
+All three come from the same root cause: **one table stores facts about several things** (orders, customers, products, order lines).
+
+### 1NF: atomic values
+
+A table is in **1NF** when every column holds a single value from its domain: no lists, no nested tables, no repeating groups like `product1, product2, product3`.
+
+```
+NOT 1NF:  1001 | 2026-03-01 | C1 | ... | "P1 x2, P7 x4"
+1NF:      one row per (order, product), as in the table above
+```
+
+"Atomic" depends on how you use the data. A date is atomic if you never query the year separately. A comma-separated list you search inside is not. Postgres arrays and JSON columns technically break strict 1NF. They are fine for data you read as a whole, and a bad idea for data you filter, join or constrain on.
+
+### 2NF: no partial dependencies
+
+A **partial dependency** is when a non-prime attribute depends on a **proper subset** of a candidate key.
+
+**2NF**: in 1NF, and no non-prime attribute is partially dependent on **any** candidate key.
+
+In `order_line`, with key `(order_id, product_id)`:
+
+- `order_id → order_date, customer_id, cust_name, cust_city` (partial: only half the key)
+- `product_id → product_name, category` (partial)
+
+So `order_line` is **in 1NF but not 2NF**.
+
+Shortcut: if every candidate key is a **single attribute**, a 1NF table is automatically in 2NF. Partial dependencies need a composite key.
+
+### 3NF: no transitive dependencies on keys
+
+The precise definition (Zaniolo's form, used by Silberschatz and Elmasri/Navathe):
+
+> A table is in **3NF** if, for every non-trivial FD `X → A`, **either** X is a superkey, **or** A is a prime attribute.
+
+The familiar version, "every non-prime attribute depends on the key, the whole key, and nothing but the key", describes the same idea. The **transitive dependency** case it targets is key → X → A, where X is not a superkey and A is non-prime. Example: `order_id → customer_id → cust_city`.
+
+Notice the escape clause: if A is **prime** (part of some candidate key), the FD is allowed even when X isn't a superkey. That clause is the only difference from BCNF.
+
+### BCNF: every determinant is a superkey
+
+> A table is in **Boyce-Codd Normal Form** if, for every non-trivial FD `X → Y`, X is a superkey.
+
+BCNF drops 3NF's prime-attribute exception. So BCNF implies 3NF. They differ only in a specific situation: the table has **several candidate keys that overlap** (share attributes), and some FD determines part of one key. If a 3NF table doesn't have multiple overlapping candidate keys, it is guaranteed to be in BCNF too.
+
+**The classic 3NF-but-not-BCNF example.** A student takes each course from one teacher, and each teacher teaches only one course:
+
+```
+enrollment(student, course, teacher)
+FDs:  student, course → teacher
+      teacher         → course
+Candidate keys: (student, course) and (student, teacher)    ← overlap on student
+```
+
+- `teacher → course`: teacher is not a superkey. So it is **not BCNF**.
+- But course is prime (it is part of the key `(student, course)`). So it **is 3NF**.
+- The redundancy is real: "Dr. Rao teaches DBMS" is repeated for every student of Dr. Rao.
+
+BCNF decomposition: `teaches(teacher, course)` and `takes(student, teacher)`. This is lossless (the shared column teacher is a key of `teaches`). But the FD `student, course → teacher` now spans two tables. Nothing stops a student from enrolling with two different DBMS teachers unless you add a check across tables. **BCNF cost you dependency preservation.**
+
+### Lossless join and dependency preservation
+
+Two properties of a decomposition of R into R1 and R2:
+
+**Lossless join** (non-additive): `R1 ⋈ R2` gives back exactly R, with no extra rows. A lossy split doesn't lose rows; it *invents* spurious ones, so you can no longer tell which combinations were real.
+
+The test for a split into two tables: it is lossless if the **shared attributes are a superkey of at least one side**. That is, `R1 ∩ R2 → R1` or `R1 ∩ R2 → R2` is in F⁺.
+
+Lossy example. R(A, B, C) with only `A → B`. Split into (A, B) and (B, C). The shared attribute B is not a key of either.
+
+```
+R:            R1=(A,B):    R2=(B,C):    R1 ⋈ R2:
+a1 b1 c1      a1 b1        b1 c1        a1 b1 c1
+a2 b1 c2      a2 b1        b1 c2        a1 b1 c2   ← spurious
+                                        a2 b1 c1   ← spurious
+                                        a2 b1 c2
+```
+
+Splitting as (A, B) and (A, C) instead is lossless, because `A → B` makes A a key of (A, B).
+
+**Dependency preservation**: every FD in F can be derived from the FDs that hold *inside* individual tables. If it is preserved, the database can enforce each rule with a key or unique constraint on one table. If not, enforcing it needs a join, a trigger or application code.
+
+| Target | Lossless? | Dependency-preserving? |
+|---|---|---|
+| **3NF** (synthesis algorithm) | Always possible | **Always possible** |
+| **BCNF** (decomposition algorithm) | Always possible | **Not always** |
+
+This table is the real reason 3NF still exists: it is the highest FD-based form you can **always** reach without giving up either property.
+
+### 4NF: multivalued dependencies
+
+BCNF only looks at FDs. Some redundancy has nothing to do with FDs.
+
+An employee has a set of skills and, independently, a set of languages:
+
+```
+emp_skill_lang(emp, skill, language)
+Asha | Java   | English
+Asha | Java   | Hindi
+Asha | Python | English
+Asha | Python | Hindi
+```
+
+There are no non-trivial FDs. The only key is all three columns, so the table is in BCNF. Yet adding one skill means adding one row **per language**. That is redundancy.
+
+A **multivalued dependency (MVD)** `X ↠ Y` holds when, for a given X, the set of Y values is **independent** of the values of the remaining columns. Formally: if two rows agree on X, then the rows formed by swapping their Y values must also be in the table. Here `emp ↠ skill` and `emp ↠ language`.
+
+- An MVD `X ↠ Y` is **trivial** if Y is a subset of X, or X and Y together are all the columns.
+- Every FD is also an MVD (if `X → Y`, then `X ↠ Y`).
+
+> A table is in **4NF** if, for every non-trivial MVD `X ↠ Y`, X is a superkey.
+
+Since every FD is an MVD, 4NF implies BCNF. Fix the example by splitting on the MVD: `emp_skill(emp, skill)` and `emp_language(emp, language)`. A split on an MVD is lossless: R1 ∩ R2 ↠ R1 is exactly the condition.
+
+Beyond 4NF, **5NF** (project-join normal form) deals with **join dependencies**: tables that can only be rebuilt losslessly from three or more projections. It is rare in practice. Mention it, but don't go deep unless asked.
+
+### The hierarchy at a glance
+
+| Form | Rule | Removes |
+|---|---|---|
+| 1NF | Atomic values | Repeating groups and lists |
+| 2NF | No non-prime attribute depends on part of a candidate key | Partial dependencies |
+| 3NF | Every non-trivial `X → A`: X superkey **or** A prime | Transitive dependencies |
+| BCNF | Every non-trivial `X → Y`: X superkey | Every redundancy caused by FDs |
+| 4NF | Every non-trivial `X ↠ Y`: X superkey | Independent multi-valued facts |
+
+4NF ⇒ BCNF ⇒ 3NF ⇒ 2NF ⇒ 1NF.
+
+## How it works
+
+### Step-by-step decomposition of `order_line`
+
+**Step 1: list the FDs and keys.** Done above. Key: `(order_id, product_id)`.
+
+**Step 2: to 2NF, remove partial dependencies.** Move each partial dependency into its own table, keyed by the part of the key it depends on.
+
+```
+orders_tmp(order_id PK, order_date, customer_id, cust_name, cust_city)
+product   (product_id PK, product_name, category)
+order_line(order_id, product_id, qty)          PK (order_id, product_id)
+```
+
+Every split is along an FD whose left side becomes the key of the new table, so each one is lossless.
+
+**Step 3: to 3NF, remove transitive dependencies.** In `orders_tmp`, `customer_id → cust_name, cust_city`. customer_id is not a superkey of `orders_tmp`, and the dependents are non-prime. Split:
+
+```
+customer(customer_id PK, cust_name, cust_city)
+orders  (order_id PK, order_date, customer_id FK)
+```
+
+**Step 4: check BCNF.** In each final table, every non-trivial FD has a key on its left side:
+
+| Table | FDs inside it | Determinant a superkey? |
+|---|---|---|
+| customer | customer_id → cust_name, cust_city | yes |
+| orders | order_id → order_date, customer_id | yes |
+| product | product_id → product_name, category | yes |
+| order_line | order_id, product_id → qty | yes |
+
+All four are in **BCNF**. Every original FD lives inside one table, so the decomposition is also **dependency-preserving**.
+
+**Step 5: re-check the anomalies.** Asha's city is now stored once (update fixed). A new product is a row in `product` (insert fixed). Deleting order 1003 leaves P9 in `product` (delete fixed).
+
+### The two textbook algorithms
+
+**BCNF decomposition** (always lossless, may lose dependencies):
+
+```
+result = { R }
+while some table Ri in result is not in BCNF:
+    pick a non-trivial FD  X → Y  that holds on Ri where X is not a superkey of Ri
+    replace Ri with:  (X ∪ Y)  and  (Ri − (Y − X))
+```
+
+Each split is lossless because X is a key of `(X ∪ Y)`. To test a smaller table Ri, you need the FDs that hold *on Ri*: compute closures with the original F and keep the attributes that fall inside Ri.
+
+**3NF synthesis** (Bernstein's algorithm; always lossless **and** dependency-preserving):
+
+```
+1. compute a canonical (minimal) cover Fc of F:
+     single attribute on each right side, no extraneous left-side attributes, no redundant FDs
+2. for each FD  X → Y  in Fc:  create table (X ∪ Y)
+3. if no table contains a candidate key of R:  add a table containing one candidate key
+4. drop any table whose attributes are a subset of another table's
+```
+
+Step 3 is what guarantees the join is lossless. Step 2 guarantees every FD is preserved.
+
+Applying synthesis to `order_line` gives the same four tables as the manual walk-through.
+
+### Denormalization: breaking the rules on purpose
+
+Normalization optimises for **correct writes**. Denormalization trades some of that back for **faster reads**.
+
+| | Normalized (3NF/BCNF) | Denormalized |
+|---|---|---|
+| Reads | More joins | Fewer joins, faster for known queries |
+| Writes | Each fact written once | Same fact written in many places |
+| Anomalies | Prevented by design | Possible; you must keep copies in sync |
+| Storage | Smaller | Larger |
+| Schema flexibility | Easy to add new queries | Tuned for specific queries |
+
+Common, defensible denormalizations in OLTP systems:
+
+- **Snapshots that are really different facts**, such as `unit_price` on an order line. This isn't true denormalization: the price at purchase time is not the same fact as today's price.
+- **Precomputed aggregates**: a `comment_count` on `post`, updated in the same transaction as inserts into `comment`.
+- **Materialized views** or read replicas shaped for heavy read paths.
+- **Document databases** embedding child data inside a parent document because they're always read together (see [MongoDB](/learn/notes/mongodb/)).
+
+**Why warehouses denormalize.** Analytical stores (see [star and snowflake schemas](/learn/notes/scd-star-snowflake/) and [OLAP engines](/learn/notes/olap-engines/)) usually use a **star schema**: a normalized fact table surrounded by **flattened, denormalized dimension tables**. Kimball's dimensional modeling guidance explicitly recommends flattening hierarchies in dimensions and avoiding "snowflaked" (normalized) dimensions, for usability and query performance. This works there because:
+
+- data is loaded in **batches by ETL/ELT jobs**, not updated by many concurrent users, so update anomalies are controlled by the pipeline;
+- queries scan and aggregate huge row counts, where every avoided join helps;
+- **columnar storage compresses repeated values** very well, so the redundancy is cheap.
+
+**How to say it in an interview:** "I normalize the OLTP schema to 3NF or BCNF so writes can't create inconsistencies. Then I denormalize specific read paths I've measured, and I make the copy's sync mechanism explicit: same transaction, trigger, materialized view or CDC pipeline."
+
+## Real-world examples
+
+- **Kimball dimensional modeling** recommends denormalized, flattened dimension tables and advises against snowflaked dimensions, because the flattened version holds the same information and is easier and faster to query.
+- The **Postgres and MySQL `UNIQUE` / `PRIMARY KEY` constraints** are how a preserved FD is enforced in practice: the left side of each FD becomes a key of its table. An FD lost in a BCNF decomposition (like `student, course → teacher`) has no single-table constraint that enforces it.
+- **The textbook result** (Beeri and Bernstein, 1979) that some FD sets, such as AB → C with C → B, cannot be represented by any BCNF schema that preserves the dependencies. This is the formal version of the enrollment example above.
+
+## Common pitfalls
+
+- **Defining 3NF against the primary key only.** 2NF and 3NF refer to *all* candidate keys, and 3NF exempts prime attributes.
+- **Saying "3NF and BCNF are the same in practice".** They differ exactly when candidate keys overlap. Be ready to show the student/course/teacher example.
+- **Reading FDs off sample data.** Two rows that happen to agree prove nothing. FDs are business rules.
+- **Splitting on an attribute that isn't a key of either side.** That creates a lossy join with spurious rows.
+- **Pushing to BCNF blindly** and losing a dependency that you then can't enforce. Sometimes 3NF plus a constraint is the better design.
+- **Treating `unit_price` on an order line as redundancy.** Historical snapshots are separate facts.
+- **Denormalizing before measuring**, then forgetting to keep the copies in sync. Every denormalized field needs an owner and a sync mechanism.
+- **Ignoring MVDs.** A table can be in BCNF and still repeat independent sets of facts (skills × languages).
+
+## Practice questions
+
+<Practice>
+
+<QA q="What is a functional dependency? Give an example and a non-example." level="easy">
+
+`X → Y` means any two rows with the same X must have the same Y. Example: `pan → name` (a PAN identifies one person). Non-example: `name → pan`, because two people can share a name. FDs come from business rules, not from whatever rows happen to be in the table.
+
+</QA>
+
+<QA q="Name and explain the insert, update and delete anomalies." level="easy">
+
+Using a table that stores orders together with customer and product details:
+
+- **Insert**: you can't record a new product until someone orders it, since the key needs an order_id.
+- **Update**: a customer's city is repeated on many rows. Changing only some of them leaves contradictory data.
+- **Delete**: deleting the only order for a product also deletes everything you knew about that product.
+
+All three come from storing facts about several things in one table.
+
+</QA>
+
+<QA q="State 2NF, 3NF and BCNF precisely." level="medium">
+
+- **2NF**: 1NF, and no **non-prime** attribute depends on a **proper subset** of any candidate key.
+- **3NF**: for every non-trivial `X → A`, X is a superkey **or** A is prime (part of some candidate key).
+- **BCNF**: for every non-trivial `X → Y`, X is a superkey.
+
+BCNF removes 3NF's prime-attribute exception, so BCNF implies 3NF, which implies 2NF.
+
+</QA>
+
+<QA q="R(A, B, C, D, E) with A → B, BC → E, ED → A. Find all candidate keys." level="medium">
+
+Right-hand sides: B, E, A. Attributes on no right side: **C, D**. They are in every key. `CD+ = CD`, not enough.
+
+Try adding one attribute:
+
+- `ACD+`: A → B, then BC → E. Result ABCDE. **Key.**
+- `BCD+`: BC → E, then ED → A. Result ABCDE. **Key.**
+- `CDE+`: ED → A, then A → B. Result ABCDE. **Key.**
+
+Each is minimal, because CD alone isn't a key. Candidate keys: **ACD, BCD, CDE**. Every attribute is prime, so this table is automatically in 3NF. It is **not** in BCNF, because A → B has a non-superkey on the left.
+
+</QA>
+
+<QA q="R(A, B, C, D) with AB → C and C → D. What is the highest normal form? Decompose it." level="medium">
+
+Key: **AB** (A and B are on no right side; `AB+ = ABCD`). Non-prime: C, D.
+
+- 2NF? `A+ = A`, `B+ = B`. Nothing depends on part of the key. **Yes.**
+- 3NF? C → D: C isn't a superkey and D is non-prime. That is a transitive dependency. **No.**
+
+Highest: **2NF**. Decompose on C → D: `R1(C, D)` with key C, and `R2(A, B, C)` with key AB. Lossless (the shared C is the key of R1), dependency-preserving, and both tables are in BCNF.
+
+</QA>
+
+<QA q="R(A, B, C, D) with AB → CD and B → D. What normal form is it in? Decompose." level="medium">
+
+Key: **AB**. B → D is a **partial dependency**: D is non-prime and depends on B, a proper subset of the key. So the table is in **1NF only**.
+
+Decompose: `R1(B, D)` with key B, and `R2(A, B, C)` with key AB (AB → C remains). Lossless, since B is the key of R1. Both are in BCNF, and AB → D is still derivable through AB → B and B → D.
+
+</QA>
+
+<QA q="R(A, B, C) with AB → C and C → B. Normal form? Decompose to BCNF and comment." level="hard">
+
+Keys: A is on no right side. `AB+ = ABC` and `AC+ = ACB`. Candidate keys: **AB** and **AC**. All attributes are prime.
+
+- 3NF: C → B has a non-superkey on the left, but B is prime. **Yes, 3NF.**
+- BCNF: C → B violates it. **Not BCNF.**
+
+BCNF decomposition on C → B: `R1(C, B)` and `R2(A, C)`. Lossless (C is the key of R1). But **AB → C is lost**: no single table contains A, B and C, so the database can't enforce it with one key. This is the student/course/teacher pattern. Trade-off: keep the 3NF table, or go BCNF and enforce AB → C another way.
+
+Note that 3NF synthesis keeps R as it is: its tables (A, B, C) and (C, B) collapse because (C, B) is a subset of (A, B, C).
+
+</QA>
+
+<QA q="Is the decomposition of R(A, B, C) with A → B into (A, B) and (B, C) lossless?" level="medium">
+
+No. The shared attribute is B, and `B+ = B`, which is not a superkey of either side. With rows (a1, b1, c1) and (a2, b1, c2), the join produces (a1, b1, c2) and (a2, b1, c1) as well: spurious rows. The lossless choice is (A, B) and (A, C), since A → B makes A the key of (A, B).
+
+</QA>
+
+<QA q="What does dependency-preserving mean, and why does it matter in practice?" level="medium">
+
+Every original FD can be derived from FDs that hold inside individual tables. If so, each rule becomes a primary key or `UNIQUE` constraint on one table, and the database enforces it cheaply. If an FD is lost, enforcing it needs a multi-table check: a trigger, a join in application code, or a locking scheme. Those are slower and easy to get wrong under concurrency.
+
+</QA>
+
+<QA q="Why might you stop at 3NF instead of BCNF?" level="hard">
+
+3NF can **always** be reached with a decomposition that is both lossless and dependency-preserving (the synthesis algorithm). BCNF is always lossless but **not always** dependency-preserving. When the BCNF split would lose an FD you need to enforce (overlapping candidate keys, like student/course/teacher), staying in 3NF keeps the rule enforceable by one key. You accept a little redundancy in return.
+
+</QA>
+
+<QA q="R(A, B, C, D, E) with A → B, BC → D, D → A. Find the keys, the normal form, and a BCNF decomposition. Is it dependency-preserving?" level="hard">
+
+**Keys.** C and E are on no right side. `CE+ = CE`. Then `ACE+ = ABCDE`, `BCE+ = ABCDE`, `CDE+ = ABCDE`. Keys: **ACE, BCE, CDE**. Every attribute is prime, so it is **3NF**. A → B, BC → D and D → A all have non-superkey left sides, so it is **not BCNF**.
+
+**BCNF decomposition.**
+
+1. Split on A → B: `R1(A, B)` (BCNF) and `R2(A, C, D, E)`.
+2. FDs on R2 (closures with the original F, restricted to ACDE): D → A, and AC → D (since `AC+ = ABCD`). Keys of R2: ACE and CDE. D → A violates BCNF. Split: `R21(D, A)` and `R22(C, D, E)`.
+3. R22(C, D, E) has no non-trivial FDs (`CD+` lacks E, for example), so it is BCNF.
+
+Result: **(A, B), (D, A), (C, D, E)**.
+
+**Preserved?** A → B and D → A are local. **BC → D is lost**: no table contains B, C and D, and the local FDs can't derive it. So the decomposition is lossless but not dependency-preserving.
+
+</QA>
+
+<QA q="Explain multivalued dependencies and 4NF with an example." level="hard">
+
+`X ↠ Y` holds when, for each X, the set of Y values is independent of the remaining columns. Table `(course, teacher, textbook)`: every teacher of a course uses every textbook of that course, so `course ↠ teacher` and `course ↠ textbook`. There are no non-trivial FDs, the key is all three columns, and it is in **BCNF**. But adding one teacher means one row per textbook: redundancy.
+
+**4NF**: every non-trivial MVD has a superkey on its left side. course isn't a superkey here, so it fails. Decompose into `(course, teacher)` and `(course, textbook)`. It is lossless because the split is on the MVD itself.
+
+</QA>
+
+<QA q="Is every two-attribute table in BCNF?" level="medium">
+
+Yes. With attributes A and B, the only possible non-trivial FDs are A → B and B → A. If A → B holds, then A determines both columns, so A is a superkey. The same goes for B. Any determinant is therefore a superkey. That's a handy sanity check, and it's why tiny link tables never need further normalizing.
+
+</QA>
+
+<QA q="Your product team wants to show order lists fast, with customer name and city on every row. Would you denormalize?" level="scenario">
+
+First measure: a join of `orders` and `customer` on an indexed primary key is cheap, and often the real issue is a missing index or N+1 queries. If reads still dominate and the join is the measured bottleneck, options in order of safety:
+
+1. A **covering index** or a **materialized view** refreshed on a schedule.
+2. Copy `cust_name` into `orders` **as a snapshot** if the business actually wants the name at order time. Then it's a different fact, not redundancy.
+3. True denormalization, with an explicit sync (same transaction, trigger or CDC), accepting staleness and write amplification.
+
+Keep the normalized `customer` table as the source of truth.
+
+</QA>
+
+<QA q="A legacy table stores emp, project, skill with rows for every project × skill combination of each employee. Updates keep missing rows. Diagnose and fix." level="scenario">
+
+Projects and skills are **independent multi-valued facts** about an employee: `emp ↠ project` and `emp ↠ skill`. The table may well be in BCNF (the key is all three columns), but it violates **4NF**. Every new skill must be inserted once per project, which is exactly where updates go wrong. Split it into `emp_project(emp, project)` and `emp_skill(emp, skill)`. Check first that the business really treats them as independent. If a skill is used *on* a specific project, it's a genuine three-way fact and the table is correct as it is.
+
+</QA>
+
+<QA q="How would you explain to a data engineer why your warehouse dimensions are not normalized?" level="scenario">
+
+In a star schema the fact table stays lean with foreign keys, and the dimensions are deliberately flattened (e.g. product with category and department in one table). Kimball's guidance prefers this over snowflaked dimensions because it's simpler to query and faster. The usual dangers of denormalization are contained: loads are batch ETL with one writer, history is handled explicitly with SCD techniques, and columnar compression makes repeated values cheap. The OLTP source stays normalized; the warehouse is a read-optimized copy.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="R(A, B, C) has candidate keys AB and AC, and the FD C → B. Which statement is true?" options={["Not in 2NF", "In 2NF but not 3NF", "In 3NF but not BCNF", "In BCNF"]} answer={2}>
+
+C isn't a superkey, so C → B violates BCNF. But B is prime (part of the key AB), so 3NF allows it. This is the overlapping-candidate-keys case.
+
+</MCQ>
+
+<MCQ q="Which is the correct definition of a partial dependency?" options={["A non-prime attribute depending on a proper subset of a candidate key", "Any attribute depending on a non-key attribute", "A key attribute depending on a non-key attribute", "An attribute depending on itself"]} answer={0}>
+
+2NF forbids non-prime attributes that depend on only part of a candidate key. Dependence on a non-key attribute describes the transitive case (3NF). An attribute depending on itself is a trivial FD.
+
+</MCQ>
+
+<MCQ q="R1 and R2 decompose R. When is the decomposition guaranteed lossless?" options={["When R1 and R2 have the same number of columns", "When the shared attributes functionally determine all of R1 or all of R2", "When every FD is preserved", "When both are in 3NF"]} answer={1}>
+
+The shared columns must be a superkey of at least one side. Dependency preservation is a separate property: a decomposition can preserve dependencies and still be lossy, or the reverse.
+
+</MCQ>
+
+<MCQ q="Which guarantee does BCNF decomposition NOT always give?" options={["Lossless join", "No FD-based redundancy", "Dependency preservation", "Each table has a key"]} answer={2}>
+
+The BCNF algorithm always produces a lossless decomposition, but some FD sets, like AB → C with C → B, can't be preserved by any BCNF schema. 3NF synthesis gives both properties.
+
+</MCQ>
+
+<MCQ q="R(A, B, C, D) with A → B, B → C, C → A. What are the candidate keys?" options={["A only", "AD only", "AD, BD and CD", "ABCD"]} answer={2}>
+
+D is on no right side, so D is in every key. A, B and C determine each other in a cycle, so each of them plus D determines everything. ABCD is a superkey, but it isn't minimal.
+
+</MCQ>
+
+<MCQ q="A table emp, skill, language with independent skills and languages, keyed on all three columns, is in which highest normal form?" options={["1NF", "3NF but not BCNF", "BCNF but not 4NF", "4NF"]} answer={2}>
+
+There are no non-trivial FDs, so it's in BCNF. But `emp ↠ skill` is a non-trivial MVD with a non-superkey on the left, so it fails 4NF.
+
+</MCQ>
+
+<MCQ q="A table's only candidate key is a single column, and the table is in 1NF. What can you conclude?" options={["It is in 2NF", "It is in 3NF", "It is in BCNF", "Nothing beyond 1NF"]} answer={0}>
+
+Partial dependencies need a composite key, so it's automatically in 2NF. Transitive dependencies can still exist, so 3NF isn't guaranteed.
+
+</MCQ>
+
+<MCQ q="Why do star-schema warehouses usually keep dimension tables denormalized?" options={["SQL cannot join more than two tables", "Batch-loaded, read-heavy analytics benefit from fewer joins, and columnar compression makes repetition cheap", "Normalization is impossible for dimensions", "It is required for ACID transactions"]} answer={1}>
+
+Warehouses are loaded by controlled pipelines and queried with large scans. Flattened dimensions are simpler and faster to query, and the anomaly risk is managed by the ETL process. Joins and normalization are perfectly possible, just not worth it there.
+
+</MCQ>
+
+<MCQ q="Which statement about 3NF is correct?" options={["It requires every determinant to be a superkey", "It allows X → A where X is not a superkey, as long as A is prime", "It only considers the primary key, not other candidate keys", "It forbids all transitive dependencies, including ones into prime attributes"]} answer={1}>
+
+That exception is exactly what separates 3NF from BCNF. The first option is BCNF's rule. 3NF considers all candidate keys, and it does allow dependencies into prime attributes.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **FD** `X → Y`: same X implies same Y. Comes from business rules.
+- **Closure** `X+`: repeatedly apply FDs. X is a superkey if `X+` is everything.
+- **Finding keys**: attributes on no right-hand side are in every key; attributes only on right-hand sides are in none.
+- **1NF** atomic values. **2NF** no partial dependency of a non-prime attribute on any candidate key. **3NF** every non-trivial `X → A`: X superkey **or** A prime. **BCNF** every determinant is a superkey. **4NF** every non-trivial MVD has a superkey on its left.
+- 3NF ≠ BCNF only with **overlapping candidate keys** (student, course, teacher).
+- **Lossless** split: the shared columns are a key of one side. **Dependency-preserving**: every FD can be checked inside one table.
+- 3NF synthesis: always lossless + preserving. BCNF: always lossless, not always preserving.
+- **Denormalize** deliberately: measured read paths, explicit sync. Warehouses flatten dimensions (Kimball).
+
+## Go deeper
+
+- **Book**: Silberschatz, Korth, Sudarshan, *Database System Concepts*, chapter on relational database design: FDs, BCNF, 3NF, 4NF, algorithms ([db-book.com](https://db-book.com/)).
+- **Book**: Ramakrishnan and Gehrke, *Database Management Systems*, chapter on schema refinement and normal forms ([book site](https://pages.cs.wisc.edu/~dbbook/)).
+- **Wikipedia**: [Third normal form](https://en.wikipedia.org/wiki/Third_normal_form), [Boyce-Codd normal form](https://en.wikipedia.org/wiki/Boyce%E2%80%93Codd_normal_form), [Fourth normal form](https://en.wikipedia.org/wiki/Fourth_normal_form), [Multivalued dependency](https://en.wikipedia.org/wiki/Multivalued_dependency).
+- **Kimball Group**: [Dimensional modeling techniques](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/), including flattened vs snowflaked dimensions.
+- Related: [Keys and ER Modeling](/learn/notes/keys-er-modeling/), [Star and Snowflake Schemas](/learn/notes/scd-star-snowflake/).

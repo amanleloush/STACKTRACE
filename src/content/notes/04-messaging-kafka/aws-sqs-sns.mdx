@@ -1,0 +1,539 @@
+---
+title: "AWS SQS and SNS: Standard vs FIFO, Visibility Timeout, Fan-out"
+phase: "04-messaging-kafka"
+order: 43
+tags: ["messaging", "aws", "sqs", "sns"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 17
+prerequisites: ["async-messaging-fundamentals", "delivery-semantics"]
+summary: "How SQS and SNS actually behave — Standard vs FIFO queues, the visibility-timeout lifecycle, polling, DLQs and redrive, Lambda partial batch failures, SNS fan-out and filtering — with the exact current limits."
+---
+
+## Definition (interview-ready)
+
+**Amazon SQS** (Simple Queue Service) is a fully managed **pull-based queue**. Producers send messages; consumers poll with `ReceiveMessage`, process, and then **explicitly delete** each message. While a consumer is working, the message is hidden by a **visibility timeout**. If it isn't deleted in time, it reappears for another consumer. That simple loop gives you **at-least-once** delivery with no servers to run.
+
+SQS has two queue types:
+
+- **Standard**: nearly unlimited throughput, at-least-once delivery, **best-effort ordering** (occasional duplicates and out-of-order messages).
+- **FIFO**: strict ordering **within a message group**, deduplication within a 5-minute window, and capped throughput.
+
+**Amazon SNS** (Simple Notification Service) is managed **push-based pub/sub**. You publish once to a **topic** and SNS pushes a copy to every subscription: SQS queues, Lambda functions, HTTP endpoints, email, SMS, mobile push. **SNS → several SQS queues** is the standard AWS "fan-out" pattern: one event, many independent consumers, each with its own durable backlog.
+
+## Why it matters
+
+SQS and SNS are the default messaging building blocks on AWS, so interviewers expect you to know their real behaviour, not just their names. The common production bugs are all about the details:
+
+- a **visibility timeout shorter than processing time**, so two workers process the same message,
+- a **missing DLQ**, so a poison message is retried until its retention period ends,
+- a Lambda batch where **one bad record makes the whole batch retry**,
+- a FIFO queue where **one hot message group ID** serialises all traffic,
+- **short polling**, which burns API calls (and money) on empty responses.
+
+For the high-level comparison with Kafka, RabbitMQ and Pulsar, see [Kafka vs RabbitMQ vs Pulsar vs SQS](/learn/notes/pulsar-rabbitmq-sqs/). This note goes deep on SQS and SNS themselves.
+
+```
+                              ┌──────────────► SQS q.billing   ──► billing workers
+ order-service ──Publish──► SNS topic ─────────► SQS q.shipping  ──► shipping workers
+                 (once)       "orders"  ───────► SQS q.analytics ──► Lambda
+                              (filter: only     each queue: own backlog,
+                               country=IN)      own retries, own DLQ
+```
+
+## Core concepts
+
+### Standard vs FIFO queues
+
+| | Standard | FIFO |
+|---|---|---|
+| Ordering | Best effort. Messages can arrive out of order. | Strict order **within a `MessageGroupId`** |
+| Duplicates | Possible (at-least-once) | Producer retries deduplicated within **5 minutes**; exactly-once processing within SQS |
+| Throughput | Nearly unlimited API calls per second | 300 TPS per API action (3,000 msgs/s with batches of 10), much higher in high-throughput mode |
+| Name | Any valid name | Must end in `.fifo` |
+| Per-message delay | Yes (message timers) | No, only a queue-level delay |
+| Use when | Order doesn't matter or the consumer handles it; you need scale | Order per entity matters (account ledger, order state changes) |
+
+**At-least-once** means the same message can be delivered twice, so the consumer must be **idempotent**. See [Delivery Semantics](/learn/notes/delivery-semantics/).
+
+### FIFO deep dive: message groups and deduplication
+
+**`MessageGroupId`** (required on FIFO) is the unit of ordering and parallelism, a lot like a Kafka partition key:
+
+- Messages with the **same group ID** are delivered strictly in order. While messages from a group are in flight, SQS won't hand out more from that group until they're deleted or their visibility timeout expires. (A single receive can return up to 10 messages of one group, in order, to one consumer.)
+- Messages in **different groups** can be processed in parallel by different consumers.
+- So the number of active group IDs is your maximum parallelism. One group ID for everything means one consumer working through the whole queue, one receive batch at a time.
+
+```
+group "acct-42":  m1 ─► m2 ─► m3      (strictly one after another)
+group "acct-77":  m4 ─► m5            (in parallel with acct-42)
+group "acct-91":  m6
+```
+
+**Deduplication**: if a producer retries `SendMessage` within the **5-minute deduplication interval**, SQS doesn't add a second copy. Choose one of:
+
+- **`MessageDeduplicationId`**: you supply it (for example, your business event ID). Best when the same body might legitimately be sent twice.
+- **Content-based deduplication**: SQS uses a SHA-256 hash of the **body** (not the attributes) as the dedup ID.
+
+Dedup protects against **producer retries**, not consumer crashes. If a consumer processes a message and dies before deleting it, the message comes back. "Exactly-once processing" in SQS means no duplicates are *introduced by SQS*; your side effects still need idempotency.
+
+On the receive side, FIFO supports **`ReceiveRequestAttemptId`**: if a `ReceiveMessage` call fails with a network error, retrying with the same ID (within 5 minutes) returns the same messages instead of leaving them locked.
+
+### FIFO throughput and high-throughput mode
+
+Normal FIFO limits are **300 transactions per second per API action** (`SendMessage`, `ReceiveMessage`, `DeleteMessage`), or **3,000 messages/second** with batches of 10.
+
+**High-throughput mode** raises this a lot. You enable it by setting the queue's **deduplication scope to message group** and its **FIFO throughput limit to per message group ID** (the console's "Enable high throughput FIFO" sets both). SQS then spreads groups across internal **partitions** by hashing the group ID, and each partition handles about 300 TPS (3,000 msgs/s batched). Current regional ceilings without batching:
+
+| Region | High-throughput FIFO (non-batched TPS) | With batches of 10 |
+|---|---|---|
+| US East (N. Virginia), US West (Oregon), Europe (Ireland) | 70,000 | 700,000 msgs/s |
+| US East (Ohio), Europe (Frankfurt) | 19,000 | 190,000 msgs/s |
+| Asia Pacific (Mumbai, Singapore, Sydney, Tokyo), Europe (Spain) | 9,000 | 90,000 msgs/s |
+| Europe (London), South America (São Paulo) | 4,500 | 45,000 msgs/s |
+| All other Regions | 2,400 | 24,000 msgs/s |
+
+The catch: high throughput only appears if traffic is spread over **many distinct group IDs**. One hot group is still processed one message at a time.
+
+### The visibility timeout lifecycle
+
+This is the core SQS mechanic. A received message is **not removed**. It's hidden.
+
+```
+  SendMessage
+      │
+      ▼
+ ┌─────────┐  ReceiveMessage   ┌────────────┐  DeleteMessage(receipt handle)   ┌─────────┐
+ │ VISIBLE │ ────────────────► │ IN FLIGHT  │ ───────────────────────────────► │ DELETED │
+ └─────────┘                   │ (invisible │                                  └─────────┘
+      ▲                        │  for VT s) │
+      │   timeout expires       └────────────┘
+      └──── (receive count +1; if count > maxReceiveCount → moved to DLQ)
+```
+
+- **Default** visibility timeout: **30 seconds**. Range **0 seconds to 12 hours**.
+- You can set it per queue, per `ReceiveMessage` call, or per message with **`ChangeMessageVisibility`**.
+- **Receipt handle**: each receive returns a receipt handle. You need it to delete the message or change its visibility. It identifies *this receive*, not the message, so use the handle from the most recent receive.
+- **Heartbeat pattern**: for jobs of unknown length, start with a modest timeout (say 2 minutes) and have a background thread call `ChangeMessageVisibility` to extend it periodically while work continues. If the worker dies, the heartbeat stops and the message reappears quickly.
+- **The 12-hour cap is counted from the first receive.** Extending doesn't reset it. Work longer than 12 hours belongs in Step Functions or must be split into steps.
+- **Give up early**: setting the visibility to **0** makes the message immediately visible to others, for example when a worker is shutting down.
+- If processing takes longer than the timeout, another consumer gets the message too (a duplicate), and your late `DeleteMessage` with the old handle may fail.
+
+Visibility timeout vs delay: a **delay** hides a message **before its first receive**; the visibility timeout hides it **after each receive**.
+
+### Short polling vs long polling
+
+- **Short polling** (the default, `WaitTimeSeconds=0`): SQS queries a **subset of its servers** and responds immediately, even if empty. With small queues you may get empty or partial responses even though messages exist. Every empty response is still a billed request.
+- **Long polling** (`WaitTimeSeconds` 1–20, or the queue attribute `ReceiveMessageWaitTimeSeconds`): SQS queries **all** servers and holds the request until at least one message arrives or the wait expires. Fewer empty responses, lower cost, lower latency.
+- Maximum wait is **20 seconds**. Make sure your HTTP client's read timeout is longer than the wait.
+- `MaxNumberOfMessages` is **1–10** per receive.
+
+Rule: almost always use long polling with 20 seconds and `MaxNumberOfMessages=10`.
+
+### Dead-letter queues, maxReceiveCount and redrive
+
+A **redrive policy** on the source queue names a DLQ and a **`maxReceiveCount`**. Each receive increments the message's `ApproximateReceiveCount`. Once it exceeds `maxReceiveCount` without a delete, SQS moves the message to the DLQ.
+
+- The DLQ must be in the **same account and region**, and the **same type** (FIFO source → FIFO DLQ).
+- Don't set `maxReceiveCount` to 1: a single timeout or crash sends a good message to the DLQ. For Lambda, AWS recommends **at least 5**.
+- **Redrive allow policy** (on the DLQ) controls which source queues may use it: all, specific queues (up to 10), or none.
+- **Retention trap (Standard)**: a message keeps its **original enqueue timestamp** when moved to the DLQ. If it spent 3 days in the source queue and the DLQ keeps messages 4 days, it vanishes from the DLQ after 1 more day. Always give the DLQ a **longer** retention than the source. (FIFO DLQs reset the timestamp.)
+- **DLQ redrive** moves messages back out, either to the original source queue or to a custom destination of the same type, using `StartMessageMoveTask` (or the console). You can set a velocity (up to 500 msgs/s custom). Redriven messages get a new message ID and enqueue time. No filtering or editing while redriving.
+- Be careful with a DLQ on FIFO queues: moving a message aside lets later messages in that group proceed, which **breaks order** for that group. If order is sacred, you may prefer to block and alert.
+- For Standard queues with `maxReceiveCount` above 3, SQS moves a message received 3+ times without deletion to the back of the queue, so it doesn't keep blocking newer work.
+
+### Delay queues and message timers
+
+- **Delay queue**: queue attribute `DelaySeconds` (0 to **15 minutes**). Every new message is invisible for that long.
+- **Message timer**: per-message `DelaySeconds` on send (also 0–15 minutes). **Standard queues only**; FIFO queues don't support per-message timers.
+- Changing a queue's delay is **not retroactive** for Standard queues but **is retroactive** for FIFO queues.
+- Need longer or exact-time scheduling? AWS points you to **EventBridge Scheduler**.
+
+### Batch APIs
+
+`SendMessageBatch`, `DeleteMessageBatch` and `ChangeMessageVisibilityBatch` handle **up to 10 entries** per call. The batch's total payload must also fit in **1 MiB**.
+
+- Batching cuts request count (and cost) by up to 10× and is how FIFO reaches 3,000 msgs/s.
+- **Partial failure**: a batch call can return HTTP 200 while some entries failed. Always check the `Failed` list and retry those entries.
+- Client-side buffering (for example the Java `AmazonSQSBufferedAsyncClient`) batches automatically.
+
+### Large payloads: the Extended Client Library
+
+The maximum SQS message is **1 MiB** (raised from 256 KiB in August 2025, for both Standard and FIFO). For anything bigger, use the **SQS Extended Client Library** (Java or Python): it uploads the body to **S3** and sends a small pointer message. The consumer library fetches the object transparently. Payloads up to **2 GB** are supported. Even under 1 MiB, the "claim check" pattern (put the blob in S3 yourself, send the key) keeps queues light and cheap.
+
+### Lambda as an SQS consumer
+
+With an **event source mapping**, Lambda polls the queue for you (long polling), invokes your function with a batch, and deletes the messages if the function succeeds.
+
+- **Batch size**: up to **10,000** for Standard queues (needs a batching window of at least 1 second above 10), up to **10** for FIFO.
+- **Visibility timeout**: set the queue's timeout to at least **6× the function timeout** (plus the batching window). Lambda refuses a mapping where the function timeout exceeds the queue's visibility timeout.
+- **Default failure behaviour**: if the function throws, the **whole batch** becomes visible again, including messages that succeeded, so they're processed twice.
+- **Partial batch responses**: enable `ReportBatchItemFailures` and return only the failed IDs:
+
+```json
+{ "batchItemFailures": [ { "itemIdentifier": "id2" }, { "itemIdentifier": "id4" } ] }
+```
+
+Only `id2` and `id4` go back to the queue. An empty list means full success. Throwing an exception still fails the whole batch. With **FIFO**, stop at the first failure and report it **and every later message** in the batch as failed, or you'll process them out of order.
+
+- **Maximum concurrency** on the mapping caps how many concurrent invocations the queue can drive, which protects a downstream database.
+
+### SNS topics and subscriptions
+
+- A **topic** is a named channel. Publishers call `Publish` (or `PublishBatch`, up to 10 messages).
+- **Subscriptions** connect a topic to endpoints: SQS, Lambda, HTTP/S, email, SMS, mobile push, Firehose.
+- SNS **pushes**. It doesn't store messages for later reading. If you need a backlog, buffering or replay, put an SQS queue behind it.
+- **Message size**: default max **256 KiB**, which can be raised to **1 MiB** via the topic's `MaximumMessageSize` attribute. Bigger payloads use the SNS Extended Client Library with S3.
+- **Raw message delivery**: by default SNS wraps your payload in a JSON envelope (Type, MessageId, TopicArn, Message, Timestamp, signature) when delivering to SQS. Enable `RawMessageDelivery` on the subscription if consumers want just the original body.
+- Subscriptions can have their own **DLQ** (an SQS queue) for messages SNS couldn't deliver.
+
+### Fan-out: SNS → SQS
+
+The pattern from the diagram above:
+
+1. The producer publishes **once** to an SNS topic.
+2. Each consuming service owns an **SQS queue** subscribed to the topic. The queue's access policy must allow the topic to `SendMessage` (typically scoped with `aws:SourceArn`).
+3. Each service processes at its own pace, with its own retries, DLQ and alarms. A slow analytics consumer can't delay billing.
+
+Why not have services subscribe to SNS directly over HTTP? Then a service that's down misses messages (beyond SNS's retry policy) and has no backlog. The queue in between is a durable buffer. It's AWS's version of "one Kafka consumer group per application".
+
+### Message filtering
+
+Without a filter, every subscription gets every message. A **filter policy** on a subscription delivers only matching messages:
+
+```json
+{
+  "event_type": ["order_placed", "order_cancelled"],
+  "country": ["IN"],
+  "amount": [{ "numeric": [">=", 1000] }]
+}
+```
+
+- **Scope**: `MessageAttributes` (the default) or `MessageBody` (payload-based filtering on JSON bodies, which also allows nested keys).
+- Operators include exact match, prefix, suffix, anything-but, numeric ranges, exists, equals-ignore-case and wildcards.
+- Limits: at most **5 keys** per policy, at most **150** total value combinations, up to **200 filter policies per topic** by default.
+- Filtering moves routing logic out of consumers: no more "receive everything, drop 90%".
+
+### SNS FIFO topics
+
+- Name ends in `.fifo`. Ordered per **message group**, deduplicated within 5 minutes, just like FIFO queues.
+- Subscribers must be **SQS queues** (FIFO, or Standard if you accept best-effort order). Email, SMS, HTTP and mobile push can't subscribe because they can't preserve order. To trigger Lambda, put a queue in between.
+- Throughput: **300 messages/s per message group**; per topic, defaults to 3,000 messages/s or 20 MB/s when the throughput scope is the whole topic. Setting `FifoThroughputScope` to `MessageGroup` allows higher per-topic throughput.
+- FIFO topics support **archiving and replay** (an archive policy on the topic, a replay policy on the subscription), which standard topics don't.
+
+### Fair queues (Standard queues)
+
+A newer Standard-queue feature for **multi-tenant** queues. Set `MessageGroupId` to a tenant ID on a Standard queue. If one tenant floods the queue (a "noisy neighbour"), SQS prioritises returning other tenants' messages so their wait time stays low. On Standard queues the group ID does **not** enforce ordering. It's only a tenant label.
+
+### SQS + SNS vs EventBridge
+
+| | SNS | EventBridge |
+|---|---|---|
+| Model | Topic → subscriptions | Event bus → rules → targets |
+| Routing | Filter policy per subscription | Content-based rules on any field of the event |
+| Sources | Your publishers | Your apps, ~all AWS services, SaaS partners |
+| Extras | SMS, email, mobile push, FIFO topics | Schema registry, archive and replay, EventBridge Scheduler, Pipes |
+| Sweet spot | High-throughput fan-out to queues and Lambdas | Integrating many event producers and consumers with rich routing |
+
+Simple rule: SNS for raw fan-out speed and simplicity; EventBridge when you're routing many event types between many services or reacting to AWS/SaaS events. Either way, SQS often sits behind them as the durable buffer.
+
+### Exact current limits (SQS and SNS)
+
+| Limit | Value |
+|---|---|
+| SQS max message size | **1 MiB** (1,048,576 bytes); up to 2 GB via Extended Client + S3 |
+| SQS message retention | Default **4 days**; min **60 seconds**; max **14 days** |
+| Visibility timeout | Default **30 s**; range **0 s – 12 h** (12 h counted from first receive) |
+| Long polling wait | Max **20 s** |
+| Delay queue / message timer | **0 – 15 minutes** (no per-message timers on FIFO) |
+| Messages per receive / per batch | **10** |
+| Batch total payload | **1 MiB** |
+| In-flight messages | Standard about **120,000**; FIFO **120,000** |
+| Backlog size | Unlimited |
+| FIFO throughput (normal) | **300 TPS** per action; **3,000 msgs/s** batched |
+| FIFO throughput (high-throughput mode) | Up to **70,000 TPS / 700,000 msgs/s** batched in the largest regions |
+| FIFO dedup interval | **5 minutes** |
+| Message attributes | **10** per message |
+| `MessageGroupId` length | **128** characters |
+| Queue name | **80** characters (`.fifo` suffix counts) |
+| DLQ redrive custom velocity | up to **500 msgs/s**; task runs at most 36 h |
+| Lambda batch size | Standard up to **10,000**; FIFO up to **10** |
+| SNS max message size | **256 KiB** default; raisable to **1 MiB** |
+| SNS subscriptions per topic | Standard **12,500,000**; FIFO **100** |
+| SNS filter policy | **5** keys, **150** combinations; **200** policies per topic |
+| SNS FIFO throughput | **300 msgs/s per group**; default **3,000 msgs/s or 20 MB/s** per topic |
+
+## How it works (a robust SQS worker)
+
+```python
+import boto3, threading
+sqs = boto3.client("sqs")
+Q = "https://sqs.ap-south-1.amazonaws.com/123456789012/orders"
+
+def heartbeat(handle, stop):
+    # extend visibility every 60s while work continues (12h total cap)
+    while not stop.wait(60):
+        sqs.change_message_visibility(QueueUrl=Q, ReceiptHandle=handle, VisibilityTimeout=120)
+
+while running:
+    resp = sqs.receive_message(
+        QueueUrl=Q,
+        MaxNumberOfMessages=10,          # batch
+        WaitTimeSeconds=20,              # long polling
+        VisibilityTimeout=120,
+        MessageSystemAttributeNames=["ApproximateReceiveCount"],
+    )
+    done = []
+    for m in resp.get("Messages", []):
+        stop = threading.Event()
+        threading.Thread(target=heartbeat, args=(m["ReceiptHandle"], stop), daemon=True).start()
+        try:
+            evt = parse(m["Body"])
+            if not already_processed(evt.id):      # idempotency: at-least-once delivery
+                handle(evt)                         # side effect + record evt.id atomically
+            done.append({"Id": m["MessageId"], "ReceiptHandle": m["ReceiptHandle"]})
+        except Exception:
+            pass   # don't delete: it reappears after the timeout; after maxReceiveCount → DLQ
+        finally:
+            stop.set()
+    if done:
+        r = sqs.delete_message_batch(QueueUrl=Q, Entries=done)
+        for f in r.get("Failed", []):              # HTTP 200 can still hide failures
+            log.warning("delete failed %s", f)
+```
+
+Queue config to go with it: redrive policy with `maxReceiveCount=5` to a DLQ whose retention is 14 days, a CloudWatch alarm on the DLQ's `ApproximateNumberOfMessagesVisible` above 0, and an alarm on the source queue's `ApproximateAgeOfOldestMessage`.
+
+## Real-world examples
+
+- **S3 event notifications** can target SQS queues and SNS topics directly. "Upload lands in S3 → message in SQS → worker processes the file" is a standard AWS ingestion pattern.
+- **AWS Lambda** has native SQS event source mappings with partial batch responses, and **Powertools for AWS Lambda** ships a batch-processor utility that implements the `batchItemFailures` logic for you.
+- The **SNS developer guide** documents SNS → SQS fan-out as the way to push one notification to several queues so that each application processes it asynchronously at its own pace.
+
+## Common pitfalls
+
+- **Visibility timeout shorter than processing time.** The message reappears and a second worker processes it. Measure p99 processing time and add margin, or use a heartbeat.
+- **Visibility timeout far too long.** A crashed worker's message stays hidden for ages, delaying the retry.
+- **No DLQ.** A poison message is received again and again until the retention period (up to 14 days) expires.
+- **`maxReceiveCount=1`.** One crash or timeout sends a perfectly good message to the DLQ.
+- **DLQ retention shorter than or equal to the source's.** Standard-queue messages keep their original timestamp, so they may expire almost immediately in the DLQ.
+- **Treating "FIFO" as "no duplicates anywhere".** Dedup covers producer retries within 5 minutes. Consumers still need idempotency.
+- **One `MessageGroupId` for everything** on a FIFO queue. The whole queue becomes single-threaded.
+- **Short polling in a tight loop.** Costs money and returns empty or partial results.
+- **Lambda without `ReportBatchItemFailures`.** One bad message re-runs the whole batch, causing duplicate side effects.
+- **Ignoring the `Failed` list** in batch responses because the call returned 200.
+- **Subscribing HTTP endpoints straight to SNS** for critical work. No backlog if the endpoint is down. Put SQS in between.
+- **Forgetting the SQS access policy** for an SNS subscription. The subscription exists, but nothing arrives.
+- **Assuming SQS can replay.** Deleted means gone. If you need replay, use Kafka/Kinesis, or SNS FIFO archiving.
+
+## Practice questions
+
+<Practice>
+
+<QA q="What is the visibility timeout in SQS and what happens when it expires?" level="easy">
+
+When a consumer receives a message, SQS doesn't delete it. It hides it from other consumers for the visibility timeout (default 30 s, max 12 h). If the consumer deletes the message (with its receipt handle) before the timeout, it's gone. If not, the message becomes **visible again**, its receive count goes up, and another consumer can get it. After `maxReceiveCount` receives it's moved to the DLQ, if one is configured.
+
+</QA>
+
+<QA q="Compare SQS Standard and FIFO queues." level="easy">
+
+- **Standard**: nearly unlimited throughput, at-least-once delivery, best-effort ordering. Duplicates and reordering are possible.
+- **FIFO**: strict order within each `MessageGroupId`, deduplication of producer retries within 5 minutes, name ends in `.fifo`. Throughput is 300 TPS per action (3,000 msgs/s batched) normally, much higher in high-throughput mode.
+
+Choose Standard unless per-entity order really matters. Either way, make consumers idempotent.
+
+</QA>
+
+<QA q="What is the difference between short polling and long polling?" level="easy">
+
+**Short polling** (`WaitTimeSeconds=0`) samples a subset of SQS servers and returns immediately, often with empty or partial results. **Long polling** (`WaitTimeSeconds` up to 20) queries all servers and waits until a message arrives or the timeout ends. Long polling means fewer empty responses, lower cost, and messages delivered as soon as they arrive. Use 20 seconds by default.
+
+</QA>
+
+<QA q="How do DLQs work in SQS, and why should the DLQ's retention be longer than the source queue's?" level="medium">
+
+The source queue's **redrive policy** names a DLQ and a `maxReceiveCount`. When a message has been received more times than that without being deleted, SQS moves it to the DLQ (same account, region and queue type).
+
+For Standard queues the message keeps its **original enqueue timestamp**, so retention keeps counting from when it was first sent. If the DLQ's retention is the same or shorter, the message can expire soon after arriving. Give the DLQ the maximum (14 days), alarm on its depth, and use **DLQ redrive** (`StartMessageMoveTask`) to move messages back once fixed.
+
+</QA>
+
+<QA q="What role does `MessageGroupId` play in FIFO queues?" level="medium">
+
+It's the ordering and parallelism unit. Messages with the same group ID are delivered strictly in order, and SQS won't release the next one in a group while an earlier one is in flight. Different groups are processed in parallel. In high-throughput mode, group IDs are hashed to partitions. So use a natural entity key (account ID, order ID) with many distinct values. A single group ID turns the queue into a single-threaded pipe.
+
+</QA>
+
+<QA q="How does FIFO deduplication work, and does it give you exactly-once processing end to end?" level="medium">
+
+If a producer sends a message with the same deduplication ID within **5 minutes**, SQS accepts the call but doesn't enqueue a second copy. The ID is either supplied (`MessageDeduplicationId`) or derived from a SHA-256 of the body (content-based dedup).
+
+It does **not** make processing exactly-once end to end. If a consumer finishes the work but crashes before `DeleteMessage`, the message reappears after the visibility timeout and is processed again. You still need idempotent consumers (for example, a processed-IDs table updated in the same transaction as the side effect).
+
+</QA>
+
+<QA q="A Lambda function processes SQS batches of 10. One malformed message causes the whole batch to be retried. How do you fix it?" level="medium">
+
+Enable **`ReportBatchItemFailures`** on the event source mapping. Catch errors per record and return `batchItemFailures` with the `itemIdentifier` (message ID) of only the failed ones. The successful messages are deleted; the failed ones become visible again and eventually reach the DLQ after `maxReceiveCount`. Don't throw from the handler, because that still fails the whole batch. For FIFO queues, stop at the first failure and report it plus all later messages, to keep order.
+
+</QA>
+
+<QA q="Explain the SNS to SQS fan-out pattern and why it's preferred over consumers subscribing to SNS directly." level="medium">
+
+The producer publishes once to an SNS topic. Each consuming service has its own SQS queue subscribed to the topic (with a queue policy allowing the topic to send). SNS copies each message to every queue.
+
+Benefits: each consumer gets a durable backlog, its own pace, retries, DLQ and alarms; one slow or failed consumer doesn't affect others; adding a consumer means adding a queue, with no producer change; filter policies can limit what each queue receives. Direct HTTP subscriptions have no backlog, so downtime beyond SNS's retries loses messages.
+
+</QA>
+
+<QA q="How would you send a 50 MB payload through SQS?" level="medium">
+
+SQS messages max out at 1 MiB. Use the **claim-check** pattern: store the payload in S3 and send a message containing the bucket and key. The **SQS Extended Client Library** (Java, Python) automates this, supporting payloads up to 2 GB. Remember lifecycle rules to delete the S3 objects, and that the consumer needs S3 read permission.
+
+</QA>
+
+<QA q="What is the 12-hour visibility limit and how does it affect long-running jobs?" level="hard">
+
+The visibility timeout can be at most 12 hours, and that cap is measured **from when the message was first received**. Calling `ChangeMessageVisibility` extends the current timeout but doesn't reset the 12-hour clock. A job that may run longer than 12 hours can't rely on a single SQS message staying hidden. Options: break the job into smaller steps (each its own message), or hand the long work to Step Functions or a batch system and use SQS only to start it.
+
+</QA>
+
+<QA q="How do you get high throughput from an SQS FIFO queue?" level="hard">
+
+1. Enable **high-throughput mode** (dedup scope = message group, throughput limit = per message group ID).
+2. Use **many distinct `MessageGroupId` values** so traffic spreads across partitions. Each partition handles about 300 TPS (3,000 msgs/s batched).
+3. **Batch** sends, receives and deletes (10 per call). Batch messages with the same group ID together for send efficiency.
+4. Use long polling and avoid needless `ChangeMessageVisibility` calls, which consume TPS.
+5. Know the regional ceiling (for example 70,000 TPS non-batched in N. Virginia) and request quota increases if needed.
+
+If strict order isn't required, a Standard queue is simpler and effectively unlimited.
+
+</QA>
+
+<QA q="When would you pick EventBridge over SNS?" level="hard">
+
+EventBridge when you need **content-based routing** across many event types and services, events from **AWS services or SaaS partners**, a **schema registry**, **archive and replay**, or scheduling. SNS when you need simple, very high-throughput fan-out to queues and Lambdas, mobile push, SMS or email, or **FIFO** ordering. Both commonly deliver into SQS so each consumer has a durable buffer.
+
+</QA>
+
+<QA q="Your SQS consumers occasionally process the same order twice, causing duplicate emails. Logs show both workers received the message about 40 seconds apart. Diagnose." level="scenario">
+
+Classic **visibility timeout too short**. The queue uses the default 30 s; some orders take longer (slow downstream call), so the message became visible again and a second worker received it about 30–40 s later.
+
+Fixes:
+
+1. Raise the visibility timeout above p99 processing time, or add a **heartbeat** that calls `ChangeMessageVisibility` while working.
+2. Make the consumer **idempotent**: record the order or message ID in a processed table and skip duplicates. Standard queues can deliver duplicates even with a perfect timeout.
+3. Alert on `ApproximateReceiveCount` greater than 1 to spot slow processing.
+
+</QA>
+
+<QA q="A FIFO queue for payment events processes only about 1 message every 200 ms even with 50 consumers. What's wrong?" level="scenario">
+
+Probably **one (or very few) `MessageGroupId` values**, for example a constant like `payments`. FIFO lets only one receive (batch) per group be in flight, so 49 of the 50 consumers sit idle, and with one message per receive throughput equals 1 ÷ processing time (about 5 msgs/s at 200 ms).
+
+Fix: use a fine-grained group ID such as the **account ID**, which keeps per-account order while letting different accounts run in parallel. Enable high-throughput mode and batch the API calls. If cross-account ordering was never needed, this was the whole problem.
+
+</QA>
+
+<QA q="Design an order-events pipeline on AWS where billing, shipping and analytics each consume every OrderPlaced event, and analytics only wants Indian orders." level="scenario">
+
+- The order service writes the order and an outbox row in one transaction; a relay publishes `OrderPlaced` to an **SNS topic** (message attributes such as `country`).
+- Three **SQS queues** subscribe: billing, shipping, analytics. The analytics subscription has a **filter policy** `country = IN`. Enable raw message delivery.
+- If billing must process each account's events in order, use an **SNS FIFO topic** with `MessageGroupId = accountId` and an SQS FIFO queue for billing (others can be Standard queues subscribed to the FIFO topic).
+- Each queue: long polling, visibility timeout above p99 processing, redrive to its own **DLQ** (`maxReceiveCount` about 5, 14-day retention), alarms on DLQ depth and oldest-message age.
+- Consumers are **idempotent** on the order event ID. Analytics can use Lambda with `ReportBatchItemFailures`.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="What is the maximum SQS visibility timeout, and what happens when you extend it with ChangeMessageVisibility?" options={["15 minutes; each extension resets the limit", "12 hours, counted from the first receive; extending does not reset that cap", "12 hours from the latest ChangeMessageVisibility call", "14 days, matching the retention period"]} answer={1}>
+
+The visibility timeout ranges from 0 seconds to 12 hours, and the 12-hour cap is measured from when the message was first received. Extending changes the current timeout but cannot push past that cap. Fifteen minutes is the maximum delay, and 14 days is the maximum retention.
+
+</MCQ>
+
+<MCQ q="An SQS FIFO queue is not in high-throughput mode. What sends throughput can it reach with batching?" options={["300 messages per second", "Unlimited", "3,000 messages per second", "70,000 messages per second"]} answer={2}>
+
+Normal FIFO is 300 transactions per second per API action, and a batch carries up to 10 messages, so 3,000 messages per second. 70,000 TPS is the high-throughput-mode ceiling in the largest regions, and unlimited describes Standard queues.
+
+</MCQ>
+
+<MCQ q="Which statement about SQS FIFO deduplication is correct?" options={["It removes duplicates for 24 hours", "Content-based dedup hashes both body and attributes", "It prevents duplicates caused by a consumer crashing before DeleteMessage", "Producer retries with the same deduplication ID within 5 minutes are not enqueued twice"]} answer={3}>
+
+The deduplication interval is 5 minutes, content-based dedup hashes only the body, and it covers duplicate sends. A consumer that crashes before deleting will still see the message again, so consumers must be idempotent.
+
+</MCQ>
+
+<MCQ q="A Lambda SQS consumer has ReportBatchItemFailures enabled. The handler throws an unhandled exception halfway through a batch. What happens?" options={["Only the messages after the exception are retried", "The entire batch is treated as failed and becomes visible again", "Messages processed before the exception are deleted automatically", "The batch is sent straight to the DLQ"]} answer={1}>
+
+Partial batch responses work only if the function returns a `batchItemFailures` list. Throwing an exception marks the whole batch as failed. Catch errors per record and report only the failed IDs.
+
+</MCQ>
+
+<MCQ q="Why should a Standard queue's DLQ have a longer retention period than its source queue?" options={["Messages keep their original enqueue timestamp when moved, so they may expire soon after reaching the DLQ", "DLQs process messages more slowly", "AWS requires it when creating the redrive policy", "Redrive resets the receive count only if retention is longer"]} answer={0}>
+
+For Standard queues the enqueue timestamp is unchanged when a message moves to the DLQ, so retention keeps counting from the original send. FIFO DLQs reset the timestamp. AWS recommends, but doesn't enforce, a longer DLQ retention.
+
+</MCQ>
+
+<MCQ q="Which endpoint can subscribe to an SNS FIFO topic?" options={["An HTTPS webhook", "An email address", "An SQS queue", "A mobile push endpoint"]} answer={2}>
+
+SNS FIFO topics deliver only to SQS queues (FIFO, or Standard if best-effort order is fine). Endpoints such as email, SMS, HTTP/S and mobile push can't guarantee ordering, so subscribing them fails. To reach Lambda, put a queue in between.
+
+</MCQ>
+
+<MCQ q="What is the current maximum SQS message size, and how do you send larger payloads?" options={["256 KiB; split into chunks", "1 MiB; use the Extended Client Library to store the body in S3", "10 MiB; enable large-message mode", "2 GB natively"]} answer={1}>
+
+SQS raised the limit from 256 KiB to 1 MiB in August 2025. Larger payloads, up to 2 GB, go through the Extended Client Library, which stores the body in S3 and sends a reference. 2 GB is the Extended Client limit, not a native one.
+
+</MCQ>
+
+<MCQ q="A FIFO queue uses the constant `orders` as MessageGroupId for every message. What is the effect?" options={["Messages are delivered in parallel to all consumers", "Deduplication stops working", "The queue rejects messages above 300 per second", "Only one consumer can hold the group's messages at a time, so adding consumers does not raise throughput"]} answer={3}>
+
+FIFO holds back later messages in a group while earlier ones are in flight. One group ID means the whole queue is processed by one consumer, one receive batch at a time. Use a fine-grained key such as account ID.
+
+</MCQ>
+
+<MCQ q="Which is the main difference between SQS delay queues and the visibility timeout?" options={["A delay hides a message before its first receive; the visibility timeout hides it after each receive", "Delay queues are FIFO-only", "The visibility timeout can be at most 15 minutes", "Delay queues delete messages after the delay"]} answer={0}>
+
+A delay (0 to 15 minutes) postpones a new message's first availability. The visibility timeout hides a message after it has been received, so a consumer can process it. Delay queues exist for both queue types, though per-message timers are Standard-only.
+
+</MCQ>
+
+<MCQ q="Which SNS filter policy constraint is correct?" options={["Unlimited keys per policy", "Filtering only works on the message body", "At most 5 keys and 150 total value combinations per policy", "Filter policies apply only to FIFO topics"]} answer={2}>
+
+A filter policy can have at most five keys, and the product of values across keys must not exceed 150. The scope can be message attributes (the default) or the message body, and filtering works on both standard and FIFO topics.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **SQS** = managed pull queue. Receive → hide (visibility timeout) → process → **delete**. Not deleted = comes back. At-least-once: consumers must be idempotent.
+- **Standard**: unlimited scale, best-effort order, duplicates possible. **FIFO**: per-`MessageGroupId` order, 5-min dedup, 300 TPS (3,000 batched) or high-throughput mode (up to 70,000 TPS / 700,000 msgs/s).
+- **Visibility timeout**: default 30 s, max 12 h from first receive. Heartbeat with `ChangeMessageVisibility`; 0 releases the message.
+- **Long polling**: `WaitTimeSeconds=20`, `MaxNumberOfMessages=10`.
+- **DLQ**: `maxReceiveCount` (at least 5 with Lambda), DLQ retention longer than the source, alarm on depth, redrive with `StartMessageMoveTask`.
+- **Limits**: 1 MiB message (2 GB via S3 Extended Client), retention 1 min – 14 days (default 4), delay 0–15 min, batches of 10.
+- **Lambda**: visibility timeout ≥ 6× function timeout; enable `ReportBatchItemFailures`; FIFO batch max 10.
+- **SNS**: push pub/sub. **SNS → SQS** fan-out gives every consumer its own buffer. Filter policies (5 keys, 150 combinations). Raw message delivery removes the JSON envelope. Messages 256 KiB default, 1 MiB max.
+- **SNS FIFO**: SQS subscribers only, 300 msgs/s per group, archive and replay.
+- **EventBridge**: rich content routing, AWS/SaaS sources, schema registry, replay, scheduler.
+
+## Go deeper
+
+- **AWS docs**: [Amazon SQS visibility timeout](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html).
+- **AWS docs**: [Amazon SQS message quotas](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/quotas-messages.html) — the source for the limits table.
+- **AWS docs**: [High throughput for FIFO queues](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/high-throughput-fifo.html).
+- **AWS docs**: [Using dead-letter queues in Amazon SQS](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html).
+- **AWS docs**: [Handling errors for an SQS event source in Lambda](https://docs.aws.amazon.com/lambda/latest/dg/services-sqs-errorhandling.html) — partial batch responses.
+- **AWS docs**: [Amazon SNS message filtering](https://docs.aws.amazon.com/sns/latest/dg/sns-message-filtering.html) and [SNS endpoints and quotas](https://docs.aws.amazon.com/general/latest/gr/sns.html).
+- **AWS What's New**: [Amazon SQS increases maximum message payload size to 1 MiB](https://aws.amazon.com/about-aws/whats-new/2025/08/amazon-sqs-max-payload-size-1mib/).

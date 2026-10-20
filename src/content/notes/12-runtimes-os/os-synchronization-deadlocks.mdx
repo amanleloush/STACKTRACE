@@ -1,0 +1,526 @@
+---
+title: "Synchronization: Mutex vs Semaphore and Deadlocks"
+phase: "12-runtimes-os"
+order: 124
+tags: ["os", "concurrency", "locks", "deadlock", "synchronization"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 20
+prerequisites: ["os-concurrency", "os-processes-threads"]
+summary: "The synchronization toolbox (mutexes, semaphores, spinlocks, condition variables, monitors, reader-writer locks, CAS), the classic problems they solve, and how deadlock, livelock, starvation and priority inversion happen and are prevented."
+---
+
+## Definition (interview-ready)
+
+**Synchronization** is controlling how concurrent threads access shared state so the result doesn't depend on timing. The main tools:
+
+- **Mutex**: a lock with an **owner**. One thread holds it at a time, and the thread that locked it is the one that unlocks it.
+- **Semaphore**: a **counter** with two atomic operations: wait (P, decrement, block if zero) and signal (V, increment, wake a waiter). It has **no owner**. Any thread can signal.
+- **Condition variable**: a queue where threads sleep until some condition on shared state might be true, always used together with a mutex.
+
+A **deadlock** is a set of threads each waiting for something held by another thread in the set, so none can ever proceed. It needs all four **Coffman conditions**: mutual exclusion, hold and wait, no preemption, circular wait.
+
+How to say it: *"A mutex is for mutual exclusion and has ownership. A semaphore is for counting and signalling and has none. You can build a lock from a binary semaphore, but you lose ownership checks and priority inheritance."*
+
+## Why it matters
+
+- "Mutex vs semaphore" and "how do you prevent deadlock" are some of the most asked OS interview questions, and follow-ups probe ownership, condition variable loops and lock ordering.
+- Real outages come from these bugs: deadlocks between services and database transactions, connection pool exhaustion (a counting semaphore in disguise), lost wakeups, priority inversion.
+- The same ideas show up at every level: CPU atomics, language locks ([Java concurrency and locks](/learn/notes/java-concurrency-locks/)), database row locks ([Concurrency control and locking](/learn/notes/concurrency-control-locking/)) and distributed locks.
+
+[OS Concurrency](/learn/notes/os-concurrency/) introduces race conditions, mutexes and memory visibility. This note goes deeper into the primitives, classic problems and deadlock theory.
+
+## Core concepts
+
+### Race conditions and critical sections
+
+A **race condition** happens when the outcome depends on the interleaving of threads that access shared data, with at least one writing. `count++` is really three steps (load, add, store), so two threads can both load 5 and both store 6.
+
+A **critical section** is the code that touches shared state and must not run in more than one thread at once. A correct solution to the critical section problem must give:
+
+1. **Mutual exclusion**: at most one thread inside.
+2. **Progress**: if nobody is inside and some want in, one of them gets in eventually (no pointless blocking).
+3. **Bounded waiting**: a waiting thread gets in after a bounded number of other entries (no starvation).
+
+### Atomic operations and CAS
+
+All locks are built on **atomic hardware instructions**: operations the CPU guarantees happen as one indivisible step, even across cores.
+
+- **Test-and-set**: set a flag and return its old value, atomically.
+- **Fetch-and-add**: add and return the old value (`atomic.AddInt64`, `AtomicLong.incrementAndGet`).
+- **Compare-and-swap (CAS)**: "if the value is still `expected`, set it to `new`, and tell me if it worked."
+
+```java
+// Lock-free increment with CAS: retry until nobody raced us
+AtomicLong counter = new AtomicLong();
+long cur, next;
+do {
+    cur  = counter.get();
+    next = cur + 1;
+} while (!counter.compareAndSet(cur, next));
+```
+
+CAS enables **lock-free** structures: no thread ever holds a lock, so a thread descheduled mid-operation can't block others. Watch for the **ABA problem**: a value changes from A to B and back to A, and CAS wrongly assumes nothing changed. Fixes: version counters next to the value (Java's `AtomicStampedReference`), or memory reclamation schemes that prevent reuse.
+
+### Spinlocks
+
+A **spinlock** busy-waits in a loop until the lock is free.
+
+```c
+while (atomic_exchange(&lock, 1) == 1) { /* spin */ }
+// critical section
+atomic_store(&lock, 0);
+```
+
+- **Good when**: the critical section is shorter than the cost of sleeping and waking (two context switches), and the holder is running on another core. The Linux kernel uses spinlocks widely, with preemption disabled while held.
+- **Bad when**: the holder might be descheduled (common in user space). Waiters then burn whole time slices spinning for nothing. On a single core, spinning is pure waste.
+- In practice, user-space mutexes are **adaptive**: spin briefly, then sleep.
+
+### Mutexes and futexes
+
+A **mutex** puts waiting threads to sleep instead of spinning. On Linux, pthread mutexes are built on **futexes** ("fast user-space mutexes"):
+
+- **Uncontended**: lock and unlock are a single atomic instruction in user space. No syscall.
+- **Contended**: the waiter calls `futex(FUTEX_WAIT)` and the kernel puts it to sleep. The unlocker calls `futex(FUTEX_WAKE)`.
+
+That's why uncontended locks are cheap and contended locks are expensive: contention means syscalls and context switches (see [Processes and threads](/learn/notes/os-processes-threads/)).
+
+**Ownership** is the key property. A mutex knows which thread holds it, which enables:
+
+- Error checking: with POSIX `PTHREAD_MUTEX_ERRORCHECK` (or recursive or robust mutexes), unlocking from a non-owner returns `EPERM`. For a default normal mutex it's undefined behaviour.
+- **Recursive / reentrant** locking: the owner can re-acquire (Java `ReentrantLock`, `synchronized`).
+- **Priority inheritance**: the kernel knows whose priority to boost (see priority inversion below).
+- **Robust mutexes**: if the owner dies, the next locker is told (`EOWNERDEAD`).
+
+Language nuance worth knowing: Go's `sync.Mutex` is **not** tied to a goroutine. Its docs explicitly allow one goroutine to lock and another to unlock, and it isn't reentrant. Java's `ReentrantLock` is owner-based and throws `IllegalMonitorStateException` if a non-owner unlocks.
+
+### Semaphores: binary and counting
+
+A semaphore (Dijkstra) is an integer with two atomic operations:
+
+```
+wait(S)   / P / acquire:  if S > 0 then S = S - 1 else block until it can
+signal(S) / V / release:  S = S + 1, and wake one waiter if any
+```
+
+- **Counting semaphore**: initialized to N. Limits concurrency to N, like a pool of N database connections or N permits for an API.
+- **Binary semaphore**: initialized to 1 (or 0). Values only 0 or 1.
+
+**Mutex vs binary semaphore.** They look the same but aren't:
+
+| | Mutex | Binary semaphore | Counting semaphore |
+|---|---|---|---|
+| Purpose | Mutual exclusion | Signalling, or a simple lock | Limit concurrency to N, count resources |
+| Owner | **Yes**, only the locker unlocks | **No**, any thread can signal | No |
+| Can start at 0 | No (starts unlocked) | Yes: "wait until someone signals me" | Yes |
+| Recursive locking | Possible (reentrant mutex) | No: a second wait by the same thread blocks itself | No |
+| Priority inheritance | Possible | Not possible (no owner to boost) | No |
+| Typical example | Protect a shared map | Thread A waits for thread B to finish init | Connection pool, rate limiting workers |
+
+Java's `Semaphore` docs say it directly: there's no requirement that the releasing thread acquired the permit. Semaphores have no notion of ownership. That makes them great for **signalling between threads** (one thread posts, another waits) and wrong as a drop-in mutex where you want error checking.
+
+Interview one-liner: *"A mutex is a key to a room: whoever took it must return it. A semaphore is a counter of free parking spots: anyone can free a spot."*
+
+### Condition variables
+
+A **condition variable** lets a thread sleep until another thread says "the state you care about may have changed". Always used with a mutex:
+
+```java
+// Java: inside a monitor (synchronized), wait/notifyAll
+synchronized (lock) {
+    while (queue.isEmpty()) {     // WHILE, not if
+        lock.wait();              // atomically releases lock and sleeps; re-acquires on wakeup
+    }
+    item = queue.removeFirst();
+}
+```
+
+Rules:
+
+1. **Check the condition in a `while` loop.** Most real systems use **Mesa semantics**: a signal is just a hint, and by the time the woken thread re-acquires the lock, another thread may have consumed the item. Spurious wakeups are also allowed by POSIX and Java.
+2. **Hold the mutex while changing the state and while waiting.** `wait` releases the mutex and sleeps **atomically**, so a signal can't slip in between the check and the sleep (the **lost wakeup** problem).
+3. **Use broadcast (`notifyAll`, `Broadcast`) when different waiters wait for different conditions** on the same variable, or you can wake the wrong one and everyone sleeps.
+
+### Monitors
+
+A **monitor** packages shared data, a mutex and condition variables so that all access goes through methods that automatically hold the lock. Java builds it into the language: every object has an intrinsic lock and a wait set, and `synchronized` methods plus `wait`/`notify`/`notifyAll` form a monitor. With `java.util.concurrent.locks`, a `Lock` can have several `Condition` objects (for example `notFull` and `notEmpty`), which is cleaner than one shared wait set.
+
+### Reader-writer locks
+
+Many readers OR one writer. Great when reads vastly outnumber writes and the critical section isn't tiny.
+
+- **Reader preference**: new readers keep entering while a writer waits → **writer starvation**.
+- **Writer preference**: once a writer waits, new readers block → readers can starve, but writes don't.
+- **Fair** (FIFO-ish) modes trade throughput for predictability (Java `ReentrantReadWriteLock(true)`).
+- **Upgrade trap**: two readers that both try to upgrade to a write lock deadlock, each waiting for the other's read lock. Java's `ReentrantReadWriteLock` allows downgrading (write → read) but **not** upgrading. Go's `RWMutex` forbids recursive read locking because a waiting writer blocks new readers.
+- If the critical section is tiny, an RW lock can be **slower** than a plain mutex because the reader count itself is a contended shared variable.
+
+### Classic problem: producer-consumer (bounded buffer)
+
+Producers put items into a buffer of size N; consumers take them out. Producers must block when the buffer is full and consumers when it's empty.
+
+**With semaphores:**
+
+```
+semaphore empty = N   // free slots
+semaphore full  = 0   // filled slots
+mutex     m           // protects the buffer itself
+
+producer:                     consumer:
+  wait(empty)                   wait(full)
+  lock(m)                       lock(m)
+  buffer.put(item)              item = buffer.take()
+  unlock(m)                     unlock(m)
+  signal(full)                  signal(empty)
+```
+
+The order matters. If a producer takes `m` **before** `wait(empty)` on a full buffer, it sleeps holding the mutex. No consumer can get in to free a slot: deadlock.
+
+In practice you'd use a ready-made blocking queue (Java `ArrayBlockingQueue`, a buffered Go channel), which is exactly this pattern with a mutex and two conditions.
+
+### Classic problem: dining philosophers
+
+Five philosophers sit at a round table with one fork between each pair. Each needs both neighbouring forks to eat. If all five pick up their left fork at the same time, each waits forever for the right one. That's a circular wait: deadlock.
+
+Fixes, each breaking a Coffman condition:
+
+- **Resource ordering**: number the forks, always pick up the lower-numbered one first. The last philosopher then reaches for the same fork as the first, so the cycle can't form. (Breaks circular wait.)
+- **Limit the diners**: a counting semaphore lets at most 4 of the 5 try to eat. At least one can always get both forks. (Breaks circular wait in practice.)
+- **All or nothing**: pick up both forks atomically, or use try-lock and put the first fork back if the second is taken. (Breaks hold and wait, but beware livelock.)
+
+### Deadlock: the four Coffman conditions
+
+A deadlock needs **all four** at once (Coffman et al., 1971):
+
+1. **Mutual exclusion**: a resource can be held by only one thread.
+2. **Hold and wait**: a thread holds one resource while waiting for another.
+3. **No preemption**: a resource can't be forcibly taken away; only its holder releases it.
+4. **Circular wait**: a cycle of threads, each waiting for a resource the next one holds.
+
+Break any one and deadlock can't happen. The four strategies:
+
+| Strategy | Idea | Practical example |
+|---|---|---|
+| **Prevention** | Design so one condition can never hold | Global lock ordering (no circular wait); acquire all locks up front (no hold-and-wait); try-lock with timeout and release (simulates preemption) |
+| **Avoidance** | Before granting a request, check it can't lead to an unsafe state | Banker's algorithm. Needs each thread's maximum demand in advance, so it's rare outside textbooks and some embedded systems |
+| **Detection and recovery** | Let deadlocks happen, find cycles, break them | Databases: build a wait-for graph, pick a victim transaction, abort it |
+| **Ignore it** | Assume it's rare, restart if it happens | The "ostrich algorithm": most general-purpose OSes don't do deadlock avoidance for application locks |
+
+### Banker's algorithm (briefly)
+
+Each process declares its **maximum** need. The system tracks **allocation**, **need** = max − allocation, and **available**. A request is granted only if, after granting it, there's still a **safe sequence**: an order in which every process could get its remaining need and finish, returning its resources.
+
+Example: one resource type, 10 units total.
+
+| Process | Max | Allocated | Need |
+|---|---|---|---|
+| P0 | 7 | 3 | 4 |
+| P1 | 4 | 2 | 2 |
+| P2 | 9 | 2 | 7 |
+
+Available = 10 − 7 = 3. Safe sequence: P1 (needs 2, has 3 → finishes, available 5), then P0 (needs 4 → available 8), then P2 (needs 7 → available 10). **Safe.**
+
+Now P0 asks for 2 more. If granted: P0 holds 5 and needs 2, available = 1. Nobody's remaining need fits in 1, so there's no safe sequence: **unsafe**, so the request waits. Unsafe doesn't mean deadlocked yet, only that deadlock can no longer be ruled out.
+
+### Detection and recovery
+
+- Build a **wait-for graph**: an edge T1 → T2 means T1 waits for something T2 holds. A **cycle** means deadlock (when each resource has a single instance).
+- Recovery: abort a victim (pick the cheapest to roll back), or preempt its resources and roll it back.
+- **PostgreSQL** waits `deadlock_timeout` (default 1 s) on a lock before running its deadlock check, then aborts one transaction with a deadlock error. **InnoDB** detects deadlocks and rolls back a victim transaction. Your application must **retry** such transactions.
+- The **JVM**: `jstack PID` (or a thread dump) reports Java-level deadlocks it finds among monitors and `java.util.concurrent` locks.
+- **Go**: the runtime crashes with "fatal error: all goroutines are asleep - deadlock!" (not a recoverable panic) only if **every** goroutine is blocked. A partial deadlock in a busy server goes undetected; use goroutine dumps (`pprof`).
+
+### Lock ordering in practice
+
+The most practical prevention technique. Classic bank transfer bug:
+
+```java
+// Deadlock-prone: transfer(a, b) and transfer(b, a) at the same time
+synchronized (from) { synchronized (to) { move(from, to, amt); } }
+
+// Fixed: always lock the lower id first
+Account first  = from.id < to.id ? from : to;
+Account second = from.id < to.id ? to   : from;
+synchronized (first) { synchronized (second) { move(from, to, amt); } }
+```
+
+The same idea in a database: update rows in a consistent order (for example by primary key) so two transactions never wait on each other in a cycle.
+
+### Livelock and starvation
+
+- **Livelock**: threads keep running but make no progress, constantly reacting to each other. Like two people in a hallway who both step aside the same way, again and again. Typical cause: try-lock, fail, release, retry immediately in lockstep. Fix: **randomized backoff** (jitter), the same reason retries need jitter in distributed systems (see [Circuit breakers and retries](/learn/notes/circuit-breakers-retries/)).
+- **Starvation**: a thread waits indefinitely because others keep winning: an unfair lock that lets newcomers barge in, writer starvation in reader-preferring RW locks, low-priority threads that never get scheduled. Fix: fair locks/queues, aging, writer-preferring RW locks.
+
+| | Deadlock | Livelock | Starvation |
+|---|---|---|---|
+| Threads running? | No, all blocked | Yes, busy | Others run, victim waits |
+| Progress | None | None | Some threads progress |
+| Fix | Break a Coffman condition | Random backoff | Fairness, aging |
+
+### Priority inversion and Mars Pathfinder
+
+**Priority inversion**: a high-priority task waits for a lock held by a low-priority task, and a **medium-priority** task (which doesn't need the lock) preempts the low one. The high-priority task now effectively waits on the medium one.
+
+```
+H: ──── wants lock ──── BLOCKED .......................... runs
+M:                    ████████████████████ (preempts L)
+L: ─ holds lock ─ preempted ............... finishes, unlocks
+```
+
+**Mars Pathfinder, 1997.** A few days after landing, the lander kept resetting itself. On its VxWorks real-time OS:
+
+- A **high-priority** bus management task needed a mutex protecting a shared "information bus".
+- A **low-priority** meteorological data task held that mutex while publishing data.
+- A **medium-priority** communications task preempted the low-priority task.
+- The high-priority task didn't run in time, a watchdog timer noticed, and it reset the whole system.
+
+The mutex had been created with **priority inheritance** turned off. Engineers enabled it by uploading a small patch that flipped the initialization flags from false to true, and the resets stopped.
+
+Fixes in general:
+
+- **Priority inheritance**: the lock holder temporarily runs at the priority of the highest waiter (POSIX `PTHREAD_PRIO_INHERIT`; Linux `rt_mutex`).
+- **Priority ceiling**: the lock holder runs at a predefined ceiling priority while holding it (`PTHREAD_PRIO_PROTECT`).
+- Keep critical sections short, and don't share locks between tasks of very different priority.
+
+Notice that both fixes need to know **who owns the lock**. That's the deepest reason semaphores and mutexes differ.
+
+## How it works (a contended mutex, end to end)
+
+```
+Thread A: lock(m)    → CAS 0→1 succeeds in user space. No syscall. A is the owner.
+Thread B: lock(m)    → CAS fails. Spin briefly (adaptive). Still locked.
+                       Mark m "contended", call futex(FUTEX_WAIT) → kernel puts B to sleep.
+                       (voluntary context switch)
+Thread A: unlock(m)  → sees "contended", sets m to 0, calls futex(FUTEX_WAKE) → kernel makes B runnable.
+Thread B: wakes, retries CAS 0→1, succeeds, becomes owner.
+          (a newcomer C could have grabbed it first: "barging" — fast but unfair)
+```
+
+Costs to remember: uncontended lock = an atomic op (tens of nanoseconds or less). Contended lock = syscalls plus context switches (microseconds), plus the throughput lost while threads wait in line.
+
+## Real-world examples
+
+- **Mars Pathfinder (1997)**: priority inversion on a VxWorks mutex with priority inheritance disabled; fixed in flight by enabling it.
+- **Databases**: PostgreSQL's deadlock detector (after `deadlock_timeout`, 1 s by default) and InnoDB's detector abort a victim transaction; applications are expected to retry.
+- **Connection pools** (HikariCP, `database/sql` in Go) behave like counting semaphores: N permits, callers wait (with a timeout) when all are taken.
+- **Linux kernel** protects short critical sections with spinlocks and uses `rt_mutex` (with priority inheritance) as the basis for priority-inheriting futexes.
+
+## Common pitfalls
+
+- **Using `if` instead of `while` around a condition wait.** Spurious and stolen wakeups break it.
+- **Taking a mutex before `wait(empty)` in producer-consumer.** Sleeps holding the lock → deadlock.
+- **Inconsistent lock order** across code paths (A then B here, B then A there).
+- **Calling unknown code while holding a lock** (callbacks, listeners, logging that blocks): it might take other locks, creating hidden ordering cycles.
+- **Using a semaphore as a mutex** and releasing it from the wrong place, so the count drifts above 1 and two threads enter.
+- **Spinlocks in user space** on oversubscribed machines or containers with CPU limits.
+- **RW lock upgrade** from read to write: deadlocks with Java's `ReentrantReadWriteLock`.
+- **Retrying without jitter** after try-lock failures → livelock.
+- **Not handling database deadlock errors**: the DB picks a victim; your code must catch and retry the transaction.
+- **Assuming Go or Java will detect your deadlock.** Go only catches the "everyone is asleep" case; Java reports it in thread dumps but doesn't break it.
+
+## Practice questions
+
+<Practice>
+
+<QA q="What is a critical section, and what must a correct solution guarantee?" level="easy">
+
+The code that accesses shared state and must not run concurrently. A correct solution guarantees **mutual exclusion** (one thread inside), **progress** (if it's free and someone wants in, someone gets in) and **bounded waiting** (no thread waits forever while others re-enter).
+
+</QA>
+
+<QA q="What is the difference between a mutex and a semaphore?" level="easy">
+
+A **mutex** provides mutual exclusion and has an **owner**: the thread that locked it should unlock it. That enables error checking, reentrancy and priority inheritance. A **semaphore** is a counter with wait/signal and **no owner**: any thread can signal. Counting semaphores limit concurrency to N (connection pools); binary semaphores are good for signalling between threads (one waits, another posts).
+
+</QA>
+
+<QA q="Is a binary semaphore the same as a mutex?" level="easy">
+
+No. They both allow one holder, but a binary semaphore can be released by any thread and can start at 0 (used to wait for an event). It doesn't support ownership checks, recursion or priority inheritance. Using one as a lock works, but you lose those safety nets, which is exactly what bit priority-inversion cases.
+
+</QA>
+
+<QA q="What are the four Coffman conditions?" level="easy">
+
+Mutual exclusion, hold and wait, no preemption, and circular wait. All four must hold for a deadlock. Breaking any one prevents deadlock; the most practical is breaking circular wait with a global lock order.
+
+</QA>
+
+<QA q="When is a spinlock better than a blocking mutex?" level="medium">
+
+When the critical section is very short (shorter than the cost of sleeping and waking a thread), the lock holder is running on another core and won't be descheduled, and there are spare cores. That describes much of the kernel (which disables preemption while holding spinlocks). In user space the holder can be preempted, so pure spinning wastes CPU; adaptive mutexes spin briefly and then sleep.
+
+</QA>
+
+<QA q="Why must you wait on a condition variable inside a while loop?" level="medium">
+
+Because waking up doesn't guarantee the condition is true. With Mesa semantics (used by pthreads and Java), a signal is a hint: another thread can grab the lock and change the state before the woken thread runs. Spurious wakeups are also permitted. The loop re-checks the condition after every wakeup.
+
+</QA>
+
+<QA q="Solve producer-consumer with semaphores. What ordering mistake causes deadlock?" level="medium">
+
+Use `empty = N`, `full = 0` and a mutex. Producer: `wait(empty)`, lock, put, unlock, `signal(full)`. Consumer: `wait(full)`, lock, take, unlock, `signal(empty)`.
+
+If a producer locks the mutex **before** `wait(empty)` when the buffer is full, it sleeps while holding the mutex. Consumers can't enter to free a slot, so everyone waits forever. Always wait on the counting semaphore before taking the mutex.
+
+</QA>
+
+<QA q="What is CAS and what is the ABA problem?" level="medium">
+
+Compare-and-swap atomically sets a memory location to a new value only if it still holds an expected value, and reports success. It's the building block of lock-free algorithms (retry until the CAS succeeds).
+
+ABA: a thread reads A, gets delayed, another thread changes the value to B and then back to A. The CAS succeeds even though the state changed in between (for example, a node freed and reused in a lock-free stack). Fix with a version stamp next to the value (`AtomicStampedReference`) or safe memory reclamation.
+
+</QA>
+
+<QA q="Explain the dining philosophers problem and two solutions." level="medium">
+
+Five philosophers, five forks between them, each needs both neighbours' forks. If everyone grabs the left fork first, there's a circular wait and deadlock. Solutions: (1) **resource ordering**: always pick up the lower-numbered fork first, so one philosopher reverses order and the cycle can't form; (2) a **counting semaphore with 4 seats**, so at most four try to eat and one always gets two forks. Try-lock-and-back-off also works but needs random backoff to avoid livelock.
+
+</QA>
+
+<QA q="Compare deadlock prevention, avoidance and detection." level="hard">
+
+**Prevention** designs a Coffman condition away: lock ordering, acquiring everything up front, try-lock with timeout. Cheap at runtime, needs discipline. **Avoidance** checks each request against a model of maximum demands (Banker's algorithm) and refuses requests that lead to an unsafe state. Needs advance knowledge of max needs, so it's rarely used in general systems. **Detection and recovery** lets deadlocks happen, finds cycles in a wait-for graph and aborts a victim. Databases do this because transactions can be rolled back and retried.
+
+</QA>
+
+<QA q="Walk through Banker's algorithm on a small example." level="hard">
+
+Total 10 units. P0: max 7, holds 3 (needs 4). P1: max 4, holds 2 (needs 2). P2: max 9, holds 2 (needs 7). Available 3. Safe sequence: P1 finishes (available 5), then P0 (available 8), then P2 (available 10), so the state is safe.
+
+If P0 requests 2 more, pretend to grant it: available 1, needs are 2, 2 and 7. Nobody can finish, so the state is unsafe and the request must wait. Unsafe means deadlock is possible, not certain.
+
+</QA>
+
+<QA q="What is priority inversion? Describe the Mars Pathfinder incident and the fix." level="hard">
+
+A high-priority task blocks on a lock held by a low-priority task, and a medium-priority task preempts the low one, so the high task is indirectly blocked by the medium one.
+
+On Mars Pathfinder (1997, VxWorks), a high-priority bus management task waited on a mutex held by a low-priority meteorological task, while a medium-priority communications task kept the low task from running. A watchdog saw the bus task hadn't completed and reset the system repeatedly. The mutex had priority inheritance disabled; engineers enabled it by uploading a patch that flipped the initialization flags. Fixes in general: priority inheritance or priority ceiling, and short critical sections.
+
+</QA>
+
+<QA q="What is the difference between deadlock, livelock and starvation?" level="hard">
+
+**Deadlock**: threads are blocked forever in a cycle, no CPU used, no progress. **Livelock**: threads are active but keep undoing each other's moves (try-lock, back off, retry in sync), so no progress. Fix with randomized backoff. **Starvation**: the system makes progress, but one thread is perpetually passed over (unfair lock, writer starvation, low priority). Fix with fairness or aging.
+
+</QA>
+
+<QA q="Two services each process transfers between accounts. Under load you see occasional 'deadlock detected' errors from PostgreSQL. Diagnose and fix." level="scenario">
+
+Two transactions lock the same rows in opposite orders (transfer A→B locks A then B; transfer B→A locks B then A). Postgres detects the cycle after `deadlock_timeout` and aborts one.
+
+Fixes: lock rows in a consistent order (for example `SELECT ... FOR UPDATE` both rows ordered by id before updating), keep transactions short, and **retry** transactions that fail with a deadlock error (SQLSTATE 40P01). Use the server log's deadlock details to see the exact statements. More in [Concurrency control and locking](/learn/notes/concurrency-control-locking/).
+
+</QA>
+
+<QA q="A Java service hangs; CPU is near zero and requests time out. How do you confirm a deadlock and fix it?" level="scenario">
+
+Take thread dumps (`jstack PID` or `jcmd PID Thread.print`) a few seconds apart. If threads are BLOCKED or WAITING on monitors/locks held by each other, the dump reports a Java-level deadlock with the cycle and the lock owners. If it's not a true cycle, look for threads all waiting on the same resource, like an exhausted connection pool whose holders wait on something else.
+
+Fix the root cause: a consistent lock order, never call external code or blocking I/O while holding a lock, use `tryLock` with timeouts where ordering is hard, and add pool-wait timeouts so the service fails fast instead of hanging.
+
+</QA>
+
+<QA q="Your cache uses a read-write lock, and under heavy read traffic cache refreshes (writes) are delayed for minutes. What is happening?" level="scenario">
+
+Writer starvation: with a reader-preferring or unfair RW lock, a continuous stream of overlapping readers means the read count never drops to zero, so the writer never gets in.
+
+Fixes: use a fair or writer-preferring lock (Java `ReentrantReadWriteLock(true)`), or avoid locking readers entirely by building the new cache off to the side and swapping a reference atomically (copy-on-write, `volatile` or `AtomicReference`). Also check whether the critical section is tiny, in which case a plain mutex or a concurrent map may be faster anyway.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="Which property does a mutex have that a semaphore does not?" options={["It can count above 1", "Ownership: the locking thread is the one expected to unlock", "It never blocks", "It can only be used between processes"]} answer={1}>
+
+Mutexes track an owner, which enables error checking, reentrancy and priority inheritance. Semaphores have no owner, and counting above 1 is a semaphore feature.
+
+</MCQ>
+
+<MCQ q="A connection pool allows at most 20 concurrent connections. Which primitive models it most directly?" options={["Counting semaphore initialized to 20", "Spinlock", "Binary semaphore initialized to 0", "Reader-writer lock"]} answer={0}>
+
+A counting semaphore with 20 permits: acquire before borrowing, release after returning.
+
+</MCQ>
+
+<MCQ q="Why is pthread_cond_wait called inside a while loop?" options={["To make it faster", "Because it does not release the mutex", "Because a woken thread may find the condition false again, and spurious wakeups are allowed", "Because signals are always lost"]} answer={2}>
+
+Mesa semantics plus spurious wakeups mean the condition must be re-checked after each wakeup. The wait does release the mutex atomically.
+
+</MCQ>
+
+<MCQ q="Global lock ordering prevents deadlock by breaking which Coffman condition?" options={["Mutual exclusion", "Hold and wait", "No preemption", "Circular wait"]} answer={3}>
+
+If every thread acquires locks in the same global order, a cycle of waits can't form.
+
+</MCQ>
+
+<MCQ q="Two threads repeatedly try-lock two locks, release on failure, and retry immediately. Both stay busy but neither finishes. This is:" options={["Deadlock", "Livelock", "Priority inversion", "Thrashing"]} answer={1}>
+
+They're active but making no progress: livelock. Randomized backoff fixes it.
+
+</MCQ>
+
+<MCQ q="On Mars Pathfinder, what fixed the repeated resets?" options={["Enabling priority inheritance on the mutex", "Replacing the mutex with a spinlock", "Raising the watchdog timeout", "Removing the meteorological task"]} answer={0}>
+
+The mutex had priority inheritance disabled. Turning it on let the low-priority holder run at the high task's priority and release the lock in time.
+
+</MCQ>
+
+<MCQ q="In producer-consumer with semaphores empty, full and mutex m, which producer order can deadlock?" options={["wait(empty), lock(m), put, unlock(m), signal(full)", "wait(empty), lock(m), put, signal(full), unlock(m)", "lock(m), wait(empty), put, unlock(m), signal(full)", "None of these"]} answer={2}>
+
+Taking the mutex first and then sleeping on `empty` when the buffer is full blocks consumers from ever freeing a slot. Option B is fine (signalling while holding the mutex is legal).
+
+</MCQ>
+
+<MCQ q="What does Banker's algorithm check before granting a request?" options={["Whether a cycle already exists in the wait-for graph", "Whether the system would still have a safe sequence in which every process can finish", "Whether the requester has the highest priority", "Whether the lock is free"]} answer={1}>
+
+It's an avoidance algorithm: grant only if the resulting state is safe. Cycle detection is the detection approach.
+
+</MCQ>
+
+<MCQ q="Which is true about Go's sync.Mutex?" options={["It is reentrant", "Unlocking from another goroutine always panics", "It supports priority inheritance", "It is not tied to a particular goroutine, so one goroutine may lock and another unlock"]} answer={3}>
+
+Go's docs say a locked Mutex is not associated with a goroutine. It's not reentrant either: locking it twice in the same goroutine deadlocks.
+
+</MCQ>
+
+<MCQ q="When is a spinlock a reasonable choice?" options={["Very short critical sections where the holder runs on another core and won't be descheduled", "Long critical sections doing disk I/O", "Single-core machines", "Any user-space code on an oversubscribed container"]} answer={0}>
+
+Spinning only pays off when the wait is shorter than a sleep/wake cycle and the holder is actually running.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **Critical section** rules: mutual exclusion, progress, bounded waiting.
+- Built on **atomics**: test-and-set, fetch-and-add, **CAS** (watch for ABA).
+- **Spinlock**: busy-wait; only for tiny sections with the holder on another core (kernel). User space: adaptive mutex.
+- **Mutex**: owner, sleeps waiters; Linux futex = no syscall when uncontended. Enables reentrancy, error checks, priority inheritance.
+- **Semaphore**: counter, no owner. Counting = limit to N; binary = signalling. Not a drop-in mutex.
+- **Condition variable**: always with a mutex, always `while (!cond) wait()`. Broadcast when waiters differ.
+- **Monitor**: data + lock + conditions (Java `synchronized` + `wait`/`notify`).
+- **RW lock**: many readers or one writer; watch writer starvation; never upgrade read → write.
+- **Producer-consumer**: `wait(empty)` before `lock(m)`. **Dining philosophers**: order the forks or allow N−1 diners.
+- **Deadlock** = mutual exclusion + hold and wait + no preemption + circular wait. Prevent (lock order), avoid (Banker's), detect and recover (DBs), or ignore.
+- **Livelock** → jittered backoff. **Starvation** → fairness, aging.
+- **Priority inversion** → priority inheritance / ceiling (Mars Pathfinder, 1997).
+
+## Go deeper
+
+- **OSTEP** (free): [Locks](https://pages.cs.wisc.edu/~remzi/OSTEP/threads-locks.pdf), [Condition variables](https://pages.cs.wisc.edu/~remzi/OSTEP/threads-cv.pdf), [Semaphores](https://pages.cs.wisc.edu/~remzi/OSTEP/threads-sema.pdf), [Common concurrency bugs](https://pages.cs.wisc.edu/~remzi/OSTEP/threads-bugs.pdf).
+- **Mars Pathfinder**: [What really happened on Mars?](https://www.cs.cornell.edu/courses/cs614/1999sp/papers/pathfinder.html) (Mike Jones's summary with Glenn Reeves's account).
+- **Linux**: [futex(7)](https://man7.org/linux/man-pages/man7/futex.7.html), [sem_overview(7)](https://man7.org/linux/man-pages/man7/sem_overview.7.html), [pthread_mutex_lock(3p)](https://man7.org/linux/man-pages/man3/pthread_mutex_lock.3p.html), [RT-mutex subsystem with PI support](https://docs.kernel.org/locking/rt-mutex.html).
+- **Java**: [Semaphore](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/Semaphore.html), [ReentrantLock](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/locks/ReentrantLock.html).
+- **Go**: [package sync](https://pkg.go.dev/sync), [x/sync/semaphore](https://pkg.go.dev/golang.org/x/sync/semaphore).
+- **PostgreSQL**: [Lock management (deadlock_timeout)](https://www.postgresql.org/docs/current/runtime-config-locks.html).
+- **Book**: Silberschatz et al., *Operating System Concepts*, chapters on synchronization tools, synchronization examples and deadlocks.

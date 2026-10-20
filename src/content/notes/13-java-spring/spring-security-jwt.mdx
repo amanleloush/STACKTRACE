@@ -1,0 +1,468 @@
+---
+title: "Spring Security and JWT Authentication"
+phase: "13-java-spring"
+order: 132
+tags: ["java", "spring", "security", "jwt", "oauth2"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 20
+prerequisites: ["spring-core-ioc", "authn-authz-oauth-oidc-jwt"]
+summary: "How Spring Security's filter chain authenticates and authorizes every request, how to configure a stateless JWT resource server the modern way, and the CSRF, CORS and token mistakes interviewers love to probe."
+---
+
+## Definition (interview-ready)
+
+**Spring Security** is a chain of **servlet filters** that runs before your controllers. For each request it figures out **who** the caller is (authentication), stores that in the **`SecurityContext`**, and decides **whether they may do this** (authorization) — at the URL level in the filter chain and at the method level with `@PreAuthorize`. You configure it by declaring one or more **`SecurityFilterChain` beans**. For APIs secured with **JWTs** (JSON Web Tokens — signed, self-contained tokens), the recommended approach is Spring's **OAuth2 Resource Server** support, which validates the token's signature and claims for you, rather than writing your own JWT filter.
+
+## Why it matters
+
+- Every backend interview with Spring on the resume reaches "how does a request get authenticated?" and "how would you secure this API with JWT?".
+- Hand-rolled JWT filters copied from old tutorials are a common source of real vulnerabilities: no expiry check, no issuer/audience check, weak HMAC secrets in source code, accepting whatever algorithm the token says.
+- Spring Security's configuration style changed substantially (`WebSecurityConfigurerAdapter` removed in 6.0, lambda DSL required in 7.0). Knowing the current way signals you're up to date.
+
+Read [AuthN vs AuthZ, OAuth2, OIDC, JWT](/learn/notes/authn-authz-oauth-oidc-jwt/) first for the protocol side (OAuth flows, ID vs access tokens, sessions vs JWT). This note is about the Spring implementation.
+
+Versions: Spring Security 6.x (Boot 3.x) and 7.x (Boot 4.x).
+
+## Core concepts
+
+### The filter chain architecture
+
+```
+HTTP request
+   │
+   ▼  Servlet container filters
+┌──────────────────────────────┐
+│ DelegatingFilterProxy        │  a plain servlet Filter registered with Tomcat;
+│  (bean: springSecurityFilterChain)  looks up a Spring bean lazily and delegates to it
+└──────────────┬───────────────┘
+               ▼
+┌──────────────────────────────┐
+│ FilterChainProxy             │  Spring Security's entry point; picks the FIRST
+│                              │  SecurityFilterChain whose matcher matches the request
+└──────────────┬───────────────┘
+               ▼
+ SecurityFilterChain for /api/**   (an ordered list of security filters)
+   CorsFilter
+   CsrfFilter
+   … authentication filters (BearerTokenAuthenticationFilter, UsernamePasswordAuthenticationFilter …)
+   ExceptionTranslationFilter      turns AuthenticationException → 401 / AccessDeniedException → 403
+   AuthorizationFilter             checks authorizeHttpRequests rules
+               ▼
+          DispatcherServlet → your controller (→ @PreAuthorize proxies)
+```
+
+- **`DelegatingFilterProxy`** bridges two worlds: the servlet container registers filters before Spring's `ApplicationContext` exists, so this proxy is registered with the container and looks up the real filter bean later.
+- **`FilterChainProxy`** is the real Spring Security filter. It holds a list of **`SecurityFilterChain`**s and runs **only the first one that matches** the request. It also clears the `SecurityContext` after each request (preventing leaks between requests on pooled threads) and applies the `HttpFirewall`.
+- You can have several chains, for example a stateless JWT chain for `/api/**` and a session-based form-login chain for `/admin/**`. Order them from most specific to least specific.
+
+### SecurityContext and the Authentication object
+
+- **`SecurityContextHolder`** holds the current **`SecurityContext`**, by default in a **`ThreadLocal`** — one per request thread. (Remember this with `@Async` or your own thread pools: the context doesn't follow you automatically.)
+- The context holds an **`Authentication`**: `principal` (who — often a `UserDetails` or a `Jwt`), `credentials` (often a password, cleared after login), and `authorities` (what they're allowed — `ROLE_ADMIN`, `SCOPE_orders:read`).
+
+```java
+Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+// or, in a controller:  @AuthenticationPrincipal Jwt jwt
+```
+
+### The authentication flow (username and password)
+
+```
+UsernamePasswordAuthenticationFilter
+   │ builds an unauthenticated UsernamePasswordAuthenticationToken(user, rawPassword)
+   ▼
+AuthenticationManager  (implementation: ProviderManager)
+   │ asks each AuthenticationProvider in turn: "can you handle this token type?"
+   ▼
+DaoAuthenticationProvider
+   │ 1. UserDetailsService.loadUserByUsername(user)   → UserDetails (hash, authorities, enabled…)
+   │ 2. PasswordEncoder.matches(rawPassword, storedHash)
+   ▼
+authenticated Authentication (principal = UserDetails, authorities)
+   │
+   ▼ the filter stores it in SecurityContextHolder (and, for sessions, in the HttpSession)
+```
+
+- **`AuthenticationManager`**: one method, `authenticate(Authentication)`. **`ProviderManager`** delegates to a list of **`AuthenticationProvider`**s (DAO/password, JWT, LDAP, …); a provider can succeed, fail, or abstain.
+- **`UserDetailsService`**: you implement this to load a user from your database.
+- **`PasswordEncoder`**: never store raw or plainly hashed passwords. Use an adaptive, deliberately slow hash: **bcrypt** (Spring's default via `PasswordEncoderFactories.createDelegatingPasswordEncoder()`), Argon2, scrypt or PBKDF2. `BCryptPasswordEncoder`'s default strength is **10**; Spring's docs suggest tuning the work factor so verification takes around one second on your hardware. The delegating encoder stores the algorithm as a prefix (`{bcrypt}$2a$10$...`) so you can migrate algorithms later.
+
+### SecurityFilterChain bean configuration (current style)
+
+`WebSecurityConfigurerAdapter` was deprecated in Spring Security 5.7 and **removed in 6.0**. You now declare beans. In **Spring Security 7**, the old `.and()` chaining and `authorizeRequests` are removed: use the **lambda DSL** and `authorizeHttpRequests`.
+
+```java
+@Configuration
+@EnableWebSecurity
+@EnableMethodSecurity                 // enables @PreAuthorize / @PostAuthorize
+class SecurityConfig {
+
+    @Bean
+    SecurityFilterChain api(HttpSecurity http) throws Exception {
+        http
+            .securityMatcher("/api/**")
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers(HttpMethod.GET, "/api/health").permitAll()
+                .requestMatchers("/api/admin/**").hasRole("ADMIN")
+                .requestMatchers(HttpMethod.POST, "/api/orders/**").hasAuthority("SCOPE_orders:write")
+                .anyRequest().authenticated())
+            .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            .csrf(csrf -> csrf.disable())            // OK only because this chain uses bearer tokens, not cookies
+            .cors(Customizer.withDefaults())
+            .oauth2ResourceServer(o -> o.jwt(Customizer.withDefaults()));
+        return http.build();
+    }
+}
+```
+
+Rules are evaluated **top to bottom, first match wins**, so put specific rules before general ones and finish with `anyRequest()`. `hasRole("ADMIN")` checks for the authority `ROLE_ADMIN` (the `ROLE_` prefix is added for you); `hasAuthority` checks the exact string.
+
+If you add `spring-boot-starter-security` and declare **no** chain, Boot secures every endpoint and generates a default user whose password is printed in the startup log — fine for a demo, never for production.
+
+### JWT structure and validation (quick recap)
+
+A JWT (RFC 7519) is `base64url(header).base64url(payload).base64url(signature)`:
+
+```
+header   {"alg":"RS256","kid":"2024-key-1","typ":"JWT"}
+payload  {"iss":"https://idp.example.com","sub":"user-42","aud":"orders-api",
+          "exp":1767225600,"iat":1767224700,"scope":"orders:read orders:write"}
+signature  RSA-SHA256(header.payload) with the issuer's PRIVATE key
+```
+
+The payload is **only encoded, not encrypted** — anyone can read it. The signature proves who issued it and that it wasn't modified. A resource server must:
+
+1. Check the **algorithm is one it expects** (never `none`, never let the token choose between asymmetric and symmetric).
+2. Verify the **signature** with the issuer's public key (fetched from its **JWKS** endpoint and cached, selected by `kid`).
+3. Check **`exp`** (expired?) and **`nbf`** (not yet valid?) with a small clock-skew allowance.
+4. Check **`iss`** (from the issuer we trust?) and **`aud`** (meant for *this* API?).
+5. Only then map claims to authorities.
+
+### Stateless JWT resource server (the recommended way)
+
+Add the starter — **`spring-boot-starter-oauth2-resource-server`** in Boot 3, renamed **`spring-boot-starter-security-oauth2-resource-server`** in Boot 4 (the old name is deprecated) — and point it at your identity provider:
+
+```yaml
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: https://idp.example.com/realms/shop     # discovery + iss validation
+          audiences: orders-api                               # aud validation
+          # jwk-set-uri: https://idp.example.com/.../certs    # optional: skip discovery
+```
+
+What you get without writing a filter:
+
+- `BearerTokenAuthenticationFilter` reads `Authorization: Bearer <token>`.
+- The decoder fetches the issuer's metadata and **JWKS** (public keys), and handles key rotation by `kid`.
+- **Signature verification**. A decoder built from `jwk-set-uri` trusts only **RS256** by default (configurable with `jws-algorithms`); with `issuer-uri` alone, the trusted algorithms are derived from the keys in the issuer's JWKS.
+- Validates **`exp` and `nbf`** with a **60-second clock skew**, validates **`iss`** when `issuer-uri` is set, and **`aud`** when `audiences` is set.
+- Maps the `scope` / `scp` claim to authorities with a **`SCOPE_` prefix** (`orders:read` → `SCOPE_orders:read`).
+- Missing or invalid token → **401** with a `WWW-Authenticate: Bearer` header; valid token without permission → **403**.
+
+Need roles from a custom claim? Plug in a converter:
+
+```java
+@Bean
+JwtAuthenticationConverter jwtAuthenticationConverter() {
+    var roles = new JwtGrantedAuthoritiesConverter();
+    roles.setAuthoritiesClaimName("roles");   // read the "roles" claim
+    roles.setAuthorityPrefix("ROLE_");        // so hasRole("ADMIN") works
+    var converter = new JwtAuthenticationConverter();
+    converter.setJwtGrantedAuthoritiesConverter(roles);
+    return converter;
+}
+```
+
+Who **issues** the tokens? Ideally a dedicated identity provider (Keycloak, Okta, Auth0, Cognito, or **Spring Authorization Server**). If your own service must issue them, use Spring's `JwtEncoder` (Nimbus-based) with an RSA or EC key pair loaded from a secrets manager — not a hand-built string with a hard-coded HMAC secret. If you must use HMAC (HS256) between two services you control, use a long random secret from a secrets store and configure `NimbusJwtDecoder.withSecretKey(...)`.
+
+### Method security
+
+```java
+@Service
+class OrderService {
+
+    @PreAuthorize("hasAuthority('SCOPE_orders:read')")
+    public Order get(long id) { ... }
+
+    @PreAuthorize("hasRole('ADMIN') or #userId == authentication.name")
+    public List<Order> forUser(String userId) { ... }
+
+    @PostAuthorize("returnObject.ownerId == authentication.name")
+    public Invoice invoice(long id) { ... }
+}
+```
+
+- Enable with **`@EnableMethodSecurity`**, which replaces the deprecated `@EnableGlobalMethodSecurity`. `@PreAuthorize`, `@PostAuthorize`, `@PreFilter`, `@PostFilter` are on by default; `@Secured` and JSR-250 (`@RolesAllowed`) need `securedEnabled = true` / `jsr250Enabled = true`.
+- It's built on Spring AOP **proxies**, so the same rules as `@Transactional` apply: self-invocation and `private` methods are not protected.
+- URL rules protect entry points; method security protects business operations no matter which controller, job or consumer calls them. Use both. Object-level checks ("is this *your* order?") belong in method security or the service, not only in URL rules — missing them is the classic **IDOR** (insecure direct object reference) bug.
+
+### CSRF: stateless tokens vs cookie sessions
+
+**CSRF** (cross-site request forgery): a malicious site makes the user's browser send a request to your site, and the **browser automatically attaches your cookies**, so the request looks authenticated.
+
+| Setup | CSRF risk | What to do |
+|---|---|---|
+| Session cookie (`JSESSIONID`) or auth cookie | **Yes** — the browser attaches it automatically | Keep Spring's CSRF protection on (synchronizer token), plus `SameSite` cookies as defense in depth |
+| JWT stored in a cookie | **Yes** — same reason, even though it's "stateless" | Keep CSRF protection on |
+| JWT sent by your code in the `Authorization` header | Low — a cross-site page can't make the browser add that header | Disabling CSRF for that chain is reasonable |
+| HTTP Basic | **Yes** — browsers resend Basic credentials automatically | Keep CSRF on for browser clients |
+
+Spring's guidance: use CSRF protection for any request a browser could make on behalf of a user; disable it only for services used by non-browser clients. **"Stateless" does not automatically mean "safe from CSRF"** — what matters is whether the credential is attached automatically by the browser. Also keep `GET` requests read-only; CSRF protection only covers state-changing methods.
+
+The trade-off for SPAs: a token in `localStorage` is safe from CSRF but readable by any injected script (**XSS**); a token in an `HttpOnly` cookie is hidden from scripts but needs CSRF protection. More in [Web auth security](/learn/notes/web-auth-security/) and [OWASP and threat modeling](/learn/notes/owasp-threat-modeling/).
+
+### CORS configuration
+
+**CORS** (cross-origin resource sharing) lets a browser page on `https://shop.example.com` call your API on `https://api.example.com`. Before non-simple requests, the browser sends a **preflight** `OPTIONS` request **with no credentials**. If Spring Security runs first, it rejects the preflight as unauthenticated, so CORS must be handled **before** authentication — which `http.cors(...)` does.
+
+```java
+@Bean
+UrlBasedCorsConfigurationSource corsConfigurationSource() {
+    var cfg = new CorsConfiguration();
+    cfg.setAllowedOrigins(List.of("https://shop.example.com"));   // exact origins, not "*"
+    cfg.setAllowedMethods(List.of("GET", "POST", "PUT", "DELETE"));
+    cfg.setAllowedHeaders(List.of("Authorization", "Content-Type"));
+    cfg.setAllowCredentials(true);
+    var source = new UrlBasedCorsConfigurationSource();
+    source.registerCorsConfiguration("/api/**", cfg);
+    return source;
+}
+```
+
+Spring refuses `allowCredentials(true)` combined with an allowed origin of `*`; use explicit origins (or `allowedOriginPatterns` carefully). CORS is a **browser** protection, not access control: `curl` ignores it entirely.
+
+### Common JWT mistakes
+
+- **Hard-coded or weak HMAC secrets** in `application.yml` or Git. Load keys from a secrets manager ([Secrets management](/learn/notes/secrets-management/)), prefer asymmetric keys (RS256/ES256) so services only hold public keys, and rotate via JWKS.
+- **Not validating `exp`, `iss` or `aud`.** Without `aud`, a token issued for another API in the same identity provider works on yours.
+- **Trusting the token's `alg` header** (`none`, or RS/HS confusion). Pin the expected algorithms.
+- **Long-lived access tokens** (days or weeks). JWTs can't be revoked without extra state, so keep access tokens short (minutes) and use **refresh tokens** with rotation; keep a denylist (by `jti`) only if you need instant revocation.
+- **Sensitive data in the payload.** It's readable by anyone holding the token.
+- **Logging full tokens** in access logs or error messages.
+- **Hand-rolled `OncePerRequestFilter`** that parses the token, forgets one of the checks, and swallows exceptions — then a malformed token passes through as anonymous. Use the resource server.
+- **Using JWTs where sessions are simpler**: for a classic server-rendered web app, a server-side session is easier to revoke and just as scalable with a shared session store.
+
+## How it works
+
+A request to `GET /api/orders/7` with `Authorization: Bearer eyJ...`:
+
+```
+1. Tomcat → DelegatingFilterProxy → FilterChainProxy
+2. FilterChainProxy: "/api/**" matcher matches → use the api chain
+3. CorsFilter: same-origin or allowed origin → continue
+4. CsrfFilter: disabled for this chain
+5. BearerTokenAuthenticationFilter:
+     extract token → JwtAuthenticationProvider → JwtDecoder
+       • header alg = RS256 ✓  kid → public key from cached JWKS
+       • signature ✓  exp/nbf ✓ (60 s skew)  iss ✓  aud ✓
+     JwtAuthenticationConverter → authorities [SCOPE_orders:read]
+     SecurityContextHolder.setContext(JwtAuthenticationToken)
+     (invalid → 401 + WWW-Authenticate: Bearer error="invalid_token")
+6. AuthorizationFilter: "/api/orders/**" requires authenticated ✓
+7. DispatcherServlet → OrderController → proxy(OrderService).get(7)
+     @PreAuthorize("hasAuthority('SCOPE_orders:read')") ✓ → method runs
+8. Response sent; FilterChainProxy clears the SecurityContext
+```
+
+No session is created and no database is touched for authentication: the token itself carries the identity, and the only network call is the occasional JWKS refresh.
+
+How to say it in an interview: *"Requests pass through FilterChainProxy, which picks the matching SecurityFilterChain. For APIs I use the OAuth2 resource server: it validates the JWT's signature against the issuer's JWKS, checks exp, nbf, iss and aud, maps scopes to authorities, and puts the Authentication in the SecurityContext. Then URL rules and @PreAuthorize do authorization. Access tokens are short-lived, and CSRF stays on wherever credentials live in cookies."*
+
+## Real-world examples
+
+- **Spring Security 6.0** removed `WebSecurityConfigurerAdapter` and the `antMatchers`/`mvcMatchers` helpers in favour of `SecurityFilterChain` beans and `requestMatchers`.
+- **Spring Security 7.0** removed `.and()` from the `HttpSecurity` DSL and `authorizeRequests` in favour of the lambda DSL and `authorizeHttpRequests`.
+- **Spring Boot 4** renamed the security starters under a `spring-boot-starter-security-*` prefix (for example `spring-boot-starter-security-oauth2-resource-server`), keeping the old names as deprecated aliases.
+- **Keycloak, Okta, Auth0 and Spring Authorization Server** all publish OIDC discovery documents and JWKS endpoints, which is exactly what `issuer-uri` consumes.
+
+## Common pitfalls
+
+- Copying pre-6.0 tutorials (`extends WebSecurityConfigurerAdapter`, `antMatchers`, `.and()`).
+- Rule order: `anyRequest().authenticated()` placed before a specific `permitAll()` rule, or a broad matcher shadowing a specific one.
+- Multiple `SecurityFilterChain`s without `securityMatcher` or `@Order`, so the wrong chain handles requests.
+- Disabling CSRF globally while still using session or cookie authentication.
+- `hasRole("ROLE_ADMIN")` (double prefix) or `hasRole` against JWT scopes that are actually `SCOPE_...` authorities.
+- Expecting `@PreAuthorize` to work on self-invoked or private methods, or forgetting `@EnableMethodSecurity`.
+- Losing the `SecurityContext` in `@Async` or custom executors (use `DelegatingSecurityContextExecutor` or similar).
+- CORS configured only in Spring MVC while Spring Security blocks the preflight, or `allowedOrigins("*")` with credentials.
+- Returning different errors for "user not found" and "wrong password" (user enumeration).
+- No rate limiting on the login endpoint.
+
+## Practice questions
+
+<Practice>
+
+<QA q="What do `DelegatingFilterProxy` and `FilterChainProxy` do?" level="easy">
+
+`DelegatingFilterProxy` is a standard servlet filter registered with the container; it delegates to a Spring bean (named `springSecurityFilterChain`), looking it up lazily because the container registers filters before the Spring context is ready. That bean is `FilterChainProxy`, which holds the `SecurityFilterChain`s, runs the first one whose matcher matches the request, clears the `SecurityContext` afterwards, and applies the HTTP firewall.
+
+</QA>
+
+<QA q="Where does Spring Security keep the current user, and what is in it?" level="easy">
+
+In `SecurityContextHolder`, which by default stores a `SecurityContext` per thread in a `ThreadLocal`. The context holds an `Authentication` with the principal (for example `UserDetails` or a `Jwt`), credentials (often cleared after login) and granted authorities (roles, scopes). Because it's thread-local, it doesn't automatically propagate to other threads.
+
+</QA>
+
+<QA q="How do you configure Spring Security in Spring Security 6 and 7 now that `WebSecurityConfigurerAdapter` is gone?" level="easy">
+
+Declare one or more `@Bean SecurityFilterChain` methods that take `HttpSecurity`, configure it with the lambda DSL (`authorizeHttpRequests(auth -> ...)`, `oauth2ResourceServer(o -> o.jwt(...))`), and return `http.build()`. User stores and encoders are also plain beans (`UserDetailsService`, `PasswordEncoder`). Spring Security 7 removed `.and()` and `authorizeRequests`.
+
+</QA>
+
+<QA q="Why is bcrypt used for passwords instead of SHA-256?" level="easy">
+
+SHA-256 is designed to be fast, so an attacker with a leaked database can try billions of guesses per second. bcrypt is a salted, adaptive hash with a tunable work factor (Spring's default strength is 10), so each guess is deliberately slow, and the salt defeats precomputed tables. Argon2, scrypt and PBKDF2 are also acceptable. Spring's `DelegatingPasswordEncoder` stores a `{bcrypt}` prefix so you can migrate algorithms.
+
+</QA>
+
+<QA q="Walk through username and password authentication in Spring Security." level="medium">
+
+The authentication filter builds an unauthenticated `UsernamePasswordAuthenticationToken` and passes it to the `AuthenticationManager` (`ProviderManager`). The manager asks its `AuthenticationProvider`s; `DaoAuthenticationProvider` loads the user via `UserDetailsService`, checks the password with `PasswordEncoder.matches`, and checks account flags. On success it returns an authenticated token with the user's authorities; the filter stores it in the `SecurityContextHolder` (and the session if stateful). On failure, an `AuthenticationException` leads to a 401 or a redirect to login.
+
+</QA>
+
+<QA q="What does the OAuth2 resource server validate on an incoming JWT by default?" level="medium">
+
+It verifies the signature using keys from the issuer's JWKS (only RS256 by default with `jwk-set-uri`; with `issuer-uri` the algorithms are derived from the JWKS keys), checks `exp` and `nbf` with 60 seconds of clock skew, checks `iss` when `issuer-uri` is configured, and checks `aud` when the Boot `audiences` property (or a custom validator) is configured. It maps `scope`/`scp` to `SCOPE_` authorities. Invalid tokens get 401 with a `WWW-Authenticate: Bearer` header.
+
+</QA>
+
+<QA q="Why prefer the resource server support over a custom JWT filter?" level="medium">
+
+Custom filters often skip checks (expiry, issuer, audience), accept the algorithm named in the token, hard-code secrets, mishandle key rotation, or swallow exceptions and continue as anonymous. The resource server is maintained and reviewed, handles JWKS discovery, caching and rotation, applies standard validators, produces correct 401/403 responses with `WWW-Authenticate`, and integrates with method security. You customise via validators and converters instead of reimplementing parsing.
+
+</QA>
+
+<QA q="Difference between `hasRole` and `hasAuthority`? Why does `hasRole` fail with JWT scopes?" level="medium">
+
+`hasAuthority('X')` checks for exactly `X`. `hasRole('X')` checks for `ROLE_X`. The resource server maps scopes to authorities like `SCOPE_orders:read`, so `hasRole` never matches them. Use `hasAuthority('SCOPE_...')`, or configure a `JwtGrantedAuthoritiesConverter` to read a roles claim with the `ROLE_` prefix.
+
+</QA>
+
+<QA q="When can you safely disable CSRF protection?" level="medium">
+
+When the credential is not attached automatically by the browser: for example an API that only accepts bearer tokens your client code puts in the `Authorization` header, or services used only by non-browser clients. Keep it on for session cookies, auth cookies (including JWTs in cookies) and HTTP Basic, because a cross-site form can make the browser send those. Stateless alone doesn't mean safe. `SameSite` cookies help but are defense in depth.
+
+</QA>
+
+<QA q="Why must CORS be processed before Spring Security, and how do you configure it?" level="medium">
+
+The browser's preflight `OPTIONS` request carries no credentials. If the security filters run first, they reject it as unauthenticated, and the browser blocks the real request. Enable `http.cors(...)` with a `CorsConfigurationSource` (or Spring MVC's CORS config), listing exact allowed origins, methods and headers. Don't combine `*` origins with credentials.
+
+</QA>
+
+<QA q="How do you handle logout and revocation with JWTs?" level="hard">
+
+A signed JWT stays valid until `exp`, so: keep access tokens short-lived (minutes); use refresh tokens stored server-side or by the IdP, with rotation and reuse detection, and revoke those on logout; for instant revocation of access tokens, keep a small denylist keyed by `jti` until expiry, or use opaque tokens with introspection for high-risk APIs. Rotate signing keys through JWKS if a key is compromised.
+
+</QA>
+
+<QA q="How would you secure an API used by both a browser SPA and other backend services?" level="hard">
+
+Use an identity provider. The SPA uses Authorization Code with PKCE (or a backend-for-frontend holding tokens in an `HttpOnly` cookie session, with CSRF on); services use the client credentials grant. The API is an OAuth2 resource server validating `iss`, `aud`, `exp` and signature, with separate `SecurityFilterChain`s if cookie and bearer flows coexist. Authorize with scopes for service calls and roles/ownership checks with `@PreAuthorize` for users. Configure CORS for the SPA origin only.
+
+</QA>
+
+<QA q="After upgrading to Spring Boot 3, all `/api` calls return 401 even with a valid token, but `/actuator/health` works. What do you check?" level="scenario">
+
+1. Whether the custom chain still applies: old `WebSecurityConfigurerAdapter` config is ignored or fails, so Boot's default chain may be in effect.
+2. `securityMatcher` / chain order: a broader chain might be handling `/api/**`.
+3. Resource server config: `issuer-uri` must exactly match the token's `iss` (trailing slash matters), and `audiences` must match `aud`.
+4. Algorithm: a decoder built from `jwk-set-uri` trusts only RS256 unless `jws-algorithms` says otherwise, so an ES256 token fails; an HS256 token never verifies against an issuer's public JWKS.
+5. Clock skew beyond 60 s, or JWKS unreachable from the pod.
+
+Turn on `logging.level.org.springframework.security=DEBUG` and read the `WWW-Authenticate` error description.
+
+</QA>
+
+<QA q="A security review finds `jwt.secret=mySecretKey123` in `application.yml` and tokens valid for 30 days. What do you change?" level="scenario">
+
+The secret is weak, in Git, and shared by everything that verifies tokens; anyone with it can mint tokens. Rotate it immediately and treat existing tokens as compromised. Move to asymmetric signing (RS256/ES256) with the private key in a secrets manager or a dedicated identity provider, and publish public keys via JWKS. Cut access token lifetime to minutes with refresh token rotation. Ensure `exp`, `iss`, `aud` and the algorithm are validated, preferably by switching to the resource server.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="With several SecurityFilterChain beans, how does FilterChainProxy choose which to run?" options={["It runs all matching chains in order", "It runs only the first chain whose matcher matches the request", "It runs the chain with the most filters", "It picks one at random per request"]} answer={1}>
+
+Only the first matching SecurityFilterChain is invoked, so specific chains must be ordered before general ones. Chains are never merged or combined.
+
+</MCQ>
+
+<MCQ q="What replaced WebSecurityConfigurerAdapter, which was removed in Spring Security 6.0?" options={["Declaring SecurityFilterChain beans", "Extending HttpSecurityAdapter", "Annotating controllers with @Secured only", "application.yml rules"]} answer={0}>
+
+Spring Security moved to component-based configuration: you declare SecurityFilterChain beans built from HttpSecurity. The other options do not exist or are not equivalent.
+
+</MCQ>
+
+<MCQ q="A JWT resource server is configured with only issuer-uri. Which claim is NOT validated by default?" options={["exp", "nbf", "iss", "aud"]} answer={3}>
+
+By default the resource server validates exp, nbf and iss (when issuer-uri is set). Audience needs the Boot audiences property or a custom validator, which is a commonly missed check.
+
+</MCQ>
+
+<MCQ q="A JWT has scope orders:read. Which expression grants access with Spring's default authority mapping?" options={["hasRole('orders:read')", "hasAuthority('SCOPE_orders:read')", "hasAuthority('orders:read')", "hasRole('SCOPE_orders:read')"]} answer={1}>
+
+Scopes are mapped to authorities with a SCOPE_ prefix. hasRole adds a ROLE_ prefix, so it can never match a SCOPE_ authority.
+
+</MCQ>
+
+<MCQ q="In which setup is disabling CSRF protection most reasonable?" options={["Session cookie login for a web app", "A JWT stored in a cookie", "An API that only accepts bearer tokens set in the Authorization header by client code", "HTTP Basic authentication used from browsers"]} answer={2}>
+
+CSRF exploits credentials the browser attaches automatically (cookies, Basic auth). A bearer token added by script to a header is not attached by a cross-site form.
+
+</MCQ>
+
+<MCQ q="Why can a browser fail CORS for an authenticated API even though the user has a valid token?" options={["Tokens are not allowed in CORS requests", "The preflight OPTIONS request has no credentials and is rejected if security runs before CORS handling", "CORS requires session cookies", "Browsers never send Authorization headers cross-origin"]} answer={1}>
+
+The preflight carries no credentials, so Spring Security must process CORS first (http.cors) or it answers 401 and the browser blocks the real call.
+
+</MCQ>
+
+<MCQ q="What does @EnableMethodSecurity enable by default?" options={["Only @Secured", "@PreAuthorize, @PostAuthorize, @PreFilter and @PostFilter", "Only JSR-250 @RolesAllowed", "Nothing until you list annotations"]} answer={1}>
+
+Pre/post annotations are on by default. @Secured and JSR-250 require securedEnabled or jsr250Enabled. It replaces the deprecated @EnableGlobalMethodSecurity.
+
+</MCQ>
+
+<MCQ q="Which algorithm does Spring's NimbusJwtDecoder trust by default?" options={["HS256", "RS256", "Any algorithm in the token header", "none"]} answer={1}>
+
+By default it only trusts RS256 (Boot's issuer-uri setup instead derives the algorithms from the issuer's JWKS). Trusting the header's alg would enable algorithm-confusion and none attacks; other algorithms must be configured explicitly.
+
+</MCQ>
+
+<MCQ q="What is the default strength of BCryptPasswordEncoder?" options={["4", "8", "10", "16"]} answer={2}>
+
+The default strength is 10. Spring recommends tuning the work factor so verification takes about one second on your system; 16 is far slower and 4 is the minimum.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- Servlet container → **`DelegatingFilterProxy`** → **`FilterChainProxy`** → first matching **`SecurityFilterChain`** → controller → method-security proxies.
+- `SecurityContextHolder` (ThreadLocal) holds an `Authentication`: principal, credentials, authorities.
+- Login: filter → `AuthenticationManager` (`ProviderManager`) → `DaoAuthenticationProvider` → `UserDetailsService` + `PasswordEncoder` (**bcrypt**, strength 10 by default).
+- Config = `SecurityFilterChain` **beans** + lambda DSL + `authorizeHttpRequests` (no `WebSecurityConfigurerAdapter` since 6.0, no `.and()` since 7.0).
+- JWT APIs: **OAuth2 resource server** starter + `issuer-uri` + `audiences`. Validates signature (JWKS; RS256 default with `jwk-set-uri`, algorithms from the JWKS with `issuer-uri`), `exp`/`nbf` (60 s skew), `iss`, `aud`. Scopes → `SCOPE_x`.
+- `@EnableMethodSecurity` + `@PreAuthorize`; proxy-based (no self-invocation). `hasRole('X')` = `ROLE_X`.
+- CSRF: **on for cookies/Basic**, off only for header bearer tokens. CORS: `http.cors(...)`, explicit origins, before security.
+- JWT hygiene: short-lived access tokens + rotating refresh tokens, asymmetric keys from a secrets manager, pin algorithms, validate `exp`/`iss`/`aud`, no secrets in payload or logs.
+
+## Go deeper
+
+- **Spring Security reference**: [Servlet architecture](https://docs.spring.io/spring-security/reference/servlet/architecture.html), [Authentication architecture](https://docs.spring.io/spring-security/reference/servlet/authentication/architecture.html), [Password storage](https://docs.spring.io/spring-security/reference/features/authentication/password-storage.html), [JWT resource server](https://docs.spring.io/spring-security/reference/servlet/oauth2/resource-server/jwt.html), [Method security](https://docs.spring.io/spring-security/reference/servlet/authorization/method-security.html), [CSRF](https://docs.spring.io/spring-security/reference/features/exploits/csrf.html), [CORS](https://docs.spring.io/spring-security/reference/servlet/integrations/cors.html).
+- **Spring Security 7.0**: [What's new](https://docs.spring.io/spring-security/reference/7.0/whats-new.html).
+- **RFC 7519**: [JSON Web Token](https://www.rfc-editor.org/rfc/rfc7519). **RFC 8725**: [JWT Best Current Practices](https://www.rfc-editor.org/rfc/rfc8725).
+- **OWASP**: [JSON Web Token cheat sheet](https://cheatsheetseries.owasp.org/cheatsheets/JSON_Web_Token_Cheat_Sheet.html), [CSRF prevention cheat sheet](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html).
+- Related notes: [AuthN vs AuthZ, OAuth2, OIDC, JWT](/learn/notes/authn-authz-oauth-oidc-jwt/), [Spring Core](/learn/notes/spring-core-ioc/), [Secrets management](/learn/notes/secrets-management/).

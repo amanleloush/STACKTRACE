@@ -1,0 +1,650 @@
+---
+title: "HLD: Distributed Key-Value Store (and Commit Log)"
+phase: "07-hld-problems"
+order: 76
+tags: ["hld", "distributed-systems", "db", "dynamo", "kafka"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 25
+prerequisites: ["replication-sharding", "cassandra-scylla", "cap-pacelc-consistency", "clocks-vector-lamport-hlc"]
+summary: "Design a Dynamo-style key-value store from scratch — consistent hashing with vnodes, N/R/W quorums, vector clocks vs last-write-wins, hinted handoff, Merkle-tree anti-entropy, gossip, and an LSM storage engine — then a Kafka-like distributed commit log."
+---
+
+## Definition (interview-ready)
+
+A **distributed key-value store** stores opaque values under keys across many machines. It exposes a tiny API (`get`, `put`, `delete`) and hides partitioning, replication and failure handling.
+
+The classic design comes from Amazon's **Dynamo paper (SOSP 2007)**. Cassandra, Riak and ScyllaDB borrowed heavily from it. It combines a small set of techniques, each solving one problem:
+
+| Problem | Technique |
+|---|---|
+| Spread data across nodes and add nodes easily | Consistent hashing with virtual nodes |
+| Survive node loss | Replicate each key on N nodes |
+| Choose consistency vs latency per request | Quorums: R and W out of N |
+| Concurrent writes to the same key | Vector clocks (Dynamo) or last-write-wins timestamps (Cassandra) |
+| Stay writable when replicas are down | Sloppy quorum + hinted handoff |
+| Repair replicas that drifted apart | Read repair + anti-entropy with Merkle trees |
+| Know who is in the cluster and who is down | Gossip + failure detection |
+| Fast writes on each node | LSM-tree storage engine (WAL, memtable, SSTables, compaction, bloom filters) |
+
+**How to say it in an interview:** "Hash keys onto a ring with vnodes, replicate each key to the next N distinct nodes, and let clients choose R and W. Writes go to a commit log and memtable and flush to SSTables. Handle temporary failures with hinted handoff, permanent drift with Merkle-tree repair, and membership with gossip. Conflicts are resolved by vector clocks if we need to keep concurrent updates, or by last-write-wins if we can tolerate losing one."
+
+## Why it matters
+
+- **It is one of the most common senior HLD questions** ("design a key-value store", "design DynamoDB", "design Cassandra").
+- **It exercises almost every distributed-systems idea** in one problem: partitioning, replication, consistency, clocks, failure detection, repair and storage engines.
+- **It explains real databases you use.** If you understand this design, Cassandra's consistency levels, tombstones and repair stop being mysterious.
+- **The commit-log variant is Kafka.** Same building blocks, different choices, because a log needs ordering.
+
+This note assumes you know replication and sharding basics ([Replication and Sharding](/learn/notes/replication-sharding/)) and the consistency vocabulary ([CAP, PACELC and Consistency](/learn/notes/cap-pacelc-consistency/)). For the production database built on these ideas, see [Cassandra and ScyllaDB](/learn/notes/cassandra-scylla/).
+
+## Core concepts
+
+### Requirements
+
+**Functional**
+
+- `put(key, value)`, `get(key)`, `delete(key)`.
+- Keys up to a few hundred bytes, values up to about 1 MB (larger blobs belong in object storage; see [HLD: Distributed File Storage](/learn/notes/hld-distributed-file-storage/)).
+- Optional per-key TTL.
+- Per-request consistency choice (fast and possibly stale, or slower and fresher).
+
+**Non-functional**
+
+- **Always writable**: a write should succeed even when some replicas are down or partitioned. (Dynamo's driving requirement: a customer must always be able to add to the shopping cart.)
+- **Low tail latency**: Dynamo's example service-level agreement was a response within 300 ms for 99.9% of requests at a given peak load.
+- **Horizontal scaling**: add nodes without downtime; capacity grows roughly linearly.
+- **Durability**: no acknowledged write is lost when one machine (or one rack or zone) fails.
+- **Eventual consistency is acceptable** by default; stronger reads are opt-in.
+
+Saying the last two out loud matters. They push the design to **AP** in CAP terms: during a partition, stay available and reconcile later.
+
+### Back-of-envelope sizing
+
+```
+Assumptions
+  keys            : 10 billion
+  avg value + key : 1 KB
+  writes          : 100,000/s peak
+  reads           : 500,000/s peak
+  replication N   : 3
+
+Raw data         = 10e9 × 1 KB              = 10 TB
+Replicated       = 10 TB × 3                = 30 TB
++50% headroom for compaction and growth     = 45 TB
+Nodes at 2 TB of data each                  = 45 / 2 = 22.5 → 24 nodes (8 per rack × 3 racks)
+
+Replica writes/s = 100,000 × 3              = 300,000/s  → 12,500/s per node
+Replica reads/s at R=2 = 500,000 × 2        = 1,000,000/s → about 41,700/s per node
+Client write bandwidth = 100,000 × 1 KB     = 100 MB/s  → 300 MB/s across replicas
+                                            → 12.5 MB/s per node, before compaction rewrites
+
+Bloom filters (1% false positives ≈ 9.6 bits per key):
+  keys per node    = 10e9 × 3 / 24          = 1.25 billion
+  memory per node  = 1.25e9 × 9.6 / 8 bytes ≈ 1.5 GB
+```
+
+Compaction multiplies the disk write rate (each byte is rewritten several times as it moves through the LSM levels), so disk bandwidth, not network, is often the per-node limit. Method: [Back-of-Envelope Math](/learn/notes/back-of-envelope-math/).
+
+### API
+
+The Dynamo paper's interface is worth copying, because it shows how conflicts surface to clients:
+
+```
+get(key)                    → (list of values, context)
+put(key, context, value)    → ok
+delete(key, context)        → ok        (written as a tombstone)
+```
+
+- `get` may return **several conflicting versions** plus an opaque **context** (which carries the version information, such as a vector clock).
+- `put` takes the context from the earlier `get`, so the store knows which version(s) the new value replaces.
+- Dynamo hashes the key with MD5 to get a 128-bit position on the ring.
+
+A Cassandra-style API instead takes a **consistency level** per request and resolves conflicts itself with timestamps:
+
+```
+GET  /kv/{key}?consistency=QUORUM
+PUT  /kv/{key}?consistency=QUORUM   body: value, optional ttl
+DELETE /kv/{key}?consistency=QUORUM
+```
+
+### High-level architecture
+
+```
+                     client (or smart client library that knows the ring)
+                                  │
+                                  ▼
+             any node can act as COORDINATOR for a request
+                                  │
+          hash(key) → position on ring → preference list of N distinct nodes
+                                  │
+            ┌─────────────────────┼─────────────────────┐
+            ▼                     ▼                     ▼
+       ┌─────────┐           ┌─────────┐           ┌─────────┐
+       │ node B  │           │ node C  │           │ node D  │   (replicas for key k)
+       │ WAL     │           │ WAL     │           │ WAL     │
+       │ memtable│           │ memtable│           │ memtable│
+       │ SSTables│           │ SSTables│           │ SSTables│
+       └─────────┘           └─────────┘           └─────────┘
+            ▲  gossip: membership, token ownership, heartbeats  ▲
+            └───────────────────────────────────────────────────┘
+       background: hinted handoff replay · read repair · Merkle-tree repair · compaction
+```
+
+There is **no leader** and **no central metadata server**. Every node is equal ("peer-to-peer"), knows the ring from gossip, and can route a request directly to the right replicas. Dynamo calls this a **zero-hop DHT**: no multi-hop routing, which keeps tail latency low.
+
+### Partitioning: consistent hashing with virtual nodes
+
+<Anim id="consistent-hash" />
+
+Hash every key onto a fixed circular space (the **ring**). Each node owns positions on the ring. A key belongs to the first node found walking **clockwise** from the key's position.
+
+Why not `hash(key) % numNodes`? Because changing `numNodes` remaps almost every key. With a ring, adding a node moves only the keys between the new node and its predecessor, about 1/(n+1) of the data.
+
+**Virtual nodes (vnodes / tokens).** Give each physical node many positions on the ring instead of one:
+
+- **Even load.** Many small ranges average out, instead of a few big uneven ones.
+- **Fast, spread-out rebuilds.** When a node dies, its many small ranges are re-replicated from many peers at once, not from two neighbours.
+- **Heterogeneous hardware.** A bigger machine can take more vnodes.
+
+Cassandra's `num_tokens` defaults to **16** in recent versions (versions before 4.0 used 256 with random allocation; newer versions pair fewer tokens with a smarter token allocator, `allocate_tokens_for_local_replication_factor`, default 3).
+
+The Dynamo paper compared three partitioning strategies and moved production from random tokens to **"Q/S tokens per node, equal-sized partitions"**: split the ring into Q fixed, equal partitions and hand them out to S nodes. Fixed partitions are easier to move, back up and repair, because partition boundaries never change. Redis Cluster's 16,384 hash slots are the same idea (see [HLD: Distributed Cache](/learn/notes/hld-distributed-cache/)). More on partitioning choices: [Sharding Strategies](/learn/notes/sharding-strategies/).
+
+### Replication and the preference list
+
+Each key is stored on **N** nodes: the owner (coordinator) plus the next N−1 nodes clockwise. That list is the key's **preference list**.
+
+Two details interviewers like:
+
+- **Skip duplicate physical nodes.** With vnodes, the next N positions on the ring might belong to fewer than N machines. The preference list skips positions until it has N **distinct** physical nodes.
+- **Spread across failure domains.** Place replicas in different racks or availability zones (Cassandra's `NetworkTopologyStrategy` sets N per datacenter and is rack-aware). Dynamo's paper describes preference lists spread across multiple datacenters.
+
+The preference list contains **more than N** nodes, so there are fallbacks when some are down (this powers sloppy quorums, below).
+
+### Quorums: N, R, W and tunable consistency
+
+- **N**: number of replicas.
+- **W**: replicas that must acknowledge a write before the coordinator reports success.
+- **R**: replicas that must respond to a read before the coordinator returns.
+
+The coordinator always **sends the write to all N** replicas; W only controls how many acknowledgements it waits for.
+
+If **R + W > N**, every read set overlaps every write set in at least one replica, so a read sees at least one copy of the latest acknowledged write (with strict quorums and no clock or conflict issues). Latency is set by the **slowest** of the R (or W) replicas you wait for, so R and W below N give better latency.
+
+| N, R, W | R + W greater than N? | Behaviour |
+|---|---|---|
+| 3, 2, 2 | Yes (4) | The common Dynamo config. Tolerates 1 slow or dead replica on both paths. |
+| 3, 1, 3 | Yes (4) | Fast reads, slow and fragile writes (any dead replica blocks writes). |
+| 3, 3, 1 | Yes (4) | Fast, always-available writes, slow reads. |
+| 3, 1, 1 | No (2) | Lowest latency, highest availability, stale reads likely. |
+| 5, 3, 3 | Yes (6) | Tolerates 2 failures on both paths. |
+
+In Cassandra these are **consistency levels**: `ONE`, `TWO`, `THREE`, `QUORUM`, `ALL`, `LOCAL_QUORUM`, `EACH_QUORUM`, `LOCAL_ONE`, and `ANY` (writes only). `LOCAL_QUORUM` is the usual multi-datacenter choice: a quorum in the local DC, so cross-region latency isn't on the request path.
+
+**What quorums do NOT give you** (a favourite follow-up):
+
+- **Not linearizability.** A write that reached only 1 of 3 replicas before failing is neither committed nor rolled back. Later reads may or may not see it. Concurrent reads during a write can see new then old values unless reads do synchronous read repair. DDIA (chapter 5) walks through these edge cases.
+- **Sloppy quorums break the overlap guarantee** (next sections): the W nodes that took a write may not be among the R nodes you read from.
+- **Last-write-wins with skewed clocks can drop acknowledged writes.**
+
+If you need linearizable operations on a key (compare-and-set, uniqueness), you need consensus, such as Cassandra's lightweight transactions (Paxos-based) or a Raft group per partition. See [Consensus: Raft and Paxos](/learn/notes/consensus-raft-paxos/).
+
+### Conflict handling: vector clocks vs last-write-wins
+
+<Anim id="vector-clock" />
+
+Without a leader, two clients can update the same key at the same time through different coordinators. The store needs to know whether one version **replaces** the other or whether they are **concurrent**.
+
+**Vector clocks (Dynamo).** Each version carries a list of `(node, counter)` pairs. Version A is an ancestor of B if every counter in A is less than or equal to the matching counter in B. Otherwise they are concurrent siblings. The Dynamo paper's example:
+
+```
+D1 written via Sx                 [(Sx,1)]
+D2 written via Sx (replaces D1)   [(Sx,2)]
+D3 written via Sy (based on D2)   [(Sx,2),(Sy,1)]
+D4 written via Sz (based on D2)   [(Sx,2),(Sz,1)]     ← concurrent with D3
+client reads both D3 and D4, merges them, writes via Sx:
+D5                                [(Sx,3),(Sy,1),(Sz,1)]  ← replaces both
+```
+
+- The store keeps **all concurrent versions** and returns them on `get`. The **client** merges them with business logic ("semantic reconciliation"). Dynamo's shopping cart merged carts by union, so an "add to cart" is never lost, but a **deleted item can reappear**.
+- Clocks can grow when many nodes coordinate writes. Dynamo stored a timestamp per pair and **truncated the oldest pair once the clock reached a threshold (the paper says "say 10")**, accepting less precise reconciliation.
+- More background: [Clocks: Lamport, Vector, HLC](/learn/notes/clocks-vector-lamport-hlc/).
+
+**Last-write-wins (Cassandra).** Every write carries a timestamp (from the client, or the coordinator's clock if absent). On conflict, the higher timestamp wins, **independently for each column**. Cassandra does not use vector clocks.
+
+- Simple: no siblings, no client merge logic.
+- **Silently loses** one of two concurrent writes, and clock skew can make an older write win. Keep clocks synchronized (NTP) and design writes to be idempotent or commutative where possible.
+
+**A third option: CRDTs.** Conflict-free replicated data types (counters, sets, maps) merge automatically and deterministically, so concurrent updates never need client code. Use them when the data fits one of the types.
+
+| | Vector clocks + siblings | Last-write-wins | CRDTs |
+|---|---|---|---|
+| Detects concurrency | Yes | No | Not needed (merge is defined) |
+| Data loss on concurrent writes | None (client merges) | Yes, one write is dropped | None, for supported types |
+| Client complexity | High | Low | Low to medium |
+| Metadata cost | Grows with writers (truncate) | One timestamp per cell | Depends on the type |
+
+### Sloppy quorum and hinted handoff
+
+A **strict** quorum would fail a write if fewer than W of the key's home replicas are reachable. Dynamo instead uses a **sloppy quorum**: reads and writes go to the **first N healthy nodes** in the preference list, which may include fallback nodes further around the ring.
+
+```
+Preference list for key k: A, B, C, D, E      (N = 3, home replicas A, B, C)
+A is down.
+Write goes to B, C and D. D stores the replica with a HINT: "this belongs to A".
+D keeps hinted data in a separate local store and checks periodically.
+A comes back → D sends the replica to A → D deletes its copy.
+```
+
+- **Benefit**: writes stay available during node failures and short partitions.
+- **Cost**: R + W > N no longer guarantees you read a node that has the write, because the write may sit on D while you read from A, B and C.
+- **Limits**: hints are for **temporary** failures. Cassandra stops generating hints for a node that has been down longer than `max_hint_window` (default **3 hours**); after that, the node must be fixed by repair. Hints also pile up on the fallback node if churn is high.
+
+### Anti-entropy: read repair and Merkle trees
+
+Replicas drift apart: a hint expired, a node was down for a day, a disk was replaced. Three mechanisms bring them back together:
+
+1. **Hinted handoff**: replays writes that a down node missed (short outages).
+2. **Read repair**: when a read finds replicas disagreeing, the coordinator writes the newest version back to the stale ones. It fixes only data that is read.
+3. **Anti-entropy repair with Merkle trees**: a background process compares whole key ranges between replicas.
+
+A **Merkle tree** is a hash tree. Leaves are hashes of individual keys (or small key ranges); each parent is the hash of its children.
+
+```
+              root = H(H12, H34)
+              /                \
+      H12 = H(H1,H2)      H34 = H(H3,H4)
+       /       \            /        \
+     H1        H2         H3         H4      ← hashes of key ranges
+```
+
+Two replicas exchange roots for a range they share. Equal roots mean the whole range matches, with no data transferred. If they differ, compare children and descend only into mismatching branches until you reach the out-of-sync keys. Cost is proportional to the **differences**, not the data size.
+
+Dynamo keeps one Merkle tree **per key range** (per virtual node). The paper notes the downside: when nodes join or leave, many ranges change and trees must be recalculated. Cassandra builds trees during repair (`nodetool repair`) and supports full, sub-range and incremental repair.
+
+**Deletes need care.** A delete is written as a **tombstone** (a marker saying "deleted at time T"). If tombstones were purged before every replica saw them, a replica that missed the delete would "resurrect" the data during repair. Cassandra keeps tombstones for `gc_grace_seconds` (default **864,000 s = 10 days**), so **repair must run on every node within that window**.
+
+### Membership and failure detection: gossip
+
+No node has a global master list. Instead, **gossip**: each node periodically picks a random peer and exchanges what it knows (membership, token ownership, heartbeat counters, status). Information spreads epidemically, in a number of rounds that grows roughly with the logarithm of cluster size.
+
+- Dynamo: each node contacts a random peer **every second** to reconcile membership change histories. Joins and removals are **explicit** admin actions, not inferred from failures.
+- Cassandra: every node gossips **once per second** with a random node, sometimes with an unreachable node, and with a seed node if it hasn't already.
+- **Seeds**: well-known nodes that new nodes contact first, which prevents the cluster from splitting into islands that never learn about each other.
+
+**Failure detection.**
+
+- Dynamo used a **purely local** view: if B doesn't answer A's requests, A treats B as down for now, routes around it, and retries B periodically. No global agreement needed for routing.
+- Cassandra uses the **phi accrual failure detector**. Instead of a fixed timeout, each node tracks the distribution of heartbeat arrival gaps for each peer and computes a suspicion level **phi** that rises the longer a heartbeat is overdue. A peer is marked down when phi crosses `phi_convict_threshold` (default **8**). This adapts to slow networks better than a fixed timeout.
+
+Temporary "down" (route around it, store hints) is different from permanent removal (re-replicate its ranges). Mixing them up causes needless data movement.
+
+### Storage engine: LSM tree
+
+<Anim id="lsm-btree" />
+
+Each node stores its data with a **log-structured merge (LSM) tree**, built for fast writes. (Dynamo itself used pluggable engines, mostly Berkeley DB; Cassandra, ScyllaDB and RocksDB-based stores use LSM trees.)
+
+**Write path on one node**
+
+1. **Append to the commit log (WAL)** on disk, so the write survives a crash.
+2. **Insert into the memtable**, a sorted in-memory structure.
+3. **Acknowledge.**
+4. When the memtable is big enough, **flush** it to a new, immutable, sorted file: an **SSTable** (sorted string table). Commit-log segments covering that data can then be recycled.
+
+Cassandra's default `commitlog_sync` is **periodic**: writes are acknowledged immediately and the log is fsynced every `commitlog_sync_period` (default **10 s**), so a single node can lose up to that window on a power failure. Replication across nodes is what protects you. `batch` and `group` modes fsync before acknowledging, at a latency cost. Background: [Storage Fundamentals](/learn/notes/storage-fundamentals/).
+
+**Read path on one node**
+
+1. Check the **memtable** (newest data).
+2. For each SSTable that might contain the key, newest first:
+   - check its **bloom filter**, which can say "definitely not here" and skip the file;
+   - if "maybe", use the SSTable's **index** to find the offset and read the block.
+3. **Merge** the versions found and return the newest (by timestamp or version).
+
+A **bloom filter** is a bit array with k hash functions. It has no false negatives and a tunable false-positive rate. At 1% it costs about 9.6 bits per key. Cassandra's default `bloom_filter_fp_chance` is **0.01**, or **0.1** for leveled compaction (which needs fewer SSTable lookups per read anyway). More: [Probabilistic Data Structures](/learn/notes/probabilistic-data-structures/).
+
+**Compaction** merges SSTables in the background, keeping the newest version of each key and dropping tombstones that are past their grace period. It trades write amplification (rewriting data) for read and space efficiency:
+
+| Strategy | How | Good for | Cost |
+|---|---|---|---|
+| Size-tiered (STCS) | Merge several similar-sized SSTables into one bigger one | Write-heavy workloads | A key may live in many SSTables (more read work); needs free space for big merges |
+| Leveled (LCS) | Levels of non-overlapping SSTables, each level much larger than the one above (about 10× is a common setting) | Read-heavy, update-heavy | More rewriting (higher write amplification) |
+| Time-window (TWCS) | Group SSTables by time window; whole windows expire together | Time-series data with TTL | Bad if data is updated out of order |
+| Unified (UCS, Cassandra 5.0) | One configurable strategy that can behave like tiered or leveled | General use | Newer; needs tuning knowledge |
+
+The three amplifications to name: **write amplification** (bytes written to disk per byte of user data), **read amplification** (files touched per read) and **space amplification** (disk used versus live data). Every compaction strategy picks a point among them.
+
+## How it works
+
+### A write at W=2 (N=3)
+
+```
+client → any node (say X) → X is not a replica → forwards to coordinator B
+         (or a token-aware client sends straight to B)
+B: hash(k) → preference list [B, C, D, E, ...]
+B: sends write to B, C, D (all N), each with timestamp/version
+   B: WAL append + memtable insert → ack
+   C: WAL append + memtable insert → ack      ← 2 acks = W → reply success to client
+   D: slow, acks 40 ms later (still applied)
+If D were down: write goes to E with a hint for D (sloppy quorum),
+               or is simply missed and fixed later by repair.
+```
+
+### A read at R=2 (N=3)
+
+```
+coordinator B asks C for the full value and D for a digest (hash)
+  - digests match       → return value
+  - digests differ      → fetch full values, pick newest (or return siblings),
+                          send newest to stale replica (read repair), return
+```
+
+Asking one replica for data and the others for small digests saves bandwidth; Cassandra does this.
+
+### A node dies, then comes back after 5 hours
+
+1. Gossip and the failure detector mark it down within seconds. Coordinators stop sending it reads.
+2. Writes for its ranges continue at W=2 using the other replicas; hints are stored for it for up to 3 hours, then hints stop.
+3. It returns. Hints are replayed. Writes from hours 3–5 are still missing.
+4. Run **repair** (Merkle trees) for its ranges, which streams only the mismatched ranges. Must happen within `gc_grace_seconds` so missed deletes don't come back.
+
+### Adding a node
+
+1. The new node picks tokens (vnodes) and announces itself via a seed and gossip.
+2. It **streams** the ranges it now owns from the current replicas while they keep serving traffic.
+3. When streaming completes, it joins the ring as a normal owner; old owners clean up the data they no longer own.
+
+## Designing a distributed commit log (Kafka-like)
+
+A **commit log** is an append-only, ordered sequence of records that consumers read by position. The interview twist: reuse the KV ideas, but notice which ones **don't fit**.
+
+### What changes when order matters
+
+- **Ordering is the product.** A leaderless, last-write-wins store can't give "record 41 comes before record 42" across replicas. So a log uses **one leader per partition**: the leader assigns offsets, followers copy its log in order.
+- **Partitioning is by key into a fixed number of partitions**, not a ring of vnodes: `partition = hash(key) % numPartitions`. Same key → same partition → ordered. Changing the partition count remaps keys, so choose it generously up front.
+- **No conflicts to resolve.** Records are immutable once written, so there are no vector clocks or read repair. Followers only need to catch up.
+
+### Storage: segments and sparse indexes
+
+```
+topic "orders", partition 3 on broker 2:
+  00000000000000000000.log        segment of record batches (append-only)
+  00000000000000000000.index      sparse offset → byte position
+  00000000000000000000.timeindex  sparse timestamp → offset
+  00000000000005242880.log        next segment, named by its base offset
+```
+
+- Only the active segment is written; it rolls at a size or time limit (Kafka: `segment.bytes` 1 GiB, `segment.ms` 7 days by default).
+- **Retention** deletes whole old segments (cheap). **Compaction** (for keyed topics) keeps only the latest record per key, like an LSM compaction that never merges across keys out of order.
+- Reads are sequential and served largely from the OS page cache, which is why a log can be very fast on ordinary disks.
+
+### Replication: ISR and the high watermark
+
+- Each partition has a leader and followers (replication factor 3 is typical). Followers fetch from the leader.
+- The **in-sync replica set (ISR)** is the leader plus followers that have caught up recently (Kafka: within `replica.lag.time.max.ms`, default 30 s).
+- A record is **committed** when every ISR member has it. The **high watermark** is the highest committed offset; consumers can only read below it, so they never see a record that a leader failover could erase.
+- Producers choose durability with `acks` (`all` waits for the ISR), and the topic's `min.insync.replicas` sets the minimum ISR size for accepting `acks=all` writes.
+- **Leader epochs** let a recovering replica truncate exactly where its log diverged from the new leader's.
+
+Why an ISR instead of a majority quorum? With majority voting, tolerating f failures takes 2f+1 replicas. An ISR acknowledges once all *currently healthy* replicas have the write, so RF=3 can keep accepting writes with 1 replica (if you allow it). The price is that the ISR can shrink to just the leader. Full details: [Kafka Internals](/learn/notes/kafka-internals/).
+
+### Offsets and consumer groups
+
+- Consumers track **their own position** (offset) per partition and commit it (Kafka stores commits in the internal `__consumer_offsets` topic). The broker doesn't track per-message acknowledgements, which keeps it cheap.
+- A **consumer group** divides partitions among its members; each partition goes to one member at a time. Partition count caps a group's parallelism. See [Kafka Consumer Groups and Rebalancing](/learn/notes/kafka-consumer-rebalancing/).
+- Replaying = resetting the offset. Many independent groups can read the same data.
+
+### Cluster metadata
+
+Who leads which partition, and which replicas are in the ISR, must be **agreed** (unlike the KV store's eventually consistent gossip). Kafka stores this in a Raft-based controller quorum (**KRaft**), which replaced ZooKeeper; Kafka 4.0 runs only in KRaft mode.
+
+### KV store vs commit log at a glance
+
+| | Dynamo-style KV store | Kafka-style commit log |
+|---|---|---|
+| Unit | Key → latest value | Partition → ordered records |
+| Replication | Leaderless, N replicas, R/W quorums | Leader per partition, ISR |
+| Conflicts | Vector clocks or LWW | None (single writer per partition) |
+| Placement | Consistent hashing ring + vnodes | Fixed partitions assigned to brokers |
+| Membership | Gossip, eventually consistent | Consensus (KRaft controller) |
+| Storage | LSM: memtable + SSTables + compaction | Append-only segments + sparse indexes |
+| Reads | Point lookups by key | Sequential scans from an offset |
+
+### Sizing sketch
+
+```
+1 GB/s produced, RF 3, 7 days retention
+  per day  = 1 GB/s × 86,400 s       = 86.4 TB
+  7 days   = 86.4 TB × 7             = 604.8 TB
+  × RF 3                              ≈ 1.8 PB of broker disk (before compression)
+```
+
+At that scale you would also consider **tiered storage** (old segments in object storage).
+
+## Real-world examples
+
+- **Amazon Dynamo (SOSP 2007)**: consistent hashing with virtual nodes, preference lists of distinct nodes, vector clocks with client-side reconciliation, sloppy quorums with hinted handoff, Merkle-tree anti-entropy per key range, and gossip-based membership. The common configuration was (N, R, W) = (3, 2, 2), and storage engines were pluggable (mostly Berkeley DB).
+- **Apache Cassandra**: Dynamo's distribution design plus a Bigtable-style LSM storage engine. Unlike Dynamo, it resolves conflicts with per-column last-write-wins timestamps, offers named consistency levels, and uses a phi accrual failure detector.
+- **Amazon DynamoDB is not Dynamo.** The 2022 USENIX ATC paper on DynamoDB describes partitions replicated with **Multi-Paxos**, where only the leader replica serves writes and strongly consistent reads. A good interview point: the leaderless design was traded for a leader-based one to give predictable consistency in a managed service.
+- **Apache Kafka**: the commit-log design above: partitions, segments, leader-per-partition replication with ISR and high watermark, and a KRaft controller quorum.
+
+## Common pitfalls
+
+- **Believing R + W > N means strong consistency.** Sloppy quorums, partial write failures and LWW clock skew all break it. Say "overlap, not linearizability."
+- **Using `hash % N` for placement.** Adding a node remaps almost every key.
+- **One token per node.** Uneven load and slow rebuilds from only two neighbours. Use vnodes or fixed partitions.
+- **Relying on hinted handoff for long outages.** Hints stop after the hint window (3 h default in Cassandra). Schedule repair.
+- **Not running repair within `gc_grace_seconds`.** Deleted data comes back to life.
+- **Trusting wall clocks for LWW.** Clock skew makes older writes win. Synchronize clocks and avoid read-modify-write patterns on LWW stores.
+- **Ignoring compaction.** It needs disk headroom (size-tiered can temporarily need a lot) and I/O; under-provisioned disks cause latency spikes and write stalls.
+- **Huge partitions or hot keys.** Consistent hashing spreads keys, not load. A celebrity key still lands on N nodes. Split hot keys or cache them.
+- **Designing the commit log leaderless.** Without a single writer per partition, you lose ordering, which is the whole point of a log.
+
+## Practice questions
+
+<Practice>
+
+<QA q="Why use consistent hashing instead of hash(key) mod number-of-nodes?" level="easy">
+
+With mod-N placement, changing the number of nodes changes the target of almost every key, so adding one node moves nearly all the data. With a consistent-hashing ring, a new node takes over only the range between itself and its predecessor, about 1/(n+1) of the data, and other keys don't move.
+
+</QA>
+
+<QA q="What are virtual nodes and what problems do they solve?" level="easy">
+
+Each physical node takes many positions (tokens) on the ring instead of one. This evens out load (many small ranges average out), spreads rebuild work across many peers when a node dies, and lets bigger machines take more tokens. Cassandra defaults to 16 tokens per node in recent versions.
+
+</QA>
+
+<QA q="Explain N, R and W. Why is (3, 2, 2) a common choice?" level="easy">
+
+N is the replica count, W the acknowledgements a write waits for, R the replies a read waits for. With (3, 2, 2), R + W = 4 > 3, so read and write sets overlap in at least one replica, and both paths still succeed with one replica slow or down. Latency is set by the second-fastest replica rather than the slowest.
+
+</QA>
+
+<QA q="Does R + W greater than N guarantee linearizable reads?" level="medium">
+
+No. It guarantees overlap between read and write sets under a strict quorum, nothing more. Linearizability can still break because:
+
+- a failed write may have reached some replicas and not others, so later reads may or may not see it;
+- concurrent reads during a write can observe new then old values unless read repair is synchronous;
+- sloppy quorums let writes land on fallback nodes outside the read set;
+- last-write-wins with clock skew can discard an acknowledged write.
+
+For linearizable operations, use consensus (for example Paxos-based lightweight transactions or Raft).
+
+</QA>
+
+<QA q="What is a sloppy quorum and how does hinted handoff work?" level="medium">
+
+A sloppy quorum sends reads and writes to the first N **healthy** nodes in the preference list, even if some are not the key's home replicas. If home replica A is down, the write goes to fallback D with a hint naming A. D keeps hinted writes separately and delivers them when A recovers, then deletes its copy. This keeps writes available during failures, at the cost of weakening the R + W > N overlap guarantee. Hints cover short outages only (Cassandra's default hint window is 3 hours).
+
+</QA>
+
+<QA q="How do vector clocks detect conflicting writes?" level="medium">
+
+Each version carries `(node, counter)` pairs. If every counter in version A is less than or equal to the corresponding counter in B, A is an ancestor of B and can be discarded. If neither dominates, the versions are concurrent. Dynamo keeps both and returns them on read; the client merges them and writes the result with the merged context, which produces a clock that dominates both. Dynamo truncates the oldest pair when the clock gets long (threshold of about 10).
+
+</QA>
+
+<QA q="Vector clocks vs last-write-wins: when would you choose each?" level="medium">
+
+- **LWW** (Cassandra): simple, no siblings, no client merge code. Accept that one of two concurrent writes is silently lost and that clock skew matters. Good when writes are mostly blind overwrites or idempotent.
+- **Vector clocks with siblings** (Dynamo): no lost updates, but clients must merge, and metadata grows. Good when losing a concurrent update is unacceptable and a merge rule exists, like a shopping cart union.
+- **CRDTs** when the data is a counter, set or map with a built-in merge.
+
+</QA>
+
+<QA q="How do Merkle trees make anti-entropy repair efficient?" level="medium">
+
+Each replica builds a hash tree over a key range: leaves hash keys or small sub-ranges, parents hash their children. Replicas compare roots; if equal, the whole range is in sync with almost no data sent. If not, they compare children and descend only into mismatching branches, ending at the specific out-of-sync keys. Work and network cost scale with the amount of difference, not the data size. Dynamo keeps a tree per key range; the downside is recomputation when ranges change.
+
+</QA>
+
+<QA q="Walk through the write and read path inside one LSM-tree node." level="medium">
+
+**Write**: append to the commit log, insert into the memtable, acknowledge. When the memtable fills, flush it to an immutable sorted SSTable; background compaction merges SSTables.
+
+**Read**: check the memtable, then for each candidate SSTable (newest first) check its bloom filter to skip files that definitely don't have the key, use the SSTable index to locate the block, read it, and merge versions to return the newest.
+
+Writes are fast because they are sequential; reads cost more, which bloom filters, caches and compaction offset.
+
+</QA>
+
+<QA q="Why do deletes need tombstones, and what is gc_grace_seconds for?" level="hard">
+
+In a replicated LSM store you can't just remove data: a replica that missed the delete would later send its old copy back during repair, resurrecting it. So a delete writes a tombstone that replicates like a normal write and shadows older values. Tombstones are dropped in compaction only after `gc_grace_seconds` (Cassandra default 10 days). If a replica stays out of sync longer than that, or repair doesn't run within that window, deleted data can come back. Too many tombstones also slow reads, which must skip over them.
+
+</QA>
+
+<QA q="How does gossip-based failure detection work, and why use phi accrual instead of a fixed timeout?" level="hard">
+
+Every second each node exchanges state with a random peer (plus seeds and sometimes unreachable nodes), including heartbeat counters, so membership and liveness spread through the cluster. A phi accrual detector tracks the history of heartbeat arrival gaps for each peer and outputs a suspicion value that rises the longer a heartbeat is overdue relative to that history. A node is marked down when phi exceeds a threshold (Cassandra default 8). It adapts to normal network jitter instead of using one fixed timeout that is too short on slow networks and too long on fast ones.
+
+</QA>
+
+<QA q="Size a cluster for 10 billion 1 KB items, RF 3, 100K writes/s and 500K reads/s at QUORUM." level="hard">
+
+- Data: 10e9 × 1 KB = 10 TB; × 3 = 30 TB; + 50% headroom ≈ 45 TB.
+- At 2 TB of data per node: 22.5 → 24 nodes (8 per rack across 3 racks).
+- Replica writes: 100K × 3 = 300K/s → 12.5K/s per node.
+- Replica reads at R=2: 500K × 2 = 1M/s → about 41.7K/s per node.
+- Bloom filters at 1%: 1.25 billion keys per node × 9.6 bits ≈ 1.5 GB RAM per node.
+
+Then check that per-node disk bandwidth covers flushes plus compaction write amplification, and that caches cover the hot set.
+
+</QA>
+
+<QA q="How would you design a Kafka-like commit log, and why not reuse the leaderless KV design?" level="hard">
+
+Split each topic into partitions by `hash(key) % numPartitions`. Each partition has one leader that assigns offsets and appends to segment files with sparse offset and time indexes; followers fetch and copy in order. A record is committed when all in-sync replicas have it, and consumers read only below the high watermark. Consumers keep their own offsets and form groups that share partitions. Metadata (leaders, ISR) lives in a consensus-backed controller.
+
+A leaderless design can't assign a single order across replicas, and ordering per partition is the core feature of a log, so a single writer per partition is required.
+
+</QA>
+
+<QA q="A node was down for 2 days. It comes back and users report deleted items reappearing. What happened and how do you fix it?" level="scenario">
+
+Hints stopped after the hint window (3 hours by default), so the node missed later writes and deletes. If repair didn't run, low-consistency reads (such as `ONE`) that hit this node return its stale copies. Worse, if tombstones on other replicas were already compacted away because the outage plus delay exceeded `gc_grace_seconds`, the node's stale copies look like live data and spread back via read repair or repair.
+
+Fix: if the node was down longer than `gc_grace_seconds`, don't let it rejoin with its old data; wipe it and rebuild it by streaming from healthy replicas. Otherwise run repair immediately. Prevent: alert on long node outages, schedule repairs well inside the grace window.
+
+</QA>
+
+<QA q="One node's CPU and latency are far higher than others even though keys are evenly spread. Why, and what do you do?" level="scenario">
+
+Consistent hashing spreads keys, not traffic. A hot key (or hot partition) puts its load on just its N replicas. Check per-partition request metrics to find it. Options: cache the hot key in front of the store, split it into sub-keys (`key#0..key#k`) and fan in on read, use `ONE` or `LOCAL_ONE` reads to spread load across all replicas, or redesign the data model so a single partition doesn't grow without bound. If it's skew from too few tokens, add vnodes or rebalance.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="With N=3, which (R, W) pair does NOT satisfy R + W greater than N?" options={["R=2, W=2", "R=1, W=3", "R=1, W=2", "R=3, W=1"]} answer={2}>
+
+1 + 2 = 3 is not greater than 3, so read and write sets may not overlap. The other pairs sum to 4.
+
+</MCQ>
+
+<MCQ q="In Dynamo, how are conflicting concurrent versions of an object resolved?" options={["The node with the highest ID wins", "The versions are returned to the client, which merges them and writes back", "The oldest version wins", "A Paxos round picks one"]} answer={1}>
+
+Dynamo detects concurrency with vector clocks, returns all causally unrelated versions on read, and relies on the application to merge them (semantic reconciliation), as with the shopping cart. It does not use node IDs, age or Paxos.
+
+</MCQ>
+
+<MCQ q="How does Cassandra resolve conflicting writes to the same column?" options={["Vector clocks", "Last-write-wins using the write timestamp, per column", "The coordinator asks the client", "Majority vote of replicas"]} answer={1}>
+
+Cassandra uses timestamps and the newest one wins, independently for each column. It does not use vector clocks; that is a key difference from Dynamo.
+
+</MCQ>
+
+<MCQ q="What is the main purpose of hinted handoff?" options={["Keep writes available when a home replica is temporarily down, and deliver the data later", "Repair replicas after permanent failures using hashes", "Elect a leader for each partition", "Compress SSTables"]} answer={0}>
+
+A fallback node stores the write with a hint and hands it to the home replica when it returns. Permanent drift is fixed with Merkle-tree repair, and there is no leader election in a Dynamo-style store.
+
+</MCQ>
+
+<MCQ q="Two replicas compare Merkle tree roots for a key range and the roots are equal. What can they conclude?" options={["They must compare every leaf to be sure", "Only the newest keys match", "The range is in sync and no data needs to be transferred", "One replica must be rebuilt"]} answer={2}>
+
+Equal roots mean every hash beneath them matches (barring a hash collision), so the whole range is identical. That is what makes Merkle trees efficient: matching subtrees are skipped entirely.
+
+</MCQ>
+
+<MCQ q="In an LSM read, what does a bloom filter answer for an SSTable?" options={["The exact offset of the key", "Whether the key is definitely absent or possibly present", "The newest timestamp of the key", "How many versions of the key exist"]} answer={1}>
+
+Bloom filters have no false negatives and some false positives, so they let a read skip SSTables that definitely lack the key. The SSTable index, not the bloom filter, gives the offset.
+
+</MCQ>
+
+<MCQ q="Why must repair run within gc_grace_seconds in Cassandra?" options={["Otherwise hinted handoff stops working", "Otherwise compaction stops", "Otherwise the commit log fills up", "Otherwise tombstones can be purged before all replicas see them, and deleted data can come back"]} answer={3}>
+
+Tombstones are dropped after the grace period; a replica that never received the delete would then reintroduce the old value. Hints, compaction and the commit log are unrelated to this rule.
+
+</MCQ>
+
+<MCQ q="Why does a Kafka-like commit log use a single leader per partition instead of leaderless quorums?" options={["Leaderless systems cannot replicate data", "A single writer per partition assigns one total order of offsets, which a log needs", "Leaders make reads cheaper than followers", "Gossip cannot work with logs"]} answer={1}>
+
+Ordering is the core guarantee of a log. Leaderless writes through different coordinators can't agree on one order without extra consensus. Leaderless stores replicate fine; they just don't order.
+
+</MCQ>
+
+<MCQ q="In Kafka, what does the high watermark represent?" options={["The highest offset replicated to all in-sync replicas; consumers read only below it", "The largest message size allowed", "The newest offset on the leader", "The consumer group's committed offset"]} answer={0}>
+
+The high watermark is the committed point across the ISR. The leader's newest offset is its log end offset, which can be higher. Consumer offsets are separate per group.
+
+</MCQ>
+
+<MCQ q="What is the default num_tokens per node in recent Cassandra versions?" options={["1", "256", "16", "16384"]} answer={2}>
+
+Recent versions default to 16 tokens with a smarter allocator. 256 was the old random-allocation default, 1 is the pre-vnode setup, and 16384 is the number of Redis Cluster hash slots.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **Placement**: consistent hashing ring + vnodes (Cassandra default 16 tokens); preference list = next N **distinct** nodes across racks/zones.
+- **Quorums**: send to all N, wait for W (writes) or R (reads). R + W > N gives overlap, **not** linearizability. (3, 2, 2) is the classic config.
+- **Conflicts**: vector clocks + client merge (Dynamo, no lost updates, deleted items may resurface) vs per-column LWW timestamps (Cassandra, simple, can lose writes) vs CRDTs.
+- **Availability**: sloppy quorum + hinted handoff for short outages (Cassandra hint window 3 h).
+- **Repair**: read repair for hot data; Merkle trees for full ranges; repair within `gc_grace_seconds` (10 days) or deletes come back.
+- **Membership**: gossip every second; seeds; phi accrual detector (threshold 8).
+- **Node storage**: WAL → memtable → flush to immutable SSTables; bloom filters (~9.6 bits/key at 1%); compaction STCS / LCS / TWCS / UCS trades write vs read vs space amplification.
+- **Commit log**: fixed partitions, leader per partition, segments + sparse indexes, ISR + high watermark, consumer-owned offsets, consensus for metadata (KRaft).
+- **DynamoDB ≠ Dynamo**: DynamoDB uses Multi-Paxos leaders per partition.
+
+## Go deeper
+
+- **Paper**: [Dynamo: Amazon's Highly Available Key-value Store (SOSP 2007)](https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf).
+- **Paper**: [Amazon DynamoDB: A Scalable, Predictably Performant, and Fully Managed NoSQL Database Service (USENIX ATC 2022)](https://www.usenix.org/conference/atc22/presentation/elhemali).
+- **Cassandra docs**: [Dynamo architecture](https://cassandra.apache.org/doc/latest/cassandra/architecture/dynamo.html), [Storage engine](https://cassandra.apache.org/doc/latest/cassandra/architecture/storage-engine.html), [Tombstones](https://cassandra.apache.org/doc/latest/cassandra/managing/operating/compaction/tombstones.html), [Bloom filters](https://cassandra.apache.org/doc/latest/cassandra/managing/operating/bloom_filters.html).
+- **RocksDB wiki**: [Leveled compaction](https://github.com/facebook/rocksdb/wiki/Leveled-Compaction).
+- **Apache Kafka docs**: [Design](https://kafka.apache.org/documentation/#design).
+- **Book**: *Designing Data-Intensive Applications* (Kleppmann), chapter 3 (LSM trees, SSTables), chapter 5 (leaderless replication, quorums, sloppy quorums, version vectors), chapter 11 (logs).
+- Related notes: [Cassandra and ScyllaDB](/learn/notes/cassandra-scylla/), [Kafka Internals](/learn/notes/kafka-internals/), [Sharding Strategies](/learn/notes/sharding-strategies/), [HLD: Distributed Cache](/learn/notes/hld-distributed-cache/).

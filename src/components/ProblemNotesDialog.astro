@@ -1,0 +1,261 @@
+---
+/**
+ * Shared "Notes" panel for the company-wise DSA tracker. Mount once per page;
+ * open it from anywhere with
+ *
+ *   window.dispatchEvent(new CustomEvent('stacktrace:open-notes', { detail }))
+ *
+ * where `detail` is an OpenNotesDetail (see the script). Notes autosave to the
+ * problem store (localStorage, plus server sync when signed in) after a short
+ * debounce, and the panel lists every company that asks the problem.
+ */
+---
+<dialog class="pn" aria-labelledby="pn-title">
+  <form method="dialog" class="pn__inner">
+    <header class="pn__head">
+      <div class="pn__head-text">
+        <span class="pn__eyebrow">Notes</span>
+        <h2 id="pn-title" class="pn__title">
+          <a class="pn__link" href="#" target="_blank" rel="noopener noreferrer"></a>
+        </h2>
+        <span class="pn__diff diff-pill"></span>
+      </div>
+      <button class="pn__close" value="close" aria-label="Close notes">✕</button>
+    </header>
+
+    <label class="pn__solved">
+      <input type="checkbox" class="pn__solved-box" />
+      <span>Solved</span>
+    </label>
+
+    <label class="pn__label" for="pn-text">Your notes</label>
+    <textarea
+      id="pn-text"
+      class="pn__text"
+      rows="10"
+      maxlength="20000"
+      spellcheck="true"
+      placeholder="Approach, edge cases, complexity, the bug that bit you… Plain text — saved automatically."
+    ></textarea>
+    <div class="pn__foot">
+      <span class="pn__status" aria-live="polite"></span>
+      <span class="pn__count"></span>
+    </div>
+
+    <section class="pn__companies" hidden>
+      <h3 class="pn__sub">Asked at <span class="pn__company-count"></span></h3>
+      <ul class="pn__chips"></ul>
+    </section>
+  </form>
+</dialog>
+
+<script>
+  import {
+    initProblemStore,
+    onChange,
+    readEntry,
+    updateEntry,
+  } from '~/lib/problem-store';
+
+  interface OpenNotesDetail {
+    slug: string;
+    title: string;
+    link: string;
+    difficulty?: string;
+    companies: Array<{ slug: string; name: string }>;
+    /** Company page the user opened this from — highlighted in the list. */
+    currentCompany?: string;
+  }
+
+  const SAVE_DEBOUNCE_MS = 500;
+
+  initProblemStore();
+
+  const dialog = document.querySelector<HTMLDialogElement>('dialog.pn');
+  if (dialog) {
+    const link = dialog.querySelector<HTMLAnchorElement>('.pn__link')!;
+    const diff = dialog.querySelector<HTMLElement>('.pn__diff')!;
+    const text = dialog.querySelector<HTMLTextAreaElement>('.pn__text')!;
+    const status = dialog.querySelector<HTMLElement>('.pn__status')!;
+    const count = dialog.querySelector<HTMLElement>('.pn__count')!;
+    const solvedBox = dialog.querySelector<HTMLInputElement>('.pn__solved-box')!;
+    const companiesSec = dialog.querySelector<HTMLElement>('.pn__companies')!;
+    const companyCount = dialog.querySelector<HTMLElement>('.pn__company-count')!;
+    const chips = dialog.querySelector<HTMLUListElement>('.pn__chips')!;
+
+    let slug: string | null = null;
+    let timer: number | undefined;
+
+    const paintCount = (): void => {
+      count.textContent = `${text.value.length.toLocaleString()} / 20,000`;
+    };
+
+    const save = (): void => {
+      if (!slug || timer === undefined) return;
+      window.clearTimeout(timer);
+      timer = undefined;
+      updateEntry(slug, { notes: text.value });
+      status.textContent = 'Saved';
+      status.dataset.state = 'saved';
+    };
+
+    text.addEventListener('input', () => {
+      paintCount();
+      status.textContent = 'Saving…';
+      status.dataset.state = 'pending';
+      window.clearTimeout(timer);
+      timer = window.setTimeout(save, SAVE_DEBOUNCE_MS);
+    });
+    // Never drop the last keystrokes: flush on blur and on close.
+    text.addEventListener('blur', save);
+    dialog.addEventListener('close', save);
+
+    solvedBox.addEventListener('change', () => {
+      if (!slug) return;
+      save();
+      updateEntry(slug, { solved: solvedBox.checked });
+    });
+
+    // Click on the backdrop (outside the inner form) closes the panel.
+    dialog.addEventListener('click', (e) => {
+      if (e.target === dialog) dialog.close();
+    });
+
+    // Another widget / tab / server sync touched the open problem.
+    onChange((d) => {
+      if (d.slug !== slug) return;
+      solvedBox.checked = d.entry?.solved ?? false;
+      // Don't clobber text the user is mid-typing.
+      if (d.source !== 'local' && timer === undefined) {
+        text.value = d.entry?.notes ?? '';
+        paintCount();
+      }
+    });
+
+    window.addEventListener('stacktrace:open-notes', (ev) => {
+      const d = (ev as CustomEvent<OpenNotesDetail>).detail;
+      if (!d?.slug) return;
+      save();
+      slug = d.slug;
+      const entry = readEntry(d.slug);
+      link.textContent = d.title;
+      link.href = d.link;
+      diff.textContent = d.difficulty ?? '';
+      diff.hidden = !d.difficulty;
+      diff.dataset.diff = d.difficulty ?? '';
+      text.value = entry?.notes ?? '';
+      solvedBox.checked = entry?.solved ?? false;
+      status.textContent = entry?.notes ? 'Saved' : '';
+      status.dataset.state = 'saved';
+      paintCount();
+
+      chips.replaceChildren(
+        ...d.companies.map((c) => {
+          const li = document.createElement('li');
+          const a = document.createElement('a');
+          a.href = `/dsa/companies/${c.slug}/`;
+          a.textContent = c.name;
+          if (c.slug === d.currentCompany) a.setAttribute('aria-current', 'page');
+          li.append(a);
+          return li;
+        }),
+      );
+      companyCount.textContent = `(${d.companies.length})`;
+      companiesSec.hidden = d.companies.length === 0;
+
+      if (!dialog.open) dialog.showModal();
+      text.focus();
+    });
+  }
+</script>
+
+<style is:global>
+  .diff-pill {
+    display: inline-block;
+    padding: 0.1rem 0.5rem;
+    border-radius: 999px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    white-space: nowrap;
+    border: 1px solid currentColor;
+  }
+  .diff-pill[data-diff='Easy'] { color: var(--anim-success); background: color-mix(in srgb, var(--anim-success) 12%, transparent); }
+  .diff-pill[data-diff='Medium'] { color: var(--anim-highlight); background: color-mix(in srgb, var(--anim-highlight) 12%, transparent); }
+  .diff-pill[data-diff='Hard'] { color: var(--anim-danger); background: color-mix(in srgb, var(--anim-danger) 12%, transparent); }
+</style>
+
+<style>
+  .pn {
+    width: min(40rem, calc(100vw - 1.5rem));
+    max-height: calc(100vh - 2rem);
+    padding: 0;
+    border: 1px solid var(--card-border);
+    border-radius: 14px;
+    background: var(--bg-soft);
+    color: var(--fg);
+    box-shadow: var(--card-shadow);
+  }
+  .pn::backdrop {
+    background: color-mix(in srgb, var(--bg) 60%, transparent);
+    backdrop-filter: blur(3px);
+  }
+  .pn__inner { padding: 1.1rem 1.2rem 1.2rem; display: flex; flex-direction: column; gap: 0.65rem; }
+  .pn__head { display: flex; align-items: flex-start; gap: 0.75rem; }
+  .pn__head-text { flex: 1; min-width: 0; }
+  .pn__eyebrow {
+    font-family: var(--font-code);
+    font-size: 0.7rem;
+    color: var(--fg-faint);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  .pn__title { margin: 0.15rem 0 0.35rem; font-size: 1.15rem; line-height: 1.3; overflow-wrap: anywhere; }
+  .pn__link { color: var(--fg); }
+  .pn__link::after { content: ' ↗'; color: var(--fg-faint); font-size: 0.85em; }
+  .pn__close {
+    flex: 0 0 auto;
+    width: 2rem;
+    height: 2rem;
+    border-radius: 8px;
+    border: 1px solid var(--card-border);
+    background: var(--card-bg);
+    color: var(--fg-muted);
+    cursor: pointer;
+  }
+  .pn__close:hover { color: var(--fg); border-color: var(--accent); }
+  .pn__solved { display: inline-flex; align-items: center; gap: 0.45rem; font-size: 0.9rem; cursor: pointer; width: fit-content; }
+  .pn__solved input { width: 1.05rem; height: 1.05rem; accent-color: var(--anim-success); }
+  .pn__label { font-size: 0.8rem; color: var(--fg-muted); font-weight: 600; }
+  .pn__text {
+    width: 100%;
+    min-height: 12rem;
+    resize: vertical;
+    padding: 0.7rem 0.8rem;
+    border-radius: 10px;
+    border: 1px solid var(--card-border);
+    background: var(--code-bg);
+    color: var(--fg);
+    font-family: var(--font-code);
+    font-size: 0.85rem;
+    line-height: 1.5;
+    box-sizing: border-box;
+  }
+  .pn__text:focus { outline: 2px solid color-mix(in srgb, var(--accent) 60%, transparent); outline-offset: 1px; }
+  .pn__foot { display: flex; justify-content: space-between; font-size: 0.75rem; color: var(--fg-faint); min-height: 1rem; }
+  .pn__status[data-state='saved'] { color: var(--anim-success); }
+  .pn__sub { margin: 0.4rem 0 0.4rem; font-size: 0.85rem; color: var(--fg-muted); }
+  .pn__chips { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 0.35rem; max-height: 9rem; overflow-y: auto; }
+  .pn__chips a {
+    display: inline-block;
+    padding: 0.15rem 0.55rem;
+    border-radius: 999px;
+    border: 1px solid var(--card-border);
+    background: var(--card-bg);
+    color: var(--fg-muted);
+    font-size: 0.78rem;
+    text-decoration: none;
+  }
+  .pn__chips a:hover { color: var(--fg); border-color: var(--accent); }
+  .pn__chips a[aria-current='page'] { color: var(--accent); border-color: var(--accent); }
+</style>

@@ -1,0 +1,528 @@
+---
+title: "Spring Data JPA and Hibernate: N+1, Fetching, @Transactional"
+phase: "13-java-spring"
+order: 131
+tags: ["java", "spring", "jpa", "hibernate", "db"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 22
+prerequisites: ["spring-core-ioc", "transactions-isolation"]
+summary: "How Hibernate's persistence context, dirty checking and lazy loading really work, how to find and fix N+1 queries, and the exact rules of Spring's @Transactional — proxies, rollback, propagation and the traps that cause production incidents."
+---
+
+## Definition (interview-ready)
+
+**JPA** (Jakarta Persistence) is the Java standard API for mapping objects to relational tables. **Hibernate** is the most common JPA implementation. **Spring Data JPA** sits on top and generates repository implementations from interfaces (`findByEmail`, `@Query`, paging). The heart of all of it is the **persistence context** — a per-transaction map of "entities I've loaded, keyed by ID" that acts as a first-level cache and lets Hibernate **detect changes automatically** and write them at **flush** time. **`@Transactional`** is Spring's way of saying "run this method inside a database transaction"; it works through a **proxy**, which is why it silently does nothing in some situations.
+
+## Why it matters
+
+- **N+1 queries** are one of the most common causes of slow Spring endpoints: one query for a list, then one extra query per row, hidden behind innocent-looking getters.
+- **`LazyInitializationException`** and the **open-in-view** default are classic interview and production topics.
+- **`@Transactional` misunderstandings** cause real data bugs: checked exceptions that commit, self-invoked methods with no transaction, `REQUIRES_NEW` exhausting the connection pool, HTTP calls holding database connections.
+- Interviewers use JPA to test whether you know what SQL your code actually runs.
+
+Version context: Spring Boot 3.x/4.x, Spring Framework 6.x/7.x, Hibernate 6.x/7.x, `jakarta.persistence.*` packages (Boot 3 dropped `javax.persistence`).
+
+## Core concepts
+
+### Entity lifecycle states
+
+```
+          new Order()                       persist()                     commit / flush
+ TRANSIENT ─────────────▶ (not tracked) ──────────────▶ MANAGED ──────────────▶ row in DB
+                                                       │   ▲
+                                      close / clear /   │   │ merge() returns a NEW managed copy
+                                      evict / tx ends   ▼   │
+                                                    DETACHED
+ MANAGED ── remove() ──▶ REMOVED ── flush ──▶ DELETE executed
+```
+
+| State | Has ID? | Tracked by a persistence context? | Meaning |
+|---|---|---|---|
+| **Transient** (new) | usually not | No | Just a Java object |
+| **Managed** (persistent) | Yes | **Yes** | Changes are tracked and flushed automatically |
+| **Detached** | Yes | No (context closed or entity evicted) | Changes are **ignored** unless you `merge()` |
+| **Removed** | Yes | Yes, scheduled for deletion | `DELETE` runs at flush |
+
+Spring Data's `save()` calls `persist()` for a new entity and `merge()` otherwise. `merge()` copies state onto a managed instance and **returns that instance**; keep using the returned object, not the one you passed in.
+
+### Persistence context = first-level cache + unit of work
+
+Within one persistence context (by default, one transaction):
+
+- `findById(42)` twice → **one** SQL `SELECT`; the second call returns the **same Java object** from the context.
+- The context guarantees **one object per row** (identity), so two parts of your code can't hold conflicting copies.
+- It is **not** a shared cache across requests. A cross-request cache is the optional second-level cache.
+
+### Dirty checking
+
+When Hibernate loads an entity, it keeps a snapshot of its loaded state. At flush it compares each managed entity with its snapshot and issues `UPDATE`s for the ones that changed. That's why this works with no `save()` call:
+
+```java
+@Transactional
+public void rename(long id, String name) {
+    Customer c = repo.findById(id).orElseThrow();
+    c.setName(name);         // no save() needed
+}                            // commit → flush → UPDATE customer SET name=? WHERE id=?
+```
+
+The cost: snapshots use memory and every managed entity is compared at flush. Loading 50,000 entities "just to read them" in a read-write transaction is expensive. Use `readOnly = true` or DTO projections for reads.
+
+### Flush and flush modes
+
+**Flush** = turn queued changes into `INSERT`/`UPDATE`/`DELETE` statements and send them to the database. Flush is **not** commit: flushed changes can still roll back.
+
+| Mode | When Hibernate flushes |
+|---|---|
+| **AUTO** (default) | Before commit, **before a JPQL/HQL query whose tables overlap pending changes**, and before native SQL queries (unless told which tables they touch) |
+| **COMMIT** | Tries to wait until commit (JPA standard mode) |
+| **ALWAYS** (Hibernate) | Before every query |
+| **MANUAL** (Hibernate) | Only when you call `flush()` |
+
+AUTO flush is why a `SELECT` in the middle of your method can suddenly trigger an `UPDATE`. One exception to "inserts wait until flush": with **`IDENTITY`** ID generation (MySQL auto-increment), Hibernate must run the `INSERT` immediately on `persist()` to learn the ID, which also prevents JDBC insert batching. `SEQUENCE` IDs don't have this problem.
+
+### Relationships and default fetch types
+
+| Mapping | JPA default fetch | Recommendation |
+|---|---|---|
+| `@ManyToOne` | **EAGER** | Set `fetch = FetchType.LAZY` |
+| `@OneToOne` | **EAGER** | Set LAZY (and know that the non-owning side of a one-to-one is hard to make lazy) |
+| `@OneToMany` | LAZY | Keep LAZY |
+| `@ManyToMany` | LAZY | Keep LAZY |
+
+Rule of thumb from Vlad Mihalcea and the Hibernate team: **make everything LAZY, then fetch what each use case needs in the query.** EAGER is a global decision that you can't undo per query, and it causes N+1 queries of its own (see below).
+
+LAZY associations are populated with **proxies** (for single entities) or **persistent collections** (for lists/sets). Touching them triggers a `SELECT` — which needs an open persistence context.
+
+### LazyInitializationException and open-in-view
+
+```java
+@GetMapping("/orders/{id}")
+OrderDto get(@PathVariable long id) {
+    Order o = orderService.find(id);   // @Transactional method; tx and context closed on return
+    return OrderDto.from(o);           // o.getItems() → LazyInitializationException: could not initialize proxy - no Session
+}
+```
+
+The entity is **detached** by the time the controller touches the lazy collection.
+
+**Open Session/EntityManager In View (OSIV)** "fixes" this by keeping the persistence context open for the **whole web request**, including JSON serialization. **Spring Boot enables it by default** (`spring.jpa.open-in-view=true`) for web apps and logs a startup warning when you haven't set the property explicitly.
+
+Why many teams turn it off (`spring.jpa.open-in-view=false`):
+
+- The request **holds a database connection** for the whole request after the first lazy load (including slow serialization and remote calls), so the pool runs dry under load.
+- Lazy loads in the web layer run **outside the service transaction** (each in auto-commit), invisible in the service code.
+- It hides N+1 problems: Jackson walks the object graph and fires a query per association.
+
+Real fixes: fetch what the endpoint needs inside the transaction (`JOIN FETCH`, `@EntityGraph`), or better, **return DTO projections** from the service layer instead of entities.
+
+### The N+1 problem
+
+You run **1** query to get N parents, then **N** more queries, one per parent, to load an association.
+
+```java
+List<Order> orders = orderRepo.findByStatus(PENDING);       // 1 query
+for (Order o : orders) {
+    total += o.getCustomer().getCreditLimit();               // +1 query per order
+}
+```
+
+What the SQL log shows (`spring.jpa.show-sql=true`, or better, logging `org.hibernate.SQL=DEBUG`):
+
+```
+select o.id, o.status, o.customer_id from orders o where o.status=?
+select c.id, c.name, c.credit_limit from customer c where c.id=?     -- customer 7
+select c.id, c.name, c.credit_limit from customer c where c.id=?     -- customer 9
+select c.id, c.name, c.credit_limit from customer c where c.id=?     -- customer 12
+... 497 more ...
+```
+
+Each query is fast, so the slow-query log doesn't flag it; the endpoint is slow because of **500 round trips**.
+
+**EAGER doesn't fix it.** With a JPQL query like `select o from Order o`, Hibernate runs your query as written, sees an EAGER `customer`, and loads it with **one extra select per distinct customer** anyway.
+
+### Fixing N+1
+
+**1. `JOIN FETCH` in JPQL** — load the association in the same SQL:
+
+```java
+@Query("select o from Order o join fetch o.customer where o.status = :status")
+List<Order> findWithCustomer(@Param("status") Status status);
+```
+```
+select o.*, c.* from orders o join customer c on c.id=o.customer_id where o.status=?
+```
+
+**2. `@EntityGraph`** — same effect, declared on a Spring Data method:
+
+```java
+@EntityGraph(attributePaths = {"customer", "items"})
+List<Order> findByStatus(Status status);
+```
+
+**3. Batch fetching** — keep lazy loading but load proxies/collections **in groups** with an `IN` list:
+
+```properties
+spring.jpa.properties.hibernate.default_batch_fetch_size=50
+```
+```
+select ... from customer c where c.id in (?,?,?, ... 50 ids)    -- 500 orders → about 10 queries
+```
+
+Or `@BatchSize(size = 50)` on a specific association. A good safety net, not a replacement for proper queries.
+
+**4. DTO projections** — for read-only views, select only the columns you need. No entities, no dirty checking, no lazy loading:
+
+```java
+record OrderSummary(long id, String customerName, BigDecimal total) {}
+
+@Query("""
+   select new com.acme.OrderSummary(o.id, c.name, o.total)
+   from Order o join o.customer c where o.status = :status""")
+List<OrderSummary> summaries(@Param("status") Status status);
+```
+
+Spring Data also supports **interface projections** (an interface with getters matching property names) for simple cases.
+
+**Detect it early**: log SQL in dev, count queries in integration tests (Hypersistence Utils or datasource-proxy can assert "this call ran at most 3 statements"), and watch Hibernate statistics.
+
+### Pagination with fetch joins: the in-memory trap
+
+```java
+@Query("select o from Order o join fetch o.items")
+Page<Order> findAllWithItems(Pageable p);   // ⚠️
+```
+
+A collection fetch join returns **one row per child**, so `LIMIT 20` at the SQL level would cut an order's items in half. Hibernate refuses to do that: it loads **all matching rows** and paginates **in memory**, logging a warning: `firstResult/maxResults specified with collection fetch; applying in memory` (HHH000104 in Hibernate 5). On a big table this is an out-of-memory incident waiting to happen. Setting `hibernate.query.fail_on_pagination_over_collection_fetch=true` turns the warning into an exception so you catch it in tests.
+
+Fix with **two queries**:
+
+```java
+@Query("select o.id from Order o where o.status = :s")
+Page<Long> pageIds(@Param("s") Status s, Pageable p);          // 1) page of IDs, LIMIT in SQL
+
+@Query("select o from Order o join fetch o.items where o.id in :ids")
+List<Order> loadWithItems(@Param("ids") List<Long> ids);       // 2) fetch those, re-sort by page order
+```
+
+(Fetch-joining a **to-one** association with pagination is fine; only collections multiply rows.) Also: fetch-joining **two `List` collections** at once throws `MultipleBagFetchException`, and even with `Set` it creates a Cartesian product. Fetch one collection per query.
+
+Note: since Hibernate 6, duplicate parent entities from a collection fetch join are removed automatically, so `select distinct` is no longer needed for that.
+
+### @Transactional: how it really works
+
+`@Transactional` is applied by a **proxy** around your bean (see [Spring Core](/learn/notes/spring-core-ioc/)):
+
+```
+controller ──▶ [ proxy: get connection, begin ] ──▶ target.method() ──▶ [ commit or rollback, release ]
+```
+
+Consequences:
+
+**1. Self-invocation doesn't work.** `this.otherMethod()` bypasses the proxy, so the `@Transactional` on `otherMethod` is ignored. Move it to another bean, or use `TransactionTemplate`.
+
+**2. Method visibility rules.**
+
+- Spring 5.x and earlier: only **`public`** methods got transactions; annotations on `protected`/package-private methods were silently ignored.
+- **Since Spring 6.0**, `protected` and **package-private** methods are also transactional **with class-based (CGLIB) proxies** — which is Boot's default. With interface-based (JDK) proxies, the method must still be `public` and declared on the interface.
+- **`private`** methods can never be intercepted by a proxy. Neither can `final` methods with CGLIB.
+
+**3. Rollback rules.** By default the transaction rolls back on **`RuntimeException` and `Error` only**. A **checked exception commits** the transaction:
+
+```java
+@Transactional
+public void transfer(...) throws InsufficientFundsException {
+    debit(a);                                   // UPDATE runs
+    if (low) throw new InsufficientFundsException();   // checked → COMMIT ⚠️ debit is kept
+}
+```
+
+Use `@Transactional(rollbackFor = Exception.class)`, or since **Spring 6.2**, change the default globally with `@EnableTransactionManagement(rollbackOn = RollbackOn.ALL_EXCEPTIONS)`. And if you **catch** an exception inside the method, Spring never sees it, so it commits.
+
+**4. Spring Data repository methods are already transactional**: `SimpleJpaRepository` runs reads with `readOnly = true` and `save`/`delete` in read-write transactions. That's why a single `repo.save()` in a controller works, but two `save()`s without an outer `@Transactional` are **two separate transactions**.
+
+### Propagation
+
+What happens when a transactional method is called while a transaction may already exist:
+
+| Propagation | Existing tx | No tx |
+|---|---|---|
+| **REQUIRED** (default) | Join it | Start one |
+| **REQUIRES_NEW** | **Suspend** it, start an independent one (new connection) | Start one |
+| **NESTED** | Create a **savepoint** inside it; inner rollback goes back to the savepoint only | Start one |
+| **SUPPORTS** | Join | Run without tx |
+| **MANDATORY** | Join | **Throw** |
+| **NOT_SUPPORTED** | Suspend it, run without | Run without |
+| **NEVER** | **Throw** | Run without |
+
+The traps:
+
+- **REQUIRED + inner failure = whole transaction doomed.** If an inner `@Transactional` method throws a runtime exception, it marks the shared transaction **rollback-only**. Even if the outer method catches the exception and carries on, the commit fails with **`UnexpectedRollbackException`**.
+- **REQUIRES_NEW** is right for "must persist even if the caller rolls back" (an audit row, a failed-attempt counter). But it holds **two connections** at once per thread. Spring's docs warn this can exhaust the pool and even deadlock if many threads do it at once; the pool must be larger than the number of concurrent threads. Inner commits are also not undone if the outer transaction rolls back.
+- **NESTED** relies on JDBC savepoints and works with `DataSourceTransactionManager` (plain JDBC). Don't assume it behaves well with JPA: a savepoint rollback doesn't roll back the entity objects already in the persistence context.
+
+### readOnly, isolation and timeout
+
+- **`readOnly = true`** is a hint. With Hibernate and Spring 5.1+, it sets the session's flush mode to MANUAL and marks the session read-only, so entities are loaded **without dirty-checking snapshots**, saving memory and CPU. Use it on query methods. Teams that route reads to replicas often key that routing on the read-only flag (for example with `AbstractRoutingDataSource`), but that is something you build, not a default.
+- **`isolation`** defaults to `Isolation.DEFAULT`, meaning the database's default (READ COMMITTED on PostgreSQL, REPEATABLE READ on MySQL InnoDB). See [Transactions and isolation levels](/learn/notes/transactions-isolation/).
+- **`timeout`** (seconds) defaults to the transaction system's default (often none). Setting it caps runaway transactions.
+
+### Transactions and external calls
+
+```java
+@Transactional
+public void placeOrder(Cart cart) {
+    orderRepo.save(order);              // connection taken, row locks may be held
+    paymentClient.charge(card, total);  // ⚠️ 2 s HTTP call inside the transaction
+    stockRepo.decrement(items);
+}
+```
+
+Problems:
+
+1. The DB connection is held for the whole HTTP call. Slow payment provider → pool exhausted → the whole service stalls.
+2. Locks are held longer, increasing contention and deadlocks.
+3. **No atomicity across systems**: if the charge succeeds and the commit fails, the customer is charged for an order that doesn't exist. If the charge times out, you don't know whether it happened.
+
+Better patterns: do remote calls **before or after** a short transaction; use **`@TransactionalEventListener(phase = AFTER_COMMIT)`** to trigger side effects only once the commit succeeded; use a **transactional outbox** for events (see [Kafka producer](/learn/notes/kafka-producer/) and [Distributed transactions](/learn/notes/distributed-transactions/)); make remote calls idempotent with an idempotency key.
+
+### Long transactions
+
+Long transactions hold connections and locks, keep old row versions alive (MVCC bloat in PostgreSQL), grow the persistence context (memory and slow flushes), and make rollbacks expensive. For batch jobs: process in **chunks** (say 500–1,000 rows per transaction), call `flush()` and `clear()` between chunks, enable JDBC batching (`hibernate.jdbc.batch_size`), and prefer `SEQUENCE` IDs so inserts can be batched.
+
+## How it works
+
+One request through the stack, annotated:
+
+```
+GET /orders?status=PENDING
+ → OrderController.list()
+ → proxy(OrderService).list()          @Transactional(readOnly = true)
+      TransactionInterceptor: JpaTransactionManager.begin
+        ↳ borrow JDBC connection from HikariCP, setAutoCommit(false)
+        ↳ open EntityManager / persistence context, bind to thread
+      OrderService.list()
+        ↳ repo.summaries(PENDING)        one SQL with join, returns DTOs (no entities)
+      TransactionInterceptor: commit (read-only → no flush, no dirty checking)
+        ↳ close persistence context, return connection to the pool
+ → Jackson serializes DTOs (no DB access possible or needed)
+```
+
+Compare with the anti-pattern: the service returns entities, OSIV keeps the context open, and Jackson triggers N lazy loads while holding the connection.
+
+How to say it in an interview: *"I keep associations lazy, fetch per use case with join fetch or entity graphs, return DTOs from read endpoints, disable open-in-view, keep transactions short with no remote calls inside, and remember that @Transactional is a proxy — so no self-invocation, and checked exceptions commit unless I say otherwise."*
+
+## Real-world examples
+
+- **Spring Boot** registers `OpenEntityManagerInViewInterceptor` by default for web applications and documents `spring.jpa.open-in-view=false` to turn it off; it has logged a warning about the default since Boot 2.0.
+- **Spring Framework 5.1** started propagating `readOnly` into Hibernate's read-only session mode (a change contributed by Vlad Mihalcea), which removed the dirty-checking snapshot cost for read-only transactions.
+- **Spring Framework 6.0** extended `@Transactional` to `protected` and package-private methods on class-based proxies; **6.2** added the global `rollbackOn` option.
+
+## Common pitfalls
+
+- **Returning entities from controllers** and letting Jackson trigger lazy loads (or infinite recursion on bidirectional relations).
+- **EAGER `@ManyToOne`** left at its default, causing N+1 on every list query.
+- **`JOIN FETCH` + `Pageable` on a collection** → whole table loaded and paged in memory.
+- **Fetching two bag collections** at once → `MultipleBagFetchException` or a Cartesian explosion.
+- **Expecting a checked exception to roll back.**
+- **Catching an exception** inside a `@Transactional` method and then being surprised by `UnexpectedRollbackException` from an inner `REQUIRED` call.
+- **`@Transactional` on a private method or a self-invoked method.**
+- **HTTP calls, Kafka sends or sleeps inside transactions.**
+- **Modifying a detached entity** and expecting it to be saved.
+- **`@Modifying` bulk update queries** bypass the persistence context; managed entities become stale unless you set `clearAutomatically = true`.
+- **`IDENTITY` IDs** with large inserts: JDBC batching is disabled.
+- **`spring.jpa.hibernate.ddl-auto=update`** in production; use Flyway or Liquibase migrations.
+
+## Practice questions
+
+<Practice>
+
+<QA q="What are the JPA entity lifecycle states?" level="easy">
+
+- **Transient**: a new object not associated with any persistence context.
+- **Managed**: associated with an open persistence context; changes are tracked and flushed.
+- **Detached**: has an ID but its context is closed or it was evicted; changes are ignored unless merged.
+- **Removed**: managed but scheduled for deletion at flush.
+
+`persist()` makes transient → managed, `merge()` copies a detached object onto a managed one and returns it, `remove()` makes managed → removed.
+
+</QA>
+
+<QA q="What is the persistence context and why does calling `findById` twice run only one query?" level="easy">
+
+It's the set of managed entities for the current EntityManager (in Spring, usually one per transaction), keyed by entity type and ID. It acts as a first-level cache and identity map: the second `findById(42)` finds the entity in the map and returns the same Java object without SQL. It is not shared between transactions or requests.
+
+</QA>
+
+<QA q="What are the default fetch types for JPA associations, and what do you change?" level="easy">
+
+`@ManyToOne` and `@OneToOne` default to **EAGER**; `@OneToMany` and `@ManyToMany` default to **LAZY**. Set the to-one sides to LAZY explicitly and fetch what each use case needs with `JOIN FETCH`, `@EntityGraph` or DTO projections. EAGER can't be turned off per query and causes extra selects.
+
+</QA>
+
+<QA q="What is dirty checking?" level="easy">
+
+When Hibernate loads an entity it stores a snapshot of its state. At flush (before commit, or before an overlapping query), it compares each managed entity with its snapshot and issues `UPDATE`s for changed ones. So modifying a managed entity inside a transaction is enough; no `save()` is needed. The cost is memory for snapshots and CPU at flush, which `readOnly = true` avoids.
+
+</QA>
+
+<QA q="Explain the N+1 problem and four ways to fix it." level="medium">
+
+One query loads N parents, then accessing a lazy (or EAGER, with JPQL) association runs one more query per parent: N+1 round trips. Fixes:
+
+1. `JOIN FETCH` in JPQL to load parent and association in one SQL.
+2. `@EntityGraph(attributePaths = ...)` on the repository method.
+3. Batch fetching (`hibernate.default_batch_fetch_size` or `@BatchSize`) to load associations in `IN (...)` groups.
+4. DTO projections selecting just the needed columns with a join.
+
+Detect it by logging SQL and asserting query counts in tests.
+
+</QA>
+
+<QA q="Why do you get `LazyInitializationException`, and why is open-in-view not a good fix?" level="medium">
+
+A lazy association was accessed after its persistence context closed (the entity is detached), typically in the controller or during JSON serialization. OSIV, which Spring Boot enables by default with a warning, keeps the context open for the whole request. But it holds a DB connection during view rendering and serialization, runs lazy loads outside the service transaction, and hides N+1 queries. Better: disable it, fetch what you need inside the transaction (join fetch, entity graph) and return DTOs.
+
+</QA>
+
+<QA q="What happens when you combine a collection `JOIN FETCH` with pagination?" level="medium">
+
+A collection fetch join returns one row per child, so applying `LIMIT` in SQL would truncate collections. Hibernate instead loads every matching row and pages in memory, logging `firstResult/maxResults specified with collection fetch; applying in memory`. On large tables this is slow and can run out of memory. Fix: query a page of parent IDs first (SQL `LIMIT`), then fetch those parents with their collection by `id in (:ids)`. Set `hibernate.query.fail_on_pagination_over_collection_fetch=true` to catch it in tests.
+
+</QA>
+
+<QA q="Which exceptions cause `@Transactional` to roll back by default, and how do you change it?" level="medium">
+
+Only unchecked ones: `RuntimeException` and `Error`. Checked exceptions **commit**. Use `rollbackFor = Exception.class` (or specific types) per method, `noRollbackFor` to exclude, or since Spring 6.2 set `@EnableTransactionManagement(rollbackOn = RollbackOn.ALL_EXCEPTIONS)` globally. An exception you catch and swallow inside the method never reaches the interceptor, so it commits.
+
+</QA>
+
+<QA q="Why doesn't `@Transactional` work on a private method or when called from the same class? What changed in Spring 6?" level="medium">
+
+Transactions are added by a proxy, which only intercepts calls that pass through it. A call on `this` goes straight to the target, and a `private` method can't be overridden by a CGLIB subclass. Before Spring 6, only `public` methods were treated as transactional. Since 6.0, `protected` and package-private methods are transactional too with class-based proxies (Boot's default); with interface-based proxies they must still be public interface methods. Fix self-invocation by moving the method to another bean or using `TransactionTemplate`.
+
+</QA>
+
+<QA q="Compare REQUIRED, REQUIRES_NEW and NESTED propagation." level="hard">
+
+- **REQUIRED** (default): join the current transaction or start one. One physical transaction; an inner failure marks it rollback-only, and the outer commit then throws `UnexpectedRollbackException`.
+- **REQUIRES_NEW**: suspend the outer transaction and run an independent one on a new connection; it commits or rolls back on its own. Good for audit logs. Holds two connections per thread, so it can exhaust the pool.
+- **NESTED**: one physical transaction with a savepoint; inner rollback returns to the savepoint while the outer continues. Uses JDBC savepoints (`DataSourceTransactionManager`); the JPA persistence context isn't rolled back with it.
+
+</QA>
+
+<QA q="What does `@Transactional(readOnly = true)` do with Hibernate?" level="hard">
+
+Since Spring 5.1 it sets the Hibernate session to read-only and flush mode MANUAL. Entities are loaded without dirty-checking snapshots, so less memory and no flush-time comparison, and accidental modifications aren't written. It's a performance hint, not a security guarantee. Many teams also use it to route queries to read replicas via a routing `DataSource`, but that's custom infrastructure.
+
+</QA>
+
+<QA q="Why is calling a payment API inside a `@Transactional` method risky?" level="hard">
+
+The DB connection (and any row locks) are held for the full network call, so a slow provider exhausts the connection pool and increases lock contention. There's also no atomicity: the charge can succeed and the commit fail, or the call can time out with unknown outcome. Keep transactions short: call the provider outside the transaction with an idempotency key, record state transitions (PENDING → CHARGED) in separate short transactions, and use `@TransactionalEventListener(phase = AFTER_COMMIT)` or an outbox for follow-up actions.
+
+</QA>
+
+<QA q="An endpoint listing 50 orders takes 2 seconds, but every SQL statement is under 2 ms. What do you suspect and how do you prove it?" level="scenario">
+
+N+1 queries: hundreds of tiny statements. Turn on SQL logging (`org.hibernate.SQL=DEBUG`) or Hibernate statistics for that request and count statements; look for repeated `select ... where id=?`. Common causes: EAGER `@ManyToOne`, lazy collections touched in a loop or by Jackson with open-in-view on. Fix with `JOIN FETCH`/`@EntityGraph`, a DTO projection, or batch fetching, and add a test asserting the statement count.
+
+</QA>
+
+<QA q="A service catches an exception from `auditService.log()` so the main flow can continue, but the request fails with `UnexpectedRollbackException`. Explain and fix." level="scenario">
+
+`auditService.log()` uses the default REQUIRED propagation, so it joined the caller's transaction. Its runtime exception passed through its proxy, which marked the shared transaction rollback-only. The caller swallowed the exception and tried to commit, and Spring threw `UnexpectedRollbackException` because the transaction was already doomed. Fix: run the audit in `REQUIRES_NEW` (its failure won't affect the outer one, at the cost of a second connection), or set `noRollbackFor` for that exception, or perform the audit after commit / asynchronously.
+
+</QA>
+
+<QA q="A nightly job that updates 2 million rows with JPA runs out of memory and holds locks for an hour. How do you fix it?" level="scenario">
+
+One giant transaction keeps every entity (and snapshot) in the persistence context and holds locks throughout. Process in chunks of 500–1,000 rows, each in its own short transaction; call `flush()` and `clear()` after each chunk; enable `hibernate.jdbc.batch_size` and ordered updates; use `SEQUENCE` IDs for inserts. For simple set-based changes, use a bulk `@Modifying` JPQL/SQL update instead of loading entities at all. Make the job restartable by tracking the last processed ID.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="What is the JPA default fetch type for @ManyToOne?" options={["LAZY", "EAGER", "It depends on the database", "There is no default"]} answer={1}>
+
+To-one associations (@ManyToOne, @OneToOne) default to EAGER; to-many associations default to LAZY. Most teams override to-one to LAZY explicitly.
+
+</MCQ>
+
+<MCQ q="A @Transactional method throws a checked exception that is not listed in rollbackFor. What happens by default?" options={["The transaction rolls back", "The transaction commits", "Spring wraps it and rolls back", "The transaction stays open"]} answer={1}>
+
+By default only RuntimeException and Error trigger rollback. Checked exceptions commit unless rollbackFor, or since Spring 6.2 a global rollbackOn setting, says otherwise.
+
+</MCQ>
+
+<MCQ q="In Spring 6 with Spring Boot's default CGLIB proxies, which @Transactional method is NOT intercepted when called from another bean?" options={["A public method", "A protected method", "A package-private method", "A private method"]} answer={3}>
+
+Since 6.0, protected and package-private methods are transactional with class-based proxies. Private methods can never be overridden by a subclass proxy, so they are never intercepted.
+
+</MCQ>
+
+<MCQ q="Which query makes Hibernate paginate in memory?" options={["select o from Order o join fetch o.customer with setMaxResults", "select o from Order o join fetch o.items with setMaxResults, where items is a collection", "select o.id from Order o with setMaxResults", "A DTO projection with setMaxResults"]} answer={1}>
+
+Only collection fetch joins multiply rows per parent, so Hibernate cannot apply LIMIT in SQL and pages in memory instead. To-one fetch joins, ID queries and projections paginate normally in SQL.
+
+</MCQ>
+
+<MCQ q="An inner REQUIRED method throws a RuntimeException that the outer method catches. What happens when the outer method returns?" options={["The transaction commits normally", "Only the inner work rolls back", "Commit fails with UnexpectedRollbackException because the shared transaction was marked rollback-only", "A new transaction is created"]} answer={2}>
+
+REQUIRED shares one physical transaction. The inner proxy marks it rollback-only on the exception; the outer commit attempt then raises UnexpectedRollbackException. Partial rollback needs NESTED (savepoints) or REQUIRES_NEW.
+
+</MCQ>
+
+<MCQ q="What is a key risk of PROPAGATION_REQUIRES_NEW under high concurrency?" options={["It disables dirty checking", "Each thread holds two connections, which can exhaust the pool and deadlock", "It changes the isolation level to SERIALIZABLE", "It cannot commit independently"]} answer={1}>
+
+The outer transaction keeps its connection while the inner one takes another. Spring's docs warn the pool must exceed concurrent threads by at least one or threads can wait on each other forever.
+
+</MCQ>
+
+<MCQ q="In the default AUTO flush mode, when can Hibernate flush pending changes before commit?" options={["Never before commit", "After every setter call", "Before running a query that overlaps the pending changes", "Only when you call save()"]} answer={2}>
+
+AUTO flushes before commit and before JPQL/HQL queries touching affected tables (and native queries without declared synchronization), so query results are consistent with pending changes.
+
+</MCQ>
+
+<MCQ q="What is Spring Boot's default for spring.jpa.open-in-view in a web application?" options={["false", "true, and Boot logs a warning if you do not set it explicitly", "true only in the dev profile", "Not applicable; Boot does not support OSIV"]} answer={1}>
+
+Boot registers OpenEntityManagerInViewInterceptor by default for web apps and warns at startup so you make a conscious choice; many teams set it to false.
+
+</MCQ>
+
+<MCQ q="Which statement about @Transactional(readOnly = true) with Hibernate on Spring 5.1+ is correct?" options={["It routes queries to a replica automatically", "It sets the session read-only and skips dirty-checking snapshots", "It prevents all SQL writes at the database level in every driver", "It has no effect with JPA"]} answer={1}>
+
+Spring propagates readOnly to Hibernate's read-only session mode and MANUAL flush. Replica routing is custom infrastructure, and database-level enforcement depends on the driver.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- States: **transient → managed → detached / removed**. Only managed entities are tracked.
+- Persistence context = first-level cache + identity map + unit of work, one per transaction.
+- **Dirty checking**: modify managed entity → `UPDATE` at flush. Flush is not commit. AUTO flush also happens before overlapping queries.
+- Defaults: **to-one EAGER, to-many LAZY**. Make everything LAZY; fetch per use case.
+- **N+1** fixes: `JOIN FETCH`, `@EntityGraph`, `default_batch_fetch_size`/`@BatchSize`, **DTO projections**.
+- **Collection fetch join + pagination = in-memory paging.** Page IDs first, then fetch.
+- **Open-in-view** is on by default (with a warning); turn it off and return DTOs.
+- `@Transactional` is a **proxy**: no self-invocation, no `private`; Spring 6+ allows `protected`/package-private with CGLIB.
+- Rolls back on **unchecked** exceptions only (checked commit). `rollbackFor`, or Spring 6.2 `rollbackOn = ALL_EXCEPTIONS`.
+- REQUIRED (join, inner failure dooms all), REQUIRES_NEW (separate connection, pool risk), NESTED (savepoints, JDBC).
+- `readOnly = true` for reads. No remote calls inside transactions; use AFTER_COMMIT listeners or an outbox. Chunk long jobs.
+
+## Go deeper
+
+- **Spring Framework reference**: [Using @Transactional](https://docs.spring.io/spring-framework/reference/data-access/transaction/declarative/annotations.html), [Transaction propagation](https://docs.spring.io/spring-framework/reference/data-access/transaction/declarative/tx-propagation.html).
+- **Spring Data JPA reference**: [Query methods and entity graphs](https://docs.spring.io/spring-data/jpa/reference/jpa/query-methods.html).
+- **Spring Boot reference**: [SQL databases and JPA](https://docs.spring.io/spring-boot/reference/data/sql.html).
+- **Hibernate ORM**: [User Guide](https://docs.hibernate.org/orm/current/userguide/html_single/Hibernate_User_Guide.html) (persistence context, flushing, fetching, settings).
+- **Vlad Mihalcea**: [N+1 query problem](https://vladmihalcea.com/n-plus-1-query-problem/), [Open Session in View anti-pattern](https://vladmihalcea.com/the-open-session-in-view-anti-pattern/), [Fixing HHH000104 pagination warning](https://vladmihalcea.com/fix-hibernate-hhh000104-entity-fetch-pagination-warning-message/), [Spring read-only transaction optimization](https://vladmihalcea.com/spring-read-only-transaction-hibernate-optimization/).
+- **Book**: *High-Performance Java Persistence* by Vlad Mihalcea.
+- Related notes: [Transactions and isolation](/learn/notes/transactions-isolation/), [Spring Core](/learn/notes/spring-core-ioc/), [Spring Security and JWT](/learn/notes/spring-security-jwt/).

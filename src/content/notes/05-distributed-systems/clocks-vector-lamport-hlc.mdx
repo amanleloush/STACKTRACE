@@ -1,7 +1,7 @@
 ---
 title: "Vector Clocks, Lamport Timestamps, HLC"
 phase: "05-distributed-systems"
-order: 28
+order: 50
 tags: ["distsys"]
 premium: false
 previewParagraphs: 4
@@ -53,7 +53,7 @@ Guarantee: if `a → b`, then `C(a) < C(b)`.
 
 **But not the reverse**: `C(a) < C(b)` doesn't imply `a → b`. They might be concurrent.
 
-For total ordering, break ties by process ID. Useful for systems that need *some* deterministic order, like Spanner's TrueTime fallback ordering.
+For total ordering, break ties by process ID. Useful for systems that need *some* deterministic order, like Lamport's own distributed mutual-exclusion algorithm or totally ordered broadcast.
 
 ### Vector clocks
 
@@ -121,9 +121,9 @@ Google's atomic-clock-backed API: returns time as `[earliest, latest]` interval.
 
 - **Conflict resolution in eventually-consistent stores**: use version vectors to detect conflicts; resolve via app logic, LWW, or CRDTs.
 - **CDC ordering across replicas**: HLC for partial orderings.
-- **Distributed tracing**: spans timestamped with HLC for cross-service ordering.
+- **Distributed tracing**: logical/HLC timestamps are one way to order spans across skewed clocks (mainstream tracers rely on the span parent-child tree instead).
 - **Snapshot reads in distributed DBs**: HLC timestamps define snapshots.
-- **Snapshots in stream processing**: barriers tagged with sequence numbers (Flink, Kafka Streams).
+- **Snapshots in stream processing**: checkpoint barriers tagged with checkpoint IDs (Flink).
 
 ## How it works (Lamport on three nodes)
 
@@ -147,7 +147,7 @@ Order:
 - **MongoDB**: HLC (since 3.6) for oplog ordering and causal consistency.
 - **Cassandra**: uses wall-clock timestamps (LWW), with all the caveats. Knowing this is critical when writing to Cassandra.
 - **Google Spanner**: TrueTime for global strict serializability.
-- **Distributed tracing (Jaeger, Zipkin)**: spans across services use HLC-like ordering.
+- **Distributed tracing (Jaeger, Zipkin)**: spans carry wall-clock timestamps; ordering comes from the parent-child span tree, and UIs apply clock-skew adjustment — a real-world example of why raw timestamps can't be trusted.
 
 ## Common pitfalls
 
@@ -157,38 +157,153 @@ Order:
 - **Forgetting concurrency**: Lamport hides it. If you need to detect conflicts, you need vector clocks.
 - **Hybrid clocks without bounded skew**: HLC assumes clocks within some skew bound; far-apart clocks degrade its physical fidelity.
 
-## Interview questions
+## Practice questions
 
-### Q1 — Easy: Why can't we trust wall-clock time in distributed systems?
-Clocks drift, NTP syncs lag, VM clocks can jump, and clocks across regions easily differ by 100ms+. Using wall-clock time for ordering or last-write-wins can silently drop the actually-later write.
+<Practice>
 
-### Q2 — Easy: What's the difference between Lamport timestamps and vector clocks?
-Lamport: single counter per process — orders events causally but can't tell if two events are concurrent or causally related. Vector clocks: one counter per process — can detect concurrency. Lamport is cheap but coarser; vector clocks are richer but grow with process count.
+<QA q="Why can't we trust wall-clock time in distributed systems?" level="easy">
 
-### Q3 — Medium: How do vector clocks help in eventually consistent systems?
-On read, if two replicas return different versions, comparing version vectors tells you whether one supersedes the other or they're truly concurrent (a conflict). Conflicts are surfaced to the application (Dynamo siblings) or merged via app logic / CRDT. Wall-clock LWW can't distinguish these cases reliably.
+Clocks drift, NTP sync lags, VM clocks can jump, leap seconds add discontinuities, and clocks across regions easily differ by 100 ms or more. Using wall-clock time for ordering or last-write-wins can silently drop the write that actually happened later.
 
-### Q4 — Medium: What is a Hybrid Logical Clock and why use it?
-HLC combines wall-clock time and a logical counter. Each timestamp has (physical, logical) — the physical part roughly tracks real time, the logical part increments on tied physical times to preserve causal order. Result: close-to-wall-clock for humans, monotonic and causally accurate for the system. Used by CockroachDB and MongoDB.
+</QA>
 
-### Q5 — Medium: Why does Cassandra still use wall-clock timestamps despite the LWW risk?
-Vector clocks were considered too operationally complex (size grows with number of writers; users would write directly from many clients). The team chose simpler semantics with the explicit guidance: clients should sync clocks tightly, or use idempotent CRDT-style operations (counters, sets) that aren't sensitive to ordering.
+<QA q="Define the happens-before relation." level="easy">
 
-### Q6 — Hard: Design conflict resolution for a multi-region eventually-consistent KV store.
-Options:
-- **Version vectors per key**: detect conflicts; on read, return all concurrent versions; app merges.
-- **HLC + CRDT**: writes are commutative (G-counter, OR-set, LWW-Register with HLC). No conflict detection needed.
-- **App-level resolver**: provide a hook; default = LWW with HLC.
+`a → b` if (1) `a` and `b` are in the same process and `a` comes first, (2) `a` is a send and `b` is the matching receive, or (3) by transitivity, `a → c` and `c → b`. Two events are **concurrent** if neither happens-before the other.
 
-Best for new design: HLC + CRDTs where data semantics allow; explicit conflict resolution for the rest.
+</QA>
 
-### Q7 — Hard: How does Spanner achieve global strict serializability?
-**TrueTime**: hardware (atomic clocks + GPS) bounds clock uncertainty to ~7ms in each DC. The API returns time as `[earliest, latest]`. On commit, Spanner picks a timestamp `t` and *waits* for `t < TrueTime.now().earliest` before returning success — guaranteeing no transaction in the future will be assigned a lower timestamp. Combined with Paxos for replication, this gives external (strict serializable) consistency without 2PC-style blocking.
+<QA q="What's the difference between Lamport timestamps and vector clocks?" level="easy">
 
-### Q8 — Hard: A distributed-tracing system orders spans by local timestamps and shows children before parents sometimes. Fix?
-- Clock skew across services. Spans from service A may show smaller timestamps than later spans from service B due to clock drift, even though B's call came after A's.
-- Fix: include logical or HLC timestamps in span context. Compute order from these, not raw wall-clock.
-- Alternatively: parent-child relationships are explicit in trace propagation — order by trace tree, use timestamps only for duration.
+**Lamport**: a single counter per process — orders events consistently with causality, but can't tell whether two events are concurrent or causally related. **Vector clocks**: one counter per process, carried as a vector — can detect concurrency. Lamport is cheap but coarser; vector clocks are richer but grow with the number of processes.
+
+</QA>
+
+<QA q="What are the Lamport clock update rules, and what does the guarantee actually promise?" level="medium">
+
+Each process keeps a counter `C`: increment it on every event, attach it to every message sent, and on receiving timestamp `T` set `C = max(C, T) + 1`. Guarantee: if `a → b` then `C(a)` is less than `C(b)`. **Not** the reverse — a smaller timestamp doesn't mean happened-before; the events may be concurrent. Break ties by process ID to get a total order.
+
+</QA>
+
+<QA q="How do you compare two vector clocks?" level="medium">
+
+`V1` happens-before `V2` if every entry of `V1` is less than or equal to the matching entry of `V2` **and** at least one is strictly less. If `V2` dominates `V1` the other way round, the order flips. If **neither dominates** — each has some entry larger than the other's — the events are **concurrent**. Vector clocks are the structure that can detect this.
+
+</QA>
+
+<QA q="How do vector clocks help in eventually consistent systems?" level="medium">
+
+When two replicas return different versions, comparing their version vectors tells you whether one supersedes the other or they're truly concurrent (a conflict). Conflicts are surfaced to the application (Dynamo/Riak 'siblings') or merged via app logic or a CRDT. Wall-clock LWW can't reliably tell these cases apart.
+
+</QA>
+
+<QA q="What is a Hybrid Logical Clock and why use it?" level="medium">
+
+An HLC timestamp is a `(physical, logical)` pair: the physical part tracks the max wall-clock time seen, and the logical counter increments when physical times tie, preserving causal order. It's monotonic, close to wall-clock (so it sorts roughly as humans expect), and captures happens-before. Used by CockroachDB, YugabyteDB, and MongoDB (since 3.6).
+
+</QA>
+
+<QA q="Why does Cassandra still use wall-clock timestamps despite the LWW risk?" level="medium">
+
+Vector clocks were judged too costly — their size grows with the number of writers (Cassandra clients write directly from many places), and they force a read before write plus application-side merging of siblings. The team chose simpler LWW semantics applied per column (cell), which keeps the blast radius of a conflict small, with guidance to keep client clocks tightly synced or use operations that aren't order-sensitive (counters, sets).
+
+</QA>
+
+<QA q="What limits the use of vector clocks in practice?" level="hard">
+
+The vector has one entry per writer, so it grows with the number of distinct writer processes. Pruning entries for decommissioned processes keeps it manageable, but with **unbounded writers** (e.g., many clients writing directly) the vector is unbounded too — the reason Cassandra didn't adopt them.
+
+</QA>
+
+<QA q="How does Spanner achieve global strict serializability?" level="hard">
+
+**TrueTime**: atomic clocks plus GPS bound clock uncertainty to a few ms (1–7 ms per the 2012 paper), and the API returns time as `[earliest, latest]`. On commit, Spanner picks timestamp `t` and **waits** until `t` is less than `TrueTime.now().earliest` before returning — so no later transaction can get a lower timestamp. With Paxos replication, this gives external consistency. Cross-shard transactions still use 2PC, but over Paxos-replicated participants, so one machine failure doesn't block them.
+
+</QA>
+
+<QA q="HLC vs TrueTime — what do you give up by not having atomic clocks?" level="hard">
+
+TrueTime needs hardware (atomic clocks + GPS in every DC) but provides a tight, known uncertainty bound that commit-wait can use for strict serializability. HLC needs only ordinary clock sync (NTP) and gets much of the benefit — causal ordering plus near-physical timestamps — but its guarantees are slightly weaker, and it assumes clocks stay within a skew bound; far-apart clocks degrade its physical fidelity.
+
+</QA>
+
+<QA q="Design conflict resolution for a multi-region eventually consistent KV store." level="scenario">
+
+- **Version vectors per key**: detect conflicts; on read, return all concurrent versions and let the app merge.
+- **HLC + CRDTs**: commutative types (G-counter, OR-set, LWW-register on HLC) so no conflict detection is needed.
+- **App-level resolver hook**: default to LWW on HLC.
+
+For a new design: HLC + CRDTs where the data semantics allow, explicit conflict resolution for the rest.
+
+</QA>
+
+<QA q="A tracing system orders spans by local timestamps and sometimes shows children before parents. Fix?" level="scenario">
+
+The cause is clock skew between services: a child span on service B can carry an earlier timestamp than its parent on service A even though B's work came after. Fixes: order spans by the **parent-child tree** that trace propagation already carries and use timestamps only for durations (what Jaeger and Zipkin do, plus skew adjustment in the UI), or attach logical/HLC timestamps to the span context and order by those.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="Lamport timestamps show C(a) = 3 and C(b) = 5. What can you conclude?" options={["a happened before b", "b happened before a", "a did not happen after b, but they may be concurrent", "a and b are concurrent"]} answer={2}>
+
+Lamport guarantees that if a happens-before b then C(a) is smaller, not the reverse. A smaller timestamp rules out b happening before a, but the events could be concurrent.
+
+</MCQ>
+
+<MCQ q="A process with Lamport counter 4 receives a message stamped 9. What is its counter after the receive?" options={["10", "5", "9", "13"]} answer={0}>
+
+On receive, C = max(C, T) + 1 = max(4, 9) + 1 = 10.
+
+</MCQ>
+
+<MCQ q="Vector clocks V1 = [2, 1, 0] and V2 = [1, 2, 0]. How are they related?" options={["V1 happened before V2", "V2 happened before V1", "They are the same event", "They are concurrent"]} answer={3}>
+
+V1 is larger in the first entry and V2 in the second, so neither dominates — the events are concurrent.
+
+</MCQ>
+
+<MCQ q="Which clock lets a replica tell that two writes conflicted rather than one superseding the other?" options={["Lamport timestamps", "Vector (version) clocks", "NTP-synced wall clocks", "Monotonic local clocks"]} answer={1}>
+
+Only vector clocks capture enough information to detect concurrency. Lamport and wall clocks impose an order even on concurrent writes.
+
+</MCQ>
+
+<MCQ q="Why did Cassandra avoid full vector clocks?" options={["They grow with the number of writers, and Cassandra clients write from many places", "They cannot detect concurrency", "They require atomic clocks", "They only work with a single leader"]} answer={0}>
+
+Vector size scales with distinct writers; with many direct clients that becomes unbounded. They do detect concurrency and need no special hardware.
+
+</MCQ>
+
+<MCQ q="What does a Hybrid Logical Clock provide that a Lamport clock does not?" options={["Detection of concurrent events", "Global strict serializability without waiting", "Timestamps that stay close to physical wall-clock time", "Independence from any clock synchronization"]} answer={2}>
+
+HLC anchors the logical counter to physical time, so timestamps sort roughly as humans expect. Like Lamport, it can't detect concurrency, and it still assumes bounded skew via NTP.
+
+</MCQ>
+
+<MCQ q="In Spanner, why does a commit wait before returning?" options={["To batch writes for throughput", "To let Paxos elect a leader", "To flush the WAL to disk", "To ensure its timestamp is in the past everywhere, so later transactions get higher timestamps"]} answer={3}>
+
+Commit-wait outlasts the TrueTime uncertainty interval, which is what gives external consistency. WAL flushing and leader election are unrelated.
+
+</MCQ>
+
+<MCQ q="Two writes to the same key in Cassandra come from clients whose clocks are skewed by 200 ms. What can happen?" options={["The later write is dropped because it carries an earlier timestamp", "Cassandra detects the conflict and keeps both", "The write with the higher vector clock wins", "Both writes are rejected"]} answer={0}>
+
+Cassandra uses wall-clock LWW, so a write stamped by a lagging clock can lose to an earlier write. It doesn't keep siblings or use vector clocks.
+
+</MCQ>
+
+<MCQ q="Which is the most robust way to order spans in a distributed trace?" options={["Sort by each service's local timestamp", "Sort by span duration", "Sync all hosts with NTP and sort by timestamp", "Use the parent-child span tree for order and timestamps only for durations"]} answer={3}>
+
+The trace tree encodes causality explicitly; local timestamps suffer clock skew, and NTP isn't precise enough at small intervals.
+
+</MCQ>
+
+</Quiz>
 
 ## TL;DR cheat sheet
 
@@ -202,7 +317,7 @@ Best for new design: HLC + CRDTs where data semantics allow; explicit conflict r
 
 ## Go deeper
 
-- **Lamport's original paper** (1978): ["Time, Clocks, and the Ordering of Events in a Distributed System"](https://lamport.azurewebsites.net/pubs/time-clocks.pdf) — a four-page classic.
+- **Lamport's original paper** (1978): ["Time, Clocks, and the Ordering of Events in a Distributed System"](https://lamport.azurewebsites.net/pubs/time-clocks.pdf) — a short (eight-page) classic.
 - **Hybrid Logical Clocks paper** (Kulkarni et al, 2014): [HLC paper](https://cse.buffalo.edu/tech-reports/2014-04.pdf).
 - **DDIA Chapter 5** — replication and conflict resolution.
 - **Martin Kleppmann lectures** (YouTube): "Distributed Systems" course at Cambridge.

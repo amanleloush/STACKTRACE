@@ -1,0 +1,953 @@
+---
+title: "LLD: Vending Machine (State) and Logger (Chain of Responsibility)"
+phase: "14-lld"
+order: 144
+tags: ["lld", "machine-coding", "java", "design-patterns", "concurrency", "state-pattern", "logging"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 45
+prerequisites: ["machine-coding-strategy", "behavioral-patterns", "creational-patterns", "java-concurrency-locks", "java-executors-virtual-threads"]
+summary: "Two classic machine-coding rounds in Java 21: a vending machine built on the State pattern with escrow, refunds and correct change-making (greedy vs bounded DP), and a logging framework with levels, a Chain of Responsibility of handlers, pluggable formatters and sinks, and a thread-safe async writer on a BlockingQueue."
+---
+
+## Problem statement
+
+These two problems are paired because each one is the "textbook" case for one behavioral pattern, and interviewers often use them to check whether you reach for that pattern naturally.
+
+**Part A — Vending machine.** *"Design a vending machine. It holds products in slots, each with a code and a price. A customer inserts coins or notes, selects a product, and gets the product plus change. The customer can cancel and get their money back at any time before dispensing. An operator can restock products and load coins. Handle sold-out products and the case where the machine can't give change."*
+
+**Part B — Logging framework.** *"Design a logging library like a mini Log4j. It supports levels (DEBUG, INFO, WARN, ERROR), sends messages to one or more destinations (console, file), lets each destination have its own minimum level and format, and must be safe to call from many threads without slowing them down."*
+
+Both fit comfortably in a 60–90 minute round. Do Part A first if asked for both: it is the one most often given alone.
+
+## Clarifying questions to ask
+
+**Vending machine**
+
+| Question | Sensible assumed answer |
+|---|---|
+| Which money is accepted? | Fixed set of denominations: 1, 2, 5, 10, 20, 50, 100 (whole rupees, so prices are `int`, never `double`). |
+| One product per transaction? | Yes. After a purchase the machine returns to idle; leftover balance comes back as change. |
+| Can the customer insert more money after a "not enough" message? | Yes — the machine stays in the "has money" state. |
+| What if the machine can't make exact change? | Reject the selection, keep the customer's money in escrow, let them pick something else or cancel. Never sell and short-change. |
+| On cancel, do they get the *same* coins back? | Yes. Inserted money is held in an **escrow** (a holding area) and only moves into the cash box when a sale completes. |
+| Multiple customers at once? | No — a physical machine has one keypad. But the operator console (restock) may run concurrently, so the public API must be thread-safe. |
+| Persistence, payments by card, admin UI? | Out of scope. Mention card payment as an extension. |
+
+**Logger**
+
+| Question | Sensible assumed answer |
+|---|---|
+| Which levels? | DEBUG lower than INFO lower than WARN lower than ERROR. A logger has a threshold; anything below it is dropped cheaply. |
+| Destinations? | Console and file now; must be easy to add more (network, database). |
+| Per-destination rules? | Yes: e.g. console gets everything, file gets WARN and above in JSON. |
+| Sync or async? | Async by default so callers don't wait on disk I/O; sync available for tests. |
+| What if the async buffer is full? | Configurable: **block** (lossless, slows callers) or **drop** (never slows callers, counts losses). |
+| Message templates? | SLF4J-style `{}` placeholders, filled only if the level is enabled. |
+| Log rotation, MDC, remote config? | Out of scope; discuss as extensions. |
+
+## Requirements
+
+**Vending machine — functional**
+- Insert money (one denomination at a time); show balance.
+- Select a product by code; dispense it and return change.
+- Refund (cancel) returns exactly the inserted coins.
+- Reject: unknown code, sold-out item, insufficient balance, change impossible.
+- Operator: restock products, load coins.
+
+**Vending machine — non-functional**
+- No money is ever created or lost: cash box + escrow is conserved except for completed sales.
+- A purchase is **all-or-nothing**: if any step fails, nothing changes.
+- Thread-safe against concurrent operator actions.
+
+**Logger — functional**
+- `debug/info/warn/error(pattern, args...)` with `{}` placeholders.
+- Threshold per logger; routing per handler by level range.
+- Multiple sinks per handler; pluggable formatter (plain text, JSON).
+
+**Logger — non-functional**
+- Thread-safe; lines never interleave mid-line.
+- Low caller latency (async writer thread).
+- Ordering: lines from one thread appear in the order that thread logged them.
+- Clean shutdown: everything already logged gets written.
+
+**Out of scope for both:** persistence, networking, UI, i18n.
+
+## Entities and relationships
+
+**Part A**
+
+```
+                   ┌────────────────────────────┐
+                   │ VendingMachine (context)   │
+                   │ - state: MachineState      │◆──► Inventory  (code → Product, count)
+                   │ - escrow: coins inserted   │◆──► CashBox    (Denomination → count)
+                   │ + insert / select / refund │◆──► ChangeMaker «strategy»
+                   └─────────────┬──────────────┘          ▲            ▲
+                                 │ delegates         GreedyChangeMaker  DpChangeMaker
+                                 ▼
+                     «interface» MachineState
+                 insert(m,d) · select(m,code) · refund(m)
+                  ▲          ▲              ▲            ▲
+              IdleState  HasMoneyState  DispensingState  OutOfStockState
+
+ Product(code, name, price) — record      Denomination — enum (value)
+ Purchase(product, change) — record       VendingException — runtime error
+```
+
+**State transitions**
+
+```
+             restock
+ OutOfStock ─────────► Idle ──insert──► HasMoney ──insert──┐
+     ▲                  ▲                 │   ▲            │ (stays)
+     │                  │ refund          │   └────────────┘
+     │                  └─────────────────┤
+     │                                    │ select OK
+     │   last item sold                   ▼
+     └──────────────────────────────── Dispensing ──► Idle (items left)
+                                          │
+                     select fails ────────┘ back to HasMoney (money kept)
+```
+
+**Part B**
+
+```
+ Logger(name, threshold) ──► Dispatcher «interface»
+                               ▲                ▲
+                       SyncDispatcher    AsyncDispatcher ── BlockingQueue ── worker thread
+                               │                │
+                               └──────┬─────────┘
+                                      ▼
+                     LogHandler (abstract, has next) ──next──► LogHandler ──next──► ...
+                          ▲
+                   LevelRangeHandler(min, max) ◆──► Formatter «strategy»   ◆──► Appender* «sink»
+                                                     Plain / Json               Console / File / Memory
+ LogManager: creates and caches Loggers, owns the Dispatcher (DI-friendly).
+ LogRecord(time, level, logger, thread, message) — immutable record.
+```
+
+## Design patterns used and why
+
+| Pattern | Where | Why it fits |
+|---|---|---|
+| **State** | `MachineState` + 4 states | Every action (insert, select, refund) behaves differently per phase. Without State you get the same `switch (state)` in every method. See [Behavioral Patterns](/learn/notes/behavioral-patterns/). |
+| **Strategy** | `ChangeMaker` (greedy vs DP), `Formatter` (plain vs JSON) | Interchangeable algorithms chosen at construction time. |
+| **Chain of Responsibility** | `LogHandler` chain | Each handler decides independently whether to write a record; adding a handler doesn't touch the others. We use the **pipeline** flavour (every handler gets a turn), like servlet filters. |
+| **Observer (fan-out)** | Handler → its list of `Appender`s | One event, many listeners that don't know about each other. |
+| **Producer–consumer** | `AsyncDispatcher` | Many logging threads produce; one worker consumes from a bounded `BlockingQueue`. |
+| **Singleton vs DI** | `LogManager` | Discussed below — we keep it a plain class and inject it. See [Creational Patterns](/learn/notes/creational-patterns/). |
+
+**How to say it in an interview:** "The vending machine is a lifecycle, so State. Change-making is an algorithm I might swap, so Strategy. Logging destinations are independent filters a record flows through, so a Chain, and each handler fans out to sinks."
+
+## Solution walkthrough
+
+### Part A, step 1 — money as an enum, prices as `int`
+
+`Denomination` is an enum with an integer value. Never use `double` for money: `0.1 + 0.2` is not `0.3` in binary floating point. Whole units (rupees, or cents for dollars) as `int`/`long` avoid that.
+
+### Step 2 — the State interface with "reject by default"
+
+```java
+interface MachineState {
+    default void insert(VendingMachine m, Denomination d) { throw new VendingException(name() + ": cannot insert money"); }
+    default Purchase select(VendingMachine m, String code) { throw new VendingException(name() + ": cannot select"); }
+    default Map<Denomination, Integer> refund(VendingMachine m) { return Map.of(); }
+    String name();
+}
+```
+
+Default methods mean each state only overrides the actions it *allows*. `DispensingState` and `OutOfStockState` override nothing — every action is rejected. That is much less code than four `switch` statements, and adding a `MaintenanceState` is one new class.
+
+The states **decide the transitions** (`IdleState.insert` moves to `HasMoneyState`). The machine is the *context*: it holds data (inventory, cash, escrow) and delegates actions.
+
+### Step 3 — escrow, not "balance"
+
+A common shortcut is a single `int balance`. The problem: on refund you'd have to *compute* coins to return, and the machine might not have them. Real machines hold inserted coins in an escrow and drop them into the cash box only on a sale. We model escrow as `EnumMap<Denomination, Integer>`; balance is derived from it. Refund simply returns the escrow map — always possible, always the exact coins.
+
+### Step 4 — an all-or-nothing purchase
+
+`completePurchase` follows **plan, then commit**:
+
+1. Compute change due.
+2. Build the coin stock that *would* exist after the sale (cash box + escrow coins).
+3. Ask the `ChangeMaker` for a plan. If none → throw; nothing has been mutated yet.
+4. Only now: move escrow into the cash box, withdraw the change, decrement inventory, pick the next state.
+
+Validations (unknown code, sold out, not enough money) happen in `HasMoneyState.select` *before* switching to `DispensingState`. If change fails, the state is restored to `HasMoney` so the user can choose again or cancel.
+
+### Step 5 — change-making: greedy vs dynamic programming
+
+**Greedy** = "always give the largest coin that fits". It is short and fast. Whether it is *correct* depends on the coin system:
+
+- A coin system is called **canonical** when greedy gives the fewest coins for every amount, assuming unlimited coins. Indian coins and notes (1, 2, 5, 10, 20, 50, 100…) and US coins (1, 5, 10, 25) are canonical. Our test checks this for INR for every amount from 0 to 400 by comparing greedy with the DP optimum.
+- **Non-canonical** example: coins 1, 3, 4 and amount 6. Greedy takes 4, then 1, then 1 = **three coins**; the optimum is 3 + 3 = **two coins**. With coins 3 and 4 only, greedy takes 4, is left with 2, and **fails completely**, even though 3 + 3 works.
+- Theory you can quote: Kozen and Zaks (1994) proved that if greedy is ever non-optimal, the smallest counterexample lies strictly between c3 + 1 and c(m) + c(m-1), where c1 = 1 is the smallest coin and c(m) the largest — so canonicity can be checked by trying a finite range. Pearson (2005) gave a polynomial-time test. In general, optimal change-making is NP-hard, but there is a **pseudo-polynomial** DP (polynomial in the *amount*, which is small for a vending machine).
+
+**The vending-machine twist:** a machine has a **limited** number of each coin. Then greedy can fail even for a canonical system. Example: the box holds one 5 and three 2s, and change due is 6. Greedy takes the 5, needs 1, has none → "can't make change". But 2 + 2 + 2 works. Customers would be refused for no reason.
+
+So the machine uses a **bounded DP** (`DpChangeMaker`): process denominations one by one; `best[a]` = fewest coins to make `a` with the denominations seen so far, trying 0..count of the current coin; remember how many of each were taken so we can walk back and rebuild the answer. Cost is about (number of denominations) × (amount) × (max count) — tiny for change amounts in the hundreds. Keep greedy behind the same interface for comparison; both are a `ChangeMaker` (Strategy).
+
+### Step 6 — thread safety for Part A
+
+Every public method is `synchronized` on the machine. That serialises a customer action against an operator `restock`. State objects are stateless, so they can be created freely (or kept as singletons). Note that a whole "insert + select" *session* is not atomic across calls — on a real machine there is only one customer at a time, so that's fine; the test simulates a session by holding the machine's lock.
+
+### Part B, step 1 — levels and the cheap check
+
+`Level` is an enum whose declaration order is severity order, so `compareTo` works. `Logger.log` checks `isEnabled(level)` **before** building the message — formatting a string that is then thrown away is the classic logging performance bug. That's also why the API takes a pattern plus arguments (`log.info("order {} placed", id)`) instead of a pre-concatenated string.
+
+### Step 2 — the handler chain
+
+```java
+abstract class LogHandler {
+    private LogHandler next;
+    LogHandler then(LogHandler next) { this.next = next; return next; }
+    final void handle(LogRecord r) {
+        if (canHandle(r)) write(r);
+        if (next != null) next.handle(r);
+    }
+    protected abstract boolean canHandle(LogRecord r);
+    protected abstract void write(LogRecord r);
+}
+```
+
+`handle` is `final` (Template Method): subclasses cannot forget to pass the record on. `LevelRangeHandler` handles a level range and writes to its appenders through its formatter. A typical chain: console for DEBUG..ERROR (plain text) → file for WARN..ERROR (JSON) → a pager sink for ERROR only.
+
+If the interviewer wants the **classic GoF** flavour ("exactly one handler handles it"), change one line: `else if (next != null)` — stop once handled.
+
+### Step 3 — formatters and sinks
+
+`Formatter` is a one-method interface, so a lambda works (`r -> r.thread() + ":" + r.message()`). `Appender` is the sink. `ConsoleAppender` and `FileAppender` are `synchronized` so that two threads in sync mode can't interleave half-lines. `FileAppender` uses a `BufferedWriter` and flushes on `close()`.
+
+### Step 4 — async dispatch with a `BlockingQueue`
+
+`AsyncDispatcher` owns a bounded `ArrayBlockingQueue` and a single worker thread:
+
+- `dispatch` (any thread): `put` blocks when full (lossless, backpressure on callers) or `offer` returns false immediately and we count a drop.
+- The worker loops on `take()` and runs the chain. Because **one** thread writes, appenders see no contention and **per-thread order is preserved** (the queue is FIFO, and each thread enqueues its own records in order).
+- **Shutdown with a poison pill:** `close()` marks the dispatcher closed, enqueues a special `POISON` record and `join`s the worker. Everything queued before the pill is written first — so no log line is lost on a clean shutdown.
+
+Real libraries make the same choices. Log4j 2's `AsyncAppender` defaults to an `ArrayBlockingQueue` of 1024 events and `blocking=true`; with blocking off, a full queue sends events to an error appender. Logback's `AsyncAppender` defaults to a queue of 256, blocks when full unless `neverBlock=true`, and by default starts **discarding TRACE, DEBUG and INFO** when less than 20% of the queue is free.
+
+### Step 5 — singleton vs dependency injection
+
+Logging is the one place where most codebases accept a global: `private static final Logger log = LoggerFactory.getLogger(X.class)` in SLF4J. If asked to make `LogManager` a singleton, the safest Java form is an enum or a holder class:
+
+```java
+enum DefaultLogging {
+    INSTANCE;
+    final LogManager manager = new LogManager(
+        new AsyncDispatcher(new LevelRangeHandler(Level.DEBUG, Level.ERROR, new PlainFormatter(), new ConsoleAppender()), 1024, false),
+        Level.INFO);
+}
+```
+
+Trade-offs to say out loud:
+
+| Singleton / static factory | Dependency injection |
+|---|---|
+| Zero wiring; every class can log | Must pass the manager (or let a container do it) |
+| Hidden global state; tests share it and must reset it | Each test builds its own manager with a `MemoryAppender` |
+| Hard to run two configs in one JVM | Trivial |
+
+Our design keeps `LogManager` a normal class (DI-friendly, easy to test) and *optionally* exposes a single default instance — the best of both. See [Creational Patterns](/learn/notes/creational-patterns/) for singleton pitfalls.
+
+## Full solution code
+
+One file, Java 21. Compile with `javac Main.java` and run `java Main`.
+
+```java
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.time.Instant;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
+
+// ============================ PART A: VENDING MACHINE ============================
+
+enum Denomination {
+    ONE(1), TWO(2), FIVE(5), TEN(10), TWENTY(20), FIFTY(50), HUNDRED(100);
+    final int value;
+    Denomination(int value) { this.value = value; }
+    static Denomination of(int value) {
+        for (Denomination d : values()) if (d.value == value) return d;
+        throw new IllegalArgumentException("unknown denomination " + value);
+    }
+}
+
+record Product(String code, String name, int price) {}
+
+class VendingException extends RuntimeException {
+    VendingException(String msg) { super(msg); }
+}
+
+record Purchase(Product product, Map<Denomination, Integer> change) {}
+
+/** Strategy: how to pay out an amount from a limited stock of coins (value -> count). */
+interface ChangeMaker {
+    Optional<Map<Integer, Integer>> makeChange(int amount, Map<Integer, Integer> stock);
+}
+
+/** Largest coin first. Optimal for canonical systems with unlimited coins; can fail with limited stock. */
+class GreedyChangeMaker implements ChangeMaker {
+    public Optional<Map<Integer, Integer>> makeChange(int amount, Map<Integer, Integer> stock) {
+        Map<Integer, Integer> out = new TreeMap<>(Comparator.reverseOrder());
+        List<Integer> values = new ArrayList<>(stock.keySet());
+        values.sort(Comparator.reverseOrder());
+        for (int v : values) {
+            int take = Math.min(amount / v, stock.get(v));
+            if (take > 0) { out.put(v, take); amount -= take * v; }
+        }
+        return amount == 0 ? Optional.of(out) : Optional.empty();
+    }
+}
+
+/** Bounded dynamic programming: fewest coins using at most stock[v] of each value. Always finds an answer if one exists. */
+class DpChangeMaker implements ChangeMaker {
+    public Optional<Map<Integer, Integer>> makeChange(int amount, Map<Integer, Integer> stock) {
+        int[] vals = stock.keySet().stream().mapToInt(Integer::intValue).toArray();
+        final int INF = Integer.MAX_VALUE / 2;
+        int[] best = new int[amount + 1];                 // best[a] = fewest coins for a, using coins seen so far
+        Arrays.fill(best, INF);
+        best[0] = 0;
+        int[][] take = new int[vals.length][amount + 1];  // how many of vals[i] used to reach a
+        for (int i = 0; i < vals.length; i++) {
+            int v = vals[i], max = stock.get(v);
+            int[] next = new int[amount + 1];
+            Arrays.fill(next, INF);
+            for (int a = 0; a <= amount; a++)
+                for (int k = 0; k <= max && k * v <= a; k++)
+                    if (best[a - k * v] + k < next[a]) { next[a] = best[a - k * v] + k; take[i][a] = k; }
+            best = next;
+        }
+        if (best[amount] >= INF) return Optional.empty();
+        Map<Integer, Integer> out = new TreeMap<>(Comparator.reverseOrder());
+        for (int i = vals.length - 1, a = amount; i >= 0; i--) {   // walk the choices backwards
+            int k = take[i][a];
+            if (k > 0) out.put(vals[i], k);
+            a -= k * vals[i];
+        }
+        return Optional.of(out);
+    }
+}
+
+class Inventory {
+    private final Map<String, Product> products = new LinkedHashMap<>();
+    private final Map<String, Integer> counts = new HashMap<>();
+    void add(Product p, int qty) { products.putIfAbsent(p.code(), p); counts.merge(p.code(), qty, Integer::sum); }
+    Product product(String code) {
+        Product p = products.get(code);
+        if (p == null) throw new VendingException("no such product " + code);
+        return p;
+    }
+    boolean inStock(String code) { return counts.getOrDefault(code, 0) > 0; }
+    boolean isEmpty() { return counts.values().stream().allMatch(c -> c == 0); }
+    void remove(String code) { counts.merge(code, -1, Integer::sum); }
+    int count(String code) { return counts.getOrDefault(code, 0); }
+}
+
+class CashBox {
+    private final EnumMap<Denomination, Integer> coins = new EnumMap<>(Denomination.class);
+    void add(Denomination d, int n) { coins.merge(d, n, Integer::sum); }
+    void addAll(Map<Denomination, Integer> m) { m.forEach(this::add); }
+    Map<Integer, Integer> stock() {
+        Map<Integer, Integer> s = new TreeMap<>();
+        coins.forEach((d, n) -> { if (n > 0) s.put(d.value, n); });
+        return s;
+    }
+    Map<Denomination, Integer> withdraw(Map<Integer, Integer> plan) {
+        Map<Denomination, Integer> out = new EnumMap<>(Denomination.class);
+        plan.forEach((v, n) -> { Denomination d = Denomination.of(v); coins.merge(d, -n, Integer::sum); out.put(d, n); });
+        return out;
+    }
+    int total() { return coins.entrySet().stream().mapToInt(e -> e.getKey().value * e.getValue()).sum(); }
+}
+
+/** State pattern: every user action is delegated to the current state. Defaults reject the action. */
+interface MachineState {
+    default void insert(VendingMachine m, Denomination d) { throw new VendingException(name() + ": cannot insert money"); }
+    default Purchase select(VendingMachine m, String code) { throw new VendingException(name() + ": cannot select"); }
+    default Map<Denomination, Integer> refund(VendingMachine m) { return Map.of(); }
+    String name();
+}
+
+class IdleState implements MachineState {
+    public void insert(VendingMachine m, Denomination d) { m.escrow(d); m.setState(new HasMoneyState()); }
+    public Purchase select(VendingMachine m, String code) { throw new VendingException("Idle: insert money first"); }
+    public String name() { return "Idle"; }
+}
+
+class HasMoneyState implements MachineState {
+    public void insert(VendingMachine m, Denomination d) { m.escrow(d); }
+    public Purchase select(VendingMachine m, String code) {
+        Product p = m.inventory().product(code);
+        if (!m.inventory().inStock(code)) throw new VendingException("sold out: " + p.name());
+        if (m.balance() < p.price()) throw new VendingException("insert " + (p.price() - m.balance()) + " more");
+        m.setState(new DispensingState());                 // block other actions while we commit
+        try {
+            return m.completePurchase(p);                  // throws if change can't be made
+        } catch (VendingException e) {
+            m.setState(this);                              // stay in HasMoney: user can pick again or refund
+            throw e;
+        }
+    }
+    public Map<Denomination, Integer> refund(VendingMachine m) {
+        Map<Denomination, Integer> back = m.releaseEscrow();
+        m.setState(new IdleState());
+        return back;
+    }
+    public String name() { return "HasMoney"; }
+}
+
+class DispensingState implements MachineState {
+    public String name() { return "Dispensing"; }   // every action rejected by the defaults
+}
+
+class OutOfStockState implements MachineState {
+    public String name() { return "OutOfStock"; }
+}
+
+class VendingMachine {
+    private final Inventory inventory = new Inventory();
+    private final CashBox cashBox = new CashBox();
+    private final ChangeMaker changeMaker;
+    private final EnumMap<Denomination, Integer> escrow = new EnumMap<>(Denomination.class); // inserted, not yet kept
+    private MachineState state = new OutOfStockState();
+
+    VendingMachine(ChangeMaker changeMaker) { this.changeMaker = changeMaker; }
+
+    // ---- public API: one customer at a time, so every action is serialised ----
+    synchronized void insert(Denomination d) { state.insert(this, d); }
+    synchronized Purchase select(String code) { return state.select(this, code); }
+    synchronized Map<Denomination, Integer> refund() { return state.refund(this); }
+    synchronized void restock(Product p, int qty) {
+        inventory.add(p, qty);
+        if (state instanceof OutOfStockState) state = new IdleState();
+    }
+    synchronized void loadCoins(Denomination d, int n) { cashBox.add(d, n); }
+    synchronized String stateName() { return state.name(); }
+
+    // ---- helpers used by the states ----
+    void setState(MachineState s) { state = s; }
+    Inventory inventory() { return inventory; }
+    void escrow(Denomination d) { escrow.merge(d, 1, Integer::sum); }
+    int balance() { return escrow.entrySet().stream().mapToInt(e -> e.getKey().value * e.getValue()).sum(); }
+    int cashTotal() { return cashBox.total(); }
+    Map<Denomination, Integer> releaseEscrow() {
+        Map<Denomination, Integer> back = new EnumMap<>(escrow);
+        escrow.clear();
+        return back;
+    }
+
+    /** All-or-nothing: plan change first (inserted coins count too), then mutate. */
+    Purchase completePurchase(Product p) {
+        int changeDue = balance() - p.price();
+        Map<Integer, Integer> stock = cashBox.stock();
+        escrow.forEach((d, n) -> stock.merge(d.value, n, Integer::sum));
+        Map<Integer, Integer> plan = changeMaker.makeChange(changeDue, stock)
+                .orElseThrow(() -> new VendingException("cannot make change of " + changeDue + "; use exact money"));
+        cashBox.addAll(releaseEscrow());
+        Map<Denomination, Integer> change = cashBox.withdraw(plan);
+        inventory.remove(p.code());
+        setState(inventory.isEmpty() ? new OutOfStockState() : new IdleState());
+        return new Purchase(p, change);
+    }
+}
+
+// ============================ PART B: LOGGING FRAMEWORK ============================
+
+enum Level { DEBUG, INFO, WARN, ERROR }   // ordinal order = severity order
+
+record LogRecord(Instant time, Level level, String logger, String thread, String message) {}
+
+/** Strategy: how a record becomes text. */
+interface Formatter { String format(LogRecord r); }
+
+class PlainFormatter implements Formatter {
+    public String format(LogRecord r) {
+        return String.format("%-5s [%s] %s - %s", r.level(), r.thread(), r.logger(), r.message());
+    }
+}
+
+class JsonFormatter implements Formatter {
+    public String format(LogRecord r) {
+        return "{\"ts\":\"" + r.time() + "\",\"level\":\"" + r.level() + "\",\"logger\":\"" + r.logger()
+                + "\",\"msg\":\"" + r.message().replace("\"", "\\\"") + "\"}";
+    }
+}
+
+/** Sink (a.k.a. appender). Handlers notify every sink they own: Observer-style fan-out. */
+interface Appender { void append(String line); default void close() {} }
+
+class ConsoleAppender implements Appender {
+    public synchronized void append(String line) { System.out.println(line); }
+}
+
+class FileAppender implements Appender {
+    private final BufferedWriter out;
+    FileAppender(Path path) throws IOException {
+        out = Files.newBufferedWriter(path, StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+    }
+    public synchronized void append(String line) {
+        try { out.write(line); out.newLine(); } catch (IOException e) { System.err.println("log write failed: " + e); }
+    }
+    public synchronized void close() {
+        try { out.close(); } catch (IOException e) { System.err.println("close failed: " + e); }   // close() flushes
+    }
+}
+
+class MemoryAppender implements Appender {
+    final List<String> lines = Collections.synchronizedList(new ArrayList<>());
+    public void append(String line) { lines.add(line); }
+}
+
+/** Chain of Responsibility (pipeline flavour): each handler may write the record, then passes it on. */
+abstract class LogHandler {
+    private LogHandler next;
+    LogHandler then(LogHandler next) { this.next = next; return next; }
+    final void handle(LogRecord r) {
+        if (canHandle(r)) write(r);
+        if (next != null) next.handle(r);
+    }
+    protected abstract boolean canHandle(LogRecord r);
+    protected abstract void write(LogRecord r);
+}
+
+class LevelRangeHandler extends LogHandler {
+    private final Level min, max;
+    private final Formatter formatter;
+    private final List<Appender> appenders;
+    LevelRangeHandler(Level min, Level max, Formatter f, Appender... appenders) {
+        this.min = min; this.max = max; this.formatter = f; this.appenders = List.of(appenders);
+    }
+    protected boolean canHandle(LogRecord r) { return r.level().compareTo(min) >= 0 && r.level().compareTo(max) <= 0; }
+    protected void write(LogRecord r) {
+        String line = formatter.format(r);
+        for (Appender a : appenders) a.append(line);
+    }
+}
+
+/** Where records go after the Logger creates them: straight into the chain, or via a queue. */
+interface Dispatcher extends AutoCloseable { void dispatch(LogRecord r); default void close() {} }
+
+class SyncDispatcher implements Dispatcher {
+    private final LogHandler chain;
+    SyncDispatcher(LogHandler chain) { this.chain = chain; }
+    public void dispatch(LogRecord r) { chain.handle(r); }
+}
+
+/** Producer threads enqueue; one worker thread drains, so appenders see one writer and per-thread order is kept. */
+class AsyncDispatcher implements Dispatcher {
+    private static final LogRecord POISON = new LogRecord(Instant.EPOCH, Level.DEBUG, "", "", "");
+    private final BlockingQueue<LogRecord> queue;
+    private final LogHandler chain;
+    private final boolean dropWhenFull;
+    private final Thread worker;
+    private volatile boolean closed;
+    final AtomicLong dropped = new AtomicLong();
+
+    AsyncDispatcher(LogHandler chain, int capacity, boolean dropWhenFull) {
+        this.chain = chain;
+        this.queue = new ArrayBlockingQueue<>(capacity);
+        this.dropWhenFull = dropWhenFull;
+        this.worker = new Thread(this::drain, "log-writer");
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    public void dispatch(LogRecord r) {
+        if (closed) throw new IllegalStateException("logger closed");
+        if (dropWhenFull) {
+            if (!queue.offer(r)) dropped.incrementAndGet();     // never block the business thread
+        } else {
+            try { queue.put(r); }                               // backpressure: caller waits for space
+            catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        }
+    }
+
+    private void drain() {
+        try {
+            while (true) {
+                LogRecord r = queue.take();
+                if (r == POISON) return;                        // everything queued before it is already written
+                try { chain.handle(r); } catch (RuntimeException e) { System.err.println("handler failed: " + e); }
+            }
+        } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+
+    public void close() {
+        closed = true;
+        try { queue.put(POISON); worker.join(); }
+        catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+}
+
+class Logger {
+    private final String name;
+    private final Level threshold;
+    private final Dispatcher dispatcher;
+    Logger(String name, Level threshold, Dispatcher dispatcher) {
+        this.name = name; this.threshold = threshold; this.dispatcher = dispatcher;
+    }
+    boolean isEnabled(Level l) { return l.compareTo(threshold) >= 0; }
+    void log(Level level, String pattern, Object... args) {
+        if (!isEnabled(level)) return;                          // cheap check before any formatting
+        dispatcher.dispatch(new LogRecord(Instant.now(), level, name,
+                Thread.currentThread().getName(), fill(pattern, args)));
+    }
+    void debug(String p, Object... a) { log(Level.DEBUG, p, a); }
+    void info(String p, Object... a)  { log(Level.INFO, p, a); }
+    void warn(String p, Object... a)  { log(Level.WARN, p, a); }
+    void error(String p, Object... a) { log(Level.ERROR, p, a); }
+
+    /** SLF4J-style "{}" placeholders. */
+    static String fill(String pattern, Object... args) {
+        StringBuilder sb = new StringBuilder();
+        int from = 0, i = 0, at;
+        while (i < args.length && (at = pattern.indexOf("{}", from)) >= 0) {
+            sb.append(pattern, from, at).append(args[i++]);
+            from = at + 2;
+        }
+        return sb.append(pattern.substring(from)).toString();
+    }
+}
+
+/** Owns configuration and caches loggers. Pass it around (DI) or wrap it in a static holder. */
+class LogManager implements AutoCloseable {
+    private final Map<String, Logger> loggers = new ConcurrentHashMap<>();
+    private final Dispatcher dispatcher;
+    private final Level defaultLevel;
+    LogManager(Dispatcher dispatcher, Level defaultLevel) { this.dispatcher = dispatcher; this.defaultLevel = defaultLevel; }
+    Logger getLogger(String name) { return loggers.computeIfAbsent(name, n -> new Logger(n, defaultLevel, dispatcher)); }
+    public void close() { dispatcher.close(); }
+}
+
+// ============================ DEMO ============================
+
+public class Main {
+    public static void main(String[] args) throws Exception {
+        System.out.println("=== Part A: vending machine ===");
+        VendingMachine vm = new VendingMachine(new DpChangeMaker());
+        vm.restock(new Product("A1", "Chips", 15), 2);
+        vm.restock(new Product("B1", "Soda", 40), 1);
+        vm.loadCoins(Denomination.FIVE, 2);
+        vm.loadCoins(Denomination.TWO, 5);
+        System.out.println("state: " + vm.stateName());
+        vm.insert(Denomination.TWENTY);
+        System.out.println("bought: " + vm.select("A1"));
+        try { vm.select("A1"); } catch (VendingException e) { System.out.println("error: " + e.getMessage()); }
+        vm.insert(Denomination.TEN);
+        try { vm.select("B1"); } catch (VendingException e) { System.out.println("error: " + e.getMessage()); }
+        System.out.println("refund: " + vm.refund() + ", state: " + vm.stateName());
+        vm.insert(Denomination.FIFTY);
+        System.out.println("bought: " + vm.select("B1"));
+        vm.insert(Denomination.TWENTY);
+        System.out.println("bought: " + vm.select("A1") + ", state: " + vm.stateName());
+
+        Map<Integer, Integer> lots = Map.of(4, 9, 3, 9, 1, 9);
+        System.out.println("greedy {4,3,1} for 6: " + new GreedyChangeMaker().makeChange(6, lots).orElseThrow());
+        System.out.println("dp     {4,3,1} for 6: " + new DpChangeMaker().makeChange(6, lots).orElseThrow());
+        Map<Integer, Integer> limited = Map.of(5, 1, 2, 3);
+        System.out.println("greedy 5x1,2x3 for 6: " + new GreedyChangeMaker().makeChange(6, limited));
+        System.out.println("dp     5x1,2x3 for 6: " + new DpChangeMaker().makeChange(6, limited));
+
+        System.out.println("=== Part B: logger ===");
+        Path file = Files.createTempFile("app", ".log");
+        FileAppender fileAppender = new FileAppender(file);
+        LogHandler chain = new LevelRangeHandler(Level.DEBUG, Level.ERROR, new PlainFormatter(), new ConsoleAppender());
+        chain.then(new LevelRangeHandler(Level.WARN, Level.ERROR, new JsonFormatter(), fileAppender));
+        try (LogManager logs = new LogManager(new AsyncDispatcher(chain, 1024, false), Level.INFO)) {
+            Logger log = logs.getLogger("checkout");
+            log.debug("hidden: below threshold");
+            log.info("order {} placed by {}", 42, "asha");
+            log.warn("payment retry {} of {}", 1, 3);
+            log.error("payment failed for order {}", 42);
+        }
+        fileAppender.close();
+        System.out.println("file has " + Files.readAllLines(file).size() + " lines (WARN and ERROR only)");
+        Files.delete(file);
+    }
+}
+```
+
+## Concurrency and edge cases
+
+**Vending machine**
+
+- **Operator restock during a purchase.** All public methods are `synchronized`, so a restock waits for the current action. Tested: one buyer thread and one restock thread; sold + remaining always equals stocked, and cash equals sales × price.
+- **State objects shared?** They hold no fields, so sharing is safe. Data lives in the context.
+- **Change impossible.** Detected before any mutation; state returns to `HasMoney` with the money still in escrow.
+- **Overpaying with a big note.** A 100 note for a 15 item with only small coins in the box is a classic failure; the DP either finds a combination or the sale is refused.
+- **Escrow coins can be used for change.** A customer inserting 10 + 5 + 5 for a 15 item can get one of their own 5s back — the plan uses cash box plus escrow.
+- **Sold-out vs out-of-stock.** One product sold out keeps the machine `Idle`; *all* products sold out moves it to `OutOfStock`, which refuses money so nobody inserts coins they can't spend.
+
+**Logger**
+
+- **Interleaved lines** — prevented by one writer thread (async) or `synchronized` appenders (sync).
+- **Logging after close** throws `IllegalStateException`; alternatively drop silently — pick one and say so.
+- **Interrupt while blocked in `put`** — restore the interrupt flag (`Thread.currentThread().interrupt()`) instead of swallowing it.
+- **Slow sink** (network down) — with block mode, callers eventually stall; with drop mode they don't but you lose lines. Log4j and Logback both let you choose; production setups often drop low levels first.
+- **An appender throws** — the worker catches it per record so one bad line doesn't kill the logging thread forever.
+- **Daemon worker** — marked daemon so it can't keep the JVM alive; that is why `close()` (flush) must be called on shutdown, typically from a shutdown hook.
+- **Memory visibility** — `closed` is `volatile`; the queue itself gives happens-before between `put` and `take`. See [Java Concurrency and Locks](/learn/notes/java-concurrency-locks/).
+
+## Testing it
+
+The plain-Java harness (no JUnit needed) ran **33 checks, all passing**. Representative cases written JUnit-style:
+
+```java
+@Test void refundReturnsExactCoins() {
+    VendingMachine vm = machine();                 // 2 x Chips(15), cash box 2 x 5
+    vm.insert(Denomination.TEN); vm.insert(Denomination.TWO);
+    assertEquals(Map.of(Denomination.TEN, 1, Denomination.TWO, 1), vm.refund());
+    assertEquals("Idle", vm.stateName());
+}
+
+@Test void cannotMakeChangeChangesNothing() {
+    VendingMachine vm = machine();
+    vm.insert(Denomination.HUNDRED);               // needs 85 change, box has only 10
+    assertThrows(VendingException.class, () -> vm.select("A1"));
+    assertEquals("HasMoney", vm.stateName());
+    assertEquals(100, vm.balance());
+    assertEquals(2, vm.inventory().count("A1"));
+}
+
+@Test void greedyFailsWithLimitedCoins() {
+    assertTrue(new GreedyChangeMaker().makeChange(6, Map.of(5, 1, 2, 3)).isEmpty());
+    assertEquals(Map.of(2, 3), new DpChangeMaker().makeChange(6, Map.of(5, 1, 2, 3)).orElseThrow());
+}
+
+@Test void asyncLoggerLosesNothingAndKeepsPerThreadOrder() throws Exception {
+    MemoryAppender sink = new MemoryAppender();
+    var chain = new LevelRangeHandler(Level.DEBUG, Level.ERROR, r -> r.thread() + ":" + r.message(), sink);
+    LogManager mgr = new LogManager(new AsyncDispatcher(chain, 256, false), Level.DEBUG);
+    // 8 threads x 20,000 log.info("{}", i) calls, released together by a CountDownLatch
+    ...
+    mgr.close();                                   // poison pill: drains the queue
+    assertEquals(160_000, sink.lines.size());
+    // for every thread name, the numbers appear as 0, 1, 2, ... with no gaps
+}
+```
+
+Other checks in the harness: `OutOfStock` refuses money; restock moves to `Idle`; insufficient balance and unknown code keep the money; cash box grows by exactly the revenue over 500 random purchases; greedy equals DP coin count for INR at every amount 0..400; greedy is non-optimal on 1, 3, 4 and fails on 3, 4; concurrent restock accounting; placeholders; level routing through the chain; loggers cached per name; logging after close rejected; drop mode with a slow sink satisfies written + dropped = offered (a typical run: 18 written, 1982 dropped).
+
+**Demo output (real run):**
+
+```
+=== Part A: vending machine ===
+state: Idle
+bought: Purchase[product=Product[code=A1, name=Chips, price=15], change={FIVE=1}]
+error: Idle: insert money first
+error: insert 30 more
+refund: {TEN=1}, state: Idle
+bought: Purchase[product=Product[code=B1, name=Soda, price=40], change={TWO=5}]
+bought: Purchase[product=Product[code=A1, name=Chips, price=15], change={FIVE=1}], state: OutOfStock
+greedy {4,3,1} for 6: {4=1, 1=2}
+dp     {4,3,1} for 6: {3=2}
+greedy 5x1,2x3 for 6: Optional.empty
+dp     5x1,2x3 for 6: Optional[{2=3}]
+=== Part B: logger ===
+INFO  [main] checkout - order 42 placed by asha
+WARN  [main] checkout - payment retry 1 of 3
+ERROR [main] checkout - payment failed for order 42
+file has 2 lines (WARN and ERROR only)
+```
+
+Notice the soda purchase: change of 10 came back as five 2s, because the only 5 left couldn't be combined with anything to make 10 — greedy would have taken the 5 and then failed on the odd remainder.
+
+## Extensions interviewers ask for
+
+| Extension | How the design absorbs it |
+|---|---|
+| Card / UPI payment | A `PaymentMethod` strategy; `HasMoneyState` becomes "HasCredit". Card payments need no change-making. |
+| Maintenance mode | New `MaintenanceState` that rejects customers; operator calls `enterMaintenance()`. One class, no edits to others. |
+| Timeout auto-refund | A scheduled task calls `refund()` if `HasMoney` lasts more than N seconds. |
+| Product display / low-stock alerts | Observer on `Inventory` changes. |
+| "Prefer to keep small coins" | Another `ChangeMaker` with a different cost (e.g. weighted DP). |
+| Log rotation by size/date | A `RollingFileAppender` decorating `FileAppender`; the chain doesn't change. |
+| MDC (request id on every line) | A `ThreadLocal` context map copied into `LogRecord` at creation — copy it on the caller thread, because the worker thread has a different `ThreadLocal`. |
+| Per-package levels (`com.shop=DEBUG`) | `LogManager` resolves a logger's threshold by the longest matching name prefix. |
+| Sampling / rate limiting | A `RateLimitingHandler` in the chain that drops after N per second. |
+| Remote config change | Make `threshold` `volatile` and add a setter; existing loggers pick it up immediately. |
+
+## Common mistakes
+
+- **`double` for money.** Use integer minor units.
+- **One `balance` integer instead of escrow** — refunds then depend on the cash box.
+- **Greedy change without checking feasibility** — it fails with limited coins even for canonical systems.
+- **Mutating before validating** — inventory decremented, then change fails, now stock is wrong. Plan, then commit.
+- **`switch (state)` in every method** — the exact smell State is meant to remove.
+- **States holding data** — keep data in the context so states stay stateless and shareable.
+- **Formatting the log message before checking the level.**
+- **Unbounded async queue** (`LinkedBlockingQueue` with no capacity) — a slow disk turns into an `OutOfMemoryError`.
+- **No flush on shutdown** — the last (most important) lines before a crash are lost.
+- **Swallowing `InterruptedException`.**
+- **Making everything a singleton** — then tests can't isolate log output.
+
+## Practice questions
+
+<Practice>
+
+<QA q="Why use the State pattern for a vending machine instead of an enum and switch statements?" level="easy">
+
+Each action (insert, select, refund) behaves differently in each phase. With an enum you repeat a `switch (state)` in every method, and adding a state means editing all of them. With State, each phase is one class that overrides only what it allows (defaults reject), and states own their transitions. Adding `MaintenanceState` is one new class — Open/Closed. For a tiny lifecycle with little behaviour, an enum with a transition table is fine; say that too.
+
+</QA>
+
+<QA q="Why does the machine keep inserted coins in escrow instead of adding them to the cash box immediately?" level="easy">
+
+So refund always returns the **exact** coins inserted, regardless of what the cash box holds. It also keeps accounting simple: the cash box only changes on a completed sale. Physical machines do the same thing.
+
+</QA>
+
+<QA q="What is a canonical coin system, and is greedy change-making always optimal?" level="medium">
+
+A coin system is canonical if the greedy algorithm (largest coin first) gives the minimum number of coins for every amount, assuming unlimited coins. INR and US coins are canonical. Not all systems are: with 1, 3, 4, greedy pays 6 as 4 + 1 + 1 while 3 + 3 is better; with 3, 4 greedy fails to pay 6 at all. Kozen and Zaks (1994) showed the smallest counterexample, if any, lies in a bounded range (between c3 + 1 and the sum of the two largest coins), so you can test a system by checking that range.
+
+</QA>
+
+<QA q="The machine uses INR, which is canonical. Why not just use greedy?" level="medium">
+
+Canonical is a statement about **unlimited** coins. A vending machine has a few of each. With one 5 and three 2s, greedy pays 6 by taking the 5 and then fails; 2 + 2 + 2 works. Using greedy would wrongly refuse sales. A bounded DP over (denomination, amount, count used) finds a plan whenever one exists and is cheap because change amounts are small.
+
+</QA>
+
+<QA q="Walk me through what happens when the customer selects a product but change can't be made." level="medium">
+
+`HasMoneyState.select` validates code, stock and balance, then switches to `DispensingState` and calls `completePurchase`. That method builds the would-be coin stock (cash box + escrow), asks the `ChangeMaker` for a plan and gets none, so it throws **before** mutating anything. `select` catches it, restores `HasMoney` and rethrows. The customer still has their full balance and can choose a cheaper item, add exact money, or refund.
+
+</QA>
+
+<QA q="Is your vending machine thread-safe? What exactly is protected?" level="medium">
+
+Each public method is `synchronized` on the machine, so a customer action and an operator restock never interleave, and state transitions are atomic. A full customer *session* (insert, insert, select) spans several calls and is not atomic — acceptable because a machine has one keypad. If the API were remote with many clients, I'd introduce a session object (escrow per session) and lock only the shared parts (inventory, cash box).
+
+</QA>
+
+<QA q="In your logger, which part is Chain of Responsibility and which flavour is it?" level="easy">
+
+`LogHandler` objects linked by `next`. It's the **pipeline** flavour: every handler sees every record and decides independently whether to write it, like servlet filters. The GoF flavour stops at the first handler that handles the request; switching is a one-line change (`else if (next != null)`). `handle` is `final` so subclasses can't forget to forward.
+
+</QA>
+
+<QA q="Why put a BlockingQueue and a worker thread behind the logger?" level="medium">
+
+Disk and network writes are slow and unpredictable; doing them on the request thread adds latency to every request that logs. With a bounded queue, the caller only pays for an enqueue. One worker thread drains it, so sinks need no locking and lines from one thread stay in order. The queue is **bounded** so a slow sink can't eat all the memory; when full you either block (backpressure, no loss) or drop (no slowdown, count losses).
+
+</QA>
+
+<QA q="How do you make sure no log lines are lost on shutdown?" level="medium">
+
+`close()` stops accepting new records, enqueues a poison pill, and `join`s the worker. Because the queue is FIFO, every record enqueued before the pill is written before the worker exits; then appenders are closed, which flushes buffered writers. Register `close()` in a JVM shutdown hook. Logback has the same idea with a bounded wait (`maxFlushTime`); after it, remaining events are discarded.
+
+</QA>
+
+<QA q="Block or drop when the async queue is full — which would you choose?" level="hard">
+
+It depends on what the logs are for. **Audit / security logs**: block — losing them is worse than slowing down. **Debug/info application logs**: drop, preferably lower levels first, and expose a dropped counter as a metric. Log4j 2's `AsyncAppender` blocks by default; Logback's `AsyncAppender` discards TRACE/DEBUG/INFO when the queue is 80% full unless configured otherwise. Mentioning both shows you know it's a policy choice.
+
+</QA>
+
+<QA q="Should LogManager be a singleton?" level="medium">
+
+Practically, applications want one default logging setup reachable from anywhere — that's why SLF4J uses a static `LoggerFactory`. But a hard singleton makes tests share global state and prevents two configs in one JVM. My design keeps `LogManager` a normal class that can be injected (tests create their own with a memory sink) and optionally exposes one default instance through an enum holder. That gives convenience without making testability impossible.
+
+</QA>
+
+<QA q="Scenario: production logs show lines from two requests mixed in the middle of a line. What happened and how does your design prevent it?" level="scenario">
+
+Two threads wrote to the same stream concurrently without synchronisation, and their writes interleaved. My design prevents it two ways: in async mode there is a single writer thread; in sync mode each appender's `append` is `synchronized`, so a whole line is written atomically with respect to other callers of that appender.
+
+</QA>
+
+<QA q="Scenario: after adding a request-id field (MDC) via ThreadLocal, async logs show the wrong or missing request ids. Why?" level="scenario">
+
+`ThreadLocal` values belong to the thread that set them. The async worker is a different thread, so reading the `ThreadLocal` there gives that thread's (empty) value. Fix: copy the context map into the `LogRecord` when it is created on the caller thread. The same issue appears whenever work hops threads — executors, `CompletableFuture`, virtual threads.
+
+</QA>
+
+<QA q="Scenario: the interviewer adds 'a customer can pay by card'. What changes?" level="scenario">
+
+Introduce a payment abstraction (Strategy): cash fills escrow; card authorises an amount. Add a `HasCreditState` (or make `HasMoneyState` work with an abstract `Payment`), skip change-making for card, and capture/void the authorisation on sale/refund. Inventory, products and other states are untouched — the change is additive.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="With coins 1, 3 and 4 (unlimited), what does greedy return for an amount of 6?" options={["3 + 3", "4 + 1 + 1", "It fails to find any answer", "4 + 2"]} answer={1}>
+
+Greedy takes the largest coin that fits: 4, then 1, then 1 — three coins. The optimum is 3 + 3. There is no 2 coin, so 4 + 2 is impossible. Greedy only fails outright on systems like 3, 4 (where 6 - 4 = 2 can't be paid).
+
+</MCQ>
+
+<MCQ q="The coin system is canonical, but the machine has one 5 and three 2s. Change due is 6. What happens with greedy?" options={["Greedy returns 5 + 1", "Greedy returns 2 + 2 + 2", "Greedy fails, even though 2 + 2 + 2 works", "Greedy loops forever"]} answer={2}>
+
+Greedy takes the 5, needs 1, has no 1 coin, and gives up. Canonicity assumes unlimited coins; with limited stock you need a search or DP.
+
+</MCQ>
+
+<MCQ q="In the State pattern, who usually decides the next state?" options={["The client calling the context", "The state objects themselves (or the context on their behalf)", "A central switch statement in the context", "The Strategy object"]} answer={1}>
+
+States own transitions — e.g. `IdleState.insert` sets `HasMoneyState`. A central switch is what State replaces. Strategy is chosen from outside and doesn't switch itself.
+
+</MCQ>
+
+<MCQ q="Why does completePurchase compute the change plan before touching inventory or the cash box?" options={["Because DP must run first for performance", "To make the purchase all-or-nothing: if change is impossible, nothing has changed", "Because Java requires it for synchronized methods", "To let greedy and DP run in parallel"]} answer={1}>
+
+Plan, then commit. Mutating first and failing later would leave inventory or the cash box inconsistent.
+
+</MCQ>
+
+<MCQ q="Which flavour of Chain of Responsibility does the logger use?" options={["GoF: first handler that can handle it stops the chain", "Pipeline: every handler gets a chance to process the record", "Broadcast via a message broker", "Decorator chain that wraps the record"]} answer={1}>
+
+Each handler checks its level range, writes if it matches, and always forwards — like servlet filters. Changing to GoF style is a one-line tweak.
+
+</MCQ>
+
+<MCQ q="What is the main reason the async logger uses a bounded ArrayBlockingQueue instead of an unbounded queue?" options={["Bounded queues are always faster", "So a slow sink can't grow memory without limit; when full we block or drop by policy", "Unbounded queues are not thread-safe", "ArrayBlockingQueue guarantees exactly-once delivery"]} answer={1}>
+
+An unbounded queue hides a slow sink until the heap fills. Both `LinkedBlockingQueue` and `ArrayBlockingQueue` are thread-safe; delivery guarantees are unrelated.
+
+</MCQ>
+
+<MCQ q="How does the poison-pill shutdown guarantee earlier log records are written?" options={["The pill has the highest priority", "The queue is FIFO, so every record enqueued before the pill is taken and written before the worker sees the pill", "close() calls interrupt() on the worker", "The pill clears the queue"]} answer={1}>
+
+FIFO order means the worker reaches the pill only after processing everything ahead of it. Interrupting would cut the drain short.
+
+</MCQ>
+
+<MCQ q="Why check isEnabled(level) before formatting the message?" options={["Formatting changes the level", "To avoid paying for string building when the record will be discarded", "Because formatters are not thread-safe", "It is required by the Chain of Responsibility pattern"]} answer={1}>
+
+Disabled DEBUG calls in a hot loop should cost almost nothing; formatting first wastes CPU and allocations. That's why APIs take a pattern plus arguments.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **Vending machine = State.** Context holds data (inventory, cash box, escrow); states hold behaviour and decide transitions; defaults reject.
+- States: `OutOfStock → Idle → HasMoney → Dispensing → Idle/OutOfStock`; failed select returns to `HasMoney` with money kept.
+- **Escrow** inserted coins; refund returns them exactly. Money as integer units, never `double`.
+- **Plan, then commit**: compute change from cash box + escrow first; mutate only if a plan exists.
+- **Greedy** is optimal only for **canonical** systems with **unlimited** coins (INR, USD yes; 1, 3, 4 no). Limited stock breaks greedy → use **bounded DP**. Kozen–Zaks: smallest counterexample lies in a bounded range.
+- **Logger**: Level enum + threshold check before formatting · `LogHandler` chain (pipeline CoR) · `Formatter` strategy · handler fans out to `Appender`s.
+- **Async**: bounded `ArrayBlockingQueue`, one worker thread (no contention, per-thread order), block vs drop policy, poison pill + join on close, daemon worker + shutdown hook.
+- Log4j 2 `AsyncAppender`: 1024 events, blocking by default. Logback `AsyncAppender`: 256, drops TRACE/DEBUG/INFO when 80% full by default.
+- **Singleton vs DI**: keep the manager injectable for tests; optionally expose one default instance.
+
+## Go deeper
+
+- [Log4j 2 — AsyncAppender and delegating appenders](https://logging.apache.org/log4j/2.x/manual/appenders/delegating.html)
+- [Logback — AsyncAppender](https://logback.qos.ch/manual/appenders-async-sift.html)
+- [Java 21 `BlockingQueue` API](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/BlockingQueue.html)
+- [Kozen and Zaks — Optimal Bounds for the Change-Making Problem](https://tidsskrift.dk/daimipb/article/view/6603)
+- [Change-making problem (overview)](https://en.wikipedia.org/wiki/Change-making_problem)
+- Related notes: [Behavioral Patterns](/learn/notes/behavioral-patterns/) · [Machine-Coding Strategy](/learn/notes/machine-coding-strategy/) · [Executors and Virtual Threads](/learn/notes/java-executors-virtual-threads/)

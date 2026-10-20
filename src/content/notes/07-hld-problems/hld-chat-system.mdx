@@ -1,7 +1,7 @@
 ---
 title: "HLD: Chat System (WhatsApp / Slack)"
 phase: "07-hld-problems"
-order: 38
+order: 61
 tags: []
 premium: false
 previewParagraphs: 4
@@ -139,7 +139,7 @@ Channel = 1:1 chat ID or group ID. Bucketed by day to avoid mega-partitions.
 
 ### Encryption (E2E for WhatsApp/Signal-style)
 
-- **Signal Protocol**: Double Ratchet for forward secrecy, X3DH for key agreement.
+- **Signal Protocol**: Double Ratchet for forward secrecy, X3DH for key agreement (Signal moved to post-quantum PQXDH in 2023).
 - Server stores only ciphertext.
 - Server can't read messages — but can see metadata (sender, recipient, timing).
 - Group chat E2E is harder (key distribution).
@@ -147,7 +147,7 @@ Channel = 1:1 chat ID or group ID. Bucketed by day to avoid mega-partitions.
 ### Offline & sync
 
 - When user reconnects, server sends missed messages since last_read.
-- Cassandra range query: `WHERE channel_id = ? AND message_id > last_read`.
+- Cassandra range query: `WHERE channel_id = ? AND bucket = ? AND message_id > last_read`, walking day buckets forward.
 - Mobile: paginate efficiently to avoid bulk transfer.
 
 ### Media
@@ -167,46 +167,170 @@ Channel = 1:1 chat ID or group ID. Bucketed by day to avoid mega-partitions.
 ## Trade-offs
 
 - **WebSocket vs HTTP/2 SSE**: WebSocket = bidirectional, well-supported. SSE = simpler but server → client only.
-- **Push notifications**: Apple APNs and Google FCM are the only mobile delivery paths when app is killed.
+- **Push notifications**: Apple APNs and Google FCM are effectively the only mobile delivery paths when app is killed (plus OEM push services on Android devices without Google services).
 - **E2E vs server-readable**: business needs (search, compliance) vs privacy.
 - **At-most-once vs at-least-once delivery**: client-side dedup by message ID lets you use at-least-once safely.
 
-## Interview questions
+## Practice questions
 
-### Q1: How would you keep millions of WebSocket connections per server?
-Use efficient I/O (epoll/kqueue), non-blocking architecture (Erlang processes, Go goroutines), modest memory per connection, OS tuning (file descriptors, TCP buffers). WhatsApp famously got to 2M connections per FreeBSD/Erlang box; modern servers commonly handle 100K-1M.
+<Practice>
 
-### Q2: How do you handle a user being on multiple devices?
-Each device has its own connection. The user has multiple device IDs. Server pushes to all devices. State (read receipts, last-read) synced across devices.
+<QA q="Why WebSockets rather than SSE for chat?" level="easy">
 
-### Q3: Design message history with 100B messages/day.
-Cassandra/Scylla, partitioned by `(channel_id, day_bucket)`. Bucket by day prevents mega-partitions. Clustering by message_id DESC for newest-first reads. Tiered storage: hot (last 3 months) on SSD, cold archived to S3/Parquet for queryable history.
+Chat is bidirectional: clients send messages, receipts and typing signals as well as receive them. WebSockets give one long-lived, full-duplex connection and are well supported. SSE is simpler but only pushes server → client, so client sends would need separate HTTP requests.
 
-### Q4: How does the server know which chat server a recipient is on?
-Service discovery layer: a directory mapping user_id → chat_server. Updated when user connects/disconnects. Stored in a fast KV (Redis). The sender's chat server looks up and forwards.
+</QA>
 
-### Q5: How does end-to-end encryption work?
-Signal Protocol: each conversation has session keys ratcheting forward; X3DH key agreement on initial setup. Server stores only ciphertext + metadata. Group E2E uses sender keys + per-recipient key distribution. Server can't decrypt.
+<QA q="How is presence (online/offline) tracked?" level="easy">
 
-### Q6: What if a chat server crashes with users connected?
-- Clients detect disconnection and reconnect.
-- They connect to a new chat server (consistent-hashed by user_id, or any healthy server).
-- Recent unread messages already persisted in DB → sync after reconnect.
-- No data loss; minor reconnection delay (typically < 1s).
+Presence is a soft signal: clients heartbeat every N seconds, and the presence service records each user as online with a TTL in Redis. If heartbeats stop, the key expires and the user shows offline. It's high-volume and only needs eventual consistency.
 
-### Q7: How to scale group chat to 100K members in a workspace?
-- Cap message broadcast: never write 100K rows per message.
-- Instead, store one message per channel; readers query their own view.
-- Use Kafka to fan out delivery notifications efficiently.
+</QA>
+
+<QA q="How should images and videos be sent?" level="easy">
+
+Never inline media in messages. The client uploads directly to object storage (S3) using a **pre-signed upload URL**, then sends a normal message containing the object reference. Recipients download through a CDN. This keeps chat servers and the message store small and fast.
+
+</QA>
+
+<QA q="How do you handle a user being on multiple devices?" level="medium">
+
+Each device has its own connection and device ID; the user maps to several devices. The server pushes each message to all of them, and per-user state such as last-read position is synced across devices.
+
+</QA>
+
+<QA q="How does the server know which chat server a recipient is on?" level="medium">
+
+A directory maps user_id → chat_server, updated on connect and disconnect and stored in a fast KV store (Redis). The sender's chat server looks up the recipient and forwards the message there; if there's no entry, the recipient is offline and gets a push notification instead.
+
+</QA>
+
+<QA q="How do read receipts and unread counts work at scale?" level="medium">
+
+Store a single **last-read message ID** per (user, channel) — the `last_read_id` column in `channels_by_user`. Unread count = messages newer than it. Send receipts in aggregate ('read up to message X') rather than one update per message, which collapses a flood of tiny writes into one.
+
+</QA>
+
+<QA q="How does a client catch up after being offline?" level="medium">
+
+On reconnect, the server sends everything since the user's last-read ID: a Cassandra range query `WHERE channel_id = ? AND bucket = ? AND message_id > last_read`, walking day buckets forward. On mobile, paginate and batch the catch-up so a long absence doesn't mean one huge transfer.
+
+</QA>
+
+<QA q="How do you get reliable delivery without showing duplicate messages?" level="medium">
+
+Use **at-least-once** delivery: the server keeps retrying until the recipient acks, so nothing is lost. Each message has a unique message ID, and the client deduplicates by it, so retries never show twice. That combination is safer than at-most-once, which can silently drop messages.
+
+</QA>
+
+<QA q="Push notifications: how do you avoid hammering APNs/FCM?" level="medium">
+
+- Batch sends where possible.
+- Use one token per device; retry transient failures with backoff.
+- Respect APNs/FCM quotas — they enforce them.
+- Coalesce multiple messages into one notification ('5 new messages').
+- Honor per-user mute/DND — don't push at all when it's on.
+
+</QA>
+
+<QA q="How would you keep millions of WebSocket connections per server?" level="hard">
+
+Efficient event-driven I/O (epoll/kqueue), a non-blocking architecture (Erlang processes, Go goroutines), modest memory per connection, and OS tuning (file-descriptor limits, TCP buffers). WhatsApp famously reached 2M connections per FreeBSD/Erlang box; modern servers commonly handle 100K–1M.
+
+</QA>
+
+<QA q="How does end-to-end encryption work?" level="hard">
+
+The Signal Protocol: X3DH key agreement sets up a session (Signal moved to post-quantum PQXDH in 2023), and the Double Ratchet keeps rotating keys for forward secrecy. The server stores only ciphertext and can't decrypt — though it still sees metadata (sender, recipient, timing). Group E2E is harder: it uses sender keys plus per-recipient key distribution.
+
+</QA>
+
+<QA q="Design message history storage for 100B messages/day." level="scenario">
+
+Cassandra/Scylla, partitioned by `(channel_id, day_bucket)` so hot channels don't create mega-partitions, clustered by `message_id DESC` for newest-first reads. At ~200 bytes/message that's ~20 TB/day raw. Tier it: hot recent data (about 3 months) on SSD in Cassandra, older history archived to S3 Parquet for queryable access.
+
+</QA>
+
+<QA q="A chat server crashes with users connected. What happens?" level="scenario">
+
+- Clients detect the disconnect and reconnect.
+- They land on a new chat server (consistent-hashed by user ID, or any healthy server), and the user → server directory is updated.
+- Messages were persisted before delivery, so the client syncs anything missed since its last-read ID.
+- No data loss; just a brief reconnection delay (typically under a second).
+
+</QA>
+
+<QA q="How do you scale group chat to 100K members in a workspace?" level="scenario">
+
+- Never write 100K rows per message — store **one message per channel**, and each reader queries its own view.
+- Fan out delivery notifications through Kafka instead of looping inside one chat server.
 - Compute unread counts asynchronously.
-- For huge groups, hierarchical groups or read-mostly broadcast lists.
+- Use parallel push with partial-result-OK semantics to control tail latency.
+- For huge groups, consider hierarchical groups or read-mostly broadcast lists.
 
-### Q8: Push notifications: how to avoid hammering APNs/FCM?
-- Batched send when possible.
-- Token-per-device, retry on transient failures with backoff.
-- Honor APNs/FCM's quotas (they enforce them).
-- Coalesce multiple messages into one notification ("5 new messages").
-- Per-user mute/DND settings — don't push if user has DND on.
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="Why is the messages table partitioned by channel ID plus a day bucket instead of channel ID alone?" options={["To bound partition size so very active channels don't create mega-partitions", "To sort messages alphabetically", "Because Cassandra requires a date in every key", "To spread one message across many nodes"]} answer={0}>
+
+Without a bucket, a busy channel's partition grows forever and becomes a hotspot. Messages are sorted by message ID, not alphabetically; Cassandra has no date-key requirement; and one message isn't split across nodes.
+
+</MCQ>
+
+<MCQ q="The recipient is offline. What does the chat server do with a new message?" options={["Drop it and tell the sender to retry", "Keep it only in memory until the user reconnects", "Persist it and send a push notification through APNs or FCM", "Send it by email"]} answer={2}>
+
+The message is already persisted, and an offline user is reached by mobile push; they sync on reconnect. Dropping or memory-only storage loses messages, and email isn't part of the design.
+
+</MCQ>
+
+<MCQ q="How does the sender's chat server find the recipient's chat server?" options={["It broadcasts to every chat server", "It looks up a user-to-server directory in a fast store like Redis", "It asks the client", "It reads the recipient's IP from the message"]} answer={1}>
+
+A directory keyed by user ID, updated on connect and disconnect, gives a direct lookup. Broadcasting doesn't scale, and the client or message doesn't know the recipient's server.
+
+</MCQ>
+
+<MCQ q="How is an unread count computed cheaply?" options={["Store a boolean per message per user", "Count every message in the channel on each request", "Ask each sender", "Compare messages against a stored last-read message ID per user and channel"]} answer={3}>
+
+One last-read pointer per user and channel makes unread count the number of messages after it. Per-message flags multiply writes, counting everything is wasteful, and senders don't know read state.
+
+</MCQ>
+
+<MCQ q="What lets a chat system use at-least-once delivery without users seeing duplicates?" options={["Client-side dedup by unique message ID", "Switching to at-most-once", "Sending each message only once over UDP", "Encrypting messages"]} answer={0}>
+
+Retries may deliver a message twice, and the client drops repeats by message ID. At-most-once can lose messages, UDP gives no guarantee, and encryption doesn't affect duplicates.
+
+</MCQ>
+
+<MCQ q="With end-to-end encryption, what can the server still see?" options={["Message plaintext", "Nothing at all", "Metadata such as sender, recipient and timing", "Each user's private keys"]} answer={2}>
+
+The server stores only ciphertext but still routes messages, so it sees who talks to whom and when. It can't read plaintext or hold users' private keys, and it isn't blind to metadata.
+
+</MCQ>
+
+<MCQ q="A workspace channel has 100K members. What is the right way to store a new message?" options={["Write one copy per member", "Store it once per channel and let readers query the channel", "Store it only on the sender's device", "Write it to a separate table per member"]} answer={1}>
+
+One row per channel, plus asynchronous fan-out of notifications, avoids 100K writes per message. Per-member copies or tables multiply writes, and sender-only storage breaks history.
+
+</MCQ>
+
+<MCQ q="How should a 50 MB video be sent in a chat?" options={["Inline in the WebSocket message", "Split into chat messages of 200 bytes each", "Stored in the Cassandra messages table", "Uploaded directly to object storage with a pre-signed URL, with only a reference in the message"]} answer={3}>
+
+Direct upload to object storage plus a reference keeps media off the chat path, and a CDN serves downloads. Inline or chunked messages and storing blobs in Cassandra overload the real-time path and the database.
+
+</MCQ>
+
+<MCQ q="A user gets 20 messages in a minute while their phone is locked. What is the best push behavior?" options={["Coalesce them into one notification such as 20 new messages", "Send 20 separate pushes", "Send nothing until the app opens", "Retry each push until it is read"]} answer={0}>
+
+Coalescing respects APNs and FCM quotas and the user's attention. Twenty pushes hammer the services, sending nothing hides messages, and retrying until read isn't how push works.
+
+</MCQ>
+
+</Quiz>
 
 ## TL;DR cheat sheet
 

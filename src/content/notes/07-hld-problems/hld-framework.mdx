@@ -1,0 +1,480 @@
+---
+title: "The System Design Interview Framework"
+phase: "07-hld-problems"
+order: 73
+tags: ["hld", "interview", "system-design", "framework"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 16
+prerequisites: ["back-of-envelope-math"]
+summary: "A repeatable step-by-step script for any system design round — requirements, estimates, API, data model, diagram, deep dives, trade-offs and wrap-up — with time budgets, level expectations and a worked example."
+---
+
+## Definition (interview-ready)
+
+A **system design interview framework** is a fixed order of steps you follow for any open-ended "design X" question, so you never freeze and the interviewer can always tell where you are:
+
+1. **Clarify requirements** — functional (what it does) and non-functional (scale, latency, availability, consistency).
+2. **Estimate** — traffic, storage, bandwidth; just enough math to drive decisions.
+3. **API** — the handful of calls clients make.
+4. **Data model** — entities, keys, access patterns, choice of store.
+5. **High-level design** — a simple diagram of the main components and the request flow.
+6. **Deep dives** — two or three of the hardest parts, in detail.
+7. **Bottlenecks, failures and trade-offs** — what breaks, what you'd change, what each choice costs.
+8. **Wrap-up** — a short summary and what you'd do next.
+
+The framework is a **map, not a script**. You follow it by default and leave it whenever the interviewer steers you somewhere.
+
+## Why it matters
+
+System design rounds are vague on purpose. "Design a ride-sharing app" could mean anything. The interviewer wants to see whether you can turn an unclear problem into a clear, defensible design in under an hour, and talk about it the way you would with teammates.
+
+Most weak interviews fail in predictable ways:
+
+- jumping straight to boxes and technologies before knowing what's being built,
+- running out of time before reaching the interesting part,
+- going wide on everything and deep on nothing,
+- naming tools without reasons ("we'll use Kafka") and never stating a trade-off.
+
+A framework fixes all four. It tells you what to do next, keeps you on time, and naturally covers what interviewers grade: problem exploration, sound high-level design, technical depth, trade-off reasoning and communication.
+
+Well-known prep resources structure the round the same way. Alex Xu's *System Design Interview* (Vol. 1, chapter 3) uses four steps: understand the problem and set the scope, propose a high-level design and get buy-in, deep dive, wrap up. The eight steps here are the same idea, split finer.
+
+## Core concepts
+
+### Step 1 — Clarify requirements
+
+Open with: "Before I design anything, let me make sure I understand what we're building."
+
+**Functional requirements** — what users can do. Aim for **3–5 core features** and say out loud which ones you're leaving out.
+
+- "Users can post a photo, follow others, and see a feed of people they follow."
+- "Out of scope for now: comments, search, DMs, ads. Happy to add them later."
+
+**Non-functional requirements** — how well it must do it. These drive almost every architecture choice:
+
+| Ask about | Example answer | What it changes |
+|---|---|---|
+| **Scale** | 50M DAU, 500M total users | Sharding, caching, number of services |
+| **Read/write ratio** | 100 reads per write | Cache-heavy read path, precomputation |
+| **Latency** | Feed p99 under 200 ms | What must be precomputed or cached |
+| **Availability** | 99.9% vs 99.99% | Redundancy, multi-AZ or multi-region |
+| **Consistency** | Can a like count be stale for seconds? | Eventual vs strong; sync vs async |
+| **Durability** | Can we ever lose a post? A payment? | Replication, acknowledgement settings |
+| **Geography** | Single country or global? | Regions, CDN, data residency |
+| **Special constraints** | Ordering, exactly-once, compliance | Specific patterns (idempotency, outbox, audit) |
+
+If the interviewer says "you decide", **pick a number and state it**: "I'll assume 10M DAU and say so; we can scale it later." Indecision costs more than a wrong guess.
+
+Write both lists somewhere visible. Every later decision should point back to one of them.
+
+### Step 2 — Back-of-envelope estimates
+
+Do just enough math to answer: **one machine or many? cache needed? shard needed? CDN needed?** See [back-of-envelope math](/learn/notes/back-of-envelope-math/) for the numbers to memorise.
+
+The usual chain:
+
+```
+DAU × actions per user per day        → requests/day
+requests/day ÷ ~100,000 s             → average QPS   (86,400 rounded up)
+average × 2–5                          → peak QPS
+writes/day × bytes per record × days  → storage (× replication factor)
+QPS × response size                    → bandwidth
+```
+
+Rules:
+
+- **Round hard.** 86,400 becomes 100,000. 2.7 KB becomes "a few KB".
+- **Separate reads and writes.** They usually lead to different designs.
+- **Turn each number into a decision**: "~350K reads/s at peak — far beyond what one database serves comfortably, so reads come from a cache." A number you don't use is wasted time.
+- **Two or three minutes** is enough. Ask the interviewer if they want more detail; some skip this step entirely.
+
+### Step 3 — API design
+
+List the **3–6 calls** that cover the functional requirements. Keep it REST-like unless there's a reason not to (see [REST vs gRPC vs GraphQL](/learn/notes/rest-grpc-graphql/)).
+
+```
+POST /v1/posts                 { media_id, caption }      → { post_id }
+GET  /v1/feed?cursor=...&limit=20                         → { posts[], next_cursor }
+POST /v1/posts/{post_id}/likes   (Idempotency-Key header)  → 204
+```
+
+Things that earn points here:
+
+- **Cursor pagination**, not page numbers, for feeds and large lists.
+- **Idempotency keys** on writes that clients may retry (payments, orders, likes).
+- **Who is the caller?** The user ID comes from the auth token, not the request body.
+- **Sync or async?** "Upload returns 202 and processes in the background."
+- **Push channel** if clients need real-time updates (WebSocket, SSE).
+
+### Step 4 — Data model
+
+Name the core **entities**, their **keys**, and the **access patterns** (the queries you must serve fast). The access patterns choose the store, not the other way round.
+
+```
+users   (user_id PK, name, created_at)
+posts   (post_id PK, author_id, media_url, caption, created_at)
+         index: (author_id, created_at DESC)    -- "posts by user, newest first"
+follows (follower_id, followee_id)  PK(follower_id, followee_id)
+         index: (followee_id)                   -- "who follows X"
+```
+
+Then justify the storage choice in one or two sentences:
+
+- **Relational DB** (Postgres/MySQL) — default for structured data with transactions and secondary indexes.
+- **Wide-column / key-value** (Cassandra, DynamoDB) — very high write rates and simple key-based access.
+- **Document store** (MongoDB) — flexible, nested records read as a whole.
+- **Object storage** (S3/GCS) — images, video, files; keep only the URL in the DB.
+- **Search index** (Elasticsearch) — full-text and faceted search.
+- **Cache** (Redis) — hot reads, counters, sessions, rate limits.
+
+Mention the **partition key** if the data will be sharded, and why it avoids hot spots. See [sharding strategies](/learn/notes/sharding-strategies/).
+
+### Step 5 — High-level design
+
+Draw the **simplest design that meets the functional requirements**, then add pieces only when a non-functional requirement or an estimate demands them.
+
+```
+          ┌────────┐
+ client ─▶│  CDN   │ (static + media)
+   │      └────────┘
+   ▼
+┌──────────────┐   ┌──────────────┐   ┌──────────┐
+│ Load balancer│──▶│ API gateway  │──▶│ Post svc │──▶ Posts DB
+└──────────────┘   │ auth, limits │   └────┬─────┘
+                   └──────┬───────┘        │ publish "post created"
+                          │                ▼
+                          │           ┌──────────┐    ┌────────────┐
+                          └──────────▶│ Feed svc │◀───│ Fan-out    │
+                                      └────┬─────┘    │ workers    │
+                                           ▼          └────────────┘
+                                      Feed cache
+```
+
+Then **walk one request end to end** for each main use case: "When a user posts, the client uploads the image to object storage with a pre-signed URL, then calls `POST /posts`. The post service writes the row and publishes an event; fan-out workers..." Walking the flow catches missing pieces and shows the interviewer that the boxes actually connect.
+
+Tips:
+
+- Label arrows with what flows ("write post", "event: post_created").
+- Name technologies only where it matters, and give a reason.
+- Check with the interviewer: "Does this cover what you had in mind before I go deeper?" That's the "get buy-in" moment.
+
+### Step 6 — Deep dives
+
+This is where the level is decided. Pick **two or three** of the hardest parts, or let the interviewer pick. Good candidates for depth:
+
+- the component that dominates the **numbers** (the 350K reads/s path),
+- the part with the hardest **correctness** requirement (payments, inventory, exactly-once),
+- the **scaling hot spot** (celebrity accounts, viral items, hot partitions),
+- the **real-time** part (presence, live location, chat delivery).
+
+For each, go concrete: schema and keys, how data is partitioned and replicated, cache keys and TTLs, consistency model, what happens on failure, and the metric you'd watch. Common deep-dive patterns you should be able to explain:
+
+| Problem | Typical tools |
+|---|---|
+| Too many reads | [Cache patterns](/learn/notes/cache-patterns/), read replicas, CDN, precomputation |
+| Too many writes | Sharding, LSM-based stores, batching, async queues |
+| Fan-out to many users | Fan-out on write vs on read, hybrid for celebrities ([news feed](/learn/notes/hld-news-feed/)) |
+| Hot keys | Key splitting, local caches, request coalescing |
+| Cross-service consistency | [Sagas, outbox](/learn/notes/distributed-transactions/), idempotency, [delivery semantics](/learn/notes/delivery-semantics/) |
+| Unique IDs | [Distributed ID generation](/learn/notes/distributed-id-generation/) |
+| Abuse and overload | [Rate limiting](/learn/notes/rate-limiting/), [circuit breakers and retries](/learn/notes/circuit-breakers-retries/) |
+| Real-time push | [WebSockets / SSE](/learn/notes/realtime-push-websockets-sse/) |
+
+### Step 7 — Bottlenecks, failures and trade-offs
+
+Don't wait to be asked. Volunteer:
+
+- **What breaks first at 10× load**, and the fix.
+- **Failure scenarios**: DB primary dies, cache cluster down, queue backlog, region outage. Use the template from [failure scenario drills](/learn/notes/hld-failure-scenarios/): detection, immediate mitigation, long-term fix.
+- **Trade-offs you made on purpose**: "I chose eventual consistency for like counts, so a count may lag by a few seconds. If counts had to be exact, I'd move them into the same transaction as the like row and accept lower write throughput."
+- **Operability**: what you'd monitor (see [golden signals](/learn/notes/red-use-golden-signals/)), how you'd deploy safely, how you'd migrate data.
+
+A useful answer shape for any trade-off: **"I chose A over B because of requirement R. The cost is C. If R changed to R', I'd switch to B."**
+
+### Step 8 — Wrap-up
+
+In the last 2–3 minutes:
+
+- Summarise the design in four or five sentences, mapped to the requirements.
+- Name what you'd do next with more time: analytics, multi-region, abuse detection, cost.
+- Ask if there's anything they'd like you to revisit.
+
+## How it works
+
+### Time budgets
+
+These are targets, not rules. Adapt when the interviewer pushes you somewhere.
+
+| Step | 45-minute round | 60-minute round |
+|---|---|---|
+| Intros (theirs) | ~3 min | ~5 min |
+| 1. Requirements | 4–5 min | 5–7 min |
+| 2. Estimates | 2–3 min | 3–5 min |
+| 3–4. API + data model | 4–5 min | 5–7 min |
+| 5. High-level design | 8–10 min | 10–12 min |
+| 6. Deep dives | 10–12 min | 15–20 min |
+| 7. Bottlenecks + trade-offs | 3–5 min | 5–7 min |
+| 8. Wrap-up + your questions | 2–3 min | 3–5 min |
+
+Two rules of thumb:
+
+- **Have a working high-level design by about the halfway mark.** If you're still on requirements at minute 20, you'll never reach the deep dive, which is where most of the signal is.
+- **In a 45-minute round, cut the estimates and API to the essentials** rather than squeezing the deep dive.
+
+### What interviewers look for at different levels
+
+Every level is graded on the same areas. What changes is how much **you** drive and how deep you go.
+
+| Area | SDE2 / mid-level | Senior (SDE3) and above |
+|---|---|---|
+| **Requirements** | Asks sensible questions, writes a clear list | Spots the requirement that makes the problem hard and focuses there |
+| **High-level design** | A complete, working design with reasonable components | Same, faster, with fewer unnecessary components |
+| **Depth** | Goes deep on one or two areas, often with prompts | Picks the hardest areas without prompting; knows internals (how the DB, cache, queue actually behave) |
+| **Trade-offs** | Can state pros and cons when asked | Volunteers trade-offs tied to requirements, with numbers |
+| **Failure and operations** | Handles common failures when prompted | Raises failure modes, monitoring, rollout and migration unasked |
+| **Driving** | Follows the framework; interviewer may steer | Runs the conversation; adapts quickly when requirements change |
+
+For SDE2, the bar is mostly: **a correct, complete design, explained clearly, with some real depth**. For senior, a correct design is the minimum; the signal is judgement — knowing what matters, what can be simpler, and what will break.
+
+### Communication tips
+
+- **Think out loud.** Silence gives the interviewer nothing to grade. Say what you're weighing.
+- **Signpost**: "I've got requirements. Next I'll do quick estimates, then the API."
+- **Offer choices, then commit**: "We could fan out on write or on read. Given 100:1 reads, I'll fan out on write, and handle celebrities separately."
+- **Check in at transitions**, not every 30 seconds: "Does this high-level design look reasonable before I go deeper?"
+- **Treat hints as gifts.** "What about celebrities?" means "go there now". Don't defend the old path.
+- **Say "I don't know" honestly**, then reason: "I haven't used Spanner, but given what I know about synchronized clocks I'd expect..."
+- **Keep the diagram tidy.** Rename and redraw instead of piling arrows.
+- **Use the interviewer's words** for features and entities so you stay aligned.
+
+### Worked mini-example: "Design the Like button"
+
+A compressed run through all eight steps, the way you'd say it.
+
+**1. Requirements.**
+Functional: like/unlike a post; show like count on every post; show "you liked this". Out of scope: list of who liked.
+Non-functional: 100M DAU; count can lag a few seconds (eventual); a user's own like must show immediately; likes must not be lost or double-counted; viral posts must not melt anything.
+
+**2. Estimates.**
+Writes: 100M users × ~10 likes/day = 1B/day ≈ 10K/s average, ~30K/s peak.
+Reads: every post view shows a count. 100M × ~100 views = 10B/day ≈ 100K/s average, ~300K/s peak.
+Storage: a like row (user_id, post_id, timestamp + index overhead) ≈ 50 bytes → ~50 GB/day, ~18 TB/year before replication.
+→ Reads need a cache. Writes need sharding. Counts can't be `COUNT(*)` at read time.
+
+**3. API.**
+```
+PUT    /v1/posts/{post_id}/like      → 204   (idempotent: liking twice = one like)
+DELETE /v1/posts/{post_id}/like      → 204
+GET    /v1/posts?ids=...             → posts with like_count and liked_by_me
+```
+
+**4. Data model.**
+`likes(post_id, user_id, created_at)` with primary key `(post_id, user_id)`, sharded by `post_id`. The primary key makes likes **idempotent**: a duplicate insert is a no-op. A separate `post_like_counts(post_id, count)` holds the aggregate. For "liked by me" on a feed of 20 posts, a lookup by `(post_id, user_id)` per post, or a per-user recent-likes set in cache.
+
+**5. High-level design.**
+Like API → write row to the likes store (sharded) → publish `like_changed` event → counter workers aggregate in small batches → update count store → update cache. Read path: post service reads counts from cache (fallback to count store).
+
+**6. Deep dive: the viral post.**
+A post getting 50K likes/s turns one counter into a **hot key**. Fixes: counter workers batch increments per post (one write per batch, not per like); split the counter into N sub-counters (`count:post:123:0..15`) and sum on read; cache the sum for a second. The like row writes are spread by `user_id` within the post's partition or buffered through the queue.
+
+**7. Trade-offs and failures.**
+Counts are eventually consistent (seconds). We hide that from the liker by updating their UI optimistically and reading `liked_by_me` from the source of truth. If the queue backs up, counts lag but no likes are lost. If the cache dies, the count store takes the reads; protect it with request coalescing (see [cache stampede](/learn/notes/cache-stampede-ttl/)).
+
+**8. Wrap-up.**
+"Writes are idempotent rows sharded by post; counts are aggregated asynchronously and cached; viral posts use batched and split counters. Next I'd add a who-liked list and abuse detection for fake likes."
+
+## Real-world examples
+
+- **Alex Xu, *System Design Interview – An Insider's Guide* (Vol. 1, ch. 3)** — the widely used 4-step framework: understand the problem and set scope, high-level design and buy-in, deep dive, wrap up.
+- **Worked problems on this site** follow the same structure: [URL shortener](/learn/notes/hld-url-shortener/), [news feed](/learn/notes/hld-news-feed/), [chat system](/learn/notes/hld-chat-system/), [payment system](/learn/notes/hld-payment-system/), [rate limiter](/learn/notes/hld-rate-limiter/). Practise by running the eight steps on each before reading the solution.
+
+## Common mistakes
+
+- **Designing before clarifying.** Twenty minutes into a design for the wrong problem.
+- **Turning requirements into an interrogation.** Ten minutes of questions with nothing written down. Ask, assume, write, move on.
+- **Estimates that go nowhere.** Precise math that never changes a decision.
+- **Starting with the "final" architecture.** Microservices, Kafka, Kubernetes and three databases in the first diagram, with no reason for any of them.
+- **Tool names instead of reasons.** "Cassandra" is not an answer; "a wide-column store partitioned by user_id because we write 200K rows/s and always read by user" is.
+- **No deep dive.** A neat high-level picture with no detail anywhere reads as shallow.
+- **Defending a design after a hint.** The interviewer is trying to help you.
+- **Ignoring failures and operations.** No word on what happens when something dies, or how you'd know.
+- **Running out of time.** No wrap-up, deep dive cut short. Watch the clock at the halfway mark.
+- **Monologuing.** Talking for ten minutes without checking whether the interviewer wants to go elsewhere.
+
+## Practice questions
+
+<Practice>
+
+<QA q="What are the main steps of a system design interview, in order?" level="easy">
+
+Clarify functional and non-functional requirements → quick estimates → API → data model → high-level design (walk a request through it) → deep dives on the two or three hardest parts → bottlenecks, failures and trade-offs → wrap-up. Keep it flexible: follow the interviewer when they steer, but default to this order so you never stall.
+
+</QA>
+
+<QA q="What is the difference between functional and non-functional requirements? Use a chat app as the example." level="easy">
+
+Functional = what the system does: send 1:1 messages, group chats, delivery receipts, message history. Non-functional = how well: 50M DAU, delivery under 500 ms, messages never lost, ordered per conversation, 99.99% availability, works on flaky mobile networks. Non-functional requirements drive the architecture (persistent connections, per-conversation ordering, durable storage before ack).
+
+</QA>
+
+<QA q="How much time should you spend on back-of-envelope estimates, and what should they produce?" level="easy">
+
+Two to five minutes. They should produce a few rounded numbers (peak read QPS, write QPS, storage per year, maybe bandwidth) and, more importantly, **decisions**: do we need a cache, sharding, a CDN, async processing? If the interviewer doesn't care about numbers, keep it to one line and move on.
+
+</QA>
+
+<QA q="The interviewer says 'you decide the scale'. What do you do?" level="easy">
+
+Pick a reasonable number, say it out loud and write it down: "I'll assume 10M DAU, 100 reads per write, global users." Then design for it and mention what would change at 10× or 100×. Refusing to pick, or asking more questions, wastes time.
+
+</QA>
+
+<QA q="Why design the API and data model before drawing the architecture?" level="medium">
+
+The API pins down exactly what clients need, and the data model plus access patterns decide the storage technology and partition keys. Drawing boxes first tends to produce generic architectures that don't match the queries you actually have to serve. It doesn't need to be long: a few endpoints and the key tables with their primary keys and indexes.
+
+</QA>
+
+<QA q="How do you choose what to deep dive into?" level="medium">
+
+Go where the risk is: the path with the biggest numbers (e.g., 300K reads/s), the strictest correctness requirement (payments, inventory), the scaling hot spot (celebrities, viral items), or the real-time part. Offer two options and let the interviewer pick: "I think the interesting parts are feed fan-out and media upload. Which would you like?" If they've hinted at something, go there.
+
+</QA>
+
+<QA q="How should you talk about a trade-off so it sounds senior?" level="medium">
+
+Tie it to a requirement, name the cost, and say when you'd change your mind: "I chose async fan-out because feed reads must be under 200 ms. The cost is that new posts take a few seconds to appear for followers, and celebrities are expensive to fan out, so they're merged at read time. If freshness mattered more than latency, I'd fan out on read." Avoid "it depends" without a decision.
+
+</QA>
+
+<QA q="What separates an SDE2 performance from a senior performance in the same round?" level="medium">
+
+Both need a correct, complete design explained clearly. The SDE2 bar adds solid depth in one or two areas, often with some steering. A senior candidate drives the whole conversation, spots the hard part early, volunteers trade-offs with numbers, raises failures, monitoring, rollout and migration without being asked, and keeps the design as simple as the requirements allow.
+
+</QA>
+
+<QA q="You're 25 minutes into a 45-minute round and still refining the high-level diagram. What do you do?" level="medium">
+
+Stop polishing. Say "Let me lock this in so we have time for depth", summarise the design in two sentences, and move to the single most important deep dive. Leave failures and trade-offs for the last five minutes, even briefly. A good-enough diagram with one strong deep dive beats a perfect diagram with none.
+
+</QA>
+
+<QA q="Why should you walk a request end to end through your diagram?" level="medium">
+
+It proves the boxes actually connect and shows where state lives at each step. It often reveals gaps: no idempotency on retries, a synchronous call that should be async, a missing cache invalidation, an ID that's needed before the row exists. It also gives the interviewer an easy hook to ask deeper questions.
+
+</QA>
+
+<QA q="Run the framework quickly on 'design a URL shortener'. What are the key decisions?" level="hard">
+
+Requirements: create short link, redirect, optional custom alias and expiry; reads far exceed writes; redirect latency low; links never collide. Estimates: e.g., 100M new links/month (~40/s writes), 100× reads (~4K/s, more at peak); a few hundred bytes per link. API: `POST /links`, `GET /{code}` → 301/302. Data: `code → long_url` key-value, keyed by code. HLD: API → ID generator → KV store; redirect path → cache → KV. Deep dive: code generation (counter + base62 or Snowflake-style IDs vs random with collision checks), caching hot links, 301 vs 302 for analytics. Failures: cache down, ID generator down, abuse. See the full [URL shortener](/learn/notes/hld-url-shortener/) note.
+
+</QA>
+
+<QA q="How do you handle a requirement change mid-interview, e.g. 'now it must work across three regions'?" level="hard">
+
+Acknowledge it and re-check what it breaks: which data must be written in multiple regions, what consistency you can still offer, and what latency costs appear. Then adjust the smallest part of the design: e.g., home-region writes with async replication for most data, strongly consistent single-region ownership for things like usernames or balances, region-aware IDs. State the new RPO/RTO. Don't redraw everything; show you can adapt the existing design.
+
+</QA>
+
+<QA q="The interviewer keeps interrupting with questions about one component and you haven't finished your design. What do you do?" level="scenario">
+
+Follow them. The interruptions are telling you where they want signal. Answer in depth, then at a natural pause briefly note what's left: "I haven't covered the notification path yet. Should I sketch it, or keep going here?" Let them decide. Don't insist on finishing your planned order.
+
+</QA>
+
+<QA q="You realise halfway through the deep dive that your data model can't serve one of the main queries efficiently. What now?" level="scenario">
+
+Say it openly: "I see a problem: listing a user's orders needs a scan because I partitioned by order_id." Propose the fix (a secondary index or a second table keyed by user_id, kept in sync via the write path or CDC) and its cost (extra writes, eventual consistency between the two). Catching and fixing your own mistake is a strong signal; hiding it isn't.
+
+</QA>
+
+<QA q="The prompt is 'Design Instagram' and nothing else. Walk through your first five minutes." level="scenario">
+
+Clarify scope: upload photos, follow users, home feed, likes; exclude stories, DMs, search for now. Non-functional: assume ~100M DAU, read-heavy, feed p99 under a few hundred ms, eventual consistency for feed and counts, uploads durable. Write both lists. Quick numbers: uploads per second, feed reads per second, media storage per day. Conclude: media in object storage behind a CDN, feed precomputed and cached, metadata sharded. Then: "I'll sketch the API and data model next. Does this scope work for you?"
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="What should you do first when given 'Design a ride-sharing app'?" options={["Clarify features, scale and constraints", "Draw the services and databases", "Pick a database", "Estimate storage for trip history"]} answer={0}>
+
+Requirements first. Everything else (estimates, stores, components) depends on them.
+
+</MCQ>
+
+<MCQ q="Which is a non-functional requirement?" options={["Riders can request a ride", "Drivers can accept a ride", "Matching must complete within 2 seconds at peak", "Riders can rate drivers"]} answer={2}>
+
+Latency at scale is a quality attribute. The others are features.
+
+</MCQ>
+
+<MCQ q="Your estimate shows about 300K reads per second at peak. What is the most useful thing to say next?" options={["That is a lot", "We need Kubernetes", "We should use GraphQL", "So reads must come from a cache or precomputed store, not the primary DB"]} answer={3}>
+
+Turn every number into a design decision. Otherwise the estimate was wasted time.
+
+</MCQ>
+
+<MCQ q="In a 45-minute round, roughly when should a working high-level design be on the board?" options={["By minute 5", "Around the halfway mark", "In the last 5 minutes", "Only if the interviewer asks"]} answer={1}>
+
+By about the middle of the round, so there's time for deep dives, which carry most of the signal.
+
+</MCQ>
+
+<MCQ q="The interviewer asks 'what about celebrities with 50M followers?' What is this most likely?" options={["Small talk", "A request to restart", "A trick question to ignore", "A hint about where to deep dive"]} answer={3}>
+
+Hints point to the hot spot they want to explore. Go there now.
+
+</MCQ>
+
+<MCQ q="Which statement best describes a senior-level trade-off discussion?" options={["Tying the choice to a requirement, naming its cost, and saying when you would switch", "Listing pros and cons of every database", "Saying it depends", "Choosing the newest technology"]} answer={0}>
+
+Requirement → choice → cost → condition for changing it.
+
+</MCQ>
+
+<MCQ q="Why include an idempotency key in a create-order API?" options={["To speed up reads", "To authenticate the user", "So client retries do not create duplicate orders", "To paginate results"]} answer={2}>
+
+Networks fail after the server commits. A retry with the same key returns the original result instead of creating a second order.
+
+</MCQ>
+
+<MCQ q="What is the main purpose of walking a request end to end through your diagram?" options={["To fill time", "To show that the components connect and to find gaps like missing idempotency or caching", "To show you know many technologies", "To avoid the deep dive"]} answer={1}>
+
+It validates the design and exposes missing pieces early.
+
+</MCQ>
+
+<MCQ q="Which is the best response when you discover a flaw in your own design mid-interview?" options={["Call it out, propose a fix and state its cost", "Ignore it and hope it isn't noticed", "Start over from scratch", "Ask the interviewer to fix it"]} answer={0}>
+
+Self-correction with a clear fix and trade-off is a positive signal.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **8 steps**: requirements → estimates → API → data model → high-level design → deep dives → bottlenecks/failures/trade-offs → wrap-up.
+- **Requirements**: 3–5 features + explicit out-of-scope; scale, read/write ratio, latency, availability, consistency, durability, geography.
+- **Estimates**: DAU × actions ÷ 100K = QPS; × 2–5 for peak; turn each number into a decision.
+- **API**: few calls, cursor pagination, idempotency keys, user from auth token.
+- **Data model**: entities + keys + access patterns → store + partition key.
+- **HLD**: simplest working design; walk each main request end to end; get buy-in.
+- **Deep dives**: 2–3 hardest parts — the biggest numbers, strictest correctness, hot spots.
+- **Trade-offs**: "A over B because R; costs C; if R changes, B."
+- **Time**: working HLD by halfway. 45 min: trim estimates/API, protect deep dives.
+- **SDE2**: correct, complete, clear, some depth. **Senior**: drives, spots the hard part, volunteers failures and operations, keeps it simple.
+- Think out loud, signpost, commit to choices, follow hints.
+
+## Go deeper
+
+- **Book**: Alex Xu, *System Design Interview – An Insider's Guide*, Vol. 1, Chapter 3 ("A framework for system design interviews").
+- **Book**: Martin Kleppmann, *Designing Data-Intensive Applications* — the depth behind most deep dives.
+- **Review**: [The Pragmatic Engineer on System Design Interview](https://blog.pragmaticengineer.com/system-design-interview-an-insiders-guide-review/).
+- Related notes: [back-of-envelope math](/learn/notes/back-of-envelope-math/), [failure scenario drills](/learn/notes/hld-failure-scenarios/), [sharding strategies](/learn/notes/sharding-strategies/), [CAP and PACELC](/learn/notes/cap-pacelc-consistency/), [sync vs async](/learn/notes/sync-async-event-driven/).

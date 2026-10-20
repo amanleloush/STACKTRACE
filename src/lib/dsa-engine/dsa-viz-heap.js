@@ -539,7 +539,7 @@
   // ===================================================================
   register("task-scheduler", {
     title: "Task scheduler — max-heap + cooldown queue",
-    caption: "Each tick, pop the most-frequent ready task and emit it. If its count is still positive, park it in a cooldown queue for n ticks. When the front of the queue is ready, push it back to the heap.",
+    caption: "Each tick, pop the most-frequent ready task and emit it. If its count is still positive, park it in a cooldown queue so it can run again n+1 ticks later. When the front of the queue is ready, push it back to the heap.",
     code: [
       "heap = max-heap of remaining counts",
       "queue = [] of (count, readyTime)",
@@ -549,7 +549,7 @@
       "    push(heap, queue.pop_front())",
       "  if heap:",
       "    (cnt, t) = pop(heap); emit t",
-      "    if cnt-1 > 0: queue.push((cnt-1, time+n))",
+      "    if cnt-1 > 0: queue.push((cnt-1, time+n+1))",
       "  else: emit 'idle'",
     ],
     init() {
@@ -614,8 +614,8 @@
           let queue = s.queue;
           let parkMsg = "";
           if (top.count - 1 > 0) {
-            queue = [...s.queue, { task: top.task, count: top.count - 1, readyTime: s.time + s.n }];
-            parkMsg = ` → park (${top.task}, count=${top.count - 1}, ready@${s.time + s.n})`;
+            queue = [...s.queue, { task: top.task, count: top.count - 1, readyTime: s.time + s.n + 1 }];
+            parkMsg = ` → park (${top.task}, count=${top.count - 1}, ready@${s.time + s.n + 1})`;
           } else {
             parkMsg = " (last copy — not parked)";
           }

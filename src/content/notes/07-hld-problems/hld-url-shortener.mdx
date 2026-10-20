@@ -1,7 +1,7 @@
 ---
 title: "HLD: URL Shortener (TinyURL / bit.ly)"
 phase: "07-hld-problems"
-order: 35
+order: 58
 tags: []
 premium: false
 previewParagraphs: 4
@@ -199,31 +199,146 @@ For analytics (clicks), use a separate store — never the OLTP DB.
 - Counter-based codes are predictable. If unguessability matters (private links), use a random 8-char code derived from secure random or HMAC.
 - Cache TTL: long for stable URLs, short for short-lived (expirable) URLs.
 
-## Interview questions
+## Practice questions
 
-### Q1: How would you generate short codes uniquely at scale?
+<Practice>
+
+<QA q="301 or 302 for the redirect, and why?" level="easy">
+
+301 (permanent) is cached aggressively by browsers, so repeat clicks never reach your servers and analytics undercount. 302 (temporary) sends every click through you. Default to 302 when click counts matter.
+
+</QA>
+
+<QA q="How long do codes need to be?" level="easy">
+
+With the 62-character alphabet `[a-zA-Z0-9]`, 6 chars give 62^6 ≈ 56 billion codes and 7 chars give 62^7 ≈ 3.5 trillion. At 100M new URLs per month (6B over 5 years), 6–7 chars is plenty.
+
+</QA>
+
+<QA q="How to avoid DB hit on every redirect?" level="easy">
+
+Cache codes in Redis. Codes are immutable so a long TTL is safe. Traffic is heavily skewed toward a small set of hot codes, so a modest cache (sized for about 20% of URLs) achieves a high hit rate.
+
+</QA>
+
+<QA q="How would you generate short codes uniquely at scale?" level="medium">
+
 Counter-based encoded in base62. For multi-region, partition counter ranges per region. Alternative: Twitter Snowflake-style 64-bit IDs (time + machine + sequence) — every ID unique without coordination.
 
-### Q2: How to avoid DB hit on every redirect?
-Cache codes in Redis. Codes are immutable so long TTL is safe. The hottest 1% of codes typically serve 50%+ of traffic — cache hit rate >99% with modest cache.
+</QA>
 
-### Q3: How do you track click analytics without slowing the redirect?
-Emit a Kafka event asynchronously; redirect proceeds in parallel. Aggregations happen in a separate consumer → ClickHouse/Druid for real-time, S3 Parquet for archival.
+<QA q="Compare hash-based and counter-based code generation." level="medium">
 
-### Q4: A celebrity tweets a short URL; 1M clicks/sec. How does the system survive?
-- CDN caches the redirect at edge — most clicks never hit origin.
+Hash-based (md5/sha256 of the URL → first N base62 chars) gives a stable mapping — the same URL can get the same code — but truncation causes collisions you must detect and resolve, and codes are predictable from the URL. Counter-based has no collisions and is simple, but sequential codes are guessable, and a single global counter is a SPOF unless you use ranges or a distributed ID generator.
+
+</QA>
+
+<QA q="How do you track click analytics without slowing the redirect?" level="medium">
+
+Emit a Kafka event asynchronously; the redirect proceeds without waiting. Aggregations happen in a separate consumer → ClickHouse/Druid for real-time, S3 Parquet for archival. Never increment a counter in the OLTP DB per click — locks and write amplification.
+
+</QA>
+
+<QA q="How to handle URL expiry?" level="medium">
+
+Store `expires_at`; check on read, return 410 Gone if expired. A background job sweeps expired codes from the primary store and purges the CDN. Use a short cache TTL for expirable URLs. Don't rely solely on cache TTL for security-sensitive expiry.
+
+</QA>
+
+<QA q="Links are meant to be private. What's wrong with counter-based codes, and what do you use instead?" level="hard">
+
+Sequential codes are enumerable: anyone can step through neighbouring codes and find other people's links. Use an unguessable random code (for example 8 chars from a secure random source, or derived from an HMAC), and handle the rare collision with a uniqueness check on insert.
+
+</QA>
+
+<QA q="Why is a single global counter a problem, and how do you fix it?" level="hard">
+
+It's a single point of failure and a cross-region bottleneck: every write anywhere must reach it. Give each region (or app server) a non-overlapping range, such as region A 0–1B and region B 1–2B, so they allocate locally. Or use a Snowflake-style generator that needs no coordination.
+
+</QA>
+
+<QA q="Estimate storage for 5 years at 100M new URLs per month." level="hard">
+
+100M × 60 months = 6B URLs. At about 500 bytes per record that's about 3 TB raw, about 9 TB with RF=3. Writes are tiny (about 40/sec average); the system is read-heavy at about 100:1.
+
+</QA>
+
+<QA q="A celebrity tweets a short URL; 1M clicks/sec. How does the system survive?" level="scenario">
+
+- CDN caches the redirect at the edge — most clicks never hit origin (so click counts must then come from CDN logs / edge compute).
 - App tier and Redis scale horizontally.
 - Click events go to Kafka — high-throughput append-only buffer.
-- Origin DB sees ~1 read per cache TTL per region, plus 0 writes (no counter to update).
+- Origin DB sees about 1 read per cache TTL per region, plus 0 writes (no counter to update).
 
-### Q5: A user wants `/my-event` as custom alias but it's taken. Design?
-Check uniqueness against a reserved-aliases blacklist + existing customs. Return error if taken. Charge premium for custom aliases (typical product model).
+</QA>
 
-### Q6: How to handle URL expiry?
-Store `expires_at`; check on read, return 410 Gone if expired. Background job sweeps expired codes from primary store and CDN purge. Don't rely solely on TTL for security-sensitive expiry.
+<QA q="A user wants `/my-event` as custom alias but it's taken. Design?" level="scenario">
 
-### Q7: A shortened malicious URL gets flagged. How do you take it down?
-Add a `disabled` flag in `url_map`. On read, return error page if disabled. Issue CDN purge to remove cached redirects. Maintain a blacklist of malicious domains (or use a service like Google Safe Browsing) and reject on shorten if matched.
+Check uniqueness against a reserved-aliases blacklist + existing customs. Return an error if taken (optionally suggest alternatives). Insert with `custom=true`. Charge premium for custom aliases (typical product model).
+
+</QA>
+
+<QA q="A shortened malicious URL gets flagged. How do you take it down?" level="scenario">
+
+Add a `disabled` flag in `url_map`. On read, return an error page if disabled. Issue a CDN purge to remove cached redirects. Maintain a blacklist of malicious domains (or use a service like Google Safe Browsing) and reject on shorten if matched.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="Marketing complains that click counts for a short link are far lower than expected. The service returns 301. What is the likely cause?" options={["Kafka is dropping events", "Browsers cache the 301 and skip the service on repeat clicks", "Redis evicted the code", "Base62 encoding loses characters"]} answer={1}>
+
+A 301 is permanent and cached by browsers, so repeat visits never reach you. Use 302. Kafka loss or eviction would show other symptoms, and base62 is lossless.
+
+</MCQ>
+
+<MCQ q="Why is a long cache TTL safe for code to long_url mappings?" options={["Codes are immutable once created", "Redis never evicts", "The CDN refreshes it every second", "DB reads are free"]} answer={0}>
+
+A code always maps to the same URL, so stale data is not a risk (except for expiry or takedown, which need explicit purges). Redis does evict, and the other options are false.
+
+</MCQ>
+
+<MCQ q="What is the main drawback of truncating a hash of the URL to make the code?" options={["It needs a global counter", "It can't be stored in Redis", "Collisions, which must be detected and resolved", "It makes codes longer than 8 chars"]} answer={2}>
+
+Taking the first N chars of a hash means different URLs can collide, so you check and retry. Hashing needs no counter, stores fine and is truncated to the length you choose.
+
+</MCQ>
+
+<MCQ q="Private share links are being discovered by strangers. What is the most likely design flaw?" options={["302 instead of 301", "Long cache TTLs", "Kafka click tracking", "Sequential counter-based codes are guessable"]} answer={3}>
+
+Sequential codes can be enumerated. Private links need unguessable random or HMAC-derived codes. Redirect status, cache TTLs and analytics don't expose links.
+
+</MCQ>
+
+<MCQ q="How should the redirect path record a click?" options={["Emit an event to Kafka asynchronously and redirect immediately", "Increment a counter in Postgres before redirecting", "Write the click to Redis and the DB synchronously", "Skip analytics on cache hits"]} answer={0}>
+
+Async events keep the redirect fast and move aggregation to consumers. A per-click DB update adds latency and lock contention, and skipping cache hits loses most clicks.
+
+</MCQ>
+
+<MCQ q="Two regions each need to issue codes without a cross-region call. What works?" options={["One shared Redis INCR in region A", "Random 3-char codes", "Non-overlapping counter ranges per region", "Let both regions use the same counter and retry on conflict"]} answer={2}>
+
+Disjoint ranges let each region allocate locally with no collisions. A shared counter adds cross-region latency and a SPOF, 3 chars collide quickly, and sharing a counter guarantees conflicts.
+
+</MCQ>
+
+<MCQ q="A short link expired yesterday. What should GET on its code return?" options={["404 Not Found", "410 Gone", "302 to the original URL", "500 Internal Server Error"]} answer={1}>
+
+410 Gone states that the resource existed and was removed deliberately. 404 is less precise, redirecting ignores the expiry, and 500 signals a server bug.
+
+</MCQ>
+
+<MCQ q="A link is flagged as malicious, but users still get redirected after you set disabled=true. Why?" options={["The DB index is stale", "Base62 decoding is cached", "Kafka replays the old event", "The CDN and cache still hold the redirect, so you must purge them"]} answer={3}>
+
+Cached redirects at the edge and in Redis bypass the new flag until purged. Indexes don't hold redirects, decoding isn't cached, and click events don't drive redirects.
+
+</MCQ>
+
+</Quiz>
 
 ## TL;DR cheat sheet
 

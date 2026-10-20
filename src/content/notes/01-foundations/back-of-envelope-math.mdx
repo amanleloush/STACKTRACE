@@ -78,9 +78,9 @@ For any HLD problem:
 
 ## Real-world examples
 
-- **WhatsApp**: famously handled 50B messages/day with ~50 engineers — math told them per-server message handling needed to be ~1M concurrent connections. They built Erlang/FreeBSD around exactly that.
-- **Instagram**: photos uploaded ≈ 100M/day. At 200KB avg + RF=3 = ~60 TB/day new storage. Hence their tiered S3 + CDN architecture.
-- **Stripe**: ~1B requests/day at peak. With p99 latency target of &lt;100 ms across multi-step flows, latency budgets per hop are &lt;10 ms — drives gRPC + co-located services + tight caching.
+- **WhatsApp**: famously ran a massive messaging service with a tiny team (~50 engineers for ~900M users in 2015). Per-server connection math drove the design: in 2012 they reported pushing a single Erlang/FreeBSD server past 2M concurrent TCP connections.
+- **Instagram**: ~95M photos and videos shared per day (2016 figure). At 200KB avg + RF=3 ≈ 60 TB/day new storage. Hence blob storage + CDN, not a database, for media.
+- **Payments APIs (e.g., Stripe)**: with an end-to-end p99 target of ~100 ms across a multi-step flow, each internal hop gets a budget of ~10 ms — which drives co-located services and tight caching.
 
 ## Common pitfalls
 
@@ -91,38 +91,154 @@ For any HLD problem:
 - **Conflating read latency with write latency**: writes often need fsync, replication ACKs, much slower than reads.
 - **Wishful caching**: "we'll cache it" doesn't help if access pattern has no locality.
 
-## Interview questions
+## Practice questions
 
-### Q1 — Easy: How much faster is RAM than SSD random read?
-RAM access ~100 ns, SSD random read ~150 μs → SSD is ~1,500× slower. Sequential SSD read of 1MB is ~1 ms, vs 250 μs from RAM (4× slower for big blocks).
+<Practice>
 
-### Q2 — Easy: How much data does 100M DAU posting 1 tweet/day (1 KB) generate per year?
-100M × 1 KB/day = 100 GB/day. × 365 = ~36 TB/year. With replication factor 3, ~110 TB/year on disk.
+<QA q="How much faster is RAM than an SSD random read?" level="easy">
 
-### Q3 — Medium: A service needs to serve 1M QPS. Each request is 2KB response. How much bandwidth?
-1M × 2KB = 2 GB/s = 16 Gbps. You need either fat NICs (40/100 Gbps) on the edge, or a CDN to absorb this.
+RAM access is ~100 ns and an SSD random read is ~150 μs, so the SSD is ~1,500× slower. For big sequential blocks the gap shrinks: reading 1 MB sequentially takes ~250 μs from RAM vs ~1 ms from SSD (about 4× slower).
 
-### Q4 — Medium: 500M users, you want to store one timestamp per user updated every login. How big is the table?
-500M × ~30 bytes (user_id 8B + timestamp 8B + indexing overhead ~14B) ≈ 15 GB. Fits in RAM on one machine. With index → ~30 GB. Still tiny — no sharding needed for this alone.
+</QA>
 
-### Q5 — Medium: A request fans out to 5 internal services, each with p99 = 20 ms. What's the upper bound for total p99?
-**It's not 20 ms.** Fan-out + wait-for-all → p99 of the slowest of 5 independent 20-ms p99 calls is much higher. With 5 calls, p99 of the slowest ≈ p(1-0.01^5)... actually closer to ~50–60 ms in practice. Lesson: fan-out amplifies tail latency. (Jeff Dean: "The Tail at Scale.")
+<QA q="Convert 100M DAU doing 10 actions per day into average and peak QPS." level="easy">
 
-### Q6 — Hard: Design a write-heavy logging system at 1M events/sec, 200 bytes each. Estimate storage and bandwidth for 1 year.
-- Throughput: 1M × 200B = 200 MB/s = 1.6 Gbps ingress (× compression ~3× → 0.5 Gbps over the wire).
-- Per day: 200 MB/s × 86,400 = ~17 TB raw, ~6 TB compressed.
-- Per year: ~6 PB compressed, ~18 PB with RF=3.
-- Conclusion: tiered storage, columnar format (Parquet), partition by date + tenant, cold storage to S3 Glacier after 30 days, query via Trino/Presto.
+100M × 10 = 1B actions/day. Divide by 86,400 s (≈ 10⁵): ~12K QPS on average. Real traffic is bursty, so apply a 2–5× peak factor; ~3× gives ~35K QPS at peak. Always size for peak, not average.
 
-### Q7 — Hard: You're sizing a cache for a system with 10TB of warm data and 80% hit rate target. Cache budget?
-80% hit rate on Zipfian access usually requires caching ~20% of the working set. ~2 TB cache. Spread across Redis cluster nodes at 50 GB each (leaving overhead) → ~40 nodes. If 80% target is from p50 not warm working set, you might need closer to 30% → ~3 TB.
+</QA>
 
-### Q8 — Hard: A new feature predicts 5M extra DAU. Each session is 30 min, generates 50 API calls of 5KB response. What infra grows?
-- Sessions/sec at peak (3× avg): 5M × (30 min / 1440 min) × 3 ≈ 300K concurrent active.
-- API peak: 5M × 50 / 86400 × 3 ≈ 8.7K QPS new load.
-- Bandwidth: 8.7K × 5KB = ~45 MB/s = 350 Mbps egress.
-- Concurrent connections ≈ 300K → matters for LB/conn pools, not bandwidth.
-- DB writes/reads: depends on feature mix; back-pressure plan needed before launch.
+<QA q="How much data does 100M DAU posting 1 tweet per day (1 KB) generate per year?" level="easy">
+
+100M × 1 KB/day = 100 GB/day. × 365 ≈ 36 TB/year. With replication factor 3, ~110 TB/year actually on disk.
+
+</QA>
+
+<QA q="How many MB/s does a 1 Gbps link carry, and why do the units trip people up?" level="easy">
+
+1 Gbps = 10⁹ bits/s ÷ 8 = **125 MB/s** (10 Gbps ≈ 1.25 GB/s). Networks are quoted in bits, storage in bytes, so forgetting the ÷8 is an 8× error. Also keep decimal (1 TB = 10¹² B, what disks and networks use) separate from binary (1 TiB = 2⁴⁰ B, what the OS often shows).
+
+</QA>
+
+<QA q="A service needs to serve 1M QPS with a 2 KB response each. How much bandwidth?" level="medium">
+
+1M × 2 KB = 2 GB/s = 16 Gbps. You need fat NICs (40/100 Gbps) at the edge, spread across many machines, or a CDN to absorb the egress.
+
+</QA>
+
+<QA q="500M users, one timestamp per user updated on every login. How big is the table?" level="medium">
+
+500M × ~30 bytes (8 B user_id + 8 B timestamp + ~14 B row overhead) ≈ 15 GB. With an index, ~30 GB. That fits in RAM on one machine, so this alone needs no sharding.
+
+</QA>
+
+<QA q="Which multipliers do people most often forget when estimating storage?" level="medium">
+
+- **Replication factor** (typically × 3).
+- **Indexes and metadata**: indexes can be 20–50% of data size; logs can equal the data they describe.
+- **Retention horizon**: 5 years is ~2,000 days, not 365.
+- **Peak vs average** for the write rate that feeds the storage.
+
+Missing any one of these is an easy 2–3× underestimate.
+
+</QA>
+
+<QA q="A request fans out to 5 internal services, each with p99 = 20 ms. What is the end-to-end p99?" level="medium">
+
+**Not 20 ms.** With wait-for-all fan-out you wait for the slowest of 5 calls. If they're independent, P(all 5 under 20 ms) = 0.99⁵ ≈ 0.95, so ~5% of requests exceed 20 ms and 20 ms is now roughly your end-to-end **p95**. The end-to-end p99 is each call's ~p99.8, which, depending on the tail shape, can be several times 20 ms. Fan-out amplifies tail latency (Dean & Barroso, "The Tail at Scale").
+
+</QA>
+
+<QA q="You're sizing a cache for 10 TB of warm data with an 80% hit-rate target. What's the budget?" level="hard">
+
+With Zipfian (skewed) access, an 80% hit rate usually needs ~20% of the working set cached: ~2 TB. At ~50 GB usable per Redis node (leaving overhead), that's ~40 nodes. If the access pattern is flatter than assumed, you may need closer to 30% (~3 TB). And if access has no locality at all, caching won't reach 80% at any sane size.
+
+</QA>
+
+<QA q="Design a write-heavy logging system at 1M events/sec, 200 bytes each. Estimate storage and bandwidth for a year." level="scenario">
+
+- Throughput: 1M × 200 B = 200 MB/s = 1.6 Gbps ingress (~3× compression → ~0.5 Gbps on the wire).
+- Per day: 200 MB/s × 86,400 ≈ 17 TB raw, ~6 TB compressed.
+- Per year: ~6 PB raw, ~2 PB compressed, ~6 PB compressed with RF=3.
+- Conclusion: tiered storage, columnar format (Parquet), partition by date + tenant, move to cold storage (e.g. S3 Glacier) after 30 days, query with Trino/Presto.
+
+</QA>
+
+<QA q="A new feature predicts 5M extra DAU. Each 30-minute session makes 50 API calls with 5 KB responses. What infra grows?" level="scenario">
+
+- Concurrent sessions at peak (3× avg): 5M × (30 / 1,440) × 3 ≈ 300K active.
+- API peak: 5M × 50 / 86,400 × 3 ≈ 8.7K QPS of new load.
+- Bandwidth: 8.7K × 5 KB ≈ 45 MB/s ≈ 350 Mbps egress.
+- ~300K concurrent connections matter for LBs and connection pools far more than bandwidth does.
+- DB reads/writes depend on the feature mix; have a back-pressure plan before launch.
+
+</QA>
+
+<QA q="Your estimate shows 300M DAU, 100:1 reads to writes, ~1M read QPS at peak and 1 GB/s egress. What design decisions follow?" level="scenario">
+
+- Reads dominate by 100×, so **cache aggressively** (a Redis layer in front of sharded read replicas).
+- 1M read QPS is far beyond one database, so shard and replicate.
+- 1 GB/s egress is fine for text; push media through a **CDN** rather than your servers.
+- Storage (~200 TB/year raw, ~600 TB with RF=3) argues for **tiered storage**: hot data in MySQL/Cassandra, cold in S3/Parquet.
+
+The point of the math is these conclusions: it picks the architecture.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="100M DAU each perform 10 actions per day. Roughly what is the average QPS?" options={["~1.2K", "~12K", "~120K", "~1.2M"]} answer={1}>
+
+1B actions/day ÷ 86,400 s ≈ 11.6K, so ~12K QPS. The other options are off by a factor of 10 or more, the classic mistake when you lose track of the 10⁵ seconds in a day.
+
+</MCQ>
+
+<MCQ q="Which ordering from fastest to slowest is correct?" options={["SSD random read, RAM reference, datacenter round trip, HDD seek", "RAM reference, datacenter round trip, SSD random read, HDD seek", "RAM reference, SSD random read, datacenter round trip, HDD seek", "RAM reference, SSD random read, HDD seek, datacenter round trip"]} answer={2}>
+
+RAM ~100 ns, SSD random read ~150 μs, datacenter round trip ~500 μs, HDD seek ~10 ms. An SSD random read is faster than a network round trip in the same datacenter, and an HDD seek is slower than both.
+
+</MCQ>
+
+<MCQ q="A service serves 1M QPS with 2 KB responses. What egress bandwidth is needed?" options={["2 Gbps", "250 Mbps", "160 Gbps", "16 Gbps"]} answer={3}>
+
+1M × 2 KB = 2 GB/s, and × 8 bits per byte = 16 Gbps. 2 Gbps forgets the bits-vs-bytes conversion; the others are off by an order of magnitude.
+
+</MCQ>
+
+<MCQ q="A request fans out to 5 independent services, each with p99 = 20 ms, and waits for all of them. What is true?" options={["Roughly 5% of requests will take longer than 20 ms", "The end-to-end p99 is exactly 20 ms", "The end-to-end p99 is 100 ms because latencies add", "Fan-out improves tail latency because calls run in parallel"]} answer={0}>
+
+P(all 5 under 20 ms) = 0.99⁵ ≈ 0.95, so ~5% exceed it and 20 ms becomes roughly the p95. Parallel calls don't add latencies, but waiting for the slowest one amplifies the tail rather than improving it.
+
+</MCQ>
+
+<MCQ q="You estimated 200 TB/year of raw writes. Which figure is the most realistic disk footprint to plan for?" options={["200 TB, since the raw estimate is what gets stored", "About 600 TB or more, after replication factor 3 plus index overhead", "About 70 TB, since compression always gives 3x", "About 20 TB, since only the hot 10 percent is kept"]} answer={1}>
+
+Storage must be multiplied by the replication factor (typically 3), and indexes and metadata add 20–50% on top. Compression and tiering can help, but you can't assume them by default.
+
+</MCQ>
+
+<MCQ q="Why size infrastructure with a peak factor of 2 to 5x rather than for average QPS?" options={["Averages are always computed incorrectly", "Replication triples the request rate", "Real traffic is bursty, and capacity planned for the average falls over at peak", "Caches only work at peak load"]} answer={2}>
+
+Traffic follows daily cycles and spikes, so a system sized for the average is overloaded for a good part of the day. Replication affects storage, not client QPS, and caches help at any load.
+
+</MCQ>
+
+<MCQ q="An 80% cache hit rate on 10 TB of warm data is the goal. Which assumption makes caching about 2 TB reasonable?" options={["Access is uniformly random across all keys", "The cache uses SSDs instead of RAM", "Every key is read exactly once", "Access is skewed (Zipfian), so a small hot set receives most reads"]} answer={3}>
+
+Under skewed access a ~20% hot set can serve most reads. With uniform access, the hit rate roughly equals the fraction cached, so 2 TB would give about 20%. Keys read only once have no locality to exploit.
+
+</MCQ>
+
+<MCQ q="A design has a 100:1 read-to-write ratio and about 1M read QPS at peak. What is the most direct conclusion?" options={["Put a cache layer and read replicas in front of the primary store", "Switch to a write-optimized LSM database", "Add more write shards to the primary", "Drop replication to save capacity"]} answer={0}>
+
+When reads dominate by 100×, the win is serving reads from caches and replicas. Write optimizations and write shards target the wrong side of the ratio, and dropping replication sacrifices durability without helping read QPS.
+
+</MCQ>
+
+</Quiz>
 
 ## TL;DR cheat sheet
 
@@ -138,7 +254,7 @@ RAM access ~100 ns, SSD random read ~150 μs → SSD is ~1,500× slower. Sequent
 
 - **Jeff Dean's latency numbers**: [gist](https://gist.github.com/jboner/2841832) and ["Numbers Everyone Should Know"](https://www.cs.cornell.edu/projects/ladis2009/talks/dean-keynote-ladis2009.pdf).
 - **Colin Scott's interactive latency**: [colin-scott.github.io/personal_website/research/interactive_latency.html](https://colin-scott.github.io/personal_website/research/interactive_latency.html) (scrubs over years).
-- **Jeff Dean, "The Tail at Scale"**: [CACM paper](https://research.google/pubs/the-tail-at-scale/) — required reading.
-- **ByteByteGo**: ["Back of the Envelope estimation"](https://blog.bytebytego.com/p/back-of-the-envelope-estimation) primer.
+- **Jeff Dean & Luiz Barroso, "The Tail at Scale"**: [CACM paper](https://research.google/pubs/the-tail-at-scale/) — required reading.
+- **ByteByteGo**: ["Back-of-the-envelope estimation"](https://bytebytego.com/courses/system-design-interview/back-of-the-envelope-estimation) primer.
 - **Alex Xu, *System Design Interview Vol 1*** — Chapter 2 has a clean back-of-envelope walkthrough.
 - **Sysbench / ab / wrk** — build intuition by actually measuring on your laptop.

@@ -1,0 +1,548 @@
+---
+title: "Redis Atomicity: Transactions, Lua, Pipelining, Pub/Sub, Streams"
+phase: "03-caching-redis"
+order: 25
+tags: ["caching"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 18
+prerequisites: ["redis-deep"]
+summary: "The tools Redis gives you to do several things safely or quickly at once (single commands, MULTI/EXEC/WATCH, Lua and Functions, pipelining), its two messaging models (Pub/Sub and Streams), and how modules extend it."
+---
+
+## Definition (interview-ready)
+
+Redis runs commands on **one main thread**, one command at a time, so **every single command is atomic**. For anything bigger there are four tools, each making a different guarantee. **`MULTI`/`EXEC`** queues commands and runs them back to back with nothing interleaved, but it has **no rollback**. **`WATCH`** adds optimistic check-and-set on top. **Lua scripts** (`EVAL`) and **Functions** (`FCALL`, Redis 7+) run logic on the server atomically, including read-then-write decisions. **Pipelining** only batches round trips and is **not atomic**. For messaging, **Pub/Sub** is fire-and-forget fan-out (at-most-once). **Streams** are a persisted, append-only log with consumer groups, acknowledgements, and redelivery (at-least-once).
+
+## Why it matters
+
+- Race conditions in Redis code are a top interview topic: double-spending a counter, lost updates, a lock released by the wrong client. The fix is almost always "use a single atomic command, `WATCH`, or a script".
+- "Is a Redis transaction ACID?" is a trap. It is isolated and all-or-nothing on *dispatch*, but a failed command doesn't undo the others.
+- Pipelining is the cheapest big performance win in Redis. Knowing it isn't atomic keeps you out of trouble.
+- Choosing Pub/Sub, Streams, or Kafka for a messaging feature is a common system-design moment.
+
+## Core concepts
+
+### Level 0: atomic single commands
+
+Before reaching for transactions, check whether **one command** already does the job:
+
+| Need | Atomic command |
+|---|---|
+| Counter / rate limit | `INCR`, `INCRBY`, `HINCRBY`, `ZINCRBY` |
+| Set only if absent (locks, idempotency keys) | `SET key val NX EX 30` |
+| Read and delete in one step | `GETDEL`, or `GETEX` to read and change the TTL |
+| Move between lists (reliable queue) | `LMOVE src dst LEFT RIGHT`, `BLMOVE` |
+| Multi-key write | `MSET`, `MSETNX` (all-or-nothing set) |
+| Pop a min/max | `ZPOPMIN`, `ZPOPMAX` (5.0+) |
+| Compare-and-set a string (8.4+) | `SET key new IFEQ old`, and `DELEX` for compare-and-delete |
+
+A command never sees another client's half-finished work, because only one command runs at a time.
+
+### MULTI / EXEC / DISCARD / WATCH
+
+```bash
+> MULTI
+OK
+> INCR foo
+QUEUED
+> INCR bar
+QUEUED
+> EXEC
+1) (integer) 1
+2) (integer) 1
+```
+
+What you get:
+
+1. **Isolation**: queued commands run back to back, and no other client's command runs in the middle.
+2. **All-or-nothing dispatch**: if the connection drops before `EXEC`, nothing runs. With AOF, the transaction is written in a single `write(2)`. If a crash leaves it half-written, `redis-check-aof` removes the partial transaction.
+
+What you don't get is rollback. There are two kinds of error:
+
+| When | Example | Result |
+|---|---|---|
+| **While queuing** (before `EXEC`) | Wrong arity, unknown command, OOM | Since 2.6.5, `EXEC` refuses the whole transaction with `EXECABORT`. Nothing runs |
+| **During `EXEC`** | `LPOP` on a string key gives `WRONGTYPE` | **The other commands still run.** `EXEC` returns a mixed array of results and errors |
+
+Redis chose not to support rollback to keep the engine simple and fast. Errors at execution time are programming bugs (a wrong type) that tests should catch.
+
+`DISCARD` throws away the queue and leaves transaction mode.
+
+#### WATCH: optimistic locking (check-and-set)
+
+Inside `MULTI` you **can't read a value and branch on it**, because commands only return `QUEUED`. `WATCH` fixes this: read *before* `MULTI`, and `EXEC` aborts if anything you watched changed.
+
+```bash
+WATCH balance:42
+GET balance:42            # → "100"   (client computes 100 - 30 = 70)
+MULTI
+SET balance:42 70
+EXEC                      # → nil if anyone touched balance:42 since WATCH → retry the loop
+```
+
+- Any change to a watched key aborts the transaction, including changes from **expiry or eviction** (expiry only counts since 6.0.9). `EXEC` then returns a null reply.
+- `EXEC` (whether it ran or aborted) and closing the connection both clear all watches. `UNWATCH` clears them by hand.
+- This is optimistic: under heavy contention on a hot key you retry a lot. Use a script there instead.
+
+#### Limitations of transactions
+
+- No rollback.
+- No conditional logic inside, apart from the `WATCH` abort.
+- In Cluster, every key must hash to the **same slot** (use hash tags like `{user:42}:balance`), or you get `CROSSSLOT`.
+- A huge transaction still blocks the server while `EXEC` runs.
+
+### Lua scripting: EVAL, EVALSHA, SCRIPT LOAD
+
+A script runs **inside Redis, atomically**. Nothing else runs until it returns. It can read, decide, and write in one step, which `MULTI` can't do.
+
+```bash
+# Release a lock only if we still own it (compare-and-delete)
+EVAL "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end" 1 lock:order:7 my-token
+
+# Cache the script, then call it by SHA1
+SCRIPT LOAD "return redis.call('INCRBY', KEYS[1], ARGV[1])"
+# → "a1b2...sha1"
+EVALSHA a1b2...sha1 1 counter 5
+# NOSCRIPT No matching script  → client falls back to EVAL / SCRIPT LOAD
+```
+
+Rules worth knowing:
+
+- **Pass every key in `KEYS`** and every other input in `ARGV`. Never build key names inside the script. Redis routes and checks slots based on the declared keys, and in Cluster all of them must be in one slot.
+- **Parameterize scripts, don't generate them.** Each distinct script body is cached by SHA1, so generated scripts leak memory.
+- **The script cache is volatile.** A restart, a failover, or `SCRIPT FLUSH` clears it. Always handle `NOSCRIPT`, which most clients do automatically.
+- `redis.call` raises errors back to the client. `redis.pcall` returns them to the script so it can handle them.
+- **Replication**: since 5.0 Redis replicates a script's **effects** (the writes it made, wrapped in `MULTI`/`EXEC`) by default. 7.0 removed verbatim script replication. That's why non-deterministic commands like `TIME` are fine in scripts now.
+- **Read-only variants** (7.0+): `EVAL_RO`, `EVALSHA_RO`, or the `no-writes` flag. These can run on replicas and can always be killed.
+- The engine is **Lua 5.1**, sandboxed: no filesystem or network.
+
+#### The blocking risk
+
+A script **blocks the whole server** while it runs. After `busy-reply-threshold` (formerly `lua-time-limit`, default **5 seconds**), Redis does *not* kill the script, because that would break atomicity. Instead:
+
+- other clients get `BUSY` errors
+- `SCRIPT KILL` / `FUNCTION KILL` work **only if the script hasn't written anything yet**
+- if it has written, the only way out is `SHUTDOWN NOSAVE`, which loses everything since the last save
+
+So keep scripts short and O(small). No loops over big collections.
+
+### Redis Functions (7.0+)
+
+Functions are scripts that **belong to the database**, not to the application:
+
+```bash
+cat mylib.lua
+#!lua name=mylib
+redis.register_function('my_incr', function(keys, args)
+  return redis.call('INCRBY', keys[1], args[1])
+end)
+
+cat mylib.lua | redis-cli -x FUNCTION LOAD REPLACE   # → "mylib"
+redis-cli FCALL my_incr 1 counter 5
+redis-cli FCALL_RO my_reader 1 somekey              # needs the no-writes flag
+```
+
+| | `EVAL` scripts | Functions |
+|---|---|---|
+| Owned by | The application, which must keep the source around | The server: loaded once, called by name |
+| Survive restart / failover | No (volatile cache) | **Yes**: persisted to RDB/AOF and replicated |
+| Identity | SHA1 digest | Library + function name |
+| Code reuse | None | Functions in one library can share helpers |
+| Atomicity | Atomic, blocks the server | Same |
+| Cluster | Script cache per node | You must load them on **every master** yourself (e.g. `redis-cli --cluster call ... FUNCTION LOAD`) |
+
+### Pipelining
+
+Without pipelining, every command pays one **round-trip time (RTT)**:
+
+```text
+No pipeline:   C→S  S→C  C→S  S→C  C→S  S→C        total ≈ N × RTT
+Pipelined:     C→S C→S C→S ...  S→C S→C S→C ...    total ≈ 1 × RTT + server time
+```
+
+- **RTT math**: 10,000 commands at a 1 ms RTT is about 10 s sequentially and well under a second pipelined. The docs' extreme example: at 250 ms RTT you get **4 req/s** no matter how fast the server is.
+- It also cuts the number of `read()`/`write()` **syscalls**. Many commands arrive in one read and many replies leave in one write. That's why throughput can rise to about 10x even on loopback.
+- The server holds every reply in memory until the client reads them, so **send in batches** (the docs suggest about 10k commands per batch).
+- **Not atomic.** Other clients' commands can run between yours. It's purely a network optimization.
+- **Can't depend on earlier results.** If command 2 needs the result of command 1, use a script.
+
+| | Pipelining | MULTI/EXEC | Lua / Functions |
+|---|---|---|---|
+| Saves RTTs | Yes | Yes, if pipelined together | Yes (one call) |
+| Atomic / isolated | **No** | Yes | Yes |
+| Read-then-write logic | No | Only with `WATCH` + retry | **Yes** |
+| Rollback | n/a | No | No (but you can validate before writing) |
+
+The best practice is to pipeline `MULTI ... EXEC` together, so you get isolation in a single round trip.
+
+### Pub/Sub
+
+```bash
+SUBSCRIBE orders:created          # exact channel
+PSUBSCRIBE orders:*               # glob pattern → 'pmessage' replies
+PUBLISH orders:created '{"id":7}' # returns number of receiving clients
+```
+
+- **At-most-once, fire-and-forget.** Messages aren't stored. A subscriber that is offline, slow, or reconnecting **misses them for good**.
+- Channels have nothing to do with the keyspace or the DB number. Publishing on db 10 reaches a subscriber on db 1. Prefix channel names if you need namespaces.
+- With RESP2, a subscribed connection can only run (P|S)SUBSCRIBE, the unsubscribe commands, `PING`, `RESET`, and `QUIT`. With RESP3 it can run anything.
+- One client can get the same message twice if it matches both a channel and a pattern.
+- **Slow subscribers get disconnected.** The default `client-output-buffer-limit pubsub 32mb 8mb 60` drops a client that hits 32 MB, or stays above 8 MB for 60 s.
+- **Sharded Pub/Sub (7.0+)**: `SSUBSCRIBE` / `SPUBLISH` hash the channel to a slot, the same way keys are hashed. Messages stay inside that shard. Classic `PUBLISH` in Cluster is broadcast over the cluster bus to **every** node, which doesn't scale.
+
+### Streams: a log with consumer groups
+
+```bash
+# Produce, capped to about 1M entries (approximate trim = cheap)
+XADD orders MAXLEN ~ 1000000 * id 7 total 499
+
+# One-time group setup (MKSTREAM creates the key if missing)
+XGROUP CREATE orders billing $ MKSTREAM
+
+# Consume: '>' = never-delivered messages; these go into the group's PEL
+XREADGROUP GROUP billing worker-1 COUNT 10 BLOCK 5000 STREAMS orders >
+
+# Done → remove from the Pending Entries List
+XACK orders billing 1700000000000-0
+
+# Crash recovery: re-read MY pending messages first (ID 0), then switch to '>'
+XREADGROUP GROUP billing worker-1 STREAMS orders 0
+
+# Inspect / steal stuck work
+XPENDING orders billing - + 10            # id, owner, idle ms, delivery count
+XAUTOCLAIM orders billing worker-2 60000 0-0 COUNT 10   # claim msgs idle > 60s (6.2+)
+```
+
+- **Entry IDs** are `ms-seq`, always increasing, and generated by the server with `*`. `XADD` is O(1).
+- **Consumer group**: each entry goes to *one* consumer in the group. Different groups each get *every* entry, like Kafka groups.
+- **PEL (Pending Entries List)**: delivered but not yet `XACK`ed. A crash means the message stays pending, so you get **at-least-once** delivery. Make handlers idempotent.
+- **Delivery counter**: it goes up on each claim or re-read. When it gets too high, move the message to a dead-letter stream and alert.
+- **Trimming**: `MAXLEN ~ N` (approximate) trims only whole radix-tree nodes, which is much cheaper than an exact `MAXLEN N`. `MINID` trims by ID, which in practice means by age.
+- **Durability**: streams and consumer-group state go through normal RDB/AOF and **async replication**. A failover can lose recent `XADD`s or `XACK`s. Use AOF and consider `WAIT`.
+- One stream is **one key on one shard**. To partition, use N stream keys (that's the closest thing to Kafka partitions). A consumer group is server-side load balancing, not partitioning.
+
+### Redis as a message broker vs Kafka
+
+| | Redis Pub/Sub | Redis Streams | Kafka |
+|---|---|---|---|
+| Delivery | At-most-once | At-least-once (PEL + XACK) | At-least-once; exactly-once with transactions |
+| Retention | None | In RAM, trimmed by `MAXLEN`/`MINID` | On disk, days to forever |
+| Replay | No | Yes, by ID | Yes, by offset |
+| Scale-out | Sharded Pub/Sub (7.0+) | Manual: N keys across shards | Partitions are built in |
+| Ordering | Per channel, in order of publish | Per stream; lost with N consumers in a group | Per partition |
+| Latency | Sub-millisecond | Sub-millisecond | Low milliseconds |
+| Sweet spot | Live notifications, cache invalidation, chat presence | Small to medium job queues, activity feeds, lightweight event sourcing | High-volume event backbone, CDC, long retention |
+
+Use Redis when you already run it, volume fits in RAM, and losing a few seconds on failover is acceptable. Use Kafka (see [Kafka deep dive](/learn/notes/kafka-deep/)) when you need durable retention, large replay, or very high throughput. For RabbitMQ and SQS, see [Pulsar, RabbitMQ, SQS](/learn/notes/pulsar-rabbitmq-sqs/).
+
+### Modules: extending Redis
+
+Modules (since **Redis 4.0**) are C shared libraries loaded with `loadmodule /path/mod.so` in `redis.conf` or `MODULE LOAD` at runtime. They can add **new commands and new native data types** that run at native speed. In Cluster, they have to be loaded on every node.
+
+The well-known ones:
+
+| Module | Adds | Example |
+|---|---|---|
+| **RedisJSON** | A JSON document type with path-based reads and updates | `JSON.SET user:1 $ '{"name":"a"}'`, `JSON.NUMINCRBY user:1 $.visits 1` |
+| **RediSearch** (Redis Query Engine) | Secondary indexes, full-text, numeric, geo, and vector search over hashes and JSON | `FT.CREATE`, `FT.SEARCH`, `FT.AGGREGATE` |
+| **RedisBloom** | Probabilistic types: Bloom, Cuckoo, Count-min sketch, Top-K, t-digest | `BF.ADD`, `BF.EXISTS` |
+| **RedisTimeSeries** | A time-series type with retention, downsampling, and aggregation | `TS.ADD`, `TS.RANGE ... AGGREGATION avg 60000` |
+
+**The Redis 8 change (May 2025):** Redis 8 **folds these into Redis Open Source**. Search and query, JSON, time series, and the five probabilistic types (plus a vector set preview) ship in the main distribution, so you no longer load them as separate modules. Redis Stack and "Community Edition" are merged into the name **Redis Open Source**. Licensing also changed. In March 2024 Redis moved to dual RSALv2/SSPLv1 source-available licensing, which isn't open source by the OSI definition, and that led to forks. Redis 8 added **AGPLv3** as a third option, so you can now choose RSALv2, SSPLv1, or AGPLv3. One practical effect: ACL categories like `@read` / `@write` now include commands such as `FT.SEARCH` and `JSON.SET`, so review your ACL rules when you upgrade.
+
+See [probabilistic data structures](/learn/notes/probabilistic-data-structures/) for the theory behind Bloom filters and friends.
+
+## How it works
+
+### Choosing the right atomicity tool
+
+```text
+Can ONE command do it?  (INCR, SET NX EX, LMOVE, GETDEL, ZPOPMIN, SET IFEQ)
+   └─ yes → use it. Done.
+   └─ no → Does a write depend on a value you read?
+            └─ no  → MULTI/EXEC (pipelined) for isolation, or plain pipeline if isolation not needed
+            └─ yes → low contention?  WATCH + MULTI/EXEC + retry
+                     high contention / complex? Lua script or Function (keep it short!)
+```
+
+### Example: fixed-window rate limiter, done three ways
+
+```bash
+# 1. Not atomic (two RTTs; a crash between them leaves a counter with no TTL):
+INCR rl:user:42:1700000060
+EXPIRE rl:user:42:1700000060 60
+
+# 2. Atomic + one RTT with MULTI/EXEC pipelined:
+MULTI
+INCR rl:user:42:1700000060
+EXPIRE rl:user:42:1700000060 60 NX     # NX: only set if no TTL yet (7.0+)
+EXEC
+
+# 3. Script, when you need logic (here: set the TTL only on the first hit; a limit check could go in the same script):
+EVAL "local c = redis.call('INCR', KEYS[1]) if c == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end return c" 1 rl:user:42:1700000060 60
+```
+
+More designs are in [rate limiting](/learn/notes/rate-limiting/) and [design a rate limiter](/learn/notes/hld-rate-limiter/).
+
+## Real-world examples
+
+- **Distributed lock release**: the GET-compare-DEL Lua script above is the standard safe unlock. A plain `DEL` can remove a lock that expired and was then taken by another client. On 8.4+, `DELEX` with a value condition does the same thing natively.
+- **BullMQ** (a Node.js job queue) runs its job state changes, such as waiting to active to completed, as Lua scripts. Each change is one atomic server-side step.
+- **Cache invalidation fan-out**: app servers `SUBSCRIBE` to an invalidation channel and drop local in-process cache entries when a message arrives. Losing an occasional message is fine because TTLs back it up.
+
+## Common pitfalls
+
+- **Expecting rollback.** One failed command in `EXEC` doesn't undo the others. Validate first, or use a script that checks before writing.
+- **Reading inside `MULTI`.** You get `QUEUED`, not a value. Read before `MULTI` with `WATCH`, or use a script.
+- **Long-running scripts.** A 2-second script is a 2-second outage for every client. After it writes, only `SHUTDOWN NOSAVE` can stop it.
+- **Building key names inside Lua.** It breaks in Cluster, because Redis can't see which slot you're about to touch.
+- **Assuming the script cache survives.** `NOSCRIPT` after a failover will happen. Handle it, or use Functions.
+- **Using Pub/Sub as a queue.** Offline consumers lose messages. Use Streams or a real broker.
+- **Never `XACK`ing, and never claiming.** The PEL grows without limit and stuck messages are never retried.
+- **Exact `MAXLEN` on a hot stream.** Use `MAXLEN ~`.
+- **Huge pipelines with no batching**, which inflate server memory for the reply buffers.
+- **Cross-slot transactions or scripts in Cluster.** You get `CROSSSLOT`. Design hash tags up front.
+
+## Practice questions
+
+<Practice>
+
+<QA q="How do you handle atomic operations in Redis?" level="easy">
+
+Start from the fact that every single command is atomic, because commands run one at a time on the main thread. So first look for a command that already does the job: `INCR`/`HINCRBY` for counters, `SET NX EX` for locks, `LMOVE` for queues, `GETDEL`, `MSETNX`, and on 8.4+ `SET ... IFEQ` for compare-and-set.
+
+If you need several commands:
+
+- `MULTI`/`EXEC` gives isolation.
+- `WATCH` adds optimistic check-and-set.
+- A **Lua script or Function** handles read-decide-write logic atomically.
+
+Pipelining alone is **not** atomic.
+
+</QA>
+
+<QA q="What is a Redis transaction and how do you create one?" level="easy">
+
+A transaction is a group of commands that run back to back with nothing from other clients in between. `MULTI` starts it. Later commands reply `QUEUED`. `EXEC` runs them all and returns an array of results. `DISCARD` throws the queue away.
+
+If the connection drops before `EXEC`, nothing runs. Add `WATCH key` before `MULTI` to make `EXEC` abort (it returns null) if that key changed in the meantime.
+
+</QA>
+
+<QA q="What is pipelining and when would you use it?" level="easy">
+
+Pipelining means sending many commands without waiting for each reply, then reading all the replies together. It turns N round trips into about one and cuts syscalls. That matters a lot for bulk loads, warming caches, and batch reads or writes, and especially over high-latency links.
+
+It isn't atomic, since other clients can interleave, and a command can't use the result of an earlier one. Send in batches (for example 10k) so the server doesn't buffer huge reply sets.
+
+</QA>
+
+<QA q="Describe the Pub/Sub model in Redis and its delivery guarantees." level="easy">
+
+Publishers `PUBLISH` to a channel. Every client currently `SUBSCRIBE`d to it, or `PSUBSCRIBE`d to a matching glob pattern, gets the message pushed to it.
+
+Delivery is **at-most-once**. Nothing is stored, so offline or disconnected subscribers miss messages, and slow ones get disconnected by the pubsub output-buffer limit. Channels are separate from the keyspace and DB numbers.
+
+In Cluster, classic `PUBLISH` is broadcast to all nodes. Sharded Pub/Sub (`SSUBSCRIBE`/`SPUBLISH`, 7.0+) keeps traffic inside the shard that owns the channel's slot.
+
+</QA>
+
+<QA q="What are the limitations of Redis transactions?" level="medium">
+
+- **No rollback.** If a command fails during `EXEC` (for example `WRONGTYPE`), the rest still run. Only errors at queue time abort the whole transaction (`EXECABORT`).
+- **No reads you can act on** inside the block. Every command returns `QUEUED`, so read-then-write needs `WATCH` + retry, or a script.
+- **Optimistic only.** `WATCH` under high contention means many retries.
+- **Cluster**: all keys must be in one hash slot.
+- `EXEC` still runs on the single thread, so a big transaction blocks everyone.
+- Not durable by itself. Durability depends on AOF and fsync like any other write.
+
+</QA>
+
+<QA q="How do you use Lua scripting in Redis, and what are the rules?" level="medium">
+
+Use `EVAL script numkeys key... arg...`. Inside the script, `KEYS[i]` and `ARGV[i]` hold the inputs and `redis.call` runs commands. For efficiency, `SCRIPT LOAD` once and then `EVALSHA sha`, falling back to EVAL or LOAD on `NOSCRIPT`.
+
+The rules:
+
+1. Declare every key in `KEYS`, and keep them in one slot in Cluster.
+2. Parameterize. Don't generate script text.
+3. Keep scripts short. They block the whole server, and after the 5s `busy-reply-threshold` a script that has written can only be stopped with `SHUTDOWN NOSAVE`.
+4. Expect the cache to be wiped on restart or failover.
+
+On 7.0+, prefer **Functions** (`FUNCTION LOAD` + `FCALL`) for logic you reuse, because they're persisted and replicated.
+
+</QA>
+
+<QA q="When would you choose Lua over MULTI/EXEC with WATCH?" level="medium">
+
+Choose Lua when the write depends on what you read and the key is **contended**. `WATCH` makes you retry the whole read-compute-write loop every time someone else touches the key, which under load can mean many retries and extra round trips. A script reads and writes in one atomic step and never retries.
+
+Lua also wins when you need branching, such as deny if over limit, or delete only if the token matches. `MULTI`/`EXEC` is fine for simple unconditional batches, like INCR and EXPIRE together.
+
+</QA>
+
+<QA q="What are Redis modules and how do they expand Redis's capabilities?" level="medium">
+
+Modules (Redis 4.0+) are C shared libraries loaded at startup with `loadmodule` or at runtime with `MODULE LOAD`. Through the modules API they can add **new commands and new native data types** that run as fast as built-in ones.
+
+The main ones:
+
+- **RedisJSON**: a JSON document type.
+- **RediSearch / Redis Query Engine**: secondary indexing, full-text, and vector search.
+- **RedisBloom**: Bloom, Cuckoo, Count-min, Top-K, and t-digest.
+- **RedisTimeSeries**: time series.
+
+As of **Redis 8** these are built into Redis Open Source and no longer separate modules, under a choice of RSALv2, SSPLv1, or AGPLv3. Redis Stack was folded into this distribution.
+
+</QA>
+
+<QA q="Explain Redis Streams consumer groups: how do you get at-least-once processing and recover from a crashed consumer?" level="hard">
+
+- The producer runs `XADD stream * field value`, ideally with `MAXLEN ~ N`.
+- Each consumer runs `XREADGROUP GROUP g c STREAMS stream >`. The group hands each new entry to one consumer and records it in the **PEL** with the owner, delivery time, and delivery count.
+- After processing, the consumer runs `XACK`, which removes the entry from the PEL.
+- If a consumer crashes, the entry stays pending. On restart, the consumer first reads its own history with ID `0`, then switches to `>`.
+- If the consumer never comes back, another one runs `XAUTOCLAIM stream g me 60000 0-0` (or `XPENDING` + `XCLAIM`) to take entries idle longer than 60 s.
+- When the delivery count passes a threshold, copy the entry to a dead-letter stream, `XACK` it, and alert.
+
+Because a message can be processed more than once, handlers must be idempotent. Remember that stream and group state replicate asynchronously.
+
+</QA>
+
+<QA q="Can Redis replace Kafka as a message broker?" level="hard">
+
+For some workloads, yes. Redis Streams give at-least-once delivery, consumer groups, replay by ID, and sub-millisecond latency. That's a good fit for job queues and moderate event streams when you already run Redis.
+
+Its limits compared with Kafka:
+
+- data lives **in RAM**, so retention is bounded by memory and trimming
+- a stream is one key on one shard, so you partition by hand across keys
+- replication is async, so a failover can lose recent writes
+- there's no built-in exactly-once and no large connector ecosystem
+
+Pub/Sub is at-most-once with no retention, so it's for live fan-out, not queuing. For high-volume, long-retention, replayable event backbones, use Kafka.
+
+</QA>
+
+<QA q="Your service does WATCH, GET, compute, MULTI, SET, EXEC on a hot inventory key. At peak, p99 latency explodes and many requests fail after max retries. What is happening and how do you fix it?" level="scenario">
+
+It's optimistic-lock thrash. Every concurrent writer invalidates the others' `WATCH`, so `EXEC` returns null and the client retries. Each retry costs extra round trips, and contention grows with load.
+
+Fixes, in order of preference:
+
+1. Use **one atomic command** if the logic allows. For a decrement, `DECRBY` and treat a negative result as sold out (compensate with `INCRBY`), or use `HINCRBY` on a hash field.
+2. Use a **Lua script or Function** that checks stock and decrements in one atomic step, returning 0 or 1.
+3. If one key is still too hot, **split the stock** across N sub-keys (bucketed inventory) and pick one at random.
+
+Keep the script O(1) so it doesn't become the new bottleneck.
+
+</QA>
+
+<QA q="A Lua script deployed last night is stuck in a loop and Redis answers every client with BUSY. What can you do?" level="scenario">
+
+1. Try `SCRIPT KILL` (or `FUNCTION KILL`). It works only if the script **hasn't performed any write**, since killing it then doesn't break atomicity.
+2. If it has written, Redis won't allow a kill that would leave half the changes applied. The only remaining command is `SHUTDOWN NOSAVE`. That stops the server without saving, so you lose writes since the last persistence point. With AOF `everysec`, that's about 1s plus whatever the script did. Then fail over or restart.
+3. Afterwards: add a code review rule (no unbounded loops, no O(N) over big keys), test against production-sized data, and possibly lower `busy-reply-threshold` so alerts fire sooner. Lowering it doesn't kill scripts; it only changes when `BUSY` starts.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="Inside MULTI, a client queues SET a hello, then LPOP a, then INCR counter, and calls EXEC. What happens?" options={["Nothing runs, because LPOP will fail", "All three run. LPOP returns WRONGTYPE, while SET and INCR take effect", "SET runs, then the transaction stops at LPOP", "Redis rolls back SET when LPOP fails"]} answer={1}>
+
+`LPOP a` is valid syntax, so it queues fine. It fails only at execution time, because `a` is a string. Errors at execution time don't stop or undo the other commands, since Redis has no rollback. Only errors at **queue time** (bad syntax or arity) make `EXEC` abort everything.
+
+</MCQ>
+
+<MCQ q="Why can't you implement 'decrement only if stock is greater than 0' with plain MULTI/EXEC?" options={["MULTI does not support DECR", "Commands inside MULTI only return QUEUED, so you cannot read stock and branch on it inside the transaction", "MULTI is not atomic", "MULTI cannot touch more than one key"]} answer={1}>
+
+The values only come back at `EXEC`, so there's no way to decide mid-transaction. You need `WATCH` before `MULTI` (read, then conditionally queue), or a Lua script or Function that reads and decides on the server.
+
+</MCQ>
+
+<MCQ q="What does pipelining guarantee?" options={["Commands from one client run without interleaving", "All commands succeed or none do", "Fewer network round trips and syscalls; nothing about atomicity", "Commands are fsynced together"]} answer={2}>
+
+Pipelining is only a transport optimization. Other clients' commands can run between yours. For isolation, wrap the batch in `MULTI`/`EXEC`, which you can also pipeline.
+
+</MCQ>
+
+<MCQ q="A Lua script has already performed one SET and is now stuck in a loop past busy-reply-threshold. Which command can end it?" options={["SCRIPT KILL", "CLIENT KILL on the calling client", "FUNCTION KILL", "SHUTDOWN NOSAVE"]} answer={3}>
+
+Once a script has written, killing it would leave half its changes applied, which breaks atomicity. So `SCRIPT KILL` and `FUNCTION KILL` are refused. Redis still accepts `SHUTDOWN NOSAVE`, which aborts the server without saving. `CLIENT KILL` doesn't interrupt a running script.
+
+</MCQ>
+
+<MCQ q="Why do Redis docs insist that scripts receive key names via KEYS rather than building them inside the script?" options={["Lua cannot concatenate strings", "Redis uses the declared keys to route the call and check that all keys share a slot, which is required in Cluster", "Keys passed in ARGV are automatically deleted", "It makes the script run faster"]} answer={1}>
+
+Redis decides which node and slot a script belongs to from the `KEYS` arguments. A key built inside the script bypasses that check and can point at a slot owned by another node.
+
+</MCQ>
+
+<MCQ q="After a failover, your app starts getting NOSCRIPT errors. What is the most robust long-term fix on Redis 7+?" options={["Restart all app servers", "Disable failover", "Move the logic to Redis Functions, which are persisted and replicated with the dataset", "Increase the script cache size"]} answer={2}>
+
+The `EVAL` script cache is volatile. It isn't persisted and isn't guaranteed to survive a failover. Functions are part of the dataset: saved to RDB/AOF and replicated, so the new master already has them. Handling `NOSCRIPT` by reloading also works, but Functions remove the problem.
+
+</MCQ>
+
+<MCQ q="A notification service uses Redis Pub/Sub. A subscriber pod restarts for 20 seconds. What happens to messages published during that window?" options={["They are lost for that subscriber", "They are queued and delivered on reconnect", "They are stored until the subscriber sends XACK", "PUBLISH blocks until the subscriber returns"]} answer={0}>
+
+Pub/Sub is at-most-once with no storage. A message goes only to the clients connected and subscribed at that moment. If you need catch-up after downtime, use Streams (or another durable broker) and read from the last ID you processed.
+
+</MCQ>
+
+<MCQ q="In a Streams consumer group, a consumer reads 10 messages and crashes before XACK. What happens to those messages?" options={["They are lost", "They are automatically redelivered to another consumer on the next XREADGROUP with '>'", "They are deleted after 60 seconds", "They stay in the group's Pending Entries List until the same consumer re-reads its history or another consumer claims them"]} answer={3}>
+
+Unacknowledged messages stay in the PEL, owned by the crashed consumer. `>` only returns **never-delivered** messages, so they won't come back by themselves. Recover them by re-reading with ID `0` as the same consumer, or with `XAUTOCLAIM`/`XCLAIM` from another consumer once they've been idle long enough.
+
+</MCQ>
+
+<MCQ q="Why is XADD ... MAXLEN ~ 1000000 preferred over an exact MAXLEN 1000000?" options={["The exact form is not supported on replicas", "The approximate form trims only whole internal radix-tree nodes, which is much cheaper, at the cost of keeping slightly more than N entries", "The approximate form keeps entries on disk", "The exact form blocks consumers"]} answer={1}>
+
+Streams store entries in macro-nodes of a radix tree. Trimming to an exact count means partly rewriting a node on almost every `XADD`. With `~`, Redis removes only whole nodes, so you may keep a few more entries, and the trim is cheap.
+
+</MCQ>
+
+<MCQ q="What did Redis 8 change about RedisJSON, RediSearch, RedisBloom and RedisTimeSeries?" options={["They were deprecated in favour of Valkey modules", "They became paid-only Redis Enterprise features", "Their capabilities were folded into Redis Open Source itself, under a choice of RSALv2, SSPLv1 or AGPLv3", "They were rewritten as Lua Functions"]} answer={2}>
+
+Redis 8 ships search and query, JSON, time series, and the probabilistic types inside the main Redis Open Source distribution, so you no longer load separate modules. It also added AGPLv3 as a licensing option alongside RSALv2 and SSPLv1.
+
+</MCQ>
+
+<MCQ q="In Redis Cluster, why prefer SPUBLISH/SSUBSCRIBE (7.0+) over PUBLISH/SUBSCRIBE for high-volume channels?" options={["Sharded messages are persisted", "Sharded Pub/Sub keeps each channel's traffic inside the shard owning its slot, while classic PUBLISH is broadcast to every node over the cluster bus", "Sharded Pub/Sub guarantees at-least-once delivery", "Classic Pub/Sub does not work in Cluster at all"]} answer={1}>
+
+Classic Pub/Sub in Cluster sends every message to every node, so adding shards adds bus traffic instead of capacity. Sharded Pub/Sub hashes the channel to a slot, so it scales by adding shards. Delivery is still at-most-once.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **Every single command is atomic.** Prefer `INCR`, `SET NX EX`, `LMOVE`, `GETDEL`, `MSETNX`, and on 8.4+ `SET IFEQ` / `DELEX`.
+- **`MULTI`/`EXEC`**: isolated, all-or-nothing *dispatch*, **no rollback**. Queue-time error means `EXECABORT`; run-time error means the others still run.
+- **`WATCH`**: optimistic CAS. `EXEC` returns null if a watched key changed (including expiry or eviction). Retry.
+- **Lua `EVAL`/`EVALSHA`**: atomic read-decide-write. Keys go in `KEYS`, the cache is volatile (`NOSCRIPT`), and scripts block the server. After the 5s `busy-reply-threshold`, `SCRIPT KILL` works only if nothing was written; otherwise `SHUTDOWN NOSAVE`.
+- **Functions (7.0+)**: `FUNCTION LOAD` + `FCALL`/`FCALL_RO`. Named, persisted, replicated. Load them on every cluster master.
+- **Pipelining**: N RTTs become about 1, with fewer syscalls. **Not atomic.** Batch about 10k at a time.
+- **Pub/Sub**: at-most-once, no storage, `PSUBSCRIBE` globs. Slow subscribers are cut at 32mb/8mb-60s. **Sharded `SSUBSCRIBE`/`SPUBLISH` (7.0+)** for Cluster.
+- **Streams**: `XADD` (`MAXLEN ~`), `XGROUP CREATE`, `XREADGROUP >`, `XACK`, PEL, `XPENDING`, `XAUTOCLAIM` (6.2+). At-least-once, so make handlers idempotent and dead-letter by delivery count.
+- **Redis vs Kafka**: Redis for in-RAM, low-latency, moderate volume. Kafka for durable retention, replay, and very high throughput.
+- **Modules** (4.0+): JSON, Search/Query Engine, Bloom family, TimeSeries. **Redis 8** builds them in, with a choice of RSALv2, SSPLv1, or AGPLv3.
+
+## Go deeper
+
+- **Redis docs**: [Transactions](https://redis.io/docs/latest/develop/using-commands/transactions/), covering MULTI/EXEC, errors, no rollback, and WATCH.
+- **Redis docs**: [Scripting with Lua](https://redis.io/docs/latest/develop/programmability/eval-intro/) and [Redis Functions](https://redis.io/docs/latest/develop/programmability/functions-intro/), plus [Programmability overview](https://redis.io/docs/latest/develop/programmability/) for the max execution time rules.
+- **Redis docs**: [Pipelining](https://redis.io/docs/latest/develop/using-commands/pipelining/), with the RTT and syscall explanation and benchmarks.
+- **Redis docs**: [Pub/Sub](https://redis.io/docs/latest/develop/pubsub/), including sharded Pub/Sub.
+- **Redis docs**: [Streams](https://redis.io/docs/latest/develop/data-types/streams/), covering consumer groups, PEL, claiming, trimming, and the Kafka comparison.
+- **Redis docs**: [Modules API](https://redis.io/docs/latest/develop/reference/modules/) and the [Redis Open Source 8.0 release notes](https://redis.io/docs/latest/operate/oss_and_stack/stack-with-enterprise/release-notes/redisce/redisos-8.0-release-notes/).
+- **Redis blog**: ["Redis is now available under the AGPLv3 open source license"](https://redis.io/blog/agplv3/) (May 2025).
+- **antirez**: ["The first release candidate of Redis 4.0 is out"](https://antirez.com/news/110), on the modules system's origins.
+- **Book**: *Redis in Action* (Josiah Carlson), whose transactions and Lua chapters are still the best intuition builders.
+- Related notes: [Redis deep dive](/learn/notes/redis-deep/), [Redis persistence](/learn/notes/redis-persistence/), [Redis patterns & use cases](/learn/notes/redis-patterns-use-cases/), [Kafka deep dive](/learn/notes/kafka-deep/), [Pulsar, RabbitMQ, SQS](/learn/notes/pulsar-rabbitmq-sqs/).

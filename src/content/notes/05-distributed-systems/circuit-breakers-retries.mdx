@@ -1,7 +1,7 @@
 ---
 title: "Circuit Breakers, Bulkheads, Retries with Backoff"
 phase: "05-distributed-systems"
-order: 26
+order: 48
 tags: ["distsys"]
 premium: false
 previewParagraphs: 4
@@ -102,7 +102,7 @@ Each retry doubles the delay. Caps prevent absurd waits.
 Without jitter, all clients retry at the same moments → **thundering herd**. Add randomness:
 - **Full jitter**: `delay = random(0, base * 2^attempt)`. Simplest, very effective.
 - **Equal jitter**: `delay = base * 2^attempt / 2 + random(0, base * 2^attempt / 2)`.
-- **Decorrelated jitter** (AWS recommendation): `delay = min(cap, random(base, prev * 3))`.
+- **Decorrelated jitter** (from the AWS Architecture Blog): `delay = min(cap, random(base, prev * 3))`.
 
 Use **full jitter** unless you have a specific reason otherwise.
 
@@ -112,7 +112,7 @@ Cap total retries — a calling service should never spend more than X% of its t
 
 #### Idempotency requirement
 
-Retries assume the call is idempotent (or has an idempotency key). Otherwise: duplicate charges, duplicate emails, duplicate orders. See Topic 19.
+Retries assume the call is idempotent (or has an idempotency key). Otherwise: duplicate charges, duplicate emails, duplicate orders. See [Delivery Semantics](/learn/notes/delivery-semantics/).
 
 ### Timeouts
 
@@ -141,7 +141,7 @@ timeout(2s,
 )
 ```
 
-Used by Netflix Hystrix (deprecated but pioneered the pattern), resilience4j, Polly (.NET), Envoy filters.
+Used by Netflix Hystrix (in maintenance mode since 2018, but popularized the pattern), resilience4j, Polly (.NET), Envoy filters.
 
 ## How it works (cascading failure walkthrough)
 
@@ -166,9 +166,9 @@ With protection:
 
 ## Real-world examples
 
-- **Netflix Hystrix**: birthed the circuit breaker pattern in microservices. Now superseded by their own resilience4j-style libraries and the service mesh.
+- **Netflix Hystrix**: popularized the circuit breaker pattern in microservices (the pattern itself comes from Nygard's *Release It!*). In maintenance mode since 2018; its README points users to resilience4j, and Netflix moved toward adaptive concurrency limits.
 - **Envoy / Istio**: declarative outlier detection (circuit breaker), retry policies, timeouts.
-- **AWS SDKs**: built-in exponential backoff + jitter (decorrelated since the AWS Architecture Blog post).
+- **AWS SDKs**: built-in exponential backoff with **full jitter** in the "standard" retry mode, plus a token-bucket retry quota (a retry budget).
 - **Spring Cloud**: Resilience4j integration.
 - **Kubernetes liveness/readiness probes**: control restarts and traffic eligibility.
 
@@ -183,54 +183,181 @@ With protection:
 - **Endless retries** without budget → amplify outages.
 - **Fail-open vs fail-closed**: when CB opens, you must decide if your service still works degraded. If not, opening just hides the problem.
 
-## Interview questions
+## Practice questions
 
-### Q1 — Easy: What is a circuit breaker?
-A state machine wrapping a remote call. Closed (normal) → Open (fast-fail when error rate exceeds threshold) → Half-Open (probe to test recovery) → back to Closed if healthy. Prevents cascading failures by short-circuiting calls to a sick downstream.
+<Practice>
 
-### Q2 — Easy: Why do you add jitter to retry backoff?
-Without jitter, all clients retry at the same moments after failure, causing a synchronized "thundering herd" that hits the recovering downstream simultaneously — preventing recovery. Random jitter spreads retries across time.
+<QA q="What is a circuit breaker?" level="easy">
 
-### Q3 — Medium: What's a bulkhead and what does it protect against?
-Resource isolation per dependency — separate thread/connection pools or semaphores for each downstream. Prevents a slow downstream from monopolizing shared resources and dragging down unrelated parts of the service.
+A state machine wrapping a remote call. **Closed** (normal, counting failures) → **Open** (fast-fail once failures cross a threshold, no remote call) → **Half-open** (after a cooldown, let a probe through) → back to Closed if the probe succeeds, or Open if it fails. It prevents cascading failures by short-circuiting calls to a sick downstream.
 
-### Q4 — Medium: Walk through a cascading failure and how each pattern helps.
-Downstream slows → upstream threads block → queue grows → service-wide latency → LB removes instances → load redistributes → other instances overwhelmed → outage.
+</QA>
 
-Defenses (in order):
-- **Timeout** — request fails fast, thread returns.
-- **Bulkhead** — only N threads can block on downstream, rest serve other work.
+<QA q="Why do you add jitter to retry backoff?" level="easy">
+
+Without jitter, all clients that failed together retry at the same moments, creating a synchronized **thundering herd** that hits the recovering downstream at once and keeps it from recovering. Random jitter spreads retries across time.
+
+</QA>
+
+<QA q="When a circuit is open, what can you return instead of calling the downstream?" level="easy">
+
+- A **cached** last-known-good value.
+- A **default** (empty list, 'service unavailable').
+- A **deferred** response — queue the work for later, 'try again'.
+- A **best-effort partial** result (e.g., a feed without recommendations).
+
+Decide the fallback explicitly per call — it defines how the feature degrades.
+
+</QA>
+
+<QA q="What's a bulkhead and what does it protect against?" level="medium">
+
+Resource isolation per dependency — separate thread pools, connection pools, or semaphores for each downstream. It stops a slow downstream from monopolizing shared resources and dragging down unrelated parts of the service. Semaphores (e.g., max 20 concurrent calls to service X) are a cheaper way to implement it than thread pools.
+
+</QA>
+
+<QA q="What is full jitter, and how does it compare with plain exponential backoff?" level="medium">
+
+Plain exponential backoff: `delay = min(cap, base * 2^attempt)` — every client waits exactly the same time. **Full jitter**: `delay = random(0, base * 2^attempt)` (capped) — each client picks a random point in the window, so retries spread out. It's the simplest effective variant and the default recommendation; AWS SDKs use it in their standard retry mode.
+
+</QA>
+
+<QA q="Why is a latency-based trip rule often better than an error-count rule?" level="medium">
+
+A slow downstream is usually more dangerous than a dead one: a fast failure returns the thread immediately, but a slow call holds threads and connections until the timeout fires, draining pools. Tripping on latency (e.g., p99 over 5 s for 10 s) catches that degradation before it turns into errors and exhaustion.
+
+</QA>
+
+<QA q="Liveness vs readiness checks — and why are deep health checks risky?" level="medium">
+
+**Liveness**: is the process alive? If not, restart it. **Readiness**: can it serve traffic right now? If not, remove it from the load balancer. **Deep health** checks whether downstreams respond — risky because outages propagate: if A's readiness depends on B and B's on C, a blip in C marks everything unhealthy and pulls healthy instances out of rotation.
+
+</QA>
+
+<QA q="Walk through a cascading failure and how each pattern helps." level="medium">
+
+Downstream slows → upstream threads block → queue grows → service-wide latency → LB removes instances → load shifts → other instances overwhelmed → outage.
+
+Defenses:
+- **Timeout** — the request fails fast and the thread returns.
+- **Bulkhead** — only N threads can block on that downstream; the rest serve other work.
 - **Circuit breaker** — after enough failures, stop trying entirely.
-- **Fallback** — return cached/default so upstream still responds.
+- **Fallback** — return cached or default data so upstream still responds.
 - **Retry budget + backoff + jitter** — don't amplify the downstream's pain.
 
-### Q5 — Medium: When should you NOT retry?
-On 4xx errors (client problem won't change). On non-idempotent calls without idempotency keys. When error indicates persistent state (downstream's bug; retry won't help). When retry budget is exhausted. When circuit breaker is open.
+</QA>
 
-### Q6 — Hard: Design a robust HTTP client for a microservice.
-- **Timeout** per call: ~1–3s default, ~10s for known-slow calls. Always set.
-- **Retry**: 3 attempts max, full-jitter exponential backoff (base 100ms, cap 5s). Retry only on transient errors (network, 5xx, 429 with Retry-After).
-- **Bulkhead**: semaphore of max 20 concurrent calls per downstream.
-- **Circuit breaker**: open at 50% error rate over 20 requests in last 10s; cooldown 30s.
-- **Fallback**: return cached / default / partial.
-- **Idempotency keys** for all writes.
-- **Metrics**: per-downstream success rate, latency histogram, CB state, retries.
-- **Headers**: include trace ID for correlation.
+<QA q="When should you NOT retry?" level="medium">
 
-### Q7 — Hard: A team enabled retries and now their downstream is overloaded during normal load. Why?
-Retry storm amplification. If 1% of calls fail and you retry 3 times, you add 3% extra load. If 30% fail (under stress), you add 90% load — pushing the downstream further into stress. Fix:
-- **Retry budget** — cap retries to (say) 10% of total calls per minute.
-- **Backoff + jitter** — spread retries across time.
-- **Circuit breaker** — stop retrying when downstream is clearly degraded.
-- **Lower retry count** — sometimes 1 retry is enough; 5 is excessive.
+On **4xx** errors (a client problem won't fix itself). On **non-idempotent** calls without idempotency keys. When the error reflects a persistent problem (a downstream bug). When the **retry budget** is exhausted. When the **circuit breaker** is open.
 
-### Q8 — Hard: Designing a multi-tier dependency chain (A → B → C), what timeout should each set?
-Total time budget from user perspective: say 2s.
-- A's call to B: timeout = 1.5s (leaving 500ms for A's own work + slack).
-- B's call to C: timeout = 1s (leaving 500ms for B's own work).
-- C's own internal calls: < 500ms.
+</QA>
 
-Each layer's timeout must be strictly less than its caller's, with budget for local processing. Without this, a slow C eats A's entire budget, A times out anyway, but resources stayed tied up in B + C uselessly.
+<QA q="A circuit breaker is shared across all users of a downstream. What can go wrong?" level="hard">
+
+One bad key — a user whose requests are slow or always fail — can push the shared error rate over the threshold and open the circuit for **everyone**, turning one user's problem into a full outage of that dependency. Where failures are key-specific, scope breakers (or bulkheads) more finely, or exclude errors caused by bad input from the failure count.
+
+</QA>
+
+<QA q="In an A → B → C chain with a 2 s user budget, what timeout should each layer set?" level="hard">
+
+- A's call to B: about 1.5 s (leaving about 500 ms for A's own work and slack).
+- B's call to C: about 1 s (leaving about 500 ms for B's work).
+- C's internal calls: under 500 ms.
+
+Each timeout must be **strictly less** than its caller's, minus local processing. Otherwise a slow C eats A's whole budget, A times out anyway, and B and C keep burning resources on a response nobody will read.
+
+</QA>
+
+<QA q="Your circuit breaker opens, but the service can't do anything useful without that dependency. What should you decide?" level="hard">
+
+Decide **fail-open vs fail-closed** explicitly. If the feature can degrade (serve cached or partial data), the breaker preserves capacity while users get a reduced experience. If it can't (e.g., an auth or payment check), opening just turns slow failures into fast errors — still valuable for protecting threads, but you must return a clear error and alert, not pretend it's degraded gracefully.
+
+</QA>
+
+<QA q="Design a robust HTTP client for a microservice." level="scenario">
+
+- **Timeout** on every call: about 1–3 s default, longer only for known-slow calls.
+- **Retry**: at most 3 attempts, full-jitter exponential backoff (base 100 ms, cap 5 s), only on transient errors (network, 5xx, 429 honoring `Retry-After`).
+- **Bulkhead**: semaphore of about 20 concurrent calls per downstream.
+- **Circuit breaker**: open at 50% errors over 20 requests in 10 s; 30 s cooldown.
+- **Fallback**: cached, default, or partial.
+- **Idempotency keys** on all writes.
+- **Metrics** per downstream: success rate, latency histogram, breaker state, retries; propagate trace IDs.
+
+</QA>
+
+<QA q="A team enabled retries and now their downstream is overloaded even under normal load. Why?" level="scenario">
+
+**Retry amplification.** With 3 retries, 1% failures add up to 3% extra load — but under stress, 30% failures add up to 90% extra, pushing the downstream deeper into trouble. Fixes:
+- **Retry budget** — cap retries at, say, 10% of calls.
+- **Backoff + jitter** — spread retries over time.
+- **Circuit breaker** — stop retrying when the downstream is clearly degraded.
+- **Fewer attempts** — often one retry is enough.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="A circuit breaker is in the half-open state and its probe request fails. What happens next?" options={["It closes and resumes normal traffic", "It returns to open and waits for another cooldown", "It stays half-open and sends all traffic", "It retries the probe immediately in a loop"]} answer={1}>
+
+Half-open exists to test recovery; a failed probe sends the breaker back to open for another cooldown. Only a successful probe closes it.
+
+</MCQ>
+
+<MCQ q="Which formula describes full jitter?" options={["delay = base * 2^attempt", "delay = min(cap, random(base, prev * 3))", "delay = half the backoff plus a random half", "delay = random(0, base * 2^attempt), capped"]} answer={3}>
+
+Full jitter picks uniformly between zero and the exponential window. The others are plain backoff, decorrelated jitter, and equal jitter.
+
+</MCQ>
+
+<MCQ q="A slow third-party API holds all of a service's shared worker threads, so unrelated endpoints hang. Which pattern prevents this?" options={["Bulkhead", "Exponential backoff", "Deep health checks", "Idempotency keys"]} answer={0}>
+
+A bulkhead caps how many threads or connections one dependency can use, so the rest stay available. Backoff and idempotency don't limit concurrency, and deep health checks can make things worse.
+
+</MCQ>
+
+<MCQ q="Which failure should generally NOT be retried?" options={["A connection reset", "A 503 from the downstream", "A 400 Bad Request", "A 429 with a Retry-After header"]} answer={2}>
+
+A 400 is a client error that will fail the same way again. Network blips, 5xx, and 429 (after the indicated wait) are transient and can be retried.
+
+</MCQ>
+
+<MCQ q="Under stress 30% of calls fail and each client retries up to 3 times. Roughly how much extra load can retries add?" options={["About 3%", "About 30%", "None, because retries are spread out", "About 90%"]} answer={3}>
+
+0.3 failures times 3 retries is about 0.9 extra calls per original call. That amplification is why retry budgets and circuit breakers matter.
+
+</MCQ>
+
+<MCQ q="Service A has a 2 s budget and calls B, which calls C. Which timeout setup is correct?" options={["A to B 1.5 s, B to C 1 s", "A to B 2 s, B to C 2 s", "A to B 1 s, B to C 1.5 s", "No timeouts; rely on the circuit breaker"]} answer={0}>
+
+Each layer's timeout must be less than its caller's, leaving time for local work. Equal or inverted timeouts mean callers give up while callees keep working.
+
+</MCQ>
+
+<MCQ q="Service A's readiness probe checks B, whose readiness checks C. C has a brief blip. What happens?" options={["Only C is restarted", "A and B are pulled from rotation too, cascading the outage", "Liveness probes absorb the failure", "Nothing, readiness ignores downstreams"]} answer={1}>
+
+Chained deep health checks propagate a downstream blip upward, removing healthy instances. Keep readiness about the instance itself.
+
+</MCQ>
+
+<MCQ q="Why must retried write calls carry idempotency keys?" options={["To make backoff exponential", "To reduce latency", "So a retry after a lost response doesn't create a duplicate charge or order", "So the circuit breaker can count failures"]} answer={2}>
+
+If the first attempt succeeded but its response was lost, a retry repeats the side effect unless the server can recognize and dedupe it via the key.
+
+</MCQ>
+
+<MCQ q="What is the main reason latency-based tripping is often preferred?" options={["Slow calls tie up threads and connections, which is often worse than fast failures", "Latency is easier to measure than errors", "Error counts can't be tracked per downstream", "It removes the need for timeouts"]} answer={0}>
+
+A slow downstream drains pools while calls wait, causing cascades. Fast errors release resources quickly. Timeouts are still needed.
+
+</MCQ>
+
+</Quiz>
 
 ## TL;DR cheat sheet
 

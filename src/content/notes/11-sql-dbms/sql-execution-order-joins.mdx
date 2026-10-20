@@ -1,0 +1,671 @@
+---
+title: "SQL Essentials: Execution Order, Joins, Views"
+phase: "11-sql-dbms"
+order: 111
+tags: ["sql", "db", "joins"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 22
+prerequisites: []
+summary: "How a SELECT is logically evaluated, every join type with tiny worked examples, the NULL traps in NOT IN and outer joins, and when to reach for views, materialized views, triggers and stored procedures."
+---
+
+## Definition (interview-ready)
+
+A SQL query says **what** you want, not **how** to get it. Even so, every `SELECT` has a fixed **logical order of evaluation**: `FROM`/`JOIN` builds a set of rows, `WHERE` filters rows, `GROUP BY` folds them into groups, `HAVING` filters groups, `SELECT` computes the output columns, `DISTINCT` removes duplicates, `ORDER BY` sorts, and `LIMIT` cuts. The optimizer is free to execute things in a different physical order, but the result must be *as if* it followed this sequence. That one idea explains most "why doesn't this work?" questions: aliases in `WHERE`, `WHERE` vs `HAVING`, and why a filter on an outer-joined table can silently turn a `LEFT JOIN` into an inner join.
+
+**Joins** combine rows from two tables on a condition. Inner joins keep only matches. Outer joins (`LEFT`, `RIGHT`, `FULL`) also keep unmatched rows and fill the gaps with `NULL`. **Views** are saved queries. **Materialized views** are saved query *results* that you refresh.
+
+## Why it matters
+
+- **SQL rounds are standard** for backend, data and SDE interviews. "Second highest salary", "find duplicates", "customers with no orders" and "employees earning more than their manager" come up again and again.
+- **NULL bugs are silent.** `NOT IN` against a column that contains a `NULL` returns zero rows with no error. A `WHERE` filter on the right table of a `LEFT JOIN` quietly drops the rows you wanted to keep.
+- **Performance starts with semantics.** If you know `EXISTS` can stop at the first match, or that a view is just a query that gets expanded inline, you write SQL the optimizer can do something with.
+- **Design questions** often lead to "should this be a materialized view, a trigger, or application code?"
+
+## Core concepts
+
+### Logical execution order
+
+```
+   written order                     logical evaluation order
+   ─────────────                     ────────────────────────
+   SELECT DISTINCT cols    ─┐        1. FROM / JOIN   build the row set (cross product + ON filter)
+   FROM t JOIN u ON ...     │        2. WHERE         keep rows where the condition is TRUE
+   WHERE row_filter         │        3. GROUP BY      fold rows into groups
+   GROUP BY keys            ├──►     4. HAVING        keep groups where the condition is TRUE
+   HAVING group_filter      │        5. SELECT        compute expressions, aliases, window functions
+   ORDER BY cols            │        6. DISTINCT      remove duplicate output rows
+   LIMIT n                 ─┘        7. ORDER BY      sort
+                                     8. LIMIT/OFFSET  cut
+```
+
+The PostgreSQL manual describes `SELECT` processing in this order (with `WITH` queries computed first and `UNION`/`INTERSECT`/`EXCEPT` applied after `DISTINCT`). Window functions run during step 5, after grouping, which is why they can't appear in `WHERE`, `GROUP BY` or `HAVING`.
+
+What follows from this order:
+
+| Consequence | Why |
+|---|---|
+| You can't use a `SELECT` alias in `WHERE` | `WHERE` runs at step 2. The alias doesn't exist until step 5. |
+| You **can** use a `SELECT` alias in `ORDER BY` | `ORDER BY` runs after `SELECT`. |
+| Aggregates (`COUNT`, `SUM`) can't go in `WHERE` | Groups don't exist yet at step 2. Use `HAVING`. |
+| Window functions can't go in `WHERE` | They're computed at step 5. Wrap the query in a subquery or CTE and filter outside. |
+| `LIMIT` without `ORDER BY` gives arbitrary rows | Without a sort, the database returns rows in whatever order is cheapest. |
+| `DISTINCT` + `ORDER BY` on a column not in the select list fails in Postgres | After `DISTINCT`, that column is gone, so there's nothing to sort by. |
+
+**Dialect differences around aliases** (worth knowing because interviewers test on one database and you may answer for another):
+
+| Clause | PostgreSQL | MySQL 8 |
+|---|---|---|
+| `WHERE alias` | Error | Error |
+| `GROUP BY alias` | Allowed (extension; an input column with the same name wins) | Allowed |
+| `HAVING alias` | **Error** (`column "cnt" does not exist`) | Allowed (MySQL extension) |
+| `ORDER BY alias` | Allowed | Allowed |
+
+So `SELECT dept_id, COUNT(*) AS cnt FROM emp GROUP BY dept_id HAVING cnt > 1` works on MySQL and fails on Postgres. The portable form repeats the aggregate: `HAVING COUNT(*) > 1`.
+
+**How to say it in an interview:** "Logically, `FROM` and joins run first, then `WHERE`, `GROUP BY`, `HAVING`, then `SELECT`, `DISTINCT`, `ORDER BY`, `LIMIT`. That's why a select-list alias isn't visible in `WHERE`. The optimizer can reorder physically, but the result has to match this order."
+
+### WHERE vs HAVING
+
+- `WHERE` filters **rows before grouping**. It can't see aggregates.
+- `HAVING` filters **groups after grouping**. It can use aggregates.
+
+```sql
+-- departments with more than 1 employee earning over 100
+SELECT dept_id, COUNT(*) AS n
+FROM employees
+WHERE salary > 100          -- row filter: runs first
+GROUP BY dept_id
+HAVING COUNT(*) > 1;        -- group filter: runs after grouping
+```
+
+Put a condition that doesn't need an aggregate in `WHERE`, not `HAVING`. It removes rows before the expensive grouping step, and some planners can't push a `HAVING` condition down. `HAVING` without `GROUP BY` is legal: the whole table becomes one group.
+
+### The example tables
+
+Every join example below uses these two tables:
+
+```
+departments                employees
+┌────┬───────┐             ┌────┬──────┬─────────┬────────────┬────────┐
+│ id │ name  │             │ id │ name │ dept_id │ manager_id │ salary │
+├────┼───────┤             ├────┼──────┼─────────┼────────────┼────────┤
+│ 10 │ Eng   │             │ 1  │ Asha │ 10      │ NULL       │ 200    │
+│ 20 │ Sales │             │ 2  │ Ben  │ 10      │ 1          │ 150    │
+│ 30 │ HR    │             │ 3  │ Chen │ 20      │ 1          │ 150    │
+└────┴───────┘             │ 4  │ Dev  │ NULL    │ 2          │ 160    │
+                           └────┴──────┴─────────┴────────────┴────────┘
+```
+
+Note the two "orphans": **Dev** has no department and **HR** has no employees.
+
+### Join types
+
+```sql
+SELECT e.name, d.name
+FROM employees e
+<JOIN TYPE> departments d ON e.dept_id = d.id;
+```
+
+| Join | Rows kept | Result |
+|---|---|---|
+| `INNER JOIN` | Only matching pairs | Asha-Eng, Ben-Eng, Chen-Sales |
+| `LEFT JOIN` | All employees, plus department if it matches | Asha-Eng, Ben-Eng, Chen-Sales, **Dev-NULL** |
+| `RIGHT JOIN` | All departments, plus employees if they match | Asha-Eng, Ben-Eng, Chen-Sales, **NULL-HR** |
+| `FULL OUTER JOIN` | Everything from both sides | the 3 matches + Dev-NULL + NULL-HR (5 rows) |
+| `CROSS JOIN` | Every combination, no condition | 4 × 3 = 12 rows |
+
+A picture of what each join keeps:
+
+```
+ INNER          LEFT           RIGHT          FULL
+ ( A [∩] B )    ([A ∩] B )     ( A [∩ B])     ([A ∩ B])
+ matches only   all of A       all of B       all of both
+```
+
+Points interviewers probe:
+
+- **`RIGHT JOIN` is just a `LEFT JOIN` with the tables swapped.** The MySQL manual recommends `LEFT JOIN` for portability. Most teams never write `RIGHT JOIN`.
+- **MySQL has no `FULL OUTER JOIN`.** Its join grammar has no `FULL` keyword. Emulate it with a `LEFT JOIN` `UNION` the "right-only" rows:
+
+```sql
+-- MySQL emulation of FULL OUTER JOIN
+SELECT e.name, d.name FROM employees e LEFT JOIN departments d ON e.dept_id = d.id
+UNION ALL
+SELECT e.name, d.name FROM employees e RIGHT JOIN departments d ON e.dept_id = d.id
+WHERE e.id IS NULL;
+```
+
+(Using `UNION` instead of `UNION ALL` also works but removes genuine duplicate rows too.)
+
+- **One-to-many joins multiply rows.** Joining customers to orders gives one row per order. Summing a customer column after that join double-counts. Aggregate the many side first, then join.
+- **`NATURAL JOIN` and `USING`.** `USING (col)` joins on equally named columns and outputs that column once. `NATURAL JOIN` does this for *all* same-named columns, which breaks silently when someone adds a column like `created_at` to both tables. Avoid `NATURAL` in production code.
+- **Comma joins** (`FROM a, b WHERE a.x = b.x`) are an old-style inner join. Forget the `WHERE` and you get a cross join.
+
+### ON vs WHERE in outer joins
+
+This is the most common outer-join bug.
+
+```sql
+-- Intended: all employees, with their department only if it is Eng
+SELECT e.name, d.name
+FROM employees e
+LEFT JOIN departments d ON e.dept_id = d.id
+WHERE d.name = 'Eng';            -- WRONG: returns only Asha, Ben
+```
+
+`WHERE` runs after the join. For Chen and Dev, `d.name` is `NULL` (or 'Sales'), so `d.name = 'Eng'` isn't true and the rows are dropped. The `LEFT JOIN` has become an inner join.
+
+```sql
+SELECT e.name, d.name
+FROM employees e
+LEFT JOIN departments d ON e.dept_id = d.id AND d.name = 'Eng';   -- RIGHT
+-- Asha-Eng, Ben-Eng, Chen-NULL, Dev-NULL
+```
+
+Rule: a condition on the **optional** (right) side of a `LEFT JOIN` belongs in `ON`. A condition on the **preserved** (left) side can go in `WHERE`.
+
+### NULL in joins and comparisons
+
+SQL uses **three-valued logic**: a comparison can be TRUE, FALSE or UNKNOWN. Anything compared with `NULL` using `=`, `<>`, `<` and so on is UNKNOWN, and `WHERE`/`ON`/`HAVING` keep only TRUE.
+
+- `NULL = NULL` is UNKNOWN, so **NULL keys never match in a join**. Two rows with `dept_id IS NULL` don't join to each other.
+- To compare in a NULL-safe way, use `IS NOT DISTINCT FROM` in PostgreSQL or the `<=>` operator in MySQL. Both treat two NULLs as equal.
+- `COUNT(*)` counts rows. `COUNT(col)` skips NULLs. After a `LEFT JOIN`, count the right table's key to get zero for "no match":
+
+```sql
+SELECT d.name, COUNT(e.id)    -- HR -> 0
+FROM departments d LEFT JOIN employees e ON e.dept_id = d.id
+GROUP BY d.name;
+-- COUNT(*) would give HR -> 1, because the NULL-padded row is still a row
+```
+
+### Semi-join and anti-join
+
+A **semi-join** returns rows from A that have **at least one** match in B, each A row **once**. An **anti-join** returns rows from A that have **no** match in B. SQL has no keyword for either; you write them with `EXISTS`, `IN`, or an outer join.
+
+```sql
+-- Semi-join: departments that have at least one employee
+SELECT d.* FROM departments d
+WHERE EXISTS (SELECT 1 FROM employees e WHERE e.dept_id = d.id);   -- Eng, Sales
+```
+
+Why not a plain `JOIN`? Eng has two employees, so `JOIN` returns Eng twice and you'd need `DISTINCT`. `EXISTS` returns each department once and can stop scanning at the first match.
+
+**Anti-join: three ways, one trap.** "Departments with no employees":
+
+```sql
+-- 1. NOT EXISTS  ->  HR   (correct, NULL-safe, usually the best plan)
+SELECT d.name FROM departments d
+WHERE NOT EXISTS (SELECT 1 FROM employees e WHERE e.dept_id = d.id);
+
+-- 2. LEFT JOIN ... IS NULL  ->  HR   (correct; test a NOT NULL column of the right table)
+SELECT d.name FROM departments d
+LEFT JOIN employees e ON e.dept_id = d.id
+WHERE e.id IS NULL;
+
+-- 3. NOT IN  ->  ZERO ROWS   (the trap)
+SELECT d.name FROM departments d
+WHERE d.id NOT IN (SELECT dept_id FROM employees);
+```
+
+Why does `NOT IN` return nothing? Dev's `dept_id` is `NULL`. For HR, `30 NOT IN (10, 10, 20, NULL)` means `30 <> 10 AND 30 <> 10 AND 30 <> 20 AND 30 <> NULL`. The last term is UNKNOWN, so the whole thing is UNKNOWN, never TRUE. The PostgreSQL manual states this rule directly, and the PostgreSQL wiki's "Don't Do This" page lists `NOT IN` for exactly this reason.
+
+| Form | Correct with NULLs? | Notes |
+|---|---|---|
+| `NOT EXISTS` | Yes | Planned as an anti-join in Postgres; MySQL 8.0.17+ also turns it into an antijoin. |
+| `LEFT JOIN ... WHERE right.pk IS NULL` | Yes | Check a column that can't be NULL in the right table, such as its primary key. |
+| `NOT IN (subquery)` | **No**, if the subquery can return NULL | Fine for a literal list without NULLs. Postgres 18 and older can't plan it as an anti-join (19 can, but only when both sides are provably non-NULL), so it may be slow on large subqueries. |
+
+**How to say it:** "For an anti-join I default to `NOT EXISTS`. `NOT IN` returns no rows if the subquery yields a single NULL, because the comparison with NULL is unknown."
+
+### Self-join patterns
+
+A self-join joins a table to itself using two aliases. Three patterns cover most interview questions.
+
+**1. Hierarchy (employee → manager)**
+
+```sql
+SELECT e.name AS employee, m.name AS manager
+FROM employees e
+LEFT JOIN employees m ON e.manager_id = m.id;
+-- Asha-NULL, Ben-Asha, Chen-Asha, Dev-Ben
+```
+
+Use `LEFT JOIN` so the top of the tree (no manager) isn't lost. For "the whole chain up to the CEO", one self-join isn't enough; use a recursive CTE (see [SQL Window Functions and CTEs](/learn/notes/sql-window-functions-ctes/)).
+
+**2. Consecutive rows (row i and row i+1)**
+
+```sql
+-- numbers that appear at least 3 times in a row (ids are gap-free)
+SELECT DISTINCT l1.num
+FROM logs l1
+JOIN logs l2 ON l2.id = l1.id + 1
+JOIN logs l3 ON l3.id = l1.id + 2
+WHERE l1.num = l2.num AND l2.num = l3.num;
+```
+
+This only works when ids have no gaps. `LAG`/`LEAD` window functions are the robust, modern alternative.
+
+**3. Pairs (every unordered pair once)**
+
+```sql
+-- employees who earn the same salary, each pair once
+SELECT a.name, b.name
+FROM employees a
+JOIN employees b ON a.id < b.id AND a.salary = b.salary;   -- Ben-Chen
+```
+
+`a.id < b.id` removes self-pairs (Ben-Ben) and mirror pairs (Chen-Ben). With `a.id <> b.id` you'd get both orderings.
+
+### Views
+
+A **view** is a named, stored `SELECT`. It stores no data. When you query it, the database expands the view's definition into your query and optimizes the whole thing (PostgreSQL implements this with its rule system; MySQL calls it the `MERGE` algorithm).
+
+```sql
+CREATE VIEW eng_staff AS
+SELECT id, name, salary FROM employees WHERE dept_id = 10;
+
+SELECT * FROM eng_staff WHERE salary > 100;   -- planned as one query on employees
+```
+
+What views are good for:
+
+- **Abstraction**: hide a complex join behind a simple name.
+- **Security**: grant access to the view (some columns or rows) rather than the base table.
+- **Compatibility**: keep an old "table shape" alive while the real schema changes.
+
+Gotchas:
+
+- **Simple views are updatable.** A view over a single table without aggregates, `DISTINCT`, `GROUP BY` and similar can accept `INSERT`/`UPDATE`/`DELETE` in both Postgres (auto-updatable since 9.3) and MySQL. `WITH CHECK OPTION` rejects writes that would produce rows the view can't see.
+- **MySQL `ALGORITHM=TEMPTABLE`** (or a view with aggregates/`DISTINCT`) materializes the view into a temporary table on each query, so outer filters can't be merged in and indexes on the base table may not help.
+- **Views over views over views** look tidy but can produce huge plans that are hard to tune.
+
+### Materialized views
+
+A **materialized view (MV)** stores the *result* of its query, like a table. Reads are fast. The cost is **staleness**: the data is only as fresh as the last refresh.
+
+```sql
+-- PostgreSQL (9.3+)
+CREATE MATERIALIZED VIEW dept_salary AS
+SELECT dept_id, COUNT(*) AS headcount, SUM(salary) AS payroll
+FROM employees GROUP BY dept_id;
+
+CREATE UNIQUE INDEX ON dept_salary (dept_id);      -- required for CONCURRENTLY
+
+REFRESH MATERIALIZED VIEW dept_salary;              -- recompute; blocks readers
+REFRESH MATERIALIZED VIEW CONCURRENTLY dept_salary; -- recompute; readers keep working (9.4+)
+```
+
+| | Plain `REFRESH` | `REFRESH ... CONCURRENTLY` |
+|---|---|---|
+| Readers during refresh | **Blocked** (exclusive lock) | Keep reading the old contents |
+| Requirement | None | At least one `UNIQUE` index on plain column names, with no `WHERE` clause and no expressions |
+| Speed | Usually faster when many rows change | Can be faster when few rows change (it diffs old vs new) |
+| Restrictions | | Can't be combined with `WITH NO DATA`; the MV must already be populated |
+
+Key facts:
+
+- PostgreSQL refresh **recomputes the whole query**. There's no built-in incremental refresh, so a refresh on a big table is a big query. Schedule it (cron, pg_cron, a job runner) based on how stale the data may be.
+- You can't `INSERT`/`UPDATE` an MV directly. You can index it like a table.
+- **MySQL 8 has no native materialized views.** The common substitute is a **summary table** kept up to date by a scheduled event, by application code, or by triggers.
+
+| | View | Materialized view | Summary table (MySQL pattern) |
+|---|---|---|---|
+| Stores data | No | Yes | Yes |
+| Freshness | Always current | As of last refresh | As of last job/trigger |
+| Read cost | Runs the query every time | Reads stored rows | Reads stored rows |
+| Can index it | No (indexes on base tables apply) | Yes | Yes |
+| Typical use | Abstraction, security | Dashboards, expensive aggregates | Same as MV on MySQL |
+
+### Triggers
+
+A **trigger** is code the database runs automatically on `INSERT`, `UPDATE` or `DELETE` (and in Postgres also `TRUNCATE`). It runs **in the same transaction** as the statement, so if the trigger fails, the statement rolls back.
+
+| | PostgreSQL | MySQL 8 |
+|---|---|---|
+| Timing | `BEFORE`, `AFTER`, `INSTEAD OF` (views only) | `BEFORE`, `AFTER` |
+| Granularity | `FOR EACH ROW` or `FOR EACH STATEMENT` | `FOR EACH ROW` only |
+| Body | Calls a trigger function (PL/pgSQL etc.) | Inline statement or `BEGIN ... END` block |
+| Order of several triggers | Alphabetical by name | Creation order; change with `FOLLOWS`/`PRECEDES` |
+
+```sql
+-- MySQL: keep updated_at current
+CREATE TRIGGER emp_touch BEFORE UPDATE ON employees
+FOR EACH ROW SET NEW.updated_at = NOW();
+```
+
+Good uses: audit tables, `updated_at` columns, enforcing an invariant the schema can't express. Bad uses: business workflows, calling other services, anything slow. Triggers are invisible from application code, fire per row (a 1-million-row `UPDATE` runs the trigger a million times in MySQL), and make bulk loads and debugging harder.
+
+### Stored procedures and functions
+
+A **stored procedure** is a named program stored in the database and run with `CALL`. A **function** returns a value and can be used inside a query.
+
+- PostgreSQL has had functions for a long time. `CREATE PROCEDURE` (PostgreSQL 11+) adds procedures that can `COMMIT`/`ROLLBACK` inside their body, which functions can't.
+- MySQL has `CREATE PROCEDURE` and `CREATE FUNCTION`.
+
+| Pros | Cons |
+|---|---|
+| Fewer network round trips for multi-step logic | Logic is split between app and DB; harder to find and review |
+| Logic runs next to the data | Harder to unit test, version, deploy and roll back |
+| One place to enforce a rule for many client apps | Ties you to one vendor's language (PL/pgSQL vs MySQL's dialect) |
+| Can grant `EXECUTE` without granting table access | Scales with the database, which is the hardest tier to scale out |
+
+The common modern stance: keep business logic in the application, and use procedures sparingly for data-heavy batch jobs, migrations, or tightly controlled operations.
+
+## How it works
+
+Here's one query traced through the logical order, using the example tables:
+
+```sql
+SELECT d.name AS dept, COUNT(e.id) AS headcount, MAX(e.salary) AS top_pay
+FROM departments d
+LEFT JOIN employees e ON e.dept_id = d.id
+WHERE d.name <> 'HR'
+GROUP BY d.name
+HAVING COUNT(e.id) >= 1
+ORDER BY top_pay DESC
+LIMIT 1;
+```
+
+```
+1. FROM/JOIN   Eng-Asha, Eng-Ben, Sales-Chen, HR-NULL              (Dev has no dept → not kept: d is the preserved side)
+2. WHERE       drop HR-NULL                                          → 3 rows
+3. GROUP BY    Eng: [Asha, Ben]    Sales: [Chen]
+4. HAVING      both have COUNT(e.id) >= 1                            → 2 groups
+5. SELECT      (Eng, 2, 200)  (Sales, 1, 150)                        top_pay alias created here
+7. ORDER BY    top_pay DESC   → Eng first                            alias usable because SELECT already ran
+8. LIMIT 1     → (Eng, 2, 200)
+```
+
+The physical plan can be very different. The planner may push `d.name <> 'HR'` into the scan of `departments`, use a hash join, and use a top-N heap sort for `ORDER BY ... LIMIT`. Use `EXPLAIN` to see what actually happens.
+
+## Real-world examples
+
+- **The PostgreSQL wiki "Don't Do This" page** lists `NOT IN (SELECT ...)` as an anti-pattern for two reasons: the NULL trap, and because the planner (before PostgreSQL 19, which handles only the provably non-NULL case) can't turn it into an anti-join, so it falls back to a hashed or plain subplan whose cost can explode once the subquery result is large.
+- **MySQL 8.0.17** added automatic antijoin transformation for `NOT EXISTS` and `NOT IN` subqueries, but the manual notes it often can't apply when the compared expressions are nullable, which is the same NULL problem in optimizer form.
+- **Materialized views for dashboards**: refreshing a Postgres MV on a schedule with `REFRESH ... CONCURRENTLY` is a standard way to serve heavy aggregates without blocking readers. On MySQL the same need is met with summary tables.
+
+## Common pitfalls
+
+- **Using a select-list alias in `WHERE`.** Repeat the expression or wrap the query.
+- **Filtering the optional side of a `LEFT JOIN` in `WHERE`.** It silently becomes an inner join. Move the condition to `ON`.
+- **`NOT IN` with a nullable subquery.** Returns zero rows. Use `NOT EXISTS`.
+- **`COUNT(*)` after a `LEFT JOIN`.** Counts the NULL-padded row as 1. Use `COUNT(right.pk)`.
+- **Joining before aggregating** on one-to-many relationships. Sums get multiplied.
+- **`LIMIT` without `ORDER BY`.** The result is not deterministic.
+- **`HAVING` for row filters.** Works, but filters later than it should.
+- **Writing `HAVING alias` on Postgres** because it worked on MySQL.
+- **Assuming MySQL has `FULL OUTER JOIN` or materialized views.** It has neither.
+- **Business logic in triggers.** Hidden side effects, per-row cost, painful debugging.
+
+## Practice questions
+
+<Practice>
+
+<QA q="What is the logical order in which a SELECT query is evaluated?" level="easy">
+
+`FROM`/`JOIN` → `WHERE` → `GROUP BY` → `HAVING` → `SELECT` (including window functions) → `DISTINCT` → `ORDER BY` → `LIMIT`/`OFFSET`. CTEs in `WITH` are conceptually computed first, and set operations (`UNION` etc.) after `DISTINCT`. The optimizer can execute things in a different physical order, but the result must be the same as if it followed this logical order.
+
+</QA>
+
+<QA q="Why can't you use a column alias from the SELECT list in WHERE, but you can in ORDER BY?" level="easy">
+
+`WHERE` is evaluated before `SELECT`, so the alias doesn't exist yet. `ORDER BY` is evaluated after `SELECT`, so the alias is visible. Fix it by repeating the expression in `WHERE`, or by wrapping the query in a subquery/CTE and filtering on the alias outside. Dialect note: Postgres and MySQL both allow aliases in `GROUP BY`; only MySQL allows them in `HAVING`.
+
+</QA>
+
+<QA q="What is the difference between WHERE and HAVING?" level="easy">
+
+`WHERE` filters individual rows **before** grouping and can't reference aggregates. `HAVING` filters groups **after** `GROUP BY` and can use aggregates such as `COUNT(*) > 5`. Put non-aggregate conditions in `WHERE` so fewer rows reach the grouping step.
+
+</QA>
+
+<QA q="Explain INNER, LEFT, RIGHT, FULL and CROSS joins." level="easy">
+
+- **INNER**: only rows with a match on both sides.
+- **LEFT**: all rows from the left table; right-side columns are `NULL` when there's no match.
+- **RIGHT**: mirror of LEFT (all rows from the right table).
+- **FULL OUTER**: all rows from both; NULLs fill whichever side has no match. MySQL lacks it; emulate with `LEFT JOIN` + `UNION ALL` + the right-only rows.
+- **CROSS**: the Cartesian product, every left row paired with every right row (m × n rows).
+
+</QA>
+
+<QA q="Find the second highest salary. Return NULL if there isn't one." level="easy">
+
+```sql
+-- Portable: max below the max
+SELECT MAX(salary) AS second_highest
+FROM employees
+WHERE salary < (SELECT MAX(salary) FROM employees);
+
+-- Offset version; wrapping in a scalar subquery returns NULL instead of no row
+SELECT (SELECT DISTINCT salary FROM employees
+        ORDER BY salary DESC LIMIT 1 OFFSET 1) AS second_highest;
+
+-- Nth highest with a window function (N = 2)
+SELECT DISTINCT salary FROM (
+  SELECT salary, DENSE_RANK() OVER (ORDER BY salary DESC) AS rnk
+  FROM employees) t
+WHERE rnk = 2;
+```
+
+Talk about ties: `DISTINCT`/`DENSE_RANK` treat equal salaries as one value. Without `DISTINCT`, salaries 200, 200, 150 would make the "second highest" 200. With the example data (200, 160, 150, 150) the answer is 160.
+
+</QA>
+
+<QA q="Find duplicate emails in a person table, then delete the duplicates keeping the lowest id." level="medium">
+
+```sql
+-- Find
+SELECT email, COUNT(*) AS cnt
+FROM person
+GROUP BY email
+HAVING COUNT(*) > 1;
+
+-- Delete, PostgreSQL
+DELETE FROM person p1
+USING person p2
+WHERE p1.email = p2.email AND p1.id > p2.id;
+
+-- Delete, MySQL (multi-table DELETE)
+DELETE p1 FROM person p1
+JOIN person p2 ON p1.email = p2.email AND p1.id > p2.id;
+```
+
+Each row that has a "twin" with a smaller id is deleted, so only the lowest id survives. In MySQL you can't write `DELETE FROM person WHERE id NOT IN (SELECT MIN(id) FROM person GROUP BY email)` directly, because MySQL doesn't let you delete from a table and select from the same table in a subquery. You'd need to wrap the subquery in a derived table. Afterwards, add a `UNIQUE` constraint on `email` so it can't happen again.
+
+</QA>
+
+<QA q="Find employees who earn more than their manager." level="easy">
+
+```sql
+SELECT e.name AS employee, e.salary, m.name AS manager, m.salary AS manager_salary
+FROM employees e
+JOIN employees m ON e.manager_id = m.id
+WHERE e.salary > m.salary;
+-- Dev (160) > Ben (150)
+```
+
+A self-join with two aliases. An inner join is correct here because an employee without a manager can't out-earn one.
+
+</QA>
+
+<QA q="Find customers who have never placed an order. Why is NOT IN risky here?" level="medium">
+
+```sql
+SELECT c.id, c.name
+FROM customers c
+WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id);
+
+-- or
+SELECT c.id, c.name
+FROM customers c
+LEFT JOIN orders o ON o.customer_id = c.id
+WHERE o.id IS NULL;
+```
+
+`WHERE c.id NOT IN (SELECT customer_id FROM orders)` returns **no rows at all** if any `orders.customer_id` is `NULL`. `x NOT IN (..., NULL)` expands to `... AND x <> NULL`, which is UNKNOWN, never TRUE. `NOT EXISTS` doesn't have this problem and is planned as an anti-join.
+
+</QA>
+
+<QA q="What is a semi-join, and why use EXISTS instead of JOIN plus DISTINCT?" level="medium">
+
+A semi-join returns each row of A **once** if it has **at least one** match in B. `JOIN` returns one row per match, so a department with 50 employees appears 50 times, and `DISTINCT` then has to sort or hash them away. `EXISTS (SELECT 1 FROM B WHERE ...)` (or `IN (subquery)`) expresses the intent directly. The engine can stop at the first match per row, and both Postgres and MySQL have dedicated semi-join strategies.
+
+</QA>
+
+<QA q="A LEFT JOIN query returns fewer rows than the left table has. What are the likely causes?" level="medium">
+
+1. **A `WHERE` condition on the right table** such as `WHERE o.status = 'paid'`. Unmatched rows have `NULL` there, so they're filtered out. Move it into `ON`.
+2. **An inner join later in the chain** that uses the right table's columns: `A LEFT JOIN B ... JOIN C ON C.x = B.x` drops rows where `B` was `NULL`.
+3. **A `HAVING` or `WHERE` on an aggregate of the right side.**
+
+(If it returns *more* rows than the left table, the right side has multiple matches per key.)
+
+</QA>
+
+<QA q="What's the difference between a view and a materialized view? How do you refresh a Postgres MV without blocking reads?" level="medium">
+
+A **view** stores only the query; every read re-runs it against the base tables, so it's always current. A **materialized view** stores the result; reads are fast but stale until refreshed. In PostgreSQL, `REFRESH MATERIALIZED VIEW mv` recomputes the whole thing and blocks readers. `REFRESH MATERIALIZED VIEW CONCURRENTLY mv` (9.4+) builds the new result and applies the differences while readers keep using the old data. It needs at least one `UNIQUE` index on plain columns (no expression, no `WHERE`) and an already-populated MV. MySQL has no native MVs; use a summary table refreshed by a job or triggers.
+
+</QA>
+
+<QA q="Compare NOT EXISTS, LEFT JOIN ... IS NULL and NOT IN for anti-joins." level="hard">
+
+- **`NOT EXISTS`**: semantically correct with NULLs. Planned as an anti-join in Postgres; MySQL 8.0.17+ transforms it into an antijoin. The default choice.
+- **`LEFT JOIN ... WHERE b.pk IS NULL`**: also correct, if you test a column that can't be NULL in B (the primary key or the join key). Postgres usually plans it as the same anti-join as `NOT EXISTS`.
+- **`NOT IN (subquery)`**: wrong if the subquery can return NULL (the result is zero rows). Even when it's correct, the Postgres planner (18 and older; 19 only when both sides are provably non-NULL) can't turn it into an anti-join; it uses a hashed subplan (fast, but only chosen when the subquery result fits in memory) or a plain subplan (re-scanned per outer row, very slow on big tables). MySQL's manual also notes its antijoin transform often can't apply when the compared expressions are nullable.
+
+</QA>
+
+<QA q="When would you use a trigger, and what are the risks?" level="medium">
+
+Good uses: writing an audit/history row, maintaining `updated_at`, enforcing a cross-row invariant the schema can't express, keeping a denormalized counter in sync. Risks: the logic is invisible to people reading application code; it runs inside every write's transaction, adding latency and lock time; MySQL triggers are row-level only, so a bulk update fires once per row; chains of triggers are hard to debug; and they can surprise bulk loads and replication tooling. If the work can be async (sending emails, updating a search index), use an outbox or CDC instead.
+
+</QA>
+
+<QA q="Stored procedures: when are they worth it?" level="hard">
+
+They help when a multi-step, data-heavy operation would otherwise need many round trips (batch backfills, archival, complex migrations) or when many different clients must apply exactly the same rule and you can grant `EXECUTE` but not table access. Downsides: logic lives outside the codebase and its review/CI/test tooling, deploys and rollbacks are harder, it ties you to one vendor's procedural language, and it pushes CPU onto the database, which is the hardest tier to scale. In Postgres, note the function vs procedure split: only procedures (PostgreSQL 11+) can `COMMIT` inside the body, which matters for long batch jobs.
+
+</QA>
+
+<QA q="A dashboard query joins five large tables and aggregates. It takes 40 seconds and the page is hit 100 times a minute. Data may be 10 minutes stale. What do you do?" level="scenario">
+
+Precompute. In Postgres, create a **materialized view** with the aggregate, add a `UNIQUE` index on its grouping key, and run `REFRESH MATERIALIZED VIEW CONCURRENTLY` every few minutes from a scheduler, so readers are never blocked. Point the dashboard at the MV, which now serves indexed reads. Watch the refresh duration: it recomputes the full query, so if it creeps toward the refresh interval, switch to an incrementally maintained summary table (upserts of only the changed keys) or a stream/OLAP pipeline. On MySQL the same design is a summary table refreshed by a scheduled job. Also check the base query with `EXPLAIN` first; sometimes a missing index is the real problem.
+
+</QA>
+
+<QA q="Find all numbers that appear at least three times consecutively in a logs table with columns id and num." level="scenario">
+
+```sql
+-- Self-join version (assumes id has no gaps)
+SELECT DISTINCT l1.num
+FROM logs l1
+JOIN logs l2 ON l2.id = l1.id + 1
+JOIN logs l3 ON l3.id = l1.id + 2
+WHERE l1.num = l2.num AND l2.num = l3.num;
+
+-- Window version (works with gaps in id; MySQL 8 / Postgres)
+SELECT DISTINCT num FROM (
+  SELECT num,
+         LAG(num, 1) OVER (ORDER BY id) AS prev1,
+         LAG(num, 2) OVER (ORDER BY id) AS prev2
+  FROM logs) t
+WHERE num = prev1 AND num = prev2;
+```
+
+Mention the gap assumption: the self-join silently misses runs if ids were deleted, while `LAG` works on row order. For runs of arbitrary length, use the gaps-and-islands technique.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="In the logical evaluation order, which clause runs immediately after WHERE?" options={["SELECT", "GROUP BY", "HAVING", "ORDER BY"]} answer={1}>
+
+The order is FROM/JOIN, WHERE, GROUP BY, HAVING, SELECT, DISTINCT, ORDER BY, LIMIT. SELECT and ORDER BY run much later, and HAVING needs groups, so it comes after GROUP BY.
+
+</MCQ>
+
+<MCQ q="On PostgreSQL, SELECT dept_id, COUNT(*) AS cnt FROM emp GROUP BY dept_id HAVING cnt > 1 does what?" options={["Returns departments with more than one employee", "Fails: column cnt does not exist", "Returns all departments", "Fails: GROUP BY needs an aggregate"]} answer={1}>
+
+PostgreSQL lets output-column names appear in GROUP BY and ORDER BY but not in WHERE or HAVING. MySQL accepts an alias in HAVING as an extension, so the same query works there. The portable form is HAVING COUNT(*) greater than 1.
+
+</MCQ>
+
+<MCQ q="departments has ids 10, 20, 30. employees.dept_id holds 10, 10, 20, NULL. What does SELECT id FROM departments WHERE id NOT IN (SELECT dept_id FROM employees) return?" options={["30", "30 and NULL", "No rows", "An error"]} answer={2}>
+
+For 30, the predicate becomes 30 not equal to 10 AND ... AND 30 not equal to NULL. The NULL comparison is UNKNOWN, so the whole predicate is never TRUE and no row qualifies. NOT EXISTS would return 30.
+
+</MCQ>
+
+<MCQ q="You want all employees, and the department name only for Eng. Which query is correct?" options={["LEFT JOIN departments d ON e.dept_id = d.id WHERE d.name = 'Eng'", "LEFT JOIN departments d ON e.dept_id = d.id AND d.name = 'Eng'", "INNER JOIN departments d ON e.dept_id = d.id AND d.name = 'Eng'", "RIGHT JOIN departments d ON e.dept_id = d.id WHERE d.name = 'Eng'"]} answer={1}>
+
+A condition on the optional side of a LEFT JOIN must go in ON. In WHERE it removes the NULL-padded rows, which turns the outer join into an inner join. The INNER and RIGHT versions drop employees outside Eng.
+
+</MCQ>
+
+<MCQ q="After departments LEFT JOIN employees, HR has no employees. Which expression gives HR a count of 0?" options={["COUNT(*)", "COUNT(1)", "COUNT(e.id)", "COUNT(d.id)"]} answer={2}>
+
+The NULL-padded HR row still exists, so COUNT(*), COUNT(1) and COUNT(d.id) all count it as 1. COUNT(e.id) skips NULLs and returns 0.
+
+</MCQ>
+
+<MCQ q="What does REFRESH MATERIALIZED VIEW CONCURRENTLY require in PostgreSQL?" options={["The MV must have been created WITH NO DATA", "A UNIQUE index on the MV using only column names and no WHERE clause", "A primary key on every base table", "Logical replication to be enabled"]} answer={1}>
+
+CONCURRENTLY diffs the old and new results, so it needs a unique index (plain columns, not partial, not an expression). It can't be combined with WITH NO DATA, and the MV must already be populated.
+
+</MCQ>
+
+<MCQ q="Which statement about MySQL 8 is true?" options={["It supports FULL OUTER JOIN", "It has CREATE MATERIALIZED VIEW", "Its triggers can be FOR EACH STATEMENT", "Its triggers are row-level only"]} answer={3}>
+
+MySQL triggers are FOR EACH ROW only. MySQL has no FULL OUTER JOIN keyword (emulate with UNION) and no native materialized views (use summary tables). Postgres supports statement-level triggers.
+
+</MCQ>
+
+<MCQ q="Why does a self-join on a.id less than b.id return each pair exactly once?" options={["It removes self-pairs and mirror pairs", "It forces a nested-loop join", "It makes the join an anti-join", "It sorts the output"]} answer={0}>
+
+With a.id not equal to b.id you'd get both (Ben, Chen) and (Chen, Ben). Requiring a.id less than b.id keeps only one ordering and also excludes pairing a row with itself.
+
+</MCQ>
+
+<MCQ q="Why can't a window function such as ROW_NUMBER() appear in WHERE?" options={["Window functions are only allowed in GROUP BY", "WHERE is evaluated before the SELECT step where window functions are computed", "It can, but only in MySQL", "Window functions require HAVING"]} answer={1}>
+
+Window functions are computed in the SELECT step, after WHERE, GROUP BY and HAVING. To filter on one, compute it in a subquery or CTE and filter in the outer query.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **Logical order**: FROM/JOIN → WHERE → GROUP BY → HAVING → SELECT (+ window functions) → DISTINCT → ORDER BY → LIMIT.
+- Aliases: never in `WHERE`; fine in `ORDER BY`; `GROUP BY` OK in both; `HAVING alias` only on MySQL.
+- `WHERE` = row filter (no aggregates). `HAVING` = group filter.
+- Joins: INNER (matches), LEFT/RIGHT (keep one side), FULL (keep both; **not in MySQL**), CROSS (m × n).
+- Condition on the optional side of a LEFT JOIN → put it in **ON**, not WHERE.
+- NULL never equals anything, including NULL. Use `IS NULL`, `IS NOT DISTINCT FROM` (Postgres) or `<=>` (MySQL).
+- **Anti-join** → `NOT EXISTS`. **Never `NOT IN`** on a nullable subquery: one NULL means zero rows.
+- **Semi-join** → `EXISTS`, not `JOIN` + `DISTINCT`.
+- `COUNT(right.pk)` after a LEFT JOIN, not `COUNT(*)`.
+- Self-join patterns: manager (`e.manager_id = m.id`), consecutive (`id + 1`), pairs (`a.id < b.id`).
+- View = stored query. MV = stored result + refresh. Postgres `REFRESH ... CONCURRENTLY` needs a unique index. MySQL: no MVs → summary tables.
+- Triggers run inside the writing transaction. MySQL: row-level only. Keep them small.
+- Stored procedures: fewer round trips, but harder to test, deploy and scale. Postgres procedures (11+) can COMMIT.
+
+## Go deeper
+
+- **PostgreSQL docs**: [SELECT](https://www.postgresql.org/docs/current/sql-select.html) (processing order, alias rules, DISTINCT ON).
+- **PostgreSQL docs**: [Table expressions and joins](https://www.postgresql.org/docs/current/queries-table-expressions.html).
+- **PostgreSQL docs**: [Subquery expressions](https://www.postgresql.org/docs/current/functions-subquery.html) (IN / NOT IN / EXISTS and NULLs).
+- **PostgreSQL docs**: [Materialized views](https://www.postgresql.org/docs/current/rules-materializedviews.html) and [REFRESH MATERIALIZED VIEW](https://www.postgresql.org/docs/current/sql-refreshmaterializedview.html).
+- **PostgreSQL docs**: [Overview of trigger behavior](https://www.postgresql.org/docs/current/trigger-definition.html).
+- **PostgreSQL wiki**: [Don't Do This](https://wiki.postgresql.org/wiki/Don%27t_Do_This) (why not NOT IN).
+- **MySQL 8.0 manual**: [JOIN clause](https://dev.mysql.com/doc/refman/8.0/en/join.html), [Problems with column aliases](https://dev.mysql.com/doc/refman/8.0/en/problems-with-alias.html), [Semijoin and antijoin optimization](https://dev.mysql.com/doc/refman/8.0/en/semijoins.html).
+- Related notes: [Transactions and isolation](/learn/notes/transactions-isolation/), [MySQL vs Postgres internals](/learn/notes/mysql-postgres-internals/), [SQL Window Functions and CTEs](/learn/notes/sql-window-functions-ctes/).

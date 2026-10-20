@@ -1,0 +1,589 @@
+---
+title: "Redis Data Structures: Strings to Streams"
+phase: "03-caching-redis"
+order: 22
+tags: ["caching"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 22
+prerequisites: ["redis-deep"]
+summary: "Every Redis data type — strings, lists, hashes, sets, sorted sets, bitmaps, bitfields, HyperLogLog, geo, and streams — with the commands, Big-O, internal encodings, and modelling patterns (leaderboards, queues, secondary indexes) you need to pick the right one."
+---
+
+## Definition (interview-ready)
+
+Redis is a **data-structure server**: each key holds a typed value, and you change it with type-specific commands that run atomically on the server. The core types are **strings** (bytes, numbers, bitmaps), **lists** (ordered sequences with O(1) push/pop at both ends), **hashes** (field→value maps), **sets** (unique unordered members), **sorted sets** (unique members ordered by a floating-point score), and **streams** (append-only logs with consumer groups). **Bitmaps, bitfields, and HyperLogLog** are built on strings, and **geospatial indexes** are built on sorted sets. Internally, each type switches between a **compact encoding** for small values (listpack, intset, embstr) and a general one for large values (hashtable, skiplist, quicklist). Picking the right type and knowing its Big-O is most of Redis data modelling.
+
+## Why it matters
+
+In Redis the data structure *is* the query. There's no planner, so the structure you choose decides your access paths, complexity, and memory. A leaderboard in a sorted set is O(log N) per update. The same leaderboard in a JSON string means reading and rewriting the whole blob every time. Interviewers ask "which Redis type would you use for X?" constantly (feeds, rate limiters, unique visitors, nearby drivers, job queues), and production incidents often come from the wrong choice: an `SMEMBERS` on 20M members, a list used as a random-access array, or a set where HyperLogLog would have used 12 KB.
+
+## Core concepts
+
+### The big table
+
+| Type | Use cases | Key commands | Big-O (N = elements in key, M = returned/affected) |
+|---|---|---|---|
+| **String** | Cache blobs (JSON), counters, flags, locks, idempotency keys | `SET` `GET` `MGET` `INCR` `INCRBYFLOAT` `APPEND` `GETRANGE` | `GET`/`SET`/`INCR` O(1). `MGET` O(keys). `GETRANGE` O(M) |
+| **List** | FIFO/LIFO queues, recent-N feeds, activity logs | `LPUSH` `RPUSH` `LPOP` `RPOP` `LRANGE` `LTRIM` `BLPOP` `BLMOVE` `LINDEX` | Push/pop at either end O(1). `LRANGE` O(S+M). `LINDEX`/`LINSERT` O(N). `LTRIM` O(removed) |
+| **Hash** | Objects/records, per-entity counters, sessions | `HSET` `HGET` `HMGET` `HINCRBY` `HDEL` `HGETALL` `HSCAN` `HEXPIRE` | Single field O(1). `HGETALL`/`HKEYS`/`HVALS` O(N) |
+| **Set** | Tags, unique visitors (exact), friends, membership, random sampling | `SADD` `SREM` `SISMEMBER` `SMISMEMBER` `SCARD` `SINTER` `SUNION` `SDIFF` `SRANDMEMBER` `SPOP` `SSCAN` | Add/remove/check O(1) each. `SMEMBERS` O(N). `SINTER` O(N·K) worst case (N = smallest set, K = number of sets). `SUNION`/`SDIFF` O(total elements) |
+| **Sorted set** | Leaderboards, priority/delayed queues, sliding windows, time indexes, secondary indexes | `ZADD` `ZINCRBY` `ZSCORE` `ZRANK` `ZRANGE` (BYSCORE/BYLEX/REV/LIMIT) `ZREMRANGEBYSCORE` `ZPOPMIN` `ZCOUNT` | `ZADD`/`ZREM`/`ZRANK` O(log N). Range O(log N + M). `ZSCORE` O(1). `ZCARD` O(1) |
+| **Bitmap** (on string) | Daily active users, feature flags per user id, presence | `SETBIT` `GETBIT` `BITCOUNT` `BITOP` `BITPOS` | `SETBIT`/`GETBIT` O(1). `BITCOUNT`/`BITOP`/`BITPOS` O(N bytes) |
+| **Bitfield** (on string) | Many small fixed-width counters packed together | `BITFIELD` `BITFIELD_RO` | O(1) per subcommand |
+| **HyperLogLog** (on string) | Approximate distinct counts (unique visitors, unique searches) | `PFADD` `PFCOUNT` `PFMERGE` | `PFADD` O(1) per element. `PFCOUNT` O(1) for one key. `PFMERGE` O(number of HLLs) |
+| **Geo** (on sorted set) | Nearby drivers/stores, radius or box search | `GEOADD` `GEOSEARCH` `GEODIST` `GEOPOS` | `GEOADD` O(log N). `GEOSEARCH` O(N + log M) (N = items in the covering area) |
+| **Stream** | Event log, durable job queue with consumer groups, audit trail | `XADD` `XRANGE` `XREAD` `XREADGROUP` `XACK` `XPENDING` `XAUTOCLAIM` `XTRIM` | `XADD` O(1) (plus trimming). `XRANGE` O(M) for M entries returned. `XACK` O(1) per id |
+
+Two rules of thumb: anything that returns "all of it" (`SMEMBERS`, `HGETALL`, `LRANGE 0 -1`, `ZRANGE 0 -1`) is O(N), so use the `*SCAN` variants or bounded ranges on large keys. And every collection type is capped at 2^32 − 1 elements, but memory runs out long before that.
+
+### Strings
+
+A string is a binary-safe byte array of up to 512 MB: text, JSON, serialised protobuf, an integer, or a raw bitmap.
+
+```bash
+SET product:991 '{"name":"Kurti","price":49900}' EX 300
+GET product:991
+MSET a 1 b 2 c 3            # atomic multi-set (same slot in Cluster)
+INCR stock:991              # atomic counter, 64-bit signed
+APPEND log:today "line\n"   # amortised O(1)
+GETRANGE big 0 99           # O(length returned)
+GETDEL / GETEX              # 6.2+: read-and-delete / read-and-set-TTL
+```
+
+Encodings: `int` (the value is a 64-bit integer), `embstr` (short strings of up to 44 bytes, allocated together with the object header), and `raw` (everything else).
+
+**String vs hash for an object**: a JSON string is simplest when you always read and write the whole object. A hash wins when you update individual fields (`HINCRBY user:1 points 5`) or read a few fields (`HMGET`).
+
+### Lists
+
+An ordered sequence of strings, ordered by **insertion**, with duplicates allowed. Implemented as a **quicklist**: a doubly linked list of listpack nodes (each node up to 8 KB by default, `list-max-listpack-size -2`). Very small lists use a single listpack (Redis 7+). Push and pop at either end are O(1). Anything by index or value in the middle is O(N).
+
+```bash
+LPUSH feed:user:42 post:9 post:8     # add to head
+LRANGE feed:user:42 0 9              # latest 10
+LTRIM feed:user:42 0 99              # cap at 100 newest (capped list pattern)
+RPUSH jobs j1 j2                     # producer
+LPOP jobs                            # consumer (FIFO with RPUSH + LPOP)
+LMOVE src dst LEFT RIGHT             # 6.2+: atomic pop-from-one-push-to-other
+LLEN jobs                            # O(1)
+LINDEX feed:user:42 5000             # O(N) - avoid on long lists
+```
+
+Common operations: **queue** (`RPUSH` + `LPOP`), **stack** (`LPUSH` + `LPOP`), **capped recent-N list** (`LPUSH` + `LTRIM` in one `MULTI` or pipeline), and **round-robin rotation** (`LMOVE key key LEFT RIGHT`).
+
+### Blocking list operations
+
+`BLPOP`, `BRPOP`, `BLMOVE` (6.2+), and `BLMPOP` (7.0+) wait on an empty list instead of making the consumer poll.
+
+```bash
+# consumer: wait up to 5 s for work on either queue (0 = wait forever)
+BRPOP queue:high queue:low 5
+1) "queue:high"      # which key it came from
+2) "job:123"
+```
+
+- The connection is parked, and Redis serves blocked clients **in the order they blocked** (FIFO) when a producer pushes.
+- The reply includes the **key name** because you can block on several lists. Keys are checked in argument order, which gives you simple priorities.
+- On timeout the reply is nil.
+- **Reliable queue pattern**: `BLMOVE queue processing RIGHT LEFT 0` atomically moves the job to a per-worker `processing` list. The worker `LREM`s it when done, and a reaper re-queues items stuck in `processing`. With a plain `BRPOP`, a worker that crashes after popping loses the job. (`BLMOVE` replaces the older `BRPOPLPUSH`.)
+- A blocked connection can't be used for anything else, so give consumers their own connections. Lists can't do acks, retries, or consumer groups. For those, use **Streams**.
+
+### Hashes
+
+A map of field → string value under one key: the natural shape for an object.
+
+```bash
+HSET user:42 name Aman city Jaipur points 0     # multi-field HSET (HMSET is legacy)
+HGET user:42 name
+HMGET user:42 name city
+HINCRBY user:42 points 10                        # atomic per-field counter
+HINCRBYFLOAT user:42 balance 12.5
+HEXISTS / HDEL / HLEN
+HGETALL user:42                                  # O(N) - fine for small objects
+HSCAN user:42 0 COUNT 100                        # iterate big hashes
+```
+
+- **Memory**: small hashes (by default up to `hash-max-listpack-entries 512` fields, each value up to `hash-max-listpack-value 64` bytes) are stored as a single **listpack**, a flat byte array. That's dramatically smaller than separate keys. Past either limit they convert to a real **hashtable**. A classic trick is to bucket many small key/value pairs into hashes (`object:12` → field `34` for `object:1234`) to save memory.
+- **Hash-field expiration (Redis 7.4+)**: individual fields can now have TTLs: `HEXPIRE`, `HPEXPIRE`, `HEXPIREAT`, `HPEXPIREAT`, inspected with `HTTL`/`HPTTL`/`HEXPIRETIME` and cleared with `HPERSIST`. Redis 8.0 added `HGETEX`, `HSETEX`, and `HGETDEL`. Before 7.4 only the whole key could expire.
+
+```bash
+HSET session:abc csrf t1 cart c9
+HEXPIRE session:abc 600 FIELDS 1 csrf     # only the csrf field expires in 10 min
+HTTL session:abc FIELDS 2 csrf cart        # → 600, -1
+```
+
+- No nesting: values are strings only. For nested documents use JSON (built into Redis 8) or serialise.
+
+### Sets
+
+Unordered collections of **unique** strings. Encodings: `intset` (all-integer members, up to `set-max-intset-entries 512`), `listpack` for small non-integer sets (Redis 7.2+, `set-max-listpack-entries 128`, `set-max-listpack-value 64`), and otherwise `hashtable`.
+
+```bash
+SADD post:9:likes u1 u2 u3          # returns number newly added
+SISMEMBER post:9:likes u2           # O(1)
+SMISMEMBER post:9:likes u2 u7       # 6.2+: check several at once
+SCARD post:9:likes                  # O(1)
+SINTER follows:u1 follows:u2        # mutual follows
+SINTERCARD 2 a b LIMIT 100          # 7.0+: just the count, can stop early
+SUNIONSTORE tags:all tags:a tags:b
+SDIFF candidates seen               # not-yet-seen items
+SRANDMEMBER pool 3 / SPOP pool      # random sample / random removal
+```
+
+- Use them for tags, de-duplication, "has user X done Y", and social graphs (followers, mutual friends).
+- Set algebra is powerful but O(N). `SINTER` on two 10M-member sets will stall the server. Precompute, keep sets small, or run on a replica.
+- For huge membership checks where some error is fine, a Bloom filter (built into Redis 8) uses a fraction of the memory. For counting uniques, use HyperLogLog. See [Probabilistic Data Structures](/learn/notes/probabilistic-data-structures/).
+
+### Sorted sets (ZSETs)
+
+Unique members, each with a double-precision **score**, kept ordered by (score, then member lexicographically). Internally a large sorted set is **both a skip list and a hash table**: the hash table gives O(1) `ZSCORE` (member → score), and the skip list keeps members ordered so rank and range queries are O(log N). Small sorted sets (up to `zset-max-listpack-entries 128` members, each up to `zset-max-listpack-value 64` bytes) use a single listpack.
+
+```
+skiplist (ordered by score)                hash table
+L3: head ─────────────────────► 300 ─►    "alice" → 120
+L2: head ────────► 120 ───────► 300 ─►    "bob"   → 300
+L1: head ─► 50 ─► 120 ─► 210 ─► 300 ─►    "cara"  → 50
+                                           "dev"   → 210
+```
+
+```bash
+ZADD lb:weekly 120 alice 300 bob 50 cara       # O(log N) each
+ZINCRBY lb:weekly 25 alice                     # atomic score change
+ZRANGE lb:weekly 0 9 REV WITHSCORES            # top 10 (6.2+ unified ZRANGE)
+ZREVRANK lb:weekly alice                       # 0-based position from the top
+ZSCORE lb:weekly alice                         # O(1)
+ZRANGE delayed 0 1729500000 BYSCORE LIMIT 0 100   # due jobs (score = run-at time)
+ZREMRANGEBYSCORE rl:u42 0 1729499940000        # drop old entries (sliding window)
+ZPOPMIN pq                                     # priority queue pop (BZPOPMIN blocks)
+```
+
+- **Sets vs sorted sets**: both hold unique members. A set has no order and costs O(1) per add/check. A sorted set adds a score, keeps members ordered, supports rank and range queries, and costs O(log N) per add.
+- **Ties** are broken lexicographically by member. Give every member the same score and `ZRANGE ... BYLEX` becomes a lexicographic index (prefix search, autocomplete).
+- **Score precision**: doubles represent integers exactly up to 2^53. Millisecond timestamps fit fine. For composite ordering (e.g. points, then earliest time), pack both into one score carefully, or break ties via the member.
+- **Leaderboards**: `ZINCRBY` on every event, `ZRANGE ... REV LIMIT` for pages, `ZREVRANK` for "your position". For huge global boards, shard by region or time period (`lb:2026-w42`) and merge with `ZUNIONSTORE`.
+
+### Bitmaps
+
+Not a separate type: bit operations on a string. A string of up to 512 MB gives 2^32 addressable bits. One bit per numeric id is extremely compact: 100 million users fit in about 12 MB.
+
+```bash
+SETBIT dau:2026-10-21 1000042 1      # user 1000042 was active today, O(1)
+GETBIT dau:2026-10-21 1000042        # → 1
+BITCOUNT dau:2026-10-21              # daily active users, O(N)
+BITOP AND active:both dau:2026-10-20 dau:2026-10-21   # active on both days
+BITPOS flags 0                       # first unset bit
+```
+
+- Ideal when ids are **dense integers**. Sparse or huge ids (UUIDs, ids in the billions) waste memory. Map them to dense ids or use a set or HyperLogLog.
+- Setting a far-away bit on a short or new key allocates the whole string up to that offset at once. The first `SETBIT key 4000000000 1` allocates about 500 MB and can stall the server.
+
+### Bitfields
+
+`BITFIELD` treats a string as an array of fixed-width integers at arbitrary bit offsets: signed up to 64 bits (`i8`, `i16`, ...), unsigned up to 63 bits (`u4`, `u8`, ...).
+
+```bash
+# 8-bit unsigned counters packed in one key: counter #0 and counter #1
+BITFIELD stats:42 INCRBY u8 #0 1 INCRBY u8 #1 5
+BITFIELD stats:42 GET u8 #0
+# overflow control: WRAP (default), SAT (clamp), FAIL (return nil, no change)
+BITFIELD stats:42 OVERFLOW SAT INCRBY u8 #0 300     # clamps at 255
+```
+
+- `#n` offsets multiply by the type width, so `#1` with `u8` means bit offset 8.
+- Each subcommand is O(1). Many subcommands go in one atomic call.
+- Classic use: Reddit's 2017 r/place canvas was built on `BITFIELD`, with every pixel's colour stored as a small integer field inside one Redis string.
+
+### HyperLogLog
+
+A probabilistic sketch that **estimates the number of distinct elements** using at most **12 KB** per key (much less while small), with a **standard error of 0.81%**. It can estimate cardinalities up to 2^64. You can't list members or test membership, only count.
+
+```bash
+PFADD uv:page:home:2026-10-21 user:1 user:2 user:3   # O(1) per element
+PFCOUNT uv:page:home:2026-10-21                      # ≈ 3
+PFMERGE uv:home:week uv:page:home:2026-10-15 ... uv:page:home:2026-10-21
+PFCOUNT uv:a uv:b                                     # union estimate on the fly
+```
+
+- **The problem it solves**: counting unique visitors per page per day with exact sets costs memory proportional to the number of visitors (tens of MB per page at scale). HLL is a fixed 12 KB with less than 1% error.
+- Merges are lossless (the union of sketches), so keep per-day HLLs and merge for weekly or monthly counts. You can't subtract or intersect precisely.
+- Stored as a string, so `GET`/`SET` can copy one between servers.
+
+### Geospatial
+
+A **geo index is just a sorted set**: `GEOADD` interleaves longitude and latitude bits into a **52-bit geohash** used as the score. Nearby points end up with nearby scores, so a radius query becomes a handful of score-range scans (the cell plus its 8 neighbours), followed by an exact distance filter.
+
+```bash
+GEOADD drivers:blr 77.5946 12.9716 d:1 77.6100 12.9352 d:2   # lon, lat, member
+GEOSEARCH drivers:blr FROMLONLAT 77.60 12.95 BYRADIUS 3 km ASC COUNT 10 WITHDIST
+GEOSEARCH drivers:blr FROMMEMBER d:1 BYBOX 5 5 km ASC
+GEODIST drivers:blr d:1 d:2 km
+GEOPOS drivers:blr d:1
+ZREM drivers:blr d:2           # no GEODEL - it's a sorted set
+```
+
+- Longitude comes **before** latitude. Valid latitudes are about ±85.05° (Web Mercator limits), so the poles can't be indexed.
+- Distances use the **Haversine** formula (the Earth treated as a sphere), with errors up to about 0.5%. That's fine for "drivers near me" but not for surveying.
+- `GEOSEARCH` / `GEOSEARCHSTORE` (6.2+) replace the older `GEORADIUS*` commands.
+- For moving objects, update positions with `GEOADD` (overwrite) and track liveness separately, for example per-driver keys with a TTL, because sorted-set members can't expire individually.
+
+### Streams
+
+An append-only log of entries (each a small field-value map) with **time-based IDs** of the form `<ms>-<seq>`. Added in 5.0. Internally it's a radix tree of listpacks.
+
+```bash
+XADD orders * orderId 991 status placed            # * = auto ID, e.g. 1729500000000-0
+XADD orders MAXLEN ~ 1000000 * orderId 992 status placed   # approximate cap
+XRANGE orders - + COUNT 10                          # oldest 10 ('-' min, '+' max)
+XREAD BLOCK 5000 STREAMS orders $                   # tail new entries ($ = only new)
+
+XGROUP CREATE orders billing $ MKSTREAM             # consumer group
+XREADGROUP GROUP billing w1 COUNT 10 BLOCK 5000 STREAMS orders >   # '>' = never-delivered
+XACK orders billing 1729500000000-0                 # done → leaves the pending list
+XPENDING orders billing                             # delivered but unacked
+XAUTOCLAIM orders billing w2 60000 0-0              # 6.2+: take over stuck messages
+```
+
+- Unlike pub/sub, entries **persist** until trimmed, so consumers can replay from any ID.
+- **Consumer groups** split entries across workers. Each entry delivered via `>` goes to exactly one consumer in the group and sits in the **Pending Entries List (PEL)** until `XACK`. This gives at-least-once delivery, so handlers must be idempotent.
+- Trim with `MAXLEN ~` or `MINID ~` (the approximate `~` form is much cheaper), or memory grows forever.
+
+Messaging semantics, comparisons with Kafka, and failure handling are covered in [Transactions, Scripting & Messaging](/learn/notes/redis-transactions-scripting/). See also [Kafka Deep Dive](/learn/notes/kafka-deep/).
+
+### Internal encodings and thresholds
+
+Redis automatically switches encodings: compact (CPU-cheap for small N, tiny memory) up to a threshold, then general-purpose. Check a key with `OBJECT ENCODING key`.
+
+| Type | Small encoding | Threshold config (Redis 7+ default) | Large encoding |
+|---|---|---|---|
+| String | `int` (integer value), `embstr` (≤ 44 bytes) | fixed | `raw` |
+| List | `listpack` (single node) | `list-max-listpack-size -2` (8 KB per node) | `quicklist` (linked list of listpacks; `list-compress-depth 0` = no compression) |
+| Hash | `listpack` | `hash-max-listpack-entries 512`, `hash-max-listpack-value 64` | `hashtable` |
+| Set | `intset` (integers only), `listpack` (7.2+) | `set-max-intset-entries 512`; `set-max-listpack-entries 128`, `set-max-listpack-value 64` | `hashtable` |
+| Sorted set | `listpack` | `zset-max-listpack-entries 128`, `zset-max-listpack-value 64` | `skiplist` (skip list + hash table) |
+| Stream | n/a | `stream-node-max-bytes`, `stream-node-max-entries` | `stream` (radix tree of listpacks) |
+
+```bash
+127.0.0.1:6379> HSET h f v
+127.0.0.1:6379> OBJECT ENCODING h
+"listpack"
+127.0.0.1:6379> SADD s 1 2 3
+127.0.0.1:6379> OBJECT ENCODING s
+"intset"
+```
+
+- **listpack** replaced **ziplist** in Redis 7.0. In 6.2 and earlier the configs were called `hash-max-ziplist-entries`, `zset-max-ziplist-value`, and so on. Listpack removes ziplist's "cascading update" worst case.
+- Don't count on a key going back to its compact encoding after it shrinks. Plan sizes so hot keys stay under the thresholds.
+- Raising thresholds trades CPU (compact encodings are scanned linearly) for memory. Benchmark before raising them.
+
+### Secondary indexes
+
+Redis looks keys up only by name. To query by attribute, you either **build the index yourself** from sorted sets and sets, or use the **Redis Query Engine**.
+
+**Manual indexes** (work on any Redis, you keep them consistent):
+
+```bash
+# primary record
+HSET product:991 name Kurti price 499 category ethnic
+# numeric index: score = price, member = id
+ZADD idx:product:price 499 991
+# tag index: one set per value
+SADD idx:product:category:ethnic 991
+
+# query: ethnic products priced 300..600
+ZRANGE idx:product:price 300 600 BYSCORE          # → ids by price
+SMEMBERS idx:product:category:ethnic               # → ids by category
+# intersect: ZINTERSTORE tmp 2 idx:product:price idx:product:category:ethnic WEIGHTS 1 0
+```
+
+- Update the record and its index entries **atomically** with `MULTI/EXEC` or a Lua script, and remove the old index entries when a value changes. Otherwise the index drifts.
+- **Lex index**: give every member the same score and encode the value in the member (`ZADD idx:name 0 "kurti:991"`), then `ZRANGE idx:name "[kur" "[kur\xff" BYLEX` for prefix search.
+- In Cluster, the record and its indexes must share a slot (hash tags) if you update them in one transaction, or you accept eventual consistency.
+
+**Redis Query Engine** (formerly RediSearch, built into Redis 8, previously a module / Redis Stack): declare an index over hashes or JSON documents by key prefix. Redis then indexes matching keys **automatically on every write** and backfills existing keys in the background.
+
+```bash
+FT.CREATE idx:product ON HASH PREFIX 1 product: SCHEMA
+    name TEXT  price NUMERIC SORTABLE  category TAG
+FT.SEARCH idx:product "@category:{ethnic} @price:[300 600]" SORTBY price ASC LIMIT 0 10
+FT.SEARCH idx:product "kurt*"
+FT.INFO idx:product
+```
+
+Field types: `TEXT` (full-text), `TAG` (exact match), `NUMERIC` (ranges), `GEO`, `GEOSHAPE`, and `VECTOR` (similarity search). Prefer it over hand-built indexes when you need multi-field filters, full-text search, or aggregations. Manual indexes are still useful for one simple access path with zero extra moving parts.
+
+## How it works (choosing a type)
+
+```
+Need only get/put of a blob or a number?           → String (INCR for counters)
+Object with fields you update individually?        → Hash (HINCRBY, field TTL 7.4+)
+Order by arrival, pop from ends, block for work?   → List (BLMOVE for reliability)
+Need acks, replay, consumer groups?                → Stream
+Unique membership / set algebra?                   → Set
+Order by a score, rank, range by score/time?       → Sorted set
+One bit (or small int) per dense numeric id?       → Bitmap / Bitfield
+Count distinct, approximate is fine?               → HyperLogLog (12 KB)
+Nearby points?                                     → Geo (sorted set)
+Query by multiple attributes / full text?          → Query Engine (FT.CREATE) or manual ZSET/SET indexes
+```
+
+## Real-world examples
+
+- **Reddit r/place (2017)**: the Redis `BITFIELD` docs note that the shared pixel canvas was built with `BITFIELD`, keeping the whole canvas in memory as packed integers.
+- **GitHub's Resque**, a widely used Ruby background-job library, keeps its job queues in Redis lists.
+
+## Common pitfalls
+
+- **O(N) reads on big collections**: `SMEMBERS`, `HGETALL`, `LRANGE 0 -1`, `ZRANGE 0 -1` on millions of elements. Paginate or use `SSCAN`/`HSCAN`/`ZSCAN`.
+- **Lists used as arrays**: `LINDEX`/`LSET`/`LINSERT` in the middle are O(N).
+- **`BRPOP` without a processing list**: a crash after the pop loses the job. Use `BLMOVE` plus a reaper, or Streams.
+- **Unbounded growth**: capped feeds need `LTRIM`, streams need `MAXLEN ~`/`MINID`, and sliding-window ZSETs need `ZREMRANGEBYSCORE` plus a TTL on the key.
+- **Bitmaps with sparse ids**: setting bit 4,000,000,000 allocates about 500 MB.
+- **Expecting per-member TTL** in sets or sorted sets: not supported (only hash fields since 7.4). Use the score as a timestamp and trim, or use separate keys.
+- **Sorted-set score collisions**: identical scores sort by member, which surprises people expecting insertion order.
+- **Stale manual indexes**: updating the record without updating its ZSET/SET entries atomically.
+- **Cross-slot set algebra in Cluster**: `SINTER`/`ZUNIONSTORE` across keys in different slots fails. Co-locate with hash tags.
+- **Raising listpack thresholds blindly**: saves memory but makes big compact values O(N) to scan on every access.
+
+## Practice questions
+
+<Practice>
+
+<QA q="What data types can you store in Redis?" level="easy">
+
+Core types: **String** (binary-safe, up to 512 MB, also used for integers and floats), **List** (ordered by insertion, O(1) at both ends), **Hash** (field→value map), **Set** (unique unordered members), **Sorted set** (unique members ordered by score), and **Stream** (append-only log with consumer groups).
+
+Built on top: **Bitmaps** and **bitfields** (bit and small-integer ops on strings), **HyperLogLog** (approximate distinct count, also stored as a string), and **Geospatial** indexes (a sorted set with geohash scores).
+
+Redis 8 also ships JSON, time series, vector sets (preview), and probabilistic types (Bloom, Cuckoo, Count-min, Top-k, t-digest), formerly separate modules. Values are never nested: a hash field holds a string, not another hash.
+
+</QA>
+
+<QA q="What are hashes in Redis and how do you use them?" level="easy">
+
+A hash is a map of string fields to string values under one key, the natural fit for an object: `HSET user:42 name Aman city Jaipur points 0`.
+
+- Read with `HGET`, `HMGET`, or `HGETALL` (O(N), fine for small objects).
+- Update single fields with `HSET` and counters with `HINCRBY`/`HINCRBYFLOAT`, without rewriting the whole object as you would with a JSON string.
+- Iterate big hashes with `HSCAN`.
+- **Memory**: small hashes (512 fields or fewer, values 64 bytes or smaller, by default) use the compact listpack encoding, often much smaller than separate keys.
+- **Field TTLs** since 7.4: `HEXPIRE key 60 FIELDS 1 f`, `HTTL`, `HPERSIST`. Redis 8 adds `HSETEX`/`HGETEX`.
+
+Choose a hash over a JSON string when you update or read individual fields. Choose the string when you always read and write the whole object.
+
+</QA>
+
+<QA q="What are lists in Redis and what are common operations on them?" level="easy">
+
+A list is an ordered (by insertion) sequence of strings that allows duplicates, implemented as a quicklist (a linked list of listpack nodes). Ends are O(1), and the middle is O(N).
+
+- Push/pop: `LPUSH`, `RPUSH`, `LPOP`, `RPOP` (with an optional count).
+- Read: `LRANGE key 0 9`, `LLEN` (O(1)), `LINDEX` (O(N)).
+- Trim: `LTRIM key 0 99` keeps the newest 100 (the capped-list pattern).
+- Move: `LMOVE` / `BLMOVE` (6.2+) atomically pop from one list and push to another.
+- Patterns: queue (`RPUSH` + `LPOP`), stack (`LPUSH` + `LPOP`), recent-activity feed (`LPUSH` + `LTRIM`), work queue with blocking consumers (`BRPOP`).
+
+</QA>
+
+<QA q="How do sets work in Redis and what operations can you perform?" level="easy">
+
+A set is an unordered collection of unique strings. Adding an existing member is a no-op. Add, remove, and membership are O(1) (`SADD`, `SREM`, `SISMEMBER`, `SMISMEMBER`), and `SCARD` is O(1).
+
+Set algebra: `SINTER` (mutual friends), `SUNION`, `SDIFF` (unseen items), each with a `*STORE` variant, and `SINTERCARD` (7.0+) to just count with an optional early-stop `LIMIT`. Random: `SRANDMEMBER` (sample) and `SPOP` (sample and remove, e.g. raffle winners). Iterate with `SSCAN`.
+
+Encodings: an intset for small integer-only sets, a listpack for small sets (7.2+), and a hashtable otherwise. Watch out for O(N) commands (`SMEMBERS`, big intersections) on large sets.
+
+</QA>
+
+<QA q="What is a bitmap in Redis and how can you use it?" level="medium">
+
+A bitmap is bit-level access to a string, not a separate type. With a 512 MB string you get up to 2^32 bits. `SETBIT key offset 1` and `GETBIT` are O(1). `BITCOUNT` counts set bits, `BITOP AND/OR/XOR/NOT` combines bitmaps, and `BITPOS` finds the first 0 or 1. Those three are O(N) in bytes.
+
+Use case: daily active users. `SETBIT dau:2026-10-21 <userId> 1` on each visit, `BITCOUNT` for the DAU, and `BITOP AND` across days for "active every day this week". 100M users take about 12 MB per day.
+
+Caveats: ids must be dense integers. Setting a huge offset allocates the whole string at once, which can be slow and huge. For sparse ids, use a set (exact) or HyperLogLog (approximate count).
+
+</QA>
+
+<QA q="What are HyperLogLogs and what problem do they solve?" level="medium">
+
+They solve **count-distinct at scale with fixed memory**. Exact unique counting needs memory proportional to the number of distinct items. Redis's HyperLogLog estimates cardinality with a **0.81% standard error using at most 12 KB per key**, regardless of whether it saw a thousand or a billion items.
+
+- `PFADD key item...` (O(1) per item) adds observations.
+- `PFCOUNT key [key...]` returns the estimate. With several keys it estimates the union.
+- `PFMERGE dest k1 k2...` merges sketches losslessly, e.g. 7 daily HLLs into a weekly one.
+
+Trade-offs: you can't list members, check membership, or precisely intersect or subtract. Use it for unique visitors, unique search queries, or distinct devices, wherever about 1% error is fine.
+
+</QA>
+
+<QA q="What are sorted sets and how do they differ from regular sets?" level="medium">
+
+Both hold **unique** string members. A sorted set additionally gives each member a floating-point **score** and keeps members ordered by (score, then member lexicographically).
+
+| | Set | Sorted set |
+|---|---|---|
+| Order | None | By score |
+| Add/remove | O(1) | O(log N) |
+| Lookup score | n/a | `ZSCORE` O(1) |
+| Rank / range | n/a | `ZRANK`, `ZRANGE ... BYSCORE / REV / LIMIT` O(log N + M) |
+| Internals | intset / listpack / hashtable | listpack, or skip list + hash table |
+
+Sorted sets power leaderboards (`ZINCRBY`, `ZRANGE 0 9 REV`), delayed and priority queues (score = run-at time, `ZPOPMIN`), sliding-window rate limiters (score = timestamp, `ZREMRANGEBYSCORE`), and time-ordered or numeric secondary indexes.
+
+</QA>
+
+<QA q="Can you explain the blocking operations on Redis lists?" level="medium">
+
+`BLPOP`, `BRPOP`, `BLMOVE` (6.2+), and `BLMPOP` (7.0+) behave like their non-blocking versions when the list has data. When it's empty, the connection **blocks** until a producer pushes or the timeout (in seconds) expires. A timeout of 0 means wait forever.
+
+- You can wait on several keys at once. They're checked in argument order, and the reply is `[key, value]` so you know the source. Timeout returns nil.
+- Multiple blocked clients are served **FIFO**: the first one to block gets the first element pushed.
+- This removes polling: workers get work as soon as it's pushed.
+- **Reliability**: `BRPOP` removes the item, so a crash afterwards loses it. `BLMOVE queue processing RIGHT LEFT 0` moves it atomically into a processing list. Remove it with `LREM` when done, and let a reaper re-queue stale entries. For acks, retries, and consumer groups, use Streams.
+- A blocked connection is tied up, so use dedicated connections for blocking consumers.
+
+</QA>
+
+<QA q="Can you use Redis for geospatial data? How?" level="medium">
+
+Yes. `GEOADD key lon lat member` stores points in a **sorted set**, where the score is a **52-bit geohash** made by interleaving longitude and latitude bits. Nearby points get nearby scores, so `GEOSEARCH key FROMLONLAT lon lat BYRADIUS 3 km ASC COUNT 10 WITHDIST` (or `FROMMEMBER`, or `BYBOX`) runs a few score-range scans over the covering geohash cells and then filters by exact distance. Cost is O(N + log M).
+
+Other commands: `GEODIST`, `GEOPOS`, `GEOHASH`, and `ZREM` to delete (there's no `GEODEL`). Notes: longitude comes first, latitude is limited to about ±85.05°, distance uses Haversine (up to about 0.5% error), and `GEOSEARCH` (6.2) replaces `GEORADIUS`. For moving drivers, re-`GEOADD` on each update and track freshness separately, because members can't have TTLs.
+
+</QA>
+
+<QA q="Explain the concept of a stream in Redis." level="medium">
+
+A stream (5.0+) is an append-only log. `XADD key * f v ...` appends an entry with an auto-generated, monotonically increasing `<ms>-<seq>` ID in O(1). Unlike pub/sub, entries persist, so you can:
+
+- **Range-read** history: `XRANGE key - +`, or by time, since IDs are timestamps.
+- **Tail** it: `XREAD BLOCK 5000 STREAMS key $`.
+- **Share work with consumer groups**: `XGROUP CREATE`, then `XREADGROUP GROUP g c STREAMS key >` delivers each new entry to one consumer. It stays in the **pending entries list** until `XACK`. `XPENDING` and `XAUTOCLAIM` (6.2+) recover messages from dead consumers. That's at-least-once delivery.
+- **Bound memory** with `XADD ... MAXLEN ~ N` or `XTRIM`.
+
+Think of it as a Kafka-like partition inside Redis. It's great for moderate-volume event pipelines and job queues, but it lives in RAM and doesn't partition one stream across nodes. See [redis-transactions-scripting](/learn/notes/redis-transactions-scripting/) for messaging semantics.
+
+</QA>
+
+<QA q="How do you create and manage indexes (secondary indexes) in Redis?" level="hard">
+
+Redis only looks up by key, so there are two approaches:
+
+1. **Manual indexes** with core types:
+   - Numeric or time attribute → a sorted set (`ZADD idx:price 499 991`), queried with `ZRANGE idx:price 300 600 BYSCORE`.
+   - Categorical attribute → one set per value (`SADD idx:cat:ethnic 991`), combined with `SINTER`/`SUNION`.
+   - Prefix or lexicographic search → an all-same-score sorted set with `ZRANGE ... BYLEX`.
+   - You must update the record and every index entry **atomically** (`MULTI/EXEC` or Lua), remove stale entries when values change, and co-locate keys with hash tags in Cluster.
+2. **Redis Query Engine** (built into Redis 8, formerly the RediSearch module): `FT.CREATE idx ON HASH PREFIX 1 product: SCHEMA name TEXT price NUMERIC SORTABLE category TAG`. Matching hashes or JSON documents are indexed automatically on write and existing keys are backfilled. Query with `FT.SEARCH idx "@category:{ethnic} @price:[300 600]"`. It supports full-text, tag, numeric, geo, and vector fields, plus aggregations (`FT.AGGREGATE`). Manage indexes with `FT.INFO`, `FT.ALTER`, and `FT.DROPINDEX`.
+
+Use manual indexes for one or two simple access paths. Use the Query Engine for multi-attribute filters, text search, or anything that would make you hand-maintain many indexes.
+
+</QA>
+
+<QA q="Design a real-time game leaderboard for 50M players with 'top 100' and 'my rank' queries." level="scenario">
+
+- One sorted set per board and period: `lb:global:2026-w42`. On each score event, `ZINCRBY lb:global:2026-w42 <delta> <playerId>`, which is O(log N), roughly 26 comparisons for 50M members.
+- Top 100: `ZRANGE lb:... 0 99 REV WITHSCORES`, O(log N + 100).
+- My rank: `ZREVRANK lb:... <playerId>` (O(log N)), and neighbours with `ZRANGE ... REV` around that rank.
+- Display names come from a `user:<id>` hash via a pipelined `HMGET`.
+- Tie-break by earliest achiever: encode `score * 2^k + (MAX_TS - ts)` into the double carefully (stay within 2^53), or accept lexicographic ties.
+- Size: 50M members cost several GB (skip list + hash table), so put it on its own shard. Use per-region boards for hot-key load and merge with `ZUNIONSTORE` offline if needed. Expire old periods with a TTL on the period key.
+
+</QA>
+
+<QA q="Memory on a Redis instance doubled after a release that 'only added two fields' to user hashes. What happened?" level="scenario">
+
+The hashes likely crossed the **listpack thresholds**: more than `hash-max-listpack-entries` (512) fields, or a value longer than `hash-max-listpack-value` (64 bytes), for example a new long JSON or URL field. Each crossing converts that hash from a compact listpack into a full **hashtable**, which costs several times more memory, and trimming it later won't necessarily restore the compact form. Confirm with `OBJECT ENCODING user:42` and `MEMORY USAGE`. Fixes: move the long value to its own key or shorten it, split wide hashes, or (after benchmarking) raise `hash-max-listpack-value`. Bigger compact values make every access a linear scan, so it's a CPU-for-memory trade.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="Which structure backs a large Redis sorted set?" options={["A B-tree", "A skip list plus a hash table", "A red-black tree", "A heap"]} answer={1}>
+
+A skip list keeps members ordered for O(log N) rank and range queries, and a hash table maps member → score for O(1) `ZSCORE`. Small sorted sets use a single listpack instead.
+
+</MCQ>
+
+<MCQ q="You need daily unique visitors per page for 1M pages, and 1% error is acceptable. Best choice?" options={["A Set per page per day", "A Sorted set per page per day", "A HyperLogLog per page per day", "A List per page with LTRIM"]} answer={2}>
+
+HyperLogLog uses at most 12 KB per key with a 0.81% standard error, and daily sketches can be merged into weekly ones with `PFMERGE`. Exact sets would need memory proportional to the visitor count.
+
+</MCQ>
+
+<MCQ q="A worker does `BRPOP jobs 0`, then crashes before finishing the job. What happens to the job, and what's the fix?" options={["It's lost. Use BLMOVE into a processing list, or a Stream with XACK", "It's redelivered automatically after a timeout", "It stays at the head of the list until acknowledged", "Redis rolls back the pop when the connection drops"]} answer={0}>
+
+List pops are destructive and have no acks. `BLMOVE` atomically keeps a copy in a processing list, and Streams track unacked entries in the PEL so they can be reclaimed with `XAUTOCLAIM`.
+
+</MCQ>
+
+<MCQ q="What is the time complexity of `ZADD` on a sorted set with N members?" options={["O(1)", "O(N)", "O(N log N)", "O(log N)"]} answer={3}>
+
+Inserting into the skip list costs O(log N) (and O(1) for the hash table). Sets are O(1) per add because they don't maintain order.
+
+</MCQ>
+
+<MCQ q="Which statement about Redis geospatial indexes is true?" options={["They need the RediSearch module", "They are sorted sets with a 52-bit geohash score, so ZREM removes a point", "They store latitude before longitude", "They support exact ellipsoidal distances"]} answer={1}>
+
+Geo is built on sorted sets, so you delete with `ZREM`. `GEOADD` takes longitude first, and distances use the spherical Haversine formula (up to about 0.5% error).
+
+</MCQ>
+
+<MCQ q="A hash grows from 100 to 600 fields under default config. What happens internally?" options={["Nothing, hashes always use a hashtable", "Redis splits it into two keys", "It converts from listpack to hashtable once it exceeds 512 fields", "It converts from hashtable to listpack"]} answer={2}>
+
+`hash-max-listpack-entries` defaults to 512. Past it, the compact listpack becomes a hashtable, using more memory but giving true O(1) field access.
+
+</MCQ>
+
+<MCQ q="Which Redis version introduced per-field TTLs on hashes (HEXPIRE)?" options={["5.0", "6.2", "7.4", "Not supported. Only keys can expire."]} answer={2}>
+
+Hash-field expiration (`HEXPIRE`, `HTTL`, `HPERSIST`, ...) arrived in 7.4. Redis 8.0 added `HGETEX`/`HSETEX`. Sets and sorted sets still have no per-member TTL.
+
+</MCQ>
+
+<MCQ q="In a consumer group, what does the special ID (the greater-than sign) mean in XREADGROUP?" options={["Read only entries never delivered to any consumer in this group", "Read entries newer than the last one you acknowledged", "Read the latest entry only", "Replay the whole stream"]} answer={0}>
+
+`>` asks for new, never-delivered entries. They're assigned to you and added to the pending entries list until `XACK`. Passing a concrete ID instead re-reads your own pending history.
+
+</MCQ>
+
+<MCQ q="You store a feature flag bit per user with SETBIT, keyed by user ID. IDs are random 64-bit numbers. What's the problem?" options={["SETBIT can't take offsets above 255", "Bitmaps lose data on restart", "BITCOUNT is O(1) so counts are approximate", "Sparse huge offsets would allocate enormous strings (bitmaps max at 2^32 bits and allocate up to the highest offset)"]} answer={3}>
+
+Bitmaps suit dense integer ids. Random 64-bit ids exceed the 2^32-bit limit, and even in range, a high offset allocates the string up to that bit. Map ids to dense integers or use a set.
+
+</MCQ>
+
+<MCQ q="Best structure for 'jobs that should run at a given future time' that workers poll for due items?" options={["A List with RPUSH", "A Sorted set with score = run-at timestamp, then ZRANGE BYSCORE up to now", "A Set of job ids", "A HyperLogLog"]} answer={1}>
+
+A sorted set ordered by run-at time makes "everything due now" a single O(log N + M) range query. Pair it with an atomic claim (Lua or `ZREM` check) so two workers don't run the same job.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **String**: blobs, counters (`INCR`), locks (`SET NX PX`). Max 512 MB. Encodings `int`/`embstr`/`raw`.
+- **List**: O(1) ends, O(N) middle. Queues, capped feeds (`LPUSH` + `LTRIM`). Blocking `BRPOP`/`BLMOVE` (served FIFO). Use `BLMOVE` + a processing list for reliability.
+- **Hash**: objects. `HINCRBY`. Listpack up to 512 fields / 64-byte values. Per-field TTL since 7.4 (`HEXPIRE`).
+- **Set**: unique, O(1) membership. `SINTER`/`SUNION`/`SDIFF` are O(N). Encodings intset/listpack/hashtable.
+- **Sorted set**: skip list + hash table. `ZADD`/`ZRANK` O(log N), `ZSCORE` O(1). Leaderboards, delayed queues, sliding windows, indexes.
+- **Bitmap**: a bit per dense id. 100M users ≈ 12 MB. `BITCOUNT`/`BITOP`.
+- **Bitfield**: packed small ints. `OVERFLOW WRAP|SAT|FAIL`.
+- **HyperLogLog**: distinct count, at most 12 KB, 0.81% error, mergeable.
+- **Geo**: sorted set + 52-bit geohash. `GEOSEARCH` (6.2+). Lon first, Haversine.
+- **Stream**: durable log, consumer groups, PEL + `XACK`, trim with `MAXLEN ~`.
+- **Indexes**: manual ZSET/SET indexes updated atomically, or `FT.CREATE` / `FT.SEARCH` (Query Engine, built into Redis 8).
+- Avoid O(N) "give me everything" calls on big keys. Use `*SCAN`.
+
+## Go deeper
+
+- **Redis docs**: [Strings](https://redis.io/docs/latest/develop/data-types/strings/), [Lists](https://redis.io/docs/latest/develop/data-types/lists/), [Hashes (incl. field expiration)](https://redis.io/docs/latest/develop/data-types/hashes/), [Sets](https://redis.io/docs/latest/develop/data-types/sets/), [Sorted sets](https://redis.io/docs/latest/develop/data-types/sorted-sets/), [HyperLogLog](https://redis.io/docs/latest/develop/data-types/probabilistic/hyperloglogs/), [Geospatial](https://redis.io/docs/latest/develop/data-types/geospatial/), [Streams](https://redis.io/docs/latest/develop/data-types/streams/), [BITFIELD](https://redis.io/docs/latest/commands/bitfield/), [GEOADD internals](https://redis.io/docs/latest/commands/geoadd/), [OBJECT ENCODING](https://redis.io/docs/latest/commands/object-encoding/), [Memory optimization (encoding thresholds)](https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/memory-optimization/), [FT.CREATE](https://redis.io/docs/latest/commands/ft.create/).
+- **antirez**: ["Redis new data structure: the HyperLogLog"](http://antirez.com/news/75).
+- **Book**: *Redis in Action* (Josiah Carlson), chapters on data modelling, indexes, and queues.
+- Related notes: [Redis Deep Dive](/learn/notes/redis-deep/) · [Transactions & Scripting](/learn/notes/redis-transactions-scripting/) · [Redis Patterns & Use Cases](/learn/notes/redis-patterns-use-cases/) · [Probabilistic Data Structures](/learn/notes/probabilistic-data-structures/).
