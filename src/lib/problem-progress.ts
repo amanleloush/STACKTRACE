@@ -1,9 +1,10 @@
 // Per-problem progress (solved flag + free-text notes) for /dsa/companies/.
 //
 // Pure contract shared by the browser store (src/lib/problem-store.ts) and
-// the API routes (/api/v1/problems/progress/*): the slug rule, request-body
-// validation, and the last-write-wins merge. DB access lives in
-// problem-progress-db.ts so this module stays safe to ship to the client.
+// the API route (/api/v1/problems/progress): the slug rule, request-body
+// validation, the batch limits, and the last-write-wins merges. KV access
+// lives in problem-progress-kv.ts so this module stays safe to ship to the
+// client.
 
 export interface ProgressEntry {
   solved: boolean;
@@ -14,12 +15,23 @@ export interface ProgressEntry {
 
 export type ProgressMap = Record<string, ProgressEntry>;
 
-/** LeetCode slugs: lowercase alnum + dashes. Also the DB key, so be strict. */
+/** LeetCode slugs: lowercase alnum + dashes. Also a key in the stored doc,
+ *  so be strict. */
 export const SLUG_RE = /^[a-z0-9-]{1,120}$/;
 export const MAX_NOTES_CHARS = 20_000;
 /** How far ahead of the server clock an `updatedAt` may be. A wildly-future
  *  timestamp would otherwise pin the row forever under last-write-wins. */
 export const MAX_CLOCK_SKEW_MS = 10 * 60 * 1000;
+/** Most problems one account may track (the slug regex admits any string). */
+export const MAX_ENTRIES_PER_USER = 5000;
+/** Most entries in one batch PUT. */
+export const MAX_BATCH_ENTRIES = 200;
+/** Cap on the serialized per-user document (UTF-8 bytes). KV allows 25 MiB
+ *  per value; this keeps reads/writes cheap and bounds abuse. */
+export const MAX_DOC_BYTES = 2 * 1024 * 1024;
+/** Cap on a batch PUT body (UTF-8 bytes). A body bigger than the whole doc
+ *  could never be stored anyway. */
+export const MAX_BATCH_BODY_BYTES = MAX_DOC_BYTES;
 
 export function isValidSlug(slug: unknown): slug is string {
   return typeof slug === 'string' && SLUG_RE.test(slug);
@@ -46,6 +58,71 @@ export function parseProgressBody(body: unknown, now: number = Date.now()): Pars
     return { ok: false, error: 'updatedAt is too far in the future' };
   }
   return { ok: true, value: { solved: b.solved, notes: b.notes, updatedAt: ts } };
+}
+
+/**
+ * Validate a batch PUT body: `{ entries: { [slug]: { solved, notes, updatedAt } } }`
+ * with 1..MAX_BATCH_ENTRIES entries. Errors name the slug, never the notes.
+ */
+export function parseBatchBody(body: unknown, now: number = Date.now()): ParseResult<ProgressMap> {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    return { ok: false, error: 'body must be a JSON object' };
+  }
+  const entries = (body as Record<string, unknown>).entries;
+  if (typeof entries !== 'object' || entries === null || Array.isArray(entries)) {
+    return { ok: false, error: 'entries must be an object keyed by slug' };
+  }
+  const slugs = Object.keys(entries);
+  if (slugs.length === 0) return { ok: false, error: 'entries must not be empty' };
+  if (slugs.length > MAX_BATCH_ENTRIES) {
+    return { ok: false, error: `at most ${MAX_BATCH_ENTRIES} entries per request` };
+  }
+  const out: ProgressMap = {};
+  for (const slug of slugs) {
+    if (!isValidSlug(slug)) {
+      return { ok: false, error: 'every slug must match ^[a-z0-9-]{1,120}$' };
+    }
+    const r = parseProgressBody((entries as Record<string, unknown>)[slug], now);
+    if (!r.ok) return { ok: false, error: `${slug}: ${r.error}` };
+    out[slug] = r.value;
+  }
+  return { ok: true, value: out };
+}
+
+export interface BatchApplyResult {
+  /** The stored map after applying every newer incoming entry. */
+  next: ProgressMap;
+  /** Slugs whose incoming entry was strictly newer and is now stored. */
+  applied: string[];
+  /** Server copies that were at least as new as the incoming entry. */
+  stale: ProgressMap;
+  /** Incoming slugs that are new to the doc (count against the cap). */
+  added: number;
+}
+
+/**
+ * Server-side last-write-wins over a batch: an incoming entry replaces the
+ * stored one only when its `updatedAt` is strictly newer; otherwise the
+ * stored entry is reported back in `stale` so the client can adopt it.
+ * Ties are stale (no flip-flopping between devices). Pure — never mutates
+ * `stored`.
+ */
+export function applyBatch(stored: ProgressMap, incoming: ProgressMap): BatchApplyResult {
+  const next: ProgressMap = { ...stored };
+  const applied: string[] = [];
+  const stale: ProgressMap = {};
+  let added = 0;
+  for (const [slug, entry] of Object.entries(incoming)) {
+    const cur = Object.prototype.hasOwnProperty.call(stored, slug) ? stored[slug] : undefined;
+    if (cur && cur.updatedAt >= entry.updatedAt) {
+      stale[slug] = cur;
+      continue;
+    }
+    if (!cur) added++;
+    next[slug] = entry;
+    applied.push(slug);
+  }
+  return { next, applied: applied.sort(), stale, added };
 }
 
 /** Lenient read of a stored entry (localStorage or server JSON). */

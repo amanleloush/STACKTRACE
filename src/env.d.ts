@@ -14,6 +14,8 @@ declare global {
       runtime?: {
         env?: {
           DB?: import('~/lib/db').D1Database;
+          /** Workers KV (wrangler.toml `kv_namespaces`), e.g. problem progress. */
+          KV?: import('~/lib/kv').KVNamespace;
         };
       };
     }
