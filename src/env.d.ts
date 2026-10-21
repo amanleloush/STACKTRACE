@@ -16,6 +16,11 @@ declare global {
           DB?: import('~/lib/db').D1Database;
           /** Workers KV (wrangler.toml `kv_namespaces`), e.g. problem progress. */
           KV?: import('~/lib/kv').KVNamespace;
+          /** Secret (`wrangler secret put ANTHROPIC_API_KEY`) for the /mock/
+           *  AI feedback endpoint. Unset → that endpoint returns 503. */
+          ANTHROPIC_API_KEY?: string;
+          /** Optional var: AI gradings per user per UTC day (default 5). */
+          AI_DAILY_LIMIT?: string;
         };
       };
     }
