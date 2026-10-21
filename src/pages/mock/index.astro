@@ -136,6 +136,7 @@ const minutes = (m: (typeof MODES)[number]) => DURATION_MS[m] / 60_000;
               <li class="mk-rb">
                 <div class="mk-rb__set" role="radiogroup" aria-labelledby={`mk-rb-${m}-${i}-l`}>
                   <span class="mk-rb__item" id={`mk-rb-${m}-${i}-l`}>{item}</span>
+                  <span class="mk-rb__ai" data-ai={i} hidden></span>
                   <span class="mk-seg">
                     {[0, 1, 2].map((v) => (
                       <label class="mk-seg__opt">
@@ -155,6 +156,44 @@ const minutes = (m: (typeof MODES)[number]) => DURATION_MS[m] / 60_000;
         </p>
         <p class="mk-hint">Bands: 75%+ strong hire signal · 50–74% borderline · below 50% needs practice.
           Your score is saved to the history below as you mark it.</p>
+      </section>
+
+      <section class="mk-card mk-ai" id="mk-ai" aria-labelledby="mk-ai-h" hidden>
+        <h3 class="mk-sub" id="mk-ai-h">AI feedback</h3>
+        <p class="mk-ai__label">AI feedback, a guide, not an official evaluation.</p>
+        <p class="mk-hint" id="mk-ai-intro">
+          Claude reads your scratchpad, the problem brief and the reference answer, then scores each
+          rubric item and suggests what to fix. Your scratchpad is sent to Anthropic's API when you click.
+        </p>
+        <div class="mk-actions">
+          <button type="button" class="mk-btn mk-btn--primary" id="mk-ai-btn" hidden>Get AI feedback</button>
+          <a class="mk-btn" id="mk-ai-login" href="/login?next=/mock/" hidden>Sign in to get AI feedback</a>
+        </div>
+        <p class="mk-ai__status" id="mk-ai-status" role="status" aria-live="polite"></p>
+
+        <div class="mk-ai__result" id="mk-ai-result" hidden>
+          <h4 class="mk-ai__h">Rubric</h4>
+          <ol class="mk-ai__items" id="mk-ai-items"></ol>
+          <p class="mk-total">
+            <span class="mk-total__n" id="mk-ai-total"></span>
+            <span class="mk-hint mk-ai__vs" id="mk-ai-vs"></span>
+          </p>
+          <div class="mk-actions">
+            <button type="button" class="mk-btn" id="mk-ai-apply">Apply AI scores to rubric</button>
+          </div>
+          <div class="mk-ai__cols">
+            <div>
+              <h4 class="mk-ai__h">Strengths</h4>
+              <ul class="mk-ai__list" id="mk-ai-strengths"></ul>
+            </div>
+            <div>
+              <h4 class="mk-ai__h">Most important gaps</h4>
+              <ol class="mk-ai__list" id="mk-ai-gaps"></ol>
+            </div>
+          </div>
+          <h4 class="mk-ai__h">What a strong candidate would have said</h4>
+          <p class="mk-ai__strong" id="mk-ai-strong"></p>
+        </div>
       </section>
     </div>
   </section>
@@ -191,6 +230,7 @@ const minutes = (m: (typeof MODES)[number]) => DURATION_MS[m] / 60_000;
 <script>
   import {
     MODE_LABEL,
+    RUBRICS,
     attemptFromRun,
     bestPerProblem,
     coerceHistory,
@@ -217,8 +257,11 @@ const minutes = (m: (typeof MODES)[number]) => DURATION_MS[m] / 60_000;
     type Warn,
   } from '~/components/mock/mock-logic';
   import type { MockProblem } from '~/components/mock/mock-problems';
+  import { MAX_SCRATCHPAD_CHARS, coerceFeedback, type Feedback } from '~/lib/mock-grade';
 
   const KEY_RUN = 'mock:v1:run';
+  /** The AI feedback for the current round: `{ runId, feedback }`. */
+  const KEY_AI = 'mock:v1:ai';
   const KEY_HIST = 'mock:v1:history';
   const PAD_PREFIX = 'mock:v1:pad:';
   const MAX_PAD_CHARS = 50_000;
@@ -377,6 +420,8 @@ const minutes = (m: (typeof MODES)[number]) => DURATION_MS[m] / 60_000;
     if (run) lsDel(PAD_PREFIX + run.id);
     run = null;
     lsDel(KEY_RUN);
+    lsDel(KEY_AI);
+    resetAi();
     stopTick();
     round.hidden = true;
     pick.hidden = false;
@@ -437,7 +482,10 @@ const minutes = (m: (typeof MODES)[number]) => DURATION_MS[m] / 60_000;
     });
 
     done.hidden = !isDone;
-    if (isDone) paintRubric();
+    if (isDone) {
+      paintRubric();
+      initAi();
+    }
 
     if (isDone || paused) stopTick();
     else startTick();
@@ -497,6 +545,7 @@ const minutes = (m: (typeof MODES)[number]) => DURATION_MS[m] / 60_000;
     totalEl.textContent = `${total} / ${max}`;
     verdictEl.textContent = v.label;
     verdictEl.dataset.band = v.band;
+    if (aiFeedback) paintAiCompare();
   }
 
   round.addEventListener('change', (e) => {
@@ -508,6 +557,222 @@ const minutes = (m: (typeof MODES)[number]) => DURATION_MS[m] / 60_000;
     save();
     recordAttempt();
     paintRubric();
+  });
+
+  // ---- AI feedback ---------------------------------------------------------------
+  // Optional: POST /api/v1/mock/grade (signed-in, daily cap). A GET first
+  // tells us whether it is enabled, whether the user is signed in, and how
+  // many gradings are left. Model text is only ever set via textContent.
+  const aiBox = $('mk-ai');
+  const aiBtn = $<HTMLButtonElement>('mk-ai-btn');
+  const aiLogin = $<HTMLAnchorElement>('mk-ai-login');
+  const aiStatus = $('mk-ai-status');
+  const aiResult = $('mk-ai-result');
+  const aiItems = $('mk-ai-items');
+  const aiTotal = $('mk-ai-total');
+  const aiVs = $('mk-ai-vs');
+  const aiApply = $<HTMLButtonElement>('mk-ai-apply');
+  const aiStrengths = $('mk-ai-strengths');
+  const aiGaps = $('mk-ai-gaps');
+  const aiStrong = $('mk-ai-strong');
+  const GRADE_URL = '/api/v1/mock/grade';
+
+  let aiFeedback: Feedback | null = null;
+  let aiInitFor: string | null = null;
+  let aiBusy = false;
+
+  const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? '' : 's'}`;
+  const leftText = (remaining: number, limit: number) =>
+    `${plural(remaining, 'AI grading')} left today (of ${limit}).`;
+
+  function readStoredAi(r: Run): Feedback | null {
+    const v = readJson(KEY_AI) as { runId?: unknown; feedback?: unknown } | null;
+    if (!v || v.runId !== r.id) return null;
+    return coerceFeedback(v.feedback, RUBRICS[r.mode]);
+  }
+
+  /** Once per finished round: restore a stored result and ask the server
+   *  whether the button should show. */
+  function initAi(): void {
+    if (!run || aiInitFor === run.id) return;
+    const r = run;
+    aiInitFor = r.id;
+    aiFeedback = readStoredAi(r);
+    if (aiFeedback) {
+      aiBox.hidden = false;
+      renderAi();
+    }
+    void fetch(GRADE_URL, { credentials: 'same-origin', headers: { Accept: 'application/json' } })
+      .then(async (res) => {
+        if (run?.id !== r.id) return;
+        const body = (await res.json().catch(() => ({}))) as { error?: string; remaining?: number; limit?: number };
+        if (res.status === 503 && body.error === 'not_configured') {
+          // Not enabled on this deployment: say so only if a stored result is
+          // showing; otherwise keep the whole panel out of the way.
+          aiBtn.hidden = true;
+          if (aiFeedback) aiStatus.textContent = 'AI feedback is not enabled on this site right now.';
+          return;
+        }
+        aiBox.hidden = false;
+        if (res.status === 401) {
+          aiLogin.hidden = false;
+          aiStatus.textContent = 'AI feedback is for signed-in users.';
+          return;
+        }
+        aiBtn.hidden = false;
+        if (res.ok && typeof body.remaining === 'number' && typeof body.limit === 'number') {
+          aiBtn.disabled = body.remaining <= 0;
+          if (!aiFeedback) aiStatus.textContent = leftText(body.remaining, body.limit);
+        }
+      })
+      .catch(() => {
+        // Offline, or a static preview with no API: leave the panel hidden
+        // unless it is already showing a stored result.
+      });
+  }
+
+  function resetAi(): void {
+    aiFeedback = null;
+    aiInitFor = null;
+    aiBox.hidden = true;
+    aiBtn.hidden = true;
+    aiBtn.disabled = false;
+    aiLogin.hidden = true;
+    aiResult.hidden = true;
+    aiStatus.textContent = '';
+    for (const b of round.querySelectorAll<HTMLElement>('.mk-rb__ai')) {
+      b.hidden = true;
+      b.textContent = '';
+    }
+  }
+
+  function li(text: string): HTMLLIElement {
+    const el = document.createElement('li');
+    el.textContent = text;
+    return el;
+  }
+
+  function renderAi(): void {
+    if (!run || !aiFeedback) return;
+    const f = aiFeedback;
+    aiItems.replaceChildren(
+      ...f.items.map((it, i) => {
+        const el = document.createElement('li');
+        el.className = 'mk-ai__item';
+        const head = document.createElement('div');
+        head.className = 'mk-ai__row';
+        const name = document.createElement('span');
+        name.className = 'mk-ai__name';
+        name.textContent = it.item;
+        const sc = document.createElement('span');
+        sc.className = 'mk-ai__score';
+        sc.dataset.i = String(i);
+        head.append(name, sc);
+        const why = document.createElement('p');
+        why.className = 'mk-ai__why';
+        why.textContent = it.why;
+        el.append(head, why);
+        return el;
+      }),
+    );
+    aiStrengths.replaceChildren(...f.strengths.map(li));
+    aiGaps.replaceChildren(...f.gaps.map(li));
+    aiStrong.textContent = f.strongAnswer;
+    aiResult.hidden = false;
+    paintAiCompare();
+  }
+
+  /** AI vs self scores, in the result list and as badges on the rubric. */
+  function paintAiCompare(): void {
+    if (!run || !aiFeedback) return;
+    const r = run;
+    const f = aiFeedback;
+    for (const sc of aiItems.querySelectorAll<HTMLElement>('.mk-ai__score')) {
+      const i = Number(sc.dataset.i);
+      const ai = f.items[i]?.score;
+      sc.textContent = `AI ${ai ?? '–'} · You ${r.scores[i] ?? 0}`;
+    }
+    const list = round.querySelector<HTMLOListElement>(`.mk-rubric[data-mode="${r.mode}"]`)!;
+    for (const b of list.querySelectorAll<HTMLElement>('.mk-rb__ai')) {
+      const ai = f.items[Number(b.dataset.ai)]?.score;
+      b.hidden = ai == null;
+      b.textContent = ai == null ? '' : `AI ${ai}`;
+      b.title = 'Score suggested by the AI feedback';
+    }
+    const aiSum = f.items.reduce((s, it) => s + (it.score ?? 0), 0);
+    const max = scoreMax(r.mode);
+    aiTotal.textContent = `AI: ${aiSum} / ${max}`;
+    aiVs.textContent = `AI verdict: ${verdict(aiSum, max).label} · your self-score: ${scoreTotal(r.scores)} / ${max}`;
+    const same = f.items.every((it, i) => it.score == null || it.score === r.scores[i]);
+    aiApply.disabled = same;
+    aiApply.textContent = same ? 'Rubric matches the AI scores' : 'Apply AI scores to rubric';
+  }
+
+  aiBtn.addEventListener('click', async () => {
+    if (!run || run.finishedAt == null || aiBusy) return;
+    const r = run;
+    const text = pad.value;
+    if (!text.trim()) {
+      aiStatus.textContent = 'Your scratchpad is empty. Add your notes first, then ask for feedback.';
+      return;
+    }
+    if (text.length > MAX_SCRATCHPAD_CHARS) {
+      aiStatus.textContent = `The scratchpad is ${text.length.toLocaleString()} characters; AI feedback takes up to ${MAX_SCRATCHPAD_CHARS.toLocaleString()}. Trim it and try again.`;
+      return;
+    }
+    aiBusy = true;
+    aiBtn.disabled = true;
+    aiBox.setAttribute('aria-busy', 'true');
+    aiStatus.textContent = 'Grading your attempt… this can take up to a minute.';
+    try {
+      const res = await fetch(GRADE_URL, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ slug: r.slug, scratchpad: text, usedMinutes: Math.round(elapsedMs(r, Date.now()) / 60_000) }),
+      });
+      const body = (await res.json().catch(() => ({}))) as {
+        feedback?: unknown;
+        message?: string;
+        remaining?: number;
+        limit?: number;
+      };
+      if (run?.id !== r.id) return;
+      const left = typeof body.remaining === 'number' && typeof body.limit === 'number'
+        ? ' ' + leftText(body.remaining, body.limit) : '';
+      const fb = res.ok ? coerceFeedback(body.feedback, RUBRICS[r.mode]) : null;
+      if (fb) {
+        aiFeedback = fb;
+        lsSet(KEY_AI, JSON.stringify({ runId: r.id, feedback: fb }));
+        renderAi();
+        aiStatus.textContent = 'AI feedback is ready below.' + left;
+        aiResult.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      } else if (res.status === 401) {
+        aiBtn.hidden = true;
+        aiLogin.hidden = false;
+        aiStatus.textContent = 'Your session has ended. Sign in again to get AI feedback.';
+      } else {
+        aiStatus.textContent = (body.message ?? 'AI feedback failed. Please try again later.') + left;
+      }
+      aiBtn.disabled = typeof body.remaining === 'number' && body.remaining <= 0;
+    } catch {
+      aiStatus.textContent = 'Could not reach the server. Check your connection and try again.';
+      aiBtn.disabled = false;
+    } finally {
+      aiBusy = false;
+      aiBox.removeAttribute('aria-busy');
+    }
+  });
+
+  aiApply.addEventListener('click', () => {
+    if (!run || run.finishedAt == null || !aiFeedback) return;
+    const f = aiFeedback;
+    const scores = run.scores.map((s, i) => f.items[i]?.score ?? s);
+    run = { ...run, scores };
+    save();
+    recordAttempt();
+    paintRubric();
+    live.textContent = `AI scores applied. Your rubric total is now ${scoreTotal(scores)} of ${scoreMax(run.mode)}.`;
   });
 
   // ---- history ----------------------------------------------------------------
@@ -732,6 +997,41 @@ const minutes = (m: (typeof MODES)[number]) => DURATION_MS[m] / 60_000;
   .mk-verdict[data-band='strong'], .mk-table :global(.mk-score[data-band='strong']) { color: var(--anim-success); }
   .mk-verdict[data-band='borderline'], .mk-table :global(.mk-score[data-band='borderline']) { color: var(--anim-highlight); }
   .mk-verdict[data-band='practice'], .mk-table :global(.mk-score[data-band='practice']) { color: var(--anim-danger); }
+
+  /* AI feedback. Its rows are built in JS, hence :global. */
+  .mk-rb__ai {
+    flex: none; font-family: var(--font-code); font-size: 0.72rem; font-weight: 600;
+    color: var(--accent); border: 1px dashed var(--accent); border-radius: 999px; padding: 0.1rem 0.5rem;
+  }
+  .mk-ai[aria-busy='true'] .mk-ai__status::before {
+    content: ''; display: inline-block; width: 0.8em; height: 0.8em; margin-right: 0.45em; vertical-align: -0.1em;
+    border: 2px solid var(--accent); border-right-color: transparent; border-radius: 50%;
+    animation: mk-spin 0.8s linear infinite;
+  }
+  @keyframes mk-spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .mk-ai[aria-busy='true'] .mk-ai__status::before { animation: none; } }
+  .mk-ai__label {
+    display: inline-block; margin: 0; font-size: 0.78rem; font-weight: 600; color: var(--fg-muted);
+    background: var(--bg-soft); border: 1px solid var(--card-border); border-radius: 6px; padding: 0.2rem 0.55rem;
+  }
+  .mk-ai .mk-btn { text-decoration: none; display: inline-block; }
+  .mk-ai .mk-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+  .mk-ai__status { font-size: 0.86rem; color: var(--fg-muted); margin: 0.75rem 0 0; min-height: 1.2em; }
+  .mk-ai__status:empty { display: none; }
+  .mk-ai__result { margin-top: 1rem; border-top: 1px solid var(--card-border); padding-top: 0.75rem; }
+  .mk-ai__h { font-size: 0.9rem; margin: 1rem 0 0.5rem; color: var(--fg); }
+  .mk-ai__result > .mk-ai__h:first-child { margin-top: 0; }
+  .mk-ai__items { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.5rem; }
+  .mk-ai__items :global(.mk-ai__item) { border-bottom: 1px solid var(--card-border); padding-bottom: 0.5rem; }
+  .mk-ai__items :global(.mk-ai__row) { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0.25rem 0.75rem; }
+  .mk-ai__items :global(.mk-ai__name) { font-size: 0.9rem; font-weight: 600; }
+  .mk-ai__items :global(.mk-ai__score) { font-family: var(--font-code); font-size: 0.78rem; color: var(--accent); white-space: nowrap; }
+  .mk-ai__items :global(.mk-ai__why) { margin: 0.25rem 0 0; font-size: 0.86rem; color: var(--fg-muted); line-height: 1.5; }
+  .mk-ai__vs { margin: 0; }
+  .mk-ai__cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 0 1.25rem; }
+  .mk-ai__list { margin: 0; padding-left: 1.2rem; font-size: 0.88rem; line-height: 1.55; }
+  .mk-ai__list :global(li) { margin: 0.25rem 0; }
+  .mk-ai__strong { margin: 0; font-size: 0.9rem; line-height: 1.6; overflow-wrap: anywhere; }
 
   /* Note HTML (brief, answer, TL;DR) comes in via innerHTML, so :global. */
   .mk-prose { line-height: 1.6; font-size: 0.93rem; overflow-wrap: anywhere; }

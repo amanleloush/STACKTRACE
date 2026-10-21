@@ -122,18 +122,21 @@ err := rdb.Set(ctx, "greeting", "hello", time.Minute).Err()
 
 The default integration is **cache-aside**: read from Redis, fall back to the DB on a miss, then populate Redis with a TTL. The variants (read-through, write-through, write-behind) and their consistency trade-offs are covered in [Cache Patterns](/learn/notes/cache-patterns/). Stampede control is in [Cache Stampede & TTL](/learn/notes/cache-stampede-ttl/). This section only covers how invalidation reaches Redis:
 
-```
- (1) App-driven                    (2) CDC-driven (recommended at scale)
- ┌─────┐ write ┌────┐              ┌─────┐ write ┌────┐ binlog ┌──────────┐ ┌───────┐
- │ App │──────▶│ DB │              │ App │──────▶│ DB │───────▶│ Debezium │▶│ Kafka │
- └──┬──┘       └────┘              └─────┘       └────┘        └──────────┘ └───┬───┘
-    │ DEL user:42                                                               │
-    ▼                                                          invalidator consumer
- ┌───────┐                                                             │ DEL user:42
- │ Redis │                                                             ▼
- └───────┘                                                         ┌───────┐
-                                                                   │ Redis │
-                                                                   └───────┘
+The two ways an invalidation can reach Redis:
+
+```mermaid
+flowchart TB
+    subgraph s1["(1) App-driven"]
+        app1[App] -->|write| db1[(DB)]
+        app1 -->|"DEL user:42"| r1[(Redis)]
+    end
+    subgraph s2["(2) CDC-driven, recommended at scale"]
+        app2[App] -->|write| db2[(DB)]
+        db2 -->|binlog| dbz[Debezium]
+        dbz --> kafka[Kafka]
+        kafka --> inv[Invalidator consumer]
+        inv -->|"DEL user:42"| r2[(Redis)]
+    end
 ```
 
 - **App-driven delete-after-write** is simple. It misses writes from other services, scripts, and manual SQL, and it races when a slow reader repopulates the old value just after the delete.
@@ -288,6 +291,23 @@ DELEX lock:order:991 IFEQ 7f3c9e1d-…             # Redis 8.4+
 - **Why the random token:** without it, a client whose lock already expired could `DEL` a lock that another client now holds.
 - **Why the TTL:** a crashed holder can't deadlock everyone.
 - **Weakness:** replication is async. If the primary fails before the key reaches the replica, the promoted replica has no lock and a second client can acquire it.
+
+How that failover lets two clients hold the same lock:
+
+```mermaid
+sequenceDiagram
+    participant A as Client A
+    participant P as Primary
+    participant R as Replica
+    participant B as Client B
+    A->>P: SET lock:order:991 tokenA NX PX 30000
+    P-->>A: OK
+    Note over P,R: Primary dies before the key replicates
+    R->>R: promoted to primary, no lock key
+    B->>R: SET lock:order:991 tokenB NX PX 30000
+    R-->>B: OK
+    Note over A,B: Both clients now believe they hold the lock
+```
 
 **Redlock** runs on N independent primaries (5 in the docs). The client tries to acquire the same key and token on all of them, using short per-node timeouts. It holds the lock only if a **majority** succeeded *and* the elapsed time is less than the TTL. Its remaining validity is the TTL minus the elapsed time minus a clock-drift margin.
 
@@ -506,6 +526,24 @@ The RESP spec states that future versions *may* change the default protocol to R
    ├─6─ XADD orders * id 7781 user 42                → consumers: email, analytics
    ├─7─ ZINCRBY lb:buyers:2026-10 1 user:42 ; PFADD uv:checkout:2026-10-21 u42
    └─8─ DELEX lock:cart:42 IFEQ <token>  (or the Lua compare-and-delete)
+```
+
+The same checkout as a sequence, showing which calls go to Redis and which go to the database:
+
+```mermaid
+sequenceDiagram
+    participant A as Checkout service
+    participant R as Redis
+    participant D as Database
+    A->>R: 1. token bucket on rl:u42
+    A->>R: 2. HGETALL then PEXPIRE sess:9f2c…
+    A->>R: 3. SET idem:abc NX EX 86400
+    A->>R: 4. SET lock:cart:42 token NX PX
+    A->>D: 5. create order in a transaction
+    D-->>A: committed
+    A->>R: 6. XADD orders (email, analytics)
+    A->>R: 7. ZINCRBY leaderboard and PFADD
+    A->>R: 8. DELEX lock:cart:42 IFEQ token
 ```
 
 Each step uses its own key prefix, has a TTL where it makes sense, and has a defined behaviour when Redis is unreachable. The order itself is committed in the database, and Redis only coordinates and accelerates.

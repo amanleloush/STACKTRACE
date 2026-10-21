@@ -118,6 +118,24 @@ Wire format of a registry-serialized record value:
 2. The registry checks the new schema against the subject's **compatibility mode**. If it's incompatible, registration fails and the producer can't publish. The bad deploy fails fast.
 3. The consumer reads the 5-byte header, fetches schema ID `N` once and caches it, then decodes the body. Avro also resolves the **writer schema** against the consumer's **reader schema**.
 
+The same three steps as a sequence:
+
+```mermaid
+sequenceDiagram
+    participant P as Producer serializer
+    participant SR as Schema Registry
+    participant K as Kafka topic
+    participant C as Consumer deserializer
+    P->>SR: register schema under topic-value subject
+    SR->>SR: check compatibility mode
+    SR-->>P: schema ID N (or reject)
+    P->>K: 0x00 + ID N + binary body
+    K-->>C: record bytes
+    C->>SR: fetch schema N (once, cached)
+    SR-->>C: writer schema
+    C->>C: resolve writer vs reader schema
+```
+
 **Compatibility modes.**
 
 | Mode | Guarantee | Safe changes | Upgrade order |
@@ -183,12 +201,28 @@ Postgres ──Debezium (Connect source, Avro + Schema Registry)──▶ cdc.or
             Kafka Streams app "order-enricher" (exactly_once_v2)    │
               KStream(cdc.orders)                                   │
                 ⋈ GlobalKTable(products)  ── enrich                 ▼
-                → groupByKey(customerId)  ── repartition topic
+                → groupBy(customerId)  ── re-key, so repartition topic
                 → windowedBy(1h tumbling) → count  ── RocksDB + changelog
                 → to(customer-hourly-orders)
                                                                     │
             Connect sink: Elasticsearch + S3 (DLQ for bad records) ◀┘
             MirrorMaker 2: replicate all topics + group offsets to DR region
+```
+
+The same pipeline as a flow, showing which component owns each hop:
+
+```mermaid
+flowchart TB
+    pg[(Postgres)] -->|"Debezium source, Avro"| cdc["cdc.orders"]
+    sr[Schema Registry] -.-> cdc
+    subgraph app["Kafka Streams: order-enricher"]
+        join["join GlobalKTable products"] --> grp["group by customerId"]
+        grp --> win["1h tumbling count"]
+    end
+    cdc --> join
+    win --> out["customer-hourly-orders"]
+    out -->|"Connect sink"| es[("Elasticsearch + S3")]
+    out -->|"MirrorMaker 2, all topics + offsets"| dr["DR region"]
 ```
 
 Each box is configuration, or a small Streams topology. None of it is a custom service that needs its own retry, offset and state-recovery logic.

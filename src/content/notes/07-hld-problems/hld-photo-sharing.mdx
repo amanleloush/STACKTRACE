@@ -101,27 +101,23 @@ Notes:
 
 ## High-level architecture
 
-```
-                         upload (bytes)                         view (bytes)
-  Client ───────────────────────────────┐        Client ◄──────── CDN edge
-    │  1. POST /uploads                  │                           │ miss
-    ▼                                    ▼                           ▼
- API gateway ──► Upload service    Object storage  ◄──────────  Origin shield
-    │           (issues pre-signed   originals/  derived/
-    │            URL, photo_id)            │  object-created event
-    │                                      ▼
-    │                               Queue (Kafka/SQS)
-    │                                      ▼
-    │                         Media workers: validate, strip EXIF,
-    │                         resize to fixed sizes, moderation hook
-    │                                      │ status = PUBLISHED
-    ▼                                      ▼
- Photo / User / Graph / Engagement   ──►  Metadata DB (sharded by user_id)
- services                                 + cache (memcached/Redis)
-    │                                      │
-    │                                      ▼ PhotoPublished event
-    ▼                                 Feed fan-out (see News Feed note)
- Feed service ◄── timelines (Redis)
+The components as a flow: uploads go straight to object storage, media workers publish the photo (they set the status in the Metadata DB and emit `PhotoPublished` for the feed fan-out), and views come back through the CDN:
+
+```mermaid
+flowchart TB
+    client[Client] -->|"POST /uploads"| gw[API gateway]
+    gw --> up["Upload service (pre-signed URL)"]
+    gw --> svc["Photo / User / Graph / Engagement services"]
+    client -->|"upload bytes"| obj["Object storage (originals, derived)"]
+    obj -->|"object-created event"| q["Queue (Kafka/SQS)"]
+    q --> mw["Media workers"]
+    mw -->|"status = PUBLISHED"| db["Metadata DB + cache"]
+    svc --> db
+    mw -->|"PhotoPublished"| fan["Feed fan-out"]
+    fan --> feed["Feed service + timelines"]
+    obj --> shield["Origin shield"]
+    shield --> cdn["CDN edge"]
+    cdn -->|"view bytes"| client
 ```
 
 ### Write path (posting a photo)
@@ -131,6 +127,29 @@ Notes:
 4. Object storage emits an "object created" event to a queue. Media workers validate the file, strip EXIF, make the fixed sizes, write them under `derived/<photo_id>/...`, and call moderation.
 5. When all sizes exist and moderation passes, the worker sets `status = PUBLISHED` and emits `PhotoPublished`.
 6. The feed fan-out consumes that event and updates followers' timelines.
+
+Steps 1 to 5 as a sequence:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant A as API services
+    participant S as Object storage
+    participant Q as Queue
+    participant W as Media worker
+    participant DB as Metadata DB
+    C->>A: POST /v1/uploads
+    A->>DB: new row, status UPLOADING
+    A-->>C: photo_id + pre-signed URL
+    C->>S: PUT originals/photo_id
+    C->>A: POST /v1/photos (caption)
+    A->>DB: status PROCESSING
+    S->>Q: object created event
+    Q->>W: process job
+    W->>S: write derived sizes
+    W->>DB: status PUBLISHED
+    Note over W: then emit PhotoPublished to feed fan-out
+```
 
 ### Read path (viewing the feed)
 1. Client calls `GET /v1/feed`. The feed service reads the user's timeline (a list of photo IDs) and merges celebrity posts, as in the [News Feed](/learn/notes/hld-news-feed/) design.
@@ -215,6 +234,18 @@ derived/<photo_id>/v<media_version>/<size>.jpg
 S3 event notifications are delivered **at least once** and usually within seconds, but sometimes a minute or more. So workers must be **idempotent**:
 - Output keys are deterministic (`derived/<photo_id>/v<n>/w640.jpg`). Re-running a job overwrites the same objects with the same bytes.
 - Status changes are conditional: `UPDATE photos SET status = PUBLISHED WHERE photo_id = ? AND status = PROCESSING`. A duplicate job finds nothing to update and stops.
+
+The `status` column's life cycle, as described across this design:
+
+```mermaid
+stateDiagram-v2
+    [*] --> UPLOADING : POST /v1/uploads
+    UPLOADING --> PROCESSING : POST /v1/photos
+    UPLOADING --> [*] : sweeper expires stale row
+    PROCESSING --> PUBLISHED : all sizes made, moderation passes
+    PUBLISHED --> HIDDEN : later moderation
+    PUBLISHED --> DELETED : owner deletes
+```
 
 Steps in the worker:
 1. **Validate:** check magic bytes, decode the image fully (catches malformed or malicious files), enforce limits on pixel dimensions so a tiny file cannot expand into a huge bitmap.

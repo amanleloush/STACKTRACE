@@ -76,6 +76,17 @@ idx_user_status leaf: (42,'PAID', id=17) (42,'PAID', id=93) ...
 clustered index:            row id=17         row id=93     ← second B+ tree walk per match
 ```
 
+The same query as two tree walks, and how a covering index skips the second one:
+
+```mermaid
+flowchart TB
+    q["WHERE user_id=42 AND status='PAID'"] --> sec["idx_user_status leaf"]
+    sec -->|"PK values 17, 93"| cl["Clustered index (PK tree)"]
+    cl --> rows["Full rows: read amount"]
+    q -.->|"with covering index"| cov["idx_user_status_amount leaf"]
+    cov -.-> done["Answer from index alone"]
+```
+
 If 5,000 rows match, that is 5,000 extra tree walks, often on random pages. This is why the optimizer sometimes ignores a secondary index and scans the whole table instead.
 
 ### Covering indexes
@@ -249,6 +260,25 @@ Crash recovery:
   PREPARED txn whose XID is NOT in binlog   → roll it back
 ```
 
+The commit path as a sequence, with the binlog as coordinator:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as MySQL server
+    participant I as InnoDB
+    participant B as Binlog
+    C->>S: COMMIT
+    S->>I: PREPARE with XID
+    I->>I: write and flush redo, mark PREPARED
+    I-->>S: prepared
+    S->>B: write events + XID event, fsync
+    S->>I: COMMIT
+    I->>I: mark committed, release locks
+    S-->>C: OK
+    Note over S,I: Crash recovery: XID in binlog means commit, else roll back
+```
+
 **Binlog group commit** batches many transactions into one fsync, which is why `sync_binlog=1` is affordable on busy servers.
 
 ### The two durability knobs
@@ -276,12 +306,20 @@ Crash recovery:
 
 ### Async, semi-sync and GTID
 
-```
-          ┌──────────── primary ────────────┐
-client ──▶│ commit → binlog                 │── binlog events ──▶ replica IO thread
-          └─────────────────────────────────┘                     → relay log
-                                                                  → SQL/applier threads
-                                                                  → replica's own data
+How a committed change travels from the primary to a replica:
+
+```mermaid
+flowchart TB
+    client[Client] --> commit
+    subgraph primary["Primary"]
+        commit[Commit] --> binlog[Binlog]
+    end
+    binlog -->|"binlog events"| io
+    subgraph replica["Replica"]
+        io[IO thread] --> relay[Relay log]
+        relay --> applier["SQL/applier threads"]
+        applier --> data["Replica's own data"]
+    end
 ```
 
 - **Asynchronous (default)**: the primary commits and replies without waiting for any replica. Fast, but if the primary dies, the last few transactions may exist only on it. Failover to a replica can lose them.

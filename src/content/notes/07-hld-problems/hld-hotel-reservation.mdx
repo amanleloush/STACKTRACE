@@ -139,9 +139,46 @@ Dates are half-open: `check_in` is the first night, `check_out` is the morning y
   Hold sweeper (cron, every minute) ──► reservation svc: expire stale HELD rows
 ```
 
+The same architecture with the read side on the left and the write side on the right (CDN and email/analytics left out):
+
+```mermaid
+flowchart TB
+    guest["Guest app / web"] --> gw["API Gateway"]
+    gw -->|read| search["Search service"]
+    gw -->|write| res["Reservation svc"]
+    search --> idx["Hotel search index"]
+    search --> cache[("Availability cache (Redis)")]
+    res <--> pay["Payment svc"]
+    pay --> prov["Payment provider"]
+    res --> db[("Inventory + reservations DB, sharded by hotel_id")]
+    db -->|"CDC / outbox"| kafka["Kafka"]
+    kafka --> upd["Availability updater"]
+    upd --> cache
+    sweep["Hold sweeper (cron)"] --> res
+```
+
 **Read path (search).** The search service asks the search index for hotels near the place that match filters (stars, amenities), getting a few dozen candidates (50 in the estimate above). It then reads `rooms_left` for those hotels and nights from the availability cache in a few batched calls, drops hotels with no room for some night, ranks, and returns a page. No database call. The data can lag the truth by seconds.
 
 **Write path (book).** The reservation service routes by `hotel_id` to one shard and, in **one transaction**, records the idempotency key and inserts a `HELD` reservation, then runs a conditional update over all nights. If every night fits, it commits and returns `HELD` with an expiry. The guest pays; the payment webhook flips the reservation to `CONFIRMED`. If nobody pays, the sweeper marks it `EXPIRED` and gives the rooms back. Every committed change flows through CDC to Kafka, which updates the availability cache and sends emails.
+
+The booking write path, from hold to confirmation:
+
+```mermaid
+sequenceDiagram
+    participant G as Guest
+    participant R as Reservation svc
+    participant DB as Shard (hotel_id)
+    participant P as Payment svc
+    G->>R: POST /reservations + Idempotency-Key
+    R->>DB: BEGIN, INSERT HELD ON CONFLICT DO NOTHING
+    R->>DB: UPDATE all nights WHERE room left
+    DB-->>R: rows updated = nights, COMMIT
+    R-->>G: 201 HELD + hold_expires_at
+    G->>P: POST /reservations/id/payment
+    P-->>R: payment succeeded (webhook)
+    R->>DB: UPDATE CONFIRMED WHERE status = HELD
+    Note over R,DB: Fewer rows than nights means ROLLBACK and 409 SOLD_OUT
+```
 
 ## Data model
 
@@ -239,12 +276,15 @@ Isolation levels are covered in [transactions and isolation](/learn/notes/transa
 
 A reservation moves through a small state machine:
 
-```
-          create (inventory taken)
-   ─────────────────────────────► HELD ──payment ok──► CONFIRMED ──cancel──► CANCELLED
-                                   │                                       (inventory back)
-                                   └── no payment by hold_expires_at ──► EXPIRED
-                                                                        (inventory back)
+```mermaid
+stateDiagram-v2
+    [*] --> HELD : create (inventory taken)
+    HELD --> CONFIRMED : payment ok
+    HELD --> CANCELLED : guest cancels hold (inventory back)
+    CONFIRMED --> CANCELLED : cancel (inventory back)
+    HELD --> EXPIRED : no payment by hold_expires_at (inventory back)
+    CANCELLED --> [*]
+    EXPIRED --> [*]
 ```
 
 **Why hold before paying?** The guest may spend minutes on the payment page. If we only took inventory after payment, two guests could pay for the last room and one would need a refund. Holding first means the guest who reaches the payment page has a room.
@@ -278,6 +318,8 @@ UPDATE room_inventory i
 ```
 
 Both the confirm and the sweeper only act `WHERE status = 'HELD'`. The row lock plus the WHERE re-check means exactly one of them wins; they can never both happen.
+
+**Cancel.** `POST /reservations/{id}/cancel` works on a `HELD` reservation as well as a `CONFIRMED` one: the guest abandons checkout and the rooms go back straight away instead of waiting for the sweeper. It is the same guarded pattern (`WHERE status IN ('HELD', 'CONFIRMED')`) in the same transaction as giving the nights back, so a cancel racing a confirm or the sweeper still has exactly one winner. Cancelling a `CONFIRMED` booking also triggers a refund under the rate's cancellation policy. If a payment webhook lands after the hold was cancelled, treat it like a late payment.
 
 **Late payment.** If the webhook arrives after the sweeper expired the hold, the confirm updates 0 rows. Don't give up yet: try to take the inventory again with the same conditional update. If it still fits, confirm. If not, **void or refund** the payment and tell the guest. Never confirm just because money arrived.
 
@@ -526,7 +568,7 @@ The key benefit is single-shard ACID for the booking. City search is served by t
 - **Book**: one transaction on the hotel's shard: insert HELD reservation with idempotency key (`ON CONFLICT DO NOTHING`), then `UPDATE ... SET reserved = reserved + n WHERE ... AND reserved + n <= total_rooms + overbook_limit`; rows updated must equal nights, else roll back.
 - **Backstop**: `CHECK (reserved <= total_rooms + overbook_limit)`.
 - **Optimistic** `WHERE version = :v` works but retries too much on hot nights; `FOR UPDATE` locks in date order.
-- **Lifecycle**: HELD (15 min) → CONFIRMED by payment webhook; sweeper → EXPIRED and returns nights; both guarded by `status = 'HELD'`.
+- **Lifecycle**: HELD (15 min) → CONFIRMED by payment webhook; sweeper → EXPIRED and returns nights; both guarded by `status = 'HELD'`. Cancel works from HELD or CONFIRMED and returns the nights.
 - **Late payment**: re-take inventory or refund. Never confirm on payment alone.
 - **Idempotency**: client UUID per checkout; stored with the reservation; reservation_id as the provider's key.
 - **Overbooking**: explicit per-night allowance from no-show history; walk cost vs empty-room cost.

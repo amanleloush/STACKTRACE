@@ -161,22 +161,16 @@ async def main(urls):
 
 Node runs your JavaScript on **one thread** on top of **libuv**, a C library that provides the event loop and a **thread pool**. Each loop iteration goes through phases:
 
-```
-   ┌───────────────────────────┐
-┌─▶│  timers                   │  setTimeout / setInterval callbacks
-│  ├───────────────────────────┤
-│  │  pending callbacks        │  some I/O callbacks deferred from last turn
-│  ├───────────────────────────┤
-│  │  idle, prepare            │  internal
-│  ├───────────────────────────┤
-│  │  poll                     │  get new I/O events, run I/O callbacks;
-│  │                           │  may block here waiting for I/O
-│  ├───────────────────────────┤
-│  │  check                    │  setImmediate callbacks
-│  ├───────────────────────────┤
-│  │  close callbacks          │  e.g. socket.on('close')
-│  └─────────────┬─────────────┘
-└────────────────┘
+The phases of one loop iteration:
+
+```mermaid
+flowchart TB
+    t["timers: setTimeout / setInterval"] --> p["pending callbacks: deferred I/O"]
+    p --> i["idle, prepare: internal"]
+    i --> po["poll: new I/O events, may block"]
+    po --> c["check: setImmediate"]
+    c --> cl["close callbacks: socket.on('close')"]
+    cl -->|next iteration| t
 ```
 
 - **Since libuv 1.45 (Node 20)**, timers run after the poll phase in each iteration (earlier versions ran them before polling), though libuv still runs timers once before entering the loop.
@@ -225,24 +219,45 @@ When to use what, by language:
 
 Two threads on a GIL build, T1 doing CPU math and T2 handling a socket:
 
-```
-t=0ms    T1 holds GIL, executing bytecode
-t=0ms    T2 wants GIL → waits, sets a timeout of switch interval (5 ms)
-t=5ms    T2 times out → sets "drop request" flag
-t~5ms    T1 sees flag at next safe point in the eval loop → releases GIL
-         OS decides who runs; say T2 takes GIL
-t~5ms    T2 calls sock.recv() → releases GIL before the blocking syscall
-         T1 reacquires GIL and keeps computing
-t=40ms   data arrives; T2's recv returns → T2 must reacquire GIL to continue
+The hand-offs, step by step:
+
+```mermaid
+sequenceDiagram
+    participant T1 as T1 (CPU math)
+    participant G as GIL
+    participant T2 as T2 (socket)
+    Note over T1,G: t=0 ms, T1 holds GIL, executing bytecode
+    T2->>G: want GIL, wait up to switch interval (5 ms)
+    Note over T2: t=5 ms, timeout
+    T2->>T1: set "drop request" flag
+    T1->>G: release at next safe point in eval loop
+    Note over T1,T2: OS decides who runs, say T2
+    G-->>T2: T2 takes GIL
+    T2->>G: release before blocking sock.recv()
+    G-->>T1: T1 reacquires, keeps computing
+    Note over T2: t=40 ms, data arrives, recv returns
+    T2->>G: must reacquire GIL to continue
 ```
 
 Same thing with asyncio, one thread:
 
-```
-loop: run task A until `await sock_recv` → A suspended, socket registered with epoll
-      run task B until `await asyncio.sleep(0.1)` → B suspended, timer set
-      epoll_wait(timeout = time until B's timer)
-      socket ready → resume A; timer due → resume B
+```mermaid
+sequenceDiagram
+    participant L as Event loop
+    participant A as Task A
+    participant B as Task B
+    participant E as epoll
+    L->>A: run
+    A-->>L: await sock_recv, suspended
+    L->>E: register socket
+    L->>B: run
+    B-->>L: await asyncio.sleep(0.1), suspended
+    Note over L: timer set
+    L->>E: epoll_wait(timeout = time until B's timer)
+    E-->>L: socket ready
+    L->>A: resume A
+    Note over L: timer due
+    L->>B: resume B
 ```
 
 ## Real-world examples

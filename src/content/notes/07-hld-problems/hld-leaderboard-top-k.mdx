@@ -138,7 +138,43 @@ GET  /v1/trending/daily?date=2026-10-22&k=50
  Clients ──► Trending API ──► Redis (current) / OLAP or Redis (history)
 ```
 
+The leaderboard half on its own. Writes go through Kafka, reads go straight to Redis:
+
+```mermaid
+flowchart TB
+    gs["Game servers"] --> sapi["Score API"]
+    sapi --> kafka["Kafka match-results (key playerId)"]
+    kafka --> cons["Score consumer"]
+    cons --> db[("Scores DB (source of truth)")]
+    cons --> redis[("Redis sorted set lb:{season-12}:global")]
+    clients["Clients"] --> lapi["Leaderboard API (small top-N cache)"]
+    lapi --> redis
+```
+
 **Leaderboard write path.** A game server posts a match result. The Score API writes it to Kafka, keyed by `playerId` so one player's updates stay in order. For each event, a consumer runs one DB transaction that inserts the `matchId` row (the primary key rejects a repeat) and updates the player's total, then writes the change to Redis. If it crashes after the DB commit but before the Redis write, the retry is rejected as a duplicate and Redis misses that match. So either write the player's new DB total with `ZADD` on every attempt (safe to repeat), or let the reconcile job (see Failure handling) catch it. If Redis is lost, it is rebuilt from the DB.
+
+The write path for one match result, including the duplicate case:
+
+```mermaid
+sequenceDiagram
+    participant GS as Game server
+    participant API as Score API
+    participant K as Kafka match-results
+    participant C as Score consumer
+    participant DB as Scores DB
+    participant R as Redis
+    GS->>API: POST match result (matchId)
+    API->>K: write, key = playerId
+    K->>C: deliver event
+    C->>DB: one tx, insert matchId row + update total
+    alt new matchId
+        DB-->>C: committed, new total
+        C->>R: ZADD player's new total
+    else duplicate matchId
+        DB-->>C: primary key rejects insert
+        Note over C: skip Redis write
+    end
+```
 
 **Leaderboard read path.** The top 100 is read with one range call and cached for a second or two, because every client asks for the same thing. "My rank plus neighbours" is one rank lookup and one small range, both O(log N).
 
@@ -327,6 +363,19 @@ Flink:
    → per-key-group: keep 60 minute counts, min-heap top K
    → every minute: local top K → global operator → merge → final top K
    → sinks: Redis SET trend:1h (whole list), OLAP (minute counts)
+```
+
+The same pipeline as a diagram, top to bottom:
+
+```mermaid
+flowchart TB
+    src["Kafka plays (key itemId, 64 partitions)"] --> filt["Filter bots, dedupe by eventId"]
+    filt --> key["keyBy(itemId)"]
+    key --> win["1-min tumbling count"]
+    win --> local["Per key group: 60 counts + min-heap"]
+    local -->|"every minute, local top K"| glob["Global operator: merge to top K"]
+    glob --> redis[("Redis SET trend:1h")]
+    win --> olap[("OLAP minute counts")]
 ```
 
 Key points:

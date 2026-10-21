@@ -38,16 +38,25 @@ When both are enabled, Redis loads the **AOF** at startup and ignores `dump.rdb`
 
 ### RDB: snapshots via fork + copy-on-write
 
-```text
-            BGSAVE (or a save rule fires)
-                    │
-        parent ─────┼──── fork() ────▶ child
-   keeps serving    │                   │ walks the whole dataset
-   clients, writes  │                   │ writes temp-<pid>.rdb
-   touch pages ──▶  │ kernel copies     │ fsyncs, then rename(2)
-   (copy-on-write)  │ only the pages    │ over dump.rdb atomically
-                    │ that change       ▼
-                    │               exits; parent logs result
+What happens when BGSAVE runs (or a save rule fires):
+
+```mermaid
+sequenceDiagram
+    participant P as Parent (redis-server)
+    participant K as Kernel
+    participant C as Child
+    P->>C: fork()
+    Note over P,C: Pages shared, copy-on-write
+    par Parent keeps serving
+        P->>K: client writes touch pages
+        K-->>P: copies only changed pages
+    and Child dumps
+        C->>C: walk the whole dataset
+        C->>K: write temp-pid.rdb, then fsync
+        C->>K: rename(2) over dump.rdb
+    end
+    C-->>P: exits
+    P->>P: log the result
 ```
 
 - **`fork()`** gives the child a frozen view of memory. Parent and child **share pages**, and the kernel copies a page only when one side writes to it. That is copy-on-write (COW).
@@ -146,6 +155,23 @@ Rewrite in 7.x:
 2. At the same moment, the parent opens a **new incr file** and keeps appending to it. If the rewrite fails, the old base, the old incr files, and the new incr file still hold everything.
 3. When the child finishes, the parent writes a **temporary manifest** listing the new base and the new incr file, then atomically swaps it in.
 4. Old files are deleted. Failed rewrites are retried at a slower and slower rate, so you don't pile up incr files.
+
+The 7.x rewrite, step by step:
+
+```mermaid
+sequenceDiagram
+    participant P as Parent
+    participant C as Child
+    participant D as appendonlydir
+    P->>C: fork()
+    C->>D: write new base file
+    P->>D: open new incr file
+    P->>D: keep appending writes to it
+    C-->>P: rewrite finished
+    P->>D: write temporary manifest
+    P->>D: atomically swap in manifest
+    P->>D: delete old base and incr files
+```
 
 The result: no big rewrite buffer in memory, and no writing every command twice.
 

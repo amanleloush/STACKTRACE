@@ -91,6 +91,26 @@ BRPOP queue:high queue:low 5
 - **Reliable queue pattern**: `BLMOVE queue processing RIGHT LEFT 0` atomically moves the job to a per-worker `processing` list. The worker `LREM`s it when done, and a reaper re-queues items stuck in `processing`. With a plain `BRPOP`, a worker that crashes after popping loses the job. (`BLMOVE` replaces the older `BRPOPLPUSH`.)
 - A blocked connection can't be used for anything else, so give consumers their own connections. Lists can't do acks, retries, or consumer groups. For those, use **Streams**.
 
+The reliable queue pattern, step by step:
+
+```mermaid
+sequenceDiagram
+    participant P as Producer
+    participant Q as queue list
+    participant W as Worker
+    participant PL as processing list
+    participant R as Reaper
+    P->>Q: push job
+    W->>Q: BLMOVE queue processing RIGHT LEFT 0
+    Q->>PL: job moved atomically
+    Q-->>W: job
+    Note over W: process the job
+    W->>PL: LREM job when done
+    Note over W,PL: if the worker crashes, job stays in processing
+    R->>PL: find stuck items
+    R->>Q: re-queue them
+```
+
 ### Hashes
 
 A map of field → string value under one key: the natural shape for an object.
@@ -249,6 +269,22 @@ XAUTOCLAIM orders billing w2 60000 0-0              # 6.2+: take over stuck mess
 - Unlike pub/sub, entries **persist** until trimmed, so consumers can replay from any ID.
 - **Consumer groups** split entries across workers. Each entry delivered via `>` goes to exactly one consumer in the group and sits in the **Pending Entries List (PEL)** until `XACK`. This gives at-least-once delivery, so handlers must be idempotent.
 - Trim with `MAXLEN ~` or `MINID ~` (the approximate `~` form is much cheaper), or memory grows forever.
+
+The life of one stream entry inside a consumer group:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Appended : XADD
+    Appended --> Pending : XREADGROUP, never-delivered
+    Pending --> Pending : XAUTOCLAIM to another consumer
+    Pending --> Acked : XACK
+    Acked --> Trimmed : MAXLEN or MINID trim
+    Trimmed --> [*]
+    note right of Pending
+        sits in the PEL, delivered
+        to exactly one consumer
+    end note
+```
 
 Messaging semantics, comparisons with Kafka, and failure handling are covered in [Transactions, Scripting & Messaging](/learn/notes/redis-transactions-scripting/). See also [Kafka Deep Dive](/learn/notes/kafka-deep/).
 

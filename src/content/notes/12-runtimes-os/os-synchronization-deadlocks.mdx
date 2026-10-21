@@ -234,6 +234,16 @@ Now P0 asks for 2 more. If granted: P0 holds 5 and needs 2, available = 1. Nobod
 
 The most practical prevention technique. Classic bank transfer bug:
 
+What goes wrong when `transfer(a, b)` and `transfer(b, a)` run at once: each thread holds one lock and waits for the other, which is a cycle in the wait-for graph:
+
+```mermaid
+flowchart LR
+    t1["Thread 1: transfer(a, b)"] -->|"holds"| la["lock a"]
+    t1 -.->|"waits for"| lb["lock b"]
+    t2["Thread 2: transfer(b, a)"] -->|"holds"| lb
+    t2 -.->|"waits for"| la
+```
+
 ```java
 // Deadlock-prone: transfer(a, b) and transfer(b, a) at the same time
 synchronized (from) { synchronized (to) { move(from, to, amt); } }
@@ -267,6 +277,23 @@ M:                    ███████████████████�
 L: ─ holds lock ─ preempted ............... finishes, unlocks
 ```
 
+The same inversion as a sequence:
+
+```mermaid
+sequenceDiagram
+    participant H as High priority
+    participant M as Medium priority
+    participant L as Low priority
+    participant X as Mutex
+    L->>X: lock (L holds it)
+    H->>X: lock, BLOCKED
+    M->>L: preempts L
+    Note over M: M runs, L cannot finish
+    Note over H: H is in effect waiting on M
+    L->>X: finishes, unlocks
+    X-->>H: lock acquired, H runs
+```
+
 **Mars Pathfinder, 1997.** A few days after landing, the lander kept resetting itself. On its VxWorks real-time OS:
 
 - A **high-priority** bus management task needed a mutex protecting a shared "information bus".
@@ -294,6 +321,25 @@ Thread B: lock(m)    → CAS fails. Spin briefly (adaptive). Still locked.
 Thread A: unlock(m)  → sees "contended", sets m to 0, calls futex(FUTEX_WAKE) → kernel makes B runnable.
 Thread B: wakes, retries CAS 0→1, succeeds, becomes owner.
           (a newcomer C could have grabbed it first: "barging" — fast but unfair)
+```
+
+The same handoff as a sequence. The kernel only gets involved once there is contention:
+
+```mermaid
+sequenceDiagram
+    participant A as Thread A
+    participant M as Mutex m
+    participant K as Kernel
+    participant B as Thread B
+    A->>M: CAS 0→1 succeeds (user space)
+    B->>M: CAS fails, spin briefly
+    B->>M: mark m contended
+    B->>K: futex(FUTEX_WAIT)
+    Note over B,K: B sleeps (context switch)
+    A->>M: unlock, sees contended, set m to 0
+    A->>K: futex(FUTEX_WAKE)
+    K-->>B: B is runnable
+    B->>M: retry CAS 0→1, becomes owner
 ```
 
 Costs to remember: uncontended lock = an atomic op (tens of nanoseconds or less). Contended lock = syscalls plus context switches (microseconds), plus the throughput lost while threads wait in line.

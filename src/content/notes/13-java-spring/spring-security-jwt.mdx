@@ -54,6 +54,23 @@ HTTP request
           DispatcherServlet → your controller (→ @PreAuthorize proxies)
 ```
 
+The same chain as a diagram, top to bottom:
+
+```mermaid
+flowchart TB
+    req["HTTP request"] --> dfp["DelegatingFilterProxy"]
+    dfp --> fcp["FilterChainProxy: first matching chain"]
+    subgraph api["SecurityFilterChain for /api/**"]
+        cors["CorsFilter"] --> csrf["CsrfFilter"]
+        csrf --> authn["Authentication filters"]
+        authn --> etf["ExceptionTranslationFilter: 401 / 403"]
+        etf --> az["AuthorizationFilter"]
+    end
+    fcp --> cors
+    az --> ds["DispatcherServlet"]
+    ds --> ctl["Controller, @PreAuthorize proxies"]
+```
+
 - **`DelegatingFilterProxy`** bridges two worlds: the servlet container registers filters before Spring's `ApplicationContext` exists, so this proxy is registered with the container and looks up the real filter bean later.
 - **`FilterChainProxy`** is the real Spring Security filter. It holds a list of **`SecurityFilterChain`**s and runs **only the first one that matches** the request. It also clears the `SecurityContext` after each request (preventing leaks between requests on pooled threads) and applies the `HttpFirewall`.
 - You can have several chains, for example a stateless JWT chain for `/api/**` and a session-based form-login chain for `/admin/**`. Order them from most specific to least specific.
@@ -70,20 +87,26 @@ Authentication auth = SecurityContextHolder.getContext().getAuthentication();
 
 ### The authentication flow (username and password)
 
-```
-UsernamePasswordAuthenticationFilter
-   │ builds an unauthenticated UsernamePasswordAuthenticationToken(user, rawPassword)
-   ▼
-AuthenticationManager  (implementation: ProviderManager)
-   │ asks each AuthenticationProvider in turn: "can you handle this token type?"
-   ▼
-DaoAuthenticationProvider
-   │ 1. UserDetailsService.loadUserByUsername(user)   → UserDetails (hash, authorities, enabled…)
-   │ 2. PasswordEncoder.matches(rawPassword, storedHash)
-   ▼
-authenticated Authentication (principal = UserDetails, authorities)
-   │
-   ▼ the filter stores it in SecurityContextHolder (and, for sessions, in the HttpSession)
+The login, step by step:
+
+```mermaid
+sequenceDiagram
+    participant F as UsernamePasswordAuthenticationFilter
+    participant M as AuthenticationManager (ProviderManager)
+    participant P as DaoAuthenticationProvider
+    participant U as UserDetailsService
+    participant E as PasswordEncoder
+    participant H as SecurityContextHolder
+    Note over F: builds unauthenticated UsernamePasswordAuthenticationToken(user, rawPassword)
+    F->>M: authenticate(token)
+    M->>P: can you handle this token type?
+    P->>U: loadUserByUsername(user)
+    U-->>P: UserDetails (hash, authorities, enabled)
+    P->>E: matches(rawPassword, storedHash)
+    E-->>P: match
+    P-->>M: authenticated Authentication
+    M-->>F: principal = UserDetails, authorities
+    F->>H: store it (and HttpSession, for sessions)
 ```
 
 - **`AuthenticationManager`**: one method, `authenticate(Authentication)`. **`ProviderManager`** delegates to a list of **`AuthenticationProvider`**s (DAO/password, JWT, LDAP, …); a provider can succeed, fail, or abstain.
@@ -268,6 +291,30 @@ A request to `GET /api/orders/7` with `Authorization: Bearer eyJ...`:
 7. DispatcherServlet → OrderController → proxy(OrderService).get(7)
      @PreAuthorize("hasAuthority('SCOPE_orders:read')") ✓ → method runs
 8. Response sent; FilterChainProxy clears the SecurityContext
+```
+
+The same request as a sequence:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant FCP as FilterChainProxy
+    participant BF as BearerTokenAuthenticationFilter
+    participant D as JwtDecoder
+    participant AF as AuthorizationFilter
+    participant S as OrderService proxy
+    C->>FCP: GET /api/orders/7 + Bearer token
+    Note over FCP: /api/** matches the api chain, CORS ok, CSRF disabled
+    FCP->>BF: next filter
+    BF->>D: decode via JwtAuthenticationProvider
+    Note over D: alg RS256, kid key from cached JWKS, signature, exp/nbf, iss, aud
+    D-->>BF: valid Jwt (invalid means 401)
+    Note over BF: authorities SCOPE_orders:read, set SecurityContext
+    BF->>AF: next filter
+    AF->>S: authenticated, via DispatcherServlet and OrderController
+    Note over S: @PreAuthorize hasAuthority SCOPE_orders:read passes
+    S-->>C: response
+    Note over FCP: clears the SecurityContext
 ```
 
 No session is created and no database is touched for authentication: the token itself carries the identity, and the only network call is the occasional JWKS refresh.

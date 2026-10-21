@@ -105,6 +105,51 @@ Both fit comfortably in a 60–90 minute round. Do Part A first if asked for bot
  Purchase(product, change) — record       VendingException — runtime error
 ```
 
+Part A as a class diagram. `VendingMachine` delegates every action to its current `MachineState`:
+
+```mermaid
+classDiagram
+    class VendingMachine {
+        -MachineState state
+        -EnumMap escrow
+        +insert(Denomination d) void
+        +select(String code) Purchase
+        +refund() Map
+        +restock(Product p, int qty) void
+        +completePurchase(Product p) Purchase
+    }
+    class MachineState {
+        <<interface>>
+        +insert(VendingMachine m, Denomination d) void
+        +select(VendingMachine m, String code) Purchase
+        +refund(VendingMachine m) Map
+        +name() String
+    }
+    class ChangeMaker {
+        <<interface>>
+        +makeChange(int amount, Map stock) Optional
+    }
+    class Inventory {
+        +inStock(String code) boolean
+        +remove(String code) void
+        +isEmpty() boolean
+    }
+    class CashBox {
+        +stock() Map
+        +withdraw(Map plan) Map
+    }
+    VendingMachine --> MachineState : delegates
+    VendingMachine *-- Inventory
+    VendingMachine *-- CashBox
+    VendingMachine --> ChangeMaker
+    MachineState <|.. IdleState
+    MachineState <|.. HasMoneyState
+    MachineState <|.. DispensingState
+    MachineState <|.. OutOfStockState
+    ChangeMaker <|.. GreedyChangeMaker
+    ChangeMaker <|.. DpChangeMaker
+```
+
 **State transitions**
 
 ```
@@ -117,7 +162,22 @@ Both fit comfortably in a 60–90 minute round. Do Part A first if asked for bot
      │   last item sold                   ▼
      └──────────────────────────────── Dispensing ──► Idle (items left)
                                           │
-                     select fails ────────┘ back to HasMoney (money kept)
+                change cannot be made ────┘ back to HasMoney (money kept)
+```
+
+The same transitions as a state diagram. A new machine starts in `OutOfStock`:
+
+```mermaid
+stateDiagram-v2
+    [*] --> OutOfStock
+    OutOfStock --> Idle : restock
+    Idle --> HasMoney : insert
+    HasMoney --> HasMoney : insert
+    HasMoney --> Idle : refund
+    HasMoney --> Dispensing : select OK
+    Dispensing --> HasMoney : change cannot be made
+    Dispensing --> Idle : items left
+    Dispensing --> OutOfStock : last item sold
 ```
 
 **Part B**
@@ -135,6 +195,63 @@ Both fit comfortably in a 60–90 minute round. Do Part A first if asked for bot
                                                      Plain / Json               Console / File / Memory
  LogManager: creates and caches Loggers, owns the Dispatcher (DI-friendly).
  LogRecord(time, level, logger, thread, message) — immutable record.
+```
+
+Part B as a class diagram. A `Logger` hands records to a `Dispatcher`, which feeds the chain of `LogHandler`s:
+
+```mermaid
+classDiagram
+    class LogManager {
+        -Map loggers
+        +getLogger(String name) Logger
+        +close() void
+    }
+    class Logger {
+        -Level threshold
+        +isEnabled(Level l) boolean
+        +log(Level level, String pattern, Object... args) void
+    }
+    class Dispatcher {
+        <<interface>>
+        +dispatch(LogRecord r) void
+        +close() void
+    }
+    class AsyncDispatcher {
+        -BlockingQueue~LogRecord~ queue
+        -boolean dropWhenFull
+        -drain() void
+    }
+    class LogHandler {
+        <<abstract>>
+        -LogHandler next
+        +then(LogHandler next) LogHandler
+        +handle(LogRecord r) void
+        #canHandle(LogRecord r)* boolean
+        #write(LogRecord r)* void
+    }
+    class LevelRangeHandler {
+        -Level min
+        -Level max
+    }
+    class Formatter {
+        <<interface>>
+        +format(LogRecord r) String
+    }
+    class Appender {
+        <<interface>>
+        +append(String line) void
+    }
+    LogManager *-- Logger : caches
+    LogManager --> Dispatcher : owns
+    Logger --> Dispatcher
+    Dispatcher <|.. SyncDispatcher
+    Dispatcher <|.. AsyncDispatcher
+    SyncDispatcher --> LogHandler : chain
+    AsyncDispatcher --> LogHandler : chain
+    LogHandler <|-- LevelRangeHandler
+    LogHandler --> LogHandler : next
+    LevelRangeHandler --> Formatter
+    LevelRangeHandler o-- Appender
 ```
 
 ## Design patterns used and why
@@ -266,7 +383,7 @@ Our design keeps `LogManager` a normal class (DI-friendly, easy to test) and *op
 
 One file, Java 21. Compile with `javac Main.java` and run `java Main`.
 
-```java
+```java run
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
@@ -747,7 +864,7 @@ Other checks in the harness: `OutOfStock` refuses money; restock moves to `Idle`
 
 **Demo output (real run):**
 
-```
+```text output
 === Part A: vending machine ===
 state: Idle
 bought: Purchase[product=Product[code=A1, name=Chips, price=15], change={FIVE=1}]
@@ -945,7 +1062,7 @@ Disabled DEBUG calls in a hot loop should cost almost nothing; formatting first 
 ## TL;DR cheat sheet
 
 - **Vending machine = State.** Context holds data (inventory, cash box, escrow); states hold behaviour and decide transitions; defaults reject.
-- States: `OutOfStock → Idle → HasMoney → Dispensing → Idle/OutOfStock`; failed select returns to `HasMoney` with money kept.
+- States: `OutOfStock → Idle → HasMoney → Dispensing → Idle/OutOfStock`; if change can't be made, `Dispensing` returns to `HasMoney` with money kept (sold out or not enough money throws while still in `HasMoney`).
 - **Escrow** inserted coins; refund returns them exactly. Money as integer units, never `double`.
 - **Plan, then commit**: compute change from cash box + escrow first; mutate only if a plan exists.
 - **Greedy** is optimal only for **canonical** systems with **unlimited** coins (INR, USD yes; 1, 3, 4 no). Limited stock breaks greedy → use **bounded DP**. Kozen–Zaks: smallest counterexample lies in a bounded range.

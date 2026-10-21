@@ -83,6 +83,23 @@ LSNs the system tracks:
 
 **The WAL rule in LSN terms:** before writing page P to disk, ensure `pageLSN(P)` is at most `flushedLSN`. Before acknowledging a commit, ensure the commit record's LSN is at most `flushedLSN`.
 
+The WAL rule on the commit path and the page-write path:
+
+```mermaid
+sequenceDiagram
+    participant T as Transaction
+    participant B as Buffer pool
+    participant L as WAL
+    participant D as Data files
+    T->>B: change page in memory
+    T->>L: append update record (LSN)
+    T->>L: append COMMIT record
+    Note over L: flush until flushedLSN covers COMMIT
+    L-->>T: commit acknowledged
+    Note over B,D: later, any time (steal, no-force)
+    B->>D: write dirty page only if pageLSN at most flushedLSN
+```
+
 ### Logging styles
 
 - **Physical** — "bytes 100–108 of page 7 changed from X to Y". Exact and idempotent-friendly, but verbose.
@@ -108,6 +125,16 @@ Trade-off: frequent checkpoints mean faster recovery but more page writes (and, 
 
 ### ARIES phase by phase
 
+The three passes over the log, in order:
+
+```mermaid
+flowchart TB
+    crash["Crash, then restart"] --> an["Analysis: last checkpoint, scan forward"]
+    an -->|"losers + DPT"| redo["Redo: from min recLSN, forward"]
+    redo -->|"exact pre-crash state"| undo["Undo: losers, backwards, write CLRs"]
+    undo --> open["Database consistent"]
+```
+
 **Analysis** (start at the last checkpoint, scan forward to the end of the log)
 - Load the ATT and DPT from `CHECKPOINT-END`.
 - For each record: add unseen transactions to the ATT, update their lastLSN; on `COMMIT` mark them committed; on `END` remove them.
@@ -121,6 +148,19 @@ For each update or CLR, re-apply it **unless**:
 - the page's on-disk pageLSN is at least the record's LSN (the change is already on disk; needs a page read to check).
 
 When redoing, set the page's pageLSN to the record's LSN. No logging happens during redo.
+
+The redo check for each update or CLR:
+
+```mermaid
+flowchart TB
+    rec["Update or CLR at LSN"] --> q1{"Page in DPT?"}
+    q1 -->|no| skip["Skip"]
+    q1 -->|yes| q2{"LSN less than recLSN?"}
+    q2 -->|yes| skip
+    q2 -->|no| q3{"On-disk pageLSN at least LSN?"}
+    q3 -->|yes| skip
+    q3 -->|no| redo["Redo it, set pageLSN = LSN"]
+```
 
 **Undo** (go backwards)
 - Put the lastLSN of every loser into a set. Repeatedly take the **largest** LSN:

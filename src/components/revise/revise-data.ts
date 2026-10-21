@@ -9,6 +9,7 @@ import {
   inlineCodeHtml,
   oneLinerHtml,
   sections,
+  shortVersionSection,
 } from '~/lib/content-extract';
 
 export interface ReviseTopic {
@@ -21,6 +22,9 @@ export interface ReviseTopic {
   /** Anchor id of this topic's block on the revision page. */
   anchor: string;
   oneLinerHtml: string;
+  /** Guide pages show "The short version" (open) instead of a definition
+   *  and have no one-liner. */
+  guide: boolean;
   /** Definition / explanation HTML with the one-liner paragraph removed
    *  (it is already shown on its own above). Empty when missing. */
   definitionHtml: string;
@@ -56,7 +60,8 @@ export const topicAnchor = (slug: string): string => `rv-${slug}`;
 export function noteTopic(entry: EntryLike): ReviseTopic {
   const body = entry.body ?? '';
   const all = sections(body);
-  const def = definitionSection(all);
+  const short = shortVersionSection(all);
+  const def = definitionSection(all) ?? short;
   const tldr = findSection(all, /^TL;DR/);
   const href = `/learn/notes/${entry.id}/`;
   // Premium notes stay behind the paywall: show only the one-liner.
@@ -68,6 +73,7 @@ export function noteTopic(entry: EntryLike): ReviseTopic {
     fullHref: tldr ? `${href}#${tldr.id}` : href,
     anchor: topicAnchor(entry.id),
     oneLinerHtml: oneLinerHtml(body) ?? '',
+    guide: short !== undefined,
     definitionHtml: locked || !def ? '' : stripOneLiner(def.html),
     cheatSheetHtml: locked || !tldr ? '' : tldr.html,
     pitfallsHtml: [],
@@ -77,7 +83,8 @@ export function noteTopic(entry: EntryLike): ReviseTopic {
 export function dsaTopic(entry: EntryLike): ReviseTopic {
   const body = entry.body ?? '';
   const all = sections(body);
-  const def = definitionSection(all);
+  const short = shortVersionSection(all);
+  const def = definitionSection(all) ?? short;
   const href = `/learn/dsa/${entry.id}/`;
   const locked = entry.data.premium === true;
   return {
@@ -87,6 +94,7 @@ export function dsaTopic(entry: EntryLike): ReviseTopic {
     fullHref: def ? `${href}#${def.id}` : href,
     anchor: topicAnchor(entry.id),
     oneLinerHtml: oneLinerHtml(body) ?? '',
+    guide: short !== undefined,
     definitionHtml: locked || !def ? '' : stripOneLiner(def.html),
     cheatSheetHtml: '',
     complexity: entry.data.complexity,

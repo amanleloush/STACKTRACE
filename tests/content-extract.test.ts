@@ -3,6 +3,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import {
   definitionSection,
+  isGuide,
   findSection,
   hashId,
   inlineCodeHtml,
@@ -37,14 +38,24 @@ describe('sections', () => {
     expect(s[1]!.text).toBe('more');
   });
 
-  it('finds the interview-ready section and one-liner on every page', () => {
+  it('every page opens with a definition + one-liner, or (guides) a short version', () => {
+    let guides = 0;
     for (const f of [...NOTES, ...DSA]) {
       const b = body(f);
-      const def = definitionSection(sections(b));
-      expect(def, f).toBeDefined();
-      expect(oneLiner(def ? b : ''), f).toBeTruthy();
+      const all = sections(b);
+      if (isGuide(all)) {
+        guides++;
+        expect(definitionSection(all), `${f}: guide must not also have a definition`).toBeUndefined();
+        expect(oneLiner(b), `${f}: guide must not have a one-liner`).toBeUndefined();
+        continue;
+      }
+      expect(definitionSection(all), f).toBeDefined();
+      expect(oneLiner(b), f).toBeTruthy();
       expect(oneLinerHtml(b), f).not.toMatch(/^<p>/);
     }
+    // Guides are the exception (strategy / how-to pages), not the rule.
+    expect(guides).toBeGreaterThan(0);
+    expect(guides).toBeLessThan(20);
   }, 120_000);
 
   it('finds the TL;DR on every note', () => {

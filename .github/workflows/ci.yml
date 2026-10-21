@@ -1,0 +1,107 @@
+# Runs the checks that need compilers and a full build on GitHub's runners,
+# so they never run on a developer laptop: unit tests, type check, the
+# production build, and the C++ / Java / Python solution check for every
+# DSA page that uses <CodeTabs> (all three languages must compile, run and
+# print identical output), and the Java program on every LLD note (it
+# must compile, run and print the demo output shown in the note).
+name: CI
+
+on:
+  push:
+    branches: [main, 'ci/**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-node@v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-java@v4.7.1
+        with:
+          distribution: temurin
+          java-version: 21
+      - run: npm ci
+      - run: npx vitest run
+      - run: npx astro check
+      - run: npm run build
+      # Same bundling step Cloudflare runs before upload; prints the worker
+      # size so a size-limit failure is visible here, without credentials.
+      - name: Worker bundle size (dry run)
+        run: npx wrangler deploy --dry-run --outdir /tmp/worker-out 2>&1 | tail -20
+      - name: Asset count and largest files
+        run: |
+          echo "files in dist: $(find dist -type f | wc -l)"
+          find dist -type f -size +5M -exec ls -lh {} \;
+          echo "largest server-bundle files:"
+          find dist/_worker.js -type f -printf '%s %p\n' | sort -rn | head -15
+          echo "gzip of all server chunks for MDX pages:"
+          find dist/_worker.js -type f -name '*.mjs' -path '*chunks*' -printf '%s\n' | awk '{s+=$1} END {print s/1048576 " MiB raw"}'
+
+  dsa-solutions:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-node@v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-java@v4.7.1
+        with:
+          distribution: temurin
+          java-version: 21
+      # The verifier parses MDX with the project's own remark packages.
+      - run: npm ci
+      - name: Compile and compare every CodeTabs program
+        run: |
+          g++ --version | head -1; javac -version; python3 --version
+          files=$(grep -l '<CodeTabs>' -r src/content/dsa | sort)
+          echo "Checking $(echo "$files" | wc -l) pages"
+          node --experimental-strip-types --no-warnings src/lib/code-tabs-verify.ts -v $files
+
+  # Every LLD (machine-coding) note has one complete Java program (the
+  # ```java run fence) and the demo output it prints (```text output).
+  # Compile and run each program and check it still prints that output.
+  lld-solutions:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-node@v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-java@v4.7.1
+        with:
+          distribution: temurin
+          java-version: 21
+      # The verifier parses MDX with the project's own remark packages.
+      - run: npm ci
+      - name: Compile, run and compare every LLD program
+        run: |
+          javac -version; java -version
+          node --experimental-strip-types --no-warnings scripts/verify-lld.ts src/content/notes/14-lld/lld-*.mdx
+
+  diagrams:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-node@v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # Playwright only lives on the runner; it is not a project dependency.
+      - run: npm i --no-save playwright@1.64.1
+      - run: npx playwright install --with-deps chromium
+      - name: Render every Mermaid diagram with the site's mermaid version
+        run: node scripts/check-mermaid.mjs

@@ -143,6 +143,17 @@ export function definitionSection(all: Section[]): Section | undefined {
   return findSection(all, /^(Definition \(interview-ready\)|Interview-ready explanation)$/);
 }
 
+/** Guides (strategy / how-to / reference pages that nobody is asked to
+ *  "define") open with "The short version" instead of a definition and
+ *  have no one-liner. */
+export function shortVersionSection(all: Section[]): Section | undefined {
+  return findSection(all, /^The short version$/);
+}
+
+export function isGuide(all: Section[]): boolean {
+  return shortVersionSection(all) !== undefined;
+}
+
 /** Text after the `**One-liner:**` label of the definition section. */
 export function oneLiner(body: string): string | undefined {
   const m = body.match(/^\*\*One-liner:\*\*\s*(.+)$/m);

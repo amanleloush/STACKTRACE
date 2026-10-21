@@ -139,6 +139,19 @@ DELETE /kv/{key}?consistency=QUORUM
        background: hinted handoff replay · read repair · Merkle-tree repair · compaction
 ```
 
+The same request path as a diagram:
+
+```mermaid
+flowchart TB
+    cl["Client or smart client"] --> co["Any node as coordinator"]
+    co --> pl["hash(key) to preference list of N nodes"]
+    pl --> nb["node B: WAL, memtable, SSTables"]
+    pl --> nc["node C: WAL, memtable, SSTables"]
+    pl --> nd["node D: WAL, memtable, SSTables"]
+    nb -.-|gossip| nc
+    nc -.-|gossip| nd
+```
+
 There is **no leader** and **no central metadata server**. Every node is equal ("peer-to-peer"), knows the ring from gossip, and can route a request directly to the right replicas. Dynamo calls this a **zero-hop DHT**: no multi-hop routing, which keeps tail latency low.
 
 ### Partitioning: consistent hashing with virtual nodes
@@ -328,25 +341,52 @@ The three amplifications to name: **write amplification** (bytes written to disk
 
 ### A write at W=2 (N=3)
 
-```
-client → any node (say X) → X is not a replica → forwards to coordinator B
-         (or a token-aware client sends straight to B)
-B: hash(k) → preference list [B, C, D, E, ...]
-B: sends write to B, C, D (all N), each with timestamp/version
-   B: WAL append + memtable insert → ack
-   C: WAL append + memtable insert → ack      ← 2 acks = W → reply success to client
-   D: slow, acks 40 ms later (still applied)
-If D were down: write goes to E with a hint for D (sloppy quorum),
-               or is simply missed and fixed later by repair.
+The write, step by step:
+
+```mermaid
+sequenceDiagram
+    participant Cl as Client
+    participant X as Node X
+    participant B as Coordinator B
+    participant C as Replica C
+    participant D as Replica D
+    Cl->>X: put(k, v)
+    X->>B: forward, X is not a replica
+    Note over Cl,B: a token-aware client sends straight to B
+    Note over B: hash(k) to preference list B, C, D, E
+    B->>B: WAL append + memtable insert, ack
+    B->>C: write with timestamp/version
+    B->>D: write with timestamp/version
+    C-->>B: ack (2 acks = W)
+    B-->>Cl: success
+    D-->>B: ack 40 ms later, still applied
+    Note over B,D: if D were down, write goes to E with a hint for D (sloppy quorum), or repair fixes it later
 ```
 
 ### A read at R=2 (N=3)
 
-```
-coordinator B asks C for the full value and D for a digest (hash)
-  - digests match       → return value
-  - digests differ      → fetch full values, pick newest (or return siblings),
-                          send newest to stale replica (read repair), return
+The read, with the digest check and read repair:
+
+```mermaid
+sequenceDiagram
+    participant Cl as Client
+    participant B as Coordinator B
+    participant C as Replica C
+    participant D as Replica D
+    Cl->>B: get(k)
+    B->>C: read full value
+    B->>D: read digest (hash)
+    C-->>B: value
+    D-->>B: digest
+    alt digests match
+        B-->>Cl: value
+    else digests differ
+        B->>D: fetch full value
+        D-->>B: value
+        Note over B: pick newest (or return siblings)
+        Note over B,D: send newest to the stale replica (read repair)
+        B-->>Cl: newest value
+    end
 ```
 
 Asking one replica for data and the others for small digests saves bandwidth; Cassandra does this.

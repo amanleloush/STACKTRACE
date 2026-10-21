@@ -32,14 +32,17 @@ This builds on [MySQL/Postgres Internals](/learn/notes/mysql-postgres-internals/
 
 ### The pipeline
 
-```
- SQL text
-   │  parser        → syntax tree
-   │  analyzer      → resolve tables/columns, types
-   │  rewriter      → expand views, simplify, flatten subqueries
-   │  optimizer     → enumerate plans, cost them with statistics, pick cheapest
-   ▼  executor      → run the operator tree, pulling rows up from the leaves
- rows
+Each stage and what it does to the query:
+
+```mermaid
+flowchart TB
+    sql["SQL text"] --> parser["Parser: build syntax tree"]
+    parser --> analyzer["Analyzer: resolve tables/columns, types"]
+    analyzer --> rewriter["Rewriter: expand views, simplify, flatten subqueries"]
+    rewriter --> opt["Optimizer: enumerate plans, cost, pick cheapest"]
+    stats[("Statistics")] --> opt
+    opt --> exec["Executor: run operator tree, pull rows from leaves"]
+    exec --> rows["rows"]
 ```
 
 Most engines execute plans in the **iterator (Volcano) model**: each operator has a "give me the next row" call and pulls rows from its children. That's why a `LIMIT 10` on top of an index scan can stop after reading 10 rows.
@@ -59,6 +62,20 @@ The two big engines make opposite choices:
 | Range scan by PK | very fast (rows physically adjacent) | rows scattered unless recently ordered with `CLUSTER` (a one-off rewrite, not maintained) |
 | Big PK (say a 36-char UUID string) | bloats **every** secondary index, random inserts split pages | only the PK index itself is big |
 | An update changing one indexed column | only that index plus the clustered row change | new tuple version; every index needs a new entry unless it's a **HOT** update (no indexed column changed and room on the same page) |
+
+How a lookup through a secondary index reaches the row in each engine:
+
+```mermaid
+flowchart TB
+    subgraph inno["InnoDB (MySQL)"]
+        s1["Secondary index B+ tree"] -->|"leaf gives PK value"| pk["PK B+ tree (clustered)"]
+        pk --> r1["Full row in PK leaf"]
+    end
+    subgraph pg["PostgreSQL"]
+        s2["Index B+ tree (incl. PK)"] -->|"leaf gives TID / ctid"| heap["Heap page"]
+        heap --> r2["Row at page + slot"]
+    end
+```
 
 **Consequences to remember:**
 
@@ -154,6 +171,18 @@ walk both sorted lists together, emitting matches
 | Index nested loop | index on inner join key | M + m·C | small outer, indexed inner (OLTP) | PG, MySQL |
 | Hash join | equality condition, memory | about M + N; 3(M + N) if partitioned | big unsorted inputs, equi-join | PG; MySQL 8.0.18+ |
 | Sort-merge | sortable keys | sort costs + M + N | inputs already sorted / output needs order | PG (MySQL has no merge join) |
+
+The "Best when" column as a rough decision tree:
+
+```mermaid
+flowchart TB
+    q1{"Small outer, index on inner join key?"} -->|"yes"| inl["Index nested loop"]
+    q1 -->|"no"| q2{"Equality condition?"}
+    q2 -->|"no"| nl["Nested loop (any condition)"]
+    q2 -->|"yes"| q3{"Inputs already sorted, or output needs order?"}
+    q3 -->|"yes"| sm["Sort-merge (PG, not MySQL)"]
+    q3 -->|"no"| hj["Hash join (big unsorted inputs)"]
+```
 
 MySQL history worth knowing: before 8.0.18 MySQL only had nested-loop variants (plus block nested loop). 8.0.18 added hash join; from 8.0.20 block nested loop was removed and hash join is used wherever BNL was used before.
 

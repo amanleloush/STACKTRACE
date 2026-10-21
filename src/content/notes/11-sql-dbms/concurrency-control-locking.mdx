@@ -186,6 +186,24 @@ Almost every lock-based database uses strict or rigorous 2PL. When people say "2
     └───waits for────┘     cycle in the waits-for graph = deadlock
 ```
 
+How that cycle forms, and how detection breaks it:
+
+```mermaid
+sequenceDiagram
+    participant T1
+    participant LM as Lock manager
+    participant T2
+    T1->>LM: lock A
+    LM-->>T1: granted
+    T2->>LM: lock B
+    LM-->>T2: granted
+    T1->>LM: lock B (waits for T2)
+    T2->>LM: lock A (waits for T1)
+    Note over T1,T2: Cycle in waits-for graph
+    LM-->>T2: abort, chosen as victim
+    LM-->>T1: lock B granted
+```
+
 Ways to handle them:
 
 - **Detection** — build a *waits-for graph* (an edge from T1 to T2 means T1 waits for a lock T2 holds). A cycle means deadlock. Pick a **victim** (often the transaction that's cheapest to roll back), abort it, and the others continue.
@@ -309,6 +327,21 @@ UPDATE products SET stock = stock - 1 WHERE id = 42 AND stock > 0;  -- 0 rows = 
 | Invariant spans many rows (write skew, like the doctors) | **SERIALIZABLE + retry**, or lock the rows you read with `FOR UPDATE`, or a constraint |
 | Across services / HTTP requests | **Optimistic** (version or ETag with `If-Match`) |
 
+The main rows of that table as a decision tree:
+
+```mermaid
+flowchart TB
+  q1{"Fits in one UPDATE?"}
+  q1 -->|yes| atomic["Atomic update"]
+  q1 -->|no| q2{"Work queue, many workers?"}
+  q2 -->|yes| skip["FOR UPDATE SKIP LOCKED"]
+  q2 -->|no| q3{"Invariant spans many rows?"}
+  q3 -->|yes| ser["SERIALIZABLE + retry, or FOR UPDATE"]
+  q3 -->|no| q4{"Hot row, high contention?"}
+  q4 -->|yes| pess["Pessimistic lock"]
+  q4 -->|no| opt["Optimistic (version check)"]
+```
+
 Rule of thumb: optimistic is cheap when conflicts are rare; each conflict costs a full retry. Pessimistic costs a lock every time, but conflicts just wait instead of redoing work.
 
 ## How it works (the doctors on call, three ways)
@@ -326,6 +359,28 @@ Alice: COMMIT           → ok
 Bob:   COMMIT           → ERROR 40001 could not serialize access due to
                           read/write dependencies among transactions
 Bob:   retry            → count = 1, so Bob may not leave. Invariant holds.
+```
+
+The same run as a sequence:
+
+```mermaid
+sequenceDiagram
+    participant A as Alice
+    participant PG as Postgres (SSI)
+    participant B as Bob
+    A->>PG: BEGIN SERIALIZABLE, count on call
+    PG-->>A: 2 (SIRead lock)
+    B->>PG: BEGIN SERIALIZABLE, count on call
+    PG-->>B: 2 (SIRead lock)
+    A->>PG: UPDATE own row
+    B->>PG: UPDATE own row
+    Note over A,B: rw-dependencies both ways
+    A->>PG: COMMIT
+    PG-->>A: ok
+    B->>PG: COMMIT
+    PG-->>B: ERROR 40001
+    B->>PG: retry
+    PG-->>B: count = 1, Bob may not leave
 ```
 
 **3. Explicit lock at any level** — lock the rows the decision depends on:

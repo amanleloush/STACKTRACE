@@ -74,6 +74,20 @@ When an incoming write would push usage past `maxmemory`, Redis evicts keys acco
 | `volatile-ttl` | keys with a TTL | shortest remaining TTL first | The app can rank disposability by giving short TTLs to keys it is fine losing. |
 | `allkeys-lrm` / `volatile-lrm` | all keys / keys with a TTL | least recently **modified**; reads don't refresh it (new in Redis 8.6) | Read-heavy data where you want to drop entries that haven't been *updated* recently. |
 
+Picking a policy from the table, as a decision tree:
+
+```mermaid
+flowchart TB
+    Q1{"Redis is a database or queue?"}
+    Q1 -->|yes| NE["noeviction"]
+    Q1 -->|"no, a cache"| Q2{"Mixes TTL and persistent keys?"}
+    Q2 -->|yes| VOL["volatile-lru / volatile-lfu"]
+    Q2 -->|"no, pure cache"| Q3{"Access pattern?"}
+    Q3 -->|"hot subset"| LRU["allkeys-lru"]
+    Q3 -->|"stable popular set"| LFU["allkeys-lfu"]
+    Q3 -->|"roughly equal access"| RND["allkeys-random"]
+```
+
 Two details interviewers like to check:
 
 - **The `volatile-*` policies behave like `noeviction` when no key has a TTL.** If you forget to set TTLs, you get OOM errors even though a "cache" policy is configured.
@@ -389,6 +403,23 @@ Sentinel / Cluster (rolling):
  3. Upgrade the old primary (now a replica)
 ```
 
+The standalone procedure as a sequence:
+
+```mermaid
+sequenceDiagram
+    participant C as Clients
+    participant O as Old primary
+    participant N as New-version instance
+    N->>O: REPLICAOF old-primary
+    O-->>N: initial sync
+    Note over O,N: compare INFO keyspace and DBSIZE
+    N->>N: CONFIG SET replica-read-only no
+    Note over O: optional CLIENT PAUSE
+    C->>N: clients now point here
+    N->>N: REPLICAOF NO ONE
+    Note over O: no traffic, stop it
+```
+
 Notes:
 
 - RDB files are readable by **newer** versions, not reliably by older ones. Treat downgrades as unsupported and keep a backup.
@@ -479,6 +510,21 @@ t=6s+   AOF fsync competes with RDB write on the same disk →
           "Asynchronous AOF fsync is taking too long" → write(2) blocks
 Fix: THP never, overcommit_memory=1, maxmemory at 60-70% of RAM, RDB on
 replica only (or diskless), separate fast disk, smaller shards → smaller forks.
+```
+
+The same chain as cause and effect, from one `save` trigger to three different stalls:
+
+```mermaid
+flowchart TB
+    S["save trigger fires"] --> F["fork()"]
+    F -->|"copy page table"| B1["Main thread blocks ~250 ms"]
+    F --> C["Child writes RDB"]
+    C --> T["Parent writes copy 2 MB pages (THP)"]
+    T --> R["RSS jumps +8 GB"]
+    R --> SW["Kernel swaps cold pages"]
+    SW --> G["GET major fault: 40 ms stall"]
+    C --> D["RDB write competes with AOF fsync"]
+    D --> W["write(2) blocks"]
 ```
 
 To diagnose, work top-down. `--latency` shows a spike. `LATENCY LATEST` shows `fork` and `aof-write-pending-fsync`. `INFO` shows `latest_fork_usec:250000`. `smaps` shows Swap greater than 0. Each tool confirms one link in the chain.

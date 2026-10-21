@@ -10,18 +10,15 @@ prerequisites: ["hld-framework", "replication-sharding", "circuit-breakers-retri
 summary: "Ready-to-use answers for the 'what happens when X fails?' questions — database failover, replica lag, cache stampedes, queue backlogs, region outages, slow dependencies, hot shards, poison messages, partitions, clock skew, full disks, expired certificates and bad deploys."
 ---
 
-## Definition (interview-ready)
+## The short version
 
-A **failure scenario drill** is a practised answer to "what happens when X fails?" for a part of your design. A good answer always has the same four parts:
+This guide gives you one answer shape for any "what happens when X fails?" question, the kind interviewers use to tell people who have **drawn** systems from people who have **run** them.
 
-1. **Impact** — what users actually see, and how far it spreads (the **blast radius**).
-2. **Detection** — which metric or alert tells you, ideally before users do.
-3. **Immediate mitigation** — what you do in the first minutes to stop the bleeding, even if it's ugly (fail over, shed load, roll back, serve stale data).
-4. **Long-term fix** — the design change that makes it not happen again, or makes it hurt less.
-
-Interviewers use these questions to tell people who have **drawn** systems from people who have **run** them.
-
-**One-liner:** For any "what if X fails?" question, I say what users see and how far it spreads, how we'd detect it, what we do in the first minutes to restore service, and what design change stops it from happening again, plus what that fix costs.
+1. **Impact**: what users actually see, and how far it spreads (the **blast radius**).
+2. **Detection**: which metric or alert tells you, ideally before users do.
+3. **Immediate mitigation**: what you do in the first minutes to stop the bleeding, even if it's ugly (fail over, shed load, roll back, serve stale data). Mitigate first, diagnose second.
+4. **Long-term fix**: the design change that makes it not happen again, or makes it hurt less.
+5. **Trade-off**: say what that fix costs.
 
 ## Why it matters
 
@@ -86,6 +83,24 @@ The drills. Each one follows the same shape so you can recall it under pressure.
 - **Fencing** the old primary (STONITH, revoking its writer role, or a fencing token checked by storage) so that if it comes back it can't accept writes. Otherwise you get **split brain**: two primaries, diverging data.
 - Connection pools and drivers that handle endpoint changes quickly (short DNS TTL, proxies like PgBouncer or ProxySQL).
 - Practise failovers regularly so they're boring.
+
+The failover, step by step:
+
+```mermaid
+sequenceDiagram
+    participant App
+    participant FM as Failover manager
+    participant Old as Old primary
+    participant Rep as Most up-to-date replica
+    App-xOld: writes fail
+    FM->>Old: health check fails
+    FM->>Rep: promote to primary
+    FM->>Old: fence (revoke writer role)
+    FM->>FM: move writer endpoint to new primary
+    App->>Rep: reconnect, retry idempotent writes
+    Rep-->>App: OK
+    Note over Old,Rep: Async replication means unshipped writes are lost
+```
 
 **Go deeper:** [replication and sharding](/learn/notes/replication-sharding/), [consensus](/learn/notes/consensus-raft-paxos/), [transactions](/learn/notes/transactions-isolation/).
 
@@ -173,6 +188,16 @@ The drills. Each one follows the same shape so you can recall it under pressure.
 
 **What breaks.** "Slow" is often worse than "down". By **Little's law**, the number of requests in flight = arrival rate × time each one takes. If a dependency goes from 50 ms to 5 s, each caller holds 100× more threads, connections and memory. Thread pools fill up, and the caller stops serving **everything**, including requests that never touch the slow dependency. That's a **cascading failure**.
 
+How one slow dependency turns into a cascading failure:
+
+```mermaid
+flowchart TB
+    slow["Dependency: 50 ms to 5 s"] --> held["Each caller holds 100x threads"]
+    held --> full["Thread and connection pools fill"]
+    full --> all["Caller stops serving everything"]
+    all --> cascade["Cascading failure"]
+```
+
 **Detect.** Per-dependency latency (p99), in-flight request counts, thread/connection pool saturation, timeouts.
 
 **Mitigate now.**
@@ -222,6 +247,18 @@ The drills. Each one follows the same shape so you can recall it under pressure.
 **Fix for good.**
 - **Bounded retries, then DLQ**, as standard: SQS redrive policies (`maxReceiveCount`), RabbitMQ dead-letter exchanges, retry and DLT topics in Kafka clients like Spring Kafka.
 - Separate **retryable** errors (timeout, dependency down: retry with backoff) from **non-retryable** ones (validation failure: straight to DLQ).
+
+What a consumer should do when a message fails:
+
+```mermaid
+flowchart TB
+    fail["Message processing fails"] --> kind{"Retryable error?"}
+    kind -->|"no, e.g. validation"| dlq["Publish to DLQ and skip"]
+    kind -->|"yes, e.g. timeout"| left{"Retries left?"}
+    left -->|yes| retry["Retry with backoff"]
+    left -->|no| dlq
+    dlq --> alert["Alert owner, fix, replay DLQ"]
+```
 - Schema validation at the producer (schema registry, compatibility checks).
 - DLQ alerting, ownership and a replay tool. A DLQ nobody watches is just a slower way to lose data.
 - If per-key order matters, decide whether skipping one message breaks the entity's state; you may need to park all later messages for that key.

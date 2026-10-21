@@ -41,13 +41,6 @@ All six are from the GoF book *Design Patterns* (1994), which lists eleven behav
 
 **Problem it solves:** checkout code has `if (type == FLAT) ... else if (type == PERCENT) ... else if (type == BOGO) ...`. Every new discount means editing and retesting this method. With Strategy, each rule is a class, and the checkout just calls `strategy.apply(cart)`.
 
-```
- Checkout ◆────► «interface» DiscountStrategy
- (context)           + apply(cart): Money
-                    ▲        ▲          ▲
-          FlatDiscount  PercentDiscount  BuyXGetY
-```
-
 ```java
 interface DiscountStrategy { Money apply(Cart cart); }
 
@@ -70,6 +63,31 @@ class Checkout {
 }
 ```
 
+The classes from the code above: `Checkout` holds one `DiscountStrategy`, and each discount rule implements it.
+
+```mermaid
+classDiagram
+    class DiscountStrategy {
+        <<interface>>
+        +apply(Cart cart) Money
+    }
+    class PercentDiscount {
+        -int percent
+        +apply(Cart c) Money
+    }
+    class FlatDiscount {
+        -Money off
+        +apply(Cart c) Money
+    }
+    class Checkout {
+        -DiscountStrategy discount
+        +payable(Cart c) Money
+    }
+    DiscountStrategy <|.. PercentDiscount
+    DiscountStrategy <|.. FlatDiscount
+    Checkout o-- DiscountStrategy : injected
+```
+
 Since Java 8, a strategy with one method is just a **functional interface**, so a lambda is a strategy: `list.sort(Comparator.comparing(User::age))`. You often pick the strategy from a `Map` keyed by type instead of a `switch`.
 
 Head First Design Patterns introduces Strategy with ducks whose fly and quack behaviours are swappable objects instead of overridden methods.
@@ -79,13 +97,6 @@ Head First Design Patterns introduces Strategy with ducks whose fly and quack be
 **Intent:** define a one-to-many dependency so that when one object (the **subject**) changes state, all its dependents (**observers**, also called listeners or subscribers) are notified automatically.
 
 **Problem it solves:** when an order is placed, you need to send email, update analytics, and award loyalty points. If `OrderService` calls all three directly, it must change every time a new reaction is added. With Observer, `OrderService` just publishes "order placed"; each reaction subscribes itself.
-
-```
- OrderService (subject)                 «interface» OrderListener
- - listeners: List  ──── notifies ───►   + onOrderPlaced(event)
- + subscribe(l)                            ▲       ▲          ▲
- + unsubscribe(l)                  EmailListener  Analytics  LoyaltyPoints
-```
 
 ```java
 record OrderPlaced(String orderId, String userId, Money total) {}
@@ -107,6 +118,31 @@ class OrderService {
         }
     }
 }
+```
+
+The subject and its listeners from the code: `OrderService` keeps a list of `OrderListener`s and pushes an `OrderPlaced` event to each.
+
+```mermaid
+classDiagram
+    class OrderService {
+        -List~OrderListener~ listeners
+        +subscribe(OrderListener l) void
+        +unsubscribe(OrderListener l) void
+        +placeOrder(Order o) void
+    }
+    class OrderListener {
+        <<interface>>
+        +onOrderPlaced(OrderPlaced e) void
+    }
+    class OrderPlaced {
+        <<record>>
+        +orderId String
+        +userId String
+        +total Money
+    }
+    OrderService o-- OrderListener : notifies
+    OrderService ..> OrderPlaced : creates
+    OrderListener ..> OrderPlaced : receives
 ```
 
 `CopyOnWriteArrayList` lets listeners subscribe or unsubscribe while a notification loop is running without a `ConcurrentModificationException`, and it suits the usual case of rare writes and frequent reads.
@@ -145,15 +181,6 @@ Fixes:
 
 **Problem it solves:** a vending machine's `insertCoin()`, `selectItem()` and `dispense()` each contain `switch (state)` with the same states. Adding a state means editing every method. With State, each state is a class implementing all actions; the machine (the **context**) delegates to its current state object, and states decide transitions.
 
-```
- VendingMachine (context) ◆──► «interface» MachineState
- - state: MachineState           + insertCoin(m, amount)
- + insertCoin(amt) ─ delegates ─►+ select(m, item)
- + select(item)                  + dispense(m)
-                                   ▲         ▲            ▲
-                                 Idle    HasMoney    Dispensing
-```
-
 ```java
 interface MachineState {
     default void insertCoin(VendingMachine m, int amt) { throw new IllegalStateException("not now"); }
@@ -183,6 +210,43 @@ class VendingMachine {
 }
 ```
 
+The classes from the code: `VendingMachine` delegates every action to its current `MachineState`.
+
+```mermaid
+classDiagram
+    class MachineState {
+        <<interface>>
+        +insertCoin(VendingMachine m, int amt) void
+        +select(VendingMachine m, String item) void
+    }
+    class Idle {
+        +insertCoin(VendingMachine m, int amt) void
+    }
+    class HasMoney {
+        +insertCoin(VendingMachine m, int amt) void
+        +select(VendingMachine m, String item) void
+    }
+    class VendingMachine {
+        -MachineState state
+        +setState(MachineState s) void
+        +insertCoin(int amt) void
+        +select(String item) void
+    }
+    MachineState <|.. Idle
+    MachineState <|.. HasMoney
+    VendingMachine *-- MachineState : current state
+```
+
+The transitions the two state classes make. Any other action throws `IllegalStateException("not now")`:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> HasMoney : insertCoin
+    HasMoney --> HasMoney : insertCoin adds balance
+    HasMoney --> Idle : select, release item and change
+```
+
 Head First's gumball machine is the classic teaching example. For simple lifecycles (an order going CREATED → PAID → SHIPPED), an `enum` with an allowed-transitions table is often enough; use full State classes when **behaviour** differs a lot per state.
 
 #### Strategy vs State
@@ -209,7 +273,7 @@ Two flavours appear in practice:
 2. **Pipeline / middleware:** **every** handler gets a turn to do something, and any handler can **stop** the chain (auth fails → 401). This is how servlet filters and web middleware work.
 
 ```
-request ──► [AuthHandler] ──► [RateLimitHandler] ──► [ValidationHandler] ──► business logic
+request ──► [AuthHandler] ──► [RateLimitHandler] ──► [SchemaValidationHandler] ──► business logic
                │ stop:401           │ stop:429                │ stop:400
 ```
 
@@ -244,6 +308,29 @@ chain.linkWith(new RateLimitHandler()).linkWith(new SchemaValidationHandler());
 chain.handle(request);
 ```
 
+The classes from the code: every handler extends `Handler`, which holds a link to the `next` one.
+
+```mermaid
+classDiagram
+    class Handler {
+        <<abstract>>
+        -Handler next
+        +linkWith(Handler next) Handler
+        +handle(Request req) void
+        #process(Request req)* boolean
+    }
+    class AuthHandler {
+        #process(Request r) boolean
+    }
+    class RateLimitHandler
+    class SchemaValidationHandler {
+        #process(Request r) boolean
+    }
+    Handler <|-- AuthHandler
+    Handler <|-- RateLimitHandler
+    Handler <|-- SchemaValidationHandler
+```
+
 A simpler modern form is a **list of validators** run in order: `List<Validator>` where each returns errors — good for collecting *all* validation errors instead of stopping at the first.
 
 **Pitfalls:** a request that falls off the end unhandled (always have a default/terminal handler); order dependence (auth must come before rate-limit-by-user); long chains that are hard to debug (log which handler stopped the request).
@@ -253,15 +340,6 @@ A simpler modern form is a **list of validators** run in order: `List<Validator>
 **Intent:** encapsulate a request as an object, letting you parameterize clients with different requests, queue or log requests, and support undoable operations.
 
 A command object bundles **what to do + the receiver + the arguments** into something with a method like `execute()`. Because it's an object, you can store it, send it to another thread, put it in a queue, write it to a log, retry it, or keep it on a stack to undo later.
-
-```
- Invoker (button, queue, scheduler)          «interface» Command
- - history: Deque  ───── calls ─────►         + execute()
-                                              + undo()
-                                                 ▲
-                                        InsertTextCommand ◆──► Document (receiver)
-                                        - position, text
-```
 
 **Undo/redo:**
 
@@ -285,6 +363,38 @@ class Editor {
 }
 ```
 
+The classes from the undo/redo code: `Editor` is the invoker, `InsertText` the command, `Document` the receiver.
+
+```mermaid
+classDiagram
+    class Command {
+        <<interface>>
+        +execute() void
+        +undo() void
+    }
+    class InsertText {
+        -Document doc
+        -int pos
+        -String text
+        +execute() void
+        +undo() void
+    }
+    class Editor {
+        -Deque~Command~ undo
+        -Deque~Command~ redo
+        +run(Command c) void
+        +undo() void
+        +redo() void
+    }
+    class Document {
+        +insert(int pos, String text) void
+        +delete(int pos, int length) void
+    }
+    Command <|.. InsertText
+    Editor o-- Command : history stacks
+    InsertText --> Document : receiver
+```
+
 **Queues and deferred work:** `Runnable` and `Callable` are command objects. `executor.submit(() -> sendInvoice(orderId))` packages the request; the executor's queue holds it and a worker thread executes it later. The same idea, made durable, is a job table or a message on a queue.
 
 Head First's example is a remote control whose buttons hold `Command` objects, including an undo button and a "macro" command that runs a list of commands.
@@ -306,6 +416,24 @@ abstract class DataExporter {
 }
 
 class CsvSalesExporter extends DataExporter { /* implements fetch + format */ }
+```
+
+The fixed `export()` skeleton lives in the base class, and the subclass fills in the abstract steps:
+
+```mermaid
+classDiagram
+    class DataExporter {
+        <<abstract>>
+        +export() void
+        #fetch()* List~Row~
+        #format(List~Row~ rows)* String
+        #write(String out) void
+    }
+    class CsvSalesExporter {
+        #fetch() List~Row~
+        #format(List~Row~ rows) String
+    }
+    DataExporter <|-- CsvSalesExporter
 ```
 
 **Template Method vs Strategy:** Template Method varies steps by **inheritance** (compile-time, the whole subclass), Strategy varies the algorithm by **composition** (runtime, swappable). Modern Java often prefers passing lambdas for the varying steps — Spring's `JdbcTemplate` and `TransactionTemplate` follow this "template + callback" style: a fixed workflow (open, run, handle errors, clean up) with your code supplied as a callback.

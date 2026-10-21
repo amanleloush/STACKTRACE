@@ -99,6 +99,72 @@ Ask these in the first five minutes and write the answers as a comment at the to
  AddOn enum (GPS, CHILD_SEAT, FULL_INSURANCE per day; EXTRA_DRIVER flat)    Invoice record
 ```
 
+The core classes from the full solution, with their key methods:
+
+```mermaid
+classDiagram
+    class RentalService {
+        +search(branchId, type, range) List~Vehicle~
+        +reserve(customerId, branchId, type, range, addOns) Reservation
+        +pickup(id) Reservation
+        +returnVehicle(id) Invoice
+        +cancel(id) Invoice
+        +markNoShow(id) Invoice
+        +extend(id, newEnd) Reservation
+    }
+    class VehicleCalendar {
+        -ReentrantLock lock
+        -NavigableMap booked
+        -Reservation onRoad
+        +isFree(DateRange r) boolean
+        +tryBook(Reservation r) boolean
+        +release(Reservation r)
+    }
+    class Reservation {
+        -ReservationStatus status
+        -DateRange range
+        +moveTo(next, at)
+        +reschedule(newRange, newCharge)
+    }
+    class PricingStrategy {
+        <<interface>>
+        +basePrice(type, days) long
+    }
+    class LateFeePolicy {
+        <<interface>>
+        +lateFee(r, returnedAt) long
+    }
+    class CancellationPolicy {
+        <<interface>>
+        +fee(r, now) long
+    }
+    RentalService "1" *-- "*" VehicleCalendar : one per vehicle
+    RentalService --> PricingStrategy
+    RentalService --> LateFeePolicy
+    RentalService --> CancellationPolicy
+    VehicleCalendar "1" o-- "*" Reservation : booked
+    Reservation --> Vehicle
+    Reservation --> DateRange
+    PricingStrategy <|.. DailyPricing
+    PricingStrategy <|.. WeeklyPricing
+    LateFeePolicy <|.. HourlyLateFee
+    CancellationPolicy <|.. TieredCancellation
+```
+
+The `ReservationStatus` state machine from `canMoveTo`, with the service method that drives each move:
+
+```mermaid
+stateDiagram-v2
+    [*] --> CONFIRMED : reserve
+    CONFIRMED --> PICKED_UP : pickup
+    CONFIRMED --> CANCELLED : cancel
+    CONFIRMED --> NO_SHOW : markNoShow
+    PICKED_UP --> COMPLETED : returnVehicle
+    COMPLETED --> [*]
+    CANCELLED --> [*]
+    NO_SHOW --> [*]
+```
+
 - A `Branch` **has** vehicles; a `Vehicle` **has** one calendar. The calendar is the only place that can add a reservation for that vehicle, so it owns the invariant "no two live reservations of this vehicle overlap".
 - `Branch`, `Vehicle`, `DateRange` and `Invoice` are immutable records. `Reservation` is a class because its status changes; every change happens while its vehicle's lock is held.
 - `RentalService` **depends on** four interfaces, all injected through its constructor.
@@ -301,7 +367,7 @@ Invoice returnVehicle(String id) {
 
 One file, `Main.java`, Java 21. Compile and run with `javac Main.java && java Main`.
 
-```java
+```java run
 import java.time.*;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -742,7 +808,7 @@ public class Main {
 
 **Demo output** (real output from running the program above):
 
-```text
+```text output
 Free sedans: [V1, V2]
 R1[alice, V1, 2026-03-05T10:00 -> 2026-03-08T10:00, CONFIRMED, charge=5700]
 R2[bob, V1, 2026-03-08T10:00 -> 2026-03-16T10:00, CONFIRMED, charge=13500]

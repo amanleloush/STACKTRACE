@@ -49,6 +49,19 @@ CREATE TABLE messages (
 - Background **compaction** merges SSTables — choices: STCS (size-tiered), LCS (leveled), TWCS (time-window). Critical tuning for performance.
 - Writes are very fast; reads must check multiple SSTables + memtable, with **bloom filters** + **partition index** to prune.
 
+How a write lands on disk, and what a read has to check:
+
+```mermaid
+flowchart TB
+    w["Write"] --> cl["Commit log (durability)"]
+    w --> mt["Memtable (sorted, in memory)"]
+    mt -->|flush| ss["SSTables (immutable)"]
+    ss -->|"compaction: STCS / LCS / TWCS"| ss
+    r["Read"] --> mt
+    r --> bf["Bloom filter + partition index"]
+    bf -->|prune| ss
+```
+
 ### Token ring & consistent hashing
 
 - Hash the partition key → token (Murmur3, 64-bit).
@@ -96,12 +109,25 @@ Cassandra `IF` clauses (`UPDATE ... IF status = 'OPEN'`) use **Paxos**. Strong c
 
 ## How it works (a write at QUORUM, RF=3)
 
-```
-Client → Coordinator (any node, ideally token-aware)
-  Coordinator forwards write to all 3 replicas
-  Each replica: commit log + memtable
-  When 2 of 3 ack → write returns to client
-  3rd may lag; hinted handoff if it was down
+The write path, step by step:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant Co as Coordinator
+    participant R1 as Replica 1
+    participant R2 as Replica 2
+    participant R3 as Replica 3
+    C->>Co: write at QUORUM
+    Note over C,Co: any node, ideally token-aware
+    Co->>R1: forward write
+    Co->>R2: forward write
+    Co->>R3: forward write
+    Note over R1,R3: each appends commit log + memtable
+    R1-->>Co: ack
+    R2-->>Co: ack
+    Co-->>C: success (2 of 3 acked)
+    Note over Co,R3: 3rd may lag, hinted handoff if it was down
 ```
 
 ## Real-world examples

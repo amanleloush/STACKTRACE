@@ -29,14 +29,17 @@ Version context: Spring Boot 3.x/4.x, Spring Framework 6.x/7.x, Hibernate 6.x/7.
 
 ### Entity lifecycle states
 
-```
-          new Order()                       persist()                     commit / flush
- TRANSIENT ─────────────▶ (not tracked) ──────────────▶ MANAGED ──────────────▶ row in DB
-                                                       │   ▲
-                                      close / clear /   │   │ merge() returns a NEW managed copy
-                                      evict / tx ends   ▼   │
-                                                    DETACHED
- MANAGED ── remove() ──▶ REMOVED ── flush ──▶ DELETE executed
+How an entity moves between the four states:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Transient : new Order()
+    Transient --> Managed : persist()
+    Managed --> Detached : close, clear, evict, tx ends
+    Detached --> Managed : merge() returns a NEW managed copy
+    Managed --> Removed : remove()
+    Removed --> [*] : flush runs DELETE
+    note right of Managed : commit or flush writes the row to the DB
 ```
 
 | State | Has ID? | Tracked by a persistence context? | Meaning |
@@ -120,12 +123,12 @@ Real fixes: fetch what the endpoint needs inside the transaction (`JOIN FETCH`, 
 
 ### The N+1 problem
 
-You run **1** query to get N parents, then **N** more queries, one per parent, to load an association.
+You run **1** query to get N rows, then up to **N** more queries to load an association: one per **distinct** associated entity. The persistence context is an identity map, so once customer 7 is loaded, every other order of customer 7 gets it without SQL. The worst case, every order from a different customer, is the full N+1.
 
 ```java
 List<Order> orders = orderRepo.findByStatus(PENDING);       // 1 query
 for (Order o : orders) {
-    total += o.getCustomer().getCreditLimit();               // +1 query per order
+    total += o.getCustomer().getCreditLimit();               // +1 query per new customer
 }
 ```
 
@@ -139,7 +142,24 @@ select c.id, c.name, c.credit_limit from customer c where c.id=?     -- customer
 ... 497 more ...
 ```
 
-Each query is fast, so the slow-query log doesn't flag it; the endpoint is slow because of **500 round trips**.
+Here 500 orders came from 500 different customers. Each query is fast, so the slow-query log doesn't flag it; the endpoint is slow because of **501 round trips**.
+
+The round trips, side by side with the `JOIN FETCH` fix below:
+
+```mermaid
+sequenceDiagram
+    participant A as App
+    participant D as Database
+    A->>D: select orders where status=?
+    D-->>A: N orders (customer proxies)
+    loop once per distinct customer
+        A->>D: select customer where id=?
+        D-->>A: one customer
+    end
+    Note over A,D: with JOIN FETCH instead
+    A->>D: select orders join customer
+    D-->>A: orders with customers, 1 query
+```
 
 **EAGER doesn't fix it.** With a JPQL query like `select o from Order o`, Hibernate runs your query as written, sees an EAGER `customer`, and loads it with **one extra select per distinct customer** anyway.
 
@@ -310,6 +330,27 @@ GET /orders?status=PENDING
  → Jackson serializes DTOs (no DB access possible or needed)
 ```
 
+The same request as a sequence of calls through the transactional proxy:
+
+```mermaid
+sequenceDiagram
+    participant C as OrderController
+    participant P as Proxy (TransactionInterceptor)
+    participant H as HikariCP
+    participant S as OrderService
+    participant D as Database
+    C->>P: list()
+    P->>H: borrow connection, setAutoCommit(false)
+    Note over P: open persistence context, bind to thread
+    P->>S: list()
+    S->>D: repo.summaries(PENDING), one SQL with join
+    D-->>S: rows as DTOs
+    S-->>P: DTOs
+    P->>D: commit (read-only, no flush)
+    P->>H: close context, return connection
+    P-->>C: DTOs for Jackson
+```
+
 Compare with the anti-pattern: the service returns entities, OSIV keeps the context open, and Jackson triggers N lazy loads while holding the connection.
 
 How to say it in an interview: *"I keep associations lazy, fetch per use case with join fetch or entity graphs, return DTOs from read endpoints, disable open-in-view, keep transactions short with no remote calls inside, and remember that @Transactional is a proxy — so no self-invocation, and checked exceptions commit unless I say otherwise."*
@@ -370,7 +411,7 @@ When Hibernate loads an entity it stores a snapshot of its state. At flush (befo
 
 <QA q="Explain the N+1 problem and four ways to fix it." level="medium">
 
-One query loads N parents, then accessing a lazy (or EAGER, with JPQL) association runs one more query per parent: N+1 round trips. Fixes:
+One query loads N parents, then accessing a lazy (or EAGER, with JPQL) association runs one more query per distinct associated entity (already-loaded ones come from the persistence context): up to N+1 round trips. Fixes:
 
 1. `JOIN FETCH` in JPQL to load parent and association in one SQL.
 2. `@EntityGraph(attributePaths = ...)` on the repository method.

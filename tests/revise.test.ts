@@ -123,11 +123,25 @@ const entry = (file: string) => {
   };
 };
 
+describe('guides', () => {
+  it('show the short version, open, with no one-liner', () => {
+    const t = noteTopic({
+      id: 'salary-negotiation',
+      body: '## The short version\n\nThree rules.\n\n## Details\n\nx\n\n## TL;DR cheat sheet\n\n- y',
+      data: { title: 'Salary', order: 1 },
+    });
+    expect(t.guide).toBe(true);
+    expect(t.oneLinerHtml).toBe('');
+    expect(t.definitionHtml).toContain('Three rules.');
+  });
+});
+
 describe('real content', () => {
   it('every note has a one-liner, definition and cheat sheet', () => {
     for (const f of mdxFiles('src/content/notes')) {
       const t = noteTopic(entry(f));
-      expect(t.oneLinerHtml, f).not.toBe('');
+      // Guides have "The short version" instead of a definition + one-liner.
+      if (!t.guide) expect(t.oneLinerHtml, f).not.toBe('');
       expect(t.definitionHtml, f).not.toBe('');
       expect(t.cheatSheetHtml, f).not.toBe('');
       expect(t.fullHref, f).toMatch(/#tldr/);
@@ -136,7 +150,7 @@ describe('real content', () => {
   it('every DSA page has a one-liner and an explanation', () => {
     for (const f of mdxFiles('src/content/dsa')) {
       const t = dsaTopic(entry(f));
-      expect(t.oneLinerHtml, f).not.toBe('');
+      if (!t.guide) expect(t.oneLinerHtml, f).not.toBe('');
       expect(t.definitionHtml, f).not.toBe('');
     }
   }, 60_000);

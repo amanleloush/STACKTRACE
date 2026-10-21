@@ -85,6 +85,87 @@ These two problems come up together because they test the same skills: a small d
                                                  FakeTicker (tests)
 ```
 
+Part A as a class diagram. Both caches implement the same `Cache` interface (generic in `K` and `V`), so callers can swap them:
+
+```mermaid
+classDiagram
+    class Cache {
+        <<interface>>
+        +get(K key) Optional~V~
+        +put(K key, V value) void
+        +size() int
+    }
+    class LinkedHashMapLRUCache {
+        -Map map
+    }
+    class LRUCache {
+        -int capacity
+        -Map index
+        -Node head
+        -Node tail
+        -ReentrantLock lock
+        +keysLruToMru() List~K~
+        -moveToTail(Node node) void
+        -unlink(Node node) void
+        -linkBeforeTail(Node node) void
+    }
+    class Node {
+        K key
+        V value
+        Node prev
+        Node next
+    }
+    Cache <|.. LinkedHashMapLRUCache
+    Cache <|.. LRUCache
+    LRUCache *-- Node : index and list
+```
+
+Part B as a class diagram. Each limiter keeps per-key state in a `ConcurrentHashMap` and reads time from an injected `Ticker`:
+
+```mermaid
+classDiagram
+    class RateLimiter {
+        <<interface>>
+        +tryAcquire(String key) boolean
+    }
+    class Ticker {
+        <<interface>>
+        +nanos() long
+    }
+    class FakeTicker {
+        +advanceMillis(long ms) void
+    }
+    class TokenBucketRateLimiter {
+        -ConcurrentHashMap buckets
+    }
+    class Bucket {
+        -double tokens
+        -long lastRefill
+        +tryConsume(long now) boolean
+    }
+    class SlidingWindowLogRateLimiter {
+        -ConcurrentHashMap logs
+    }
+    class SlidingWindowCounterRateLimiter {
+        -ConcurrentHashMap windows
+    }
+    class Window {
+        -long windowIndex
+        -long previous
+        -long current
+        +tryAcquire() boolean
+    }
+    RateLimiter <|.. TokenBucketRateLimiter
+    RateLimiter <|.. SlidingWindowLogRateLimiter
+    RateLimiter <|.. SlidingWindowCounterRateLimiter
+    TokenBucketRateLimiter *-- Bucket : one per key
+    SlidingWindowCounterRateLimiter *-- Window : one per key
+    Ticker <|.. FakeTicker
+    TokenBucketRateLimiter --> Ticker
+    SlidingWindowLogRateLimiter --> Ticker
+    SlidingWindowCounterRateLimiter --> Ticker
+```
+
 CHM is `ConcurrentHashMap`. Each limiter owns a map from key to that key's private state, and each piece of state has its own lock.
 
 ## Design patterns used and why
@@ -133,6 +214,22 @@ Many interviewers then say "now do it without `LinkedHashMap`". The classic desi
  head(sentinel) <-> [c] <-> [a] <-> [d] <-> tail(sentinel)
    LRU side                                    MRU side
 ```
+
+The same picture as a diagram. The map points straight at each node, and the list runs from least to most recently used:
+
+```mermaid
+flowchart LR
+    idx["index: HashMap"]
+    subgraph list["Doubly linked list"]
+        direction LR
+        head["head (sentinel)"] <--> c["c"] <--> a["a"] <--> d["d"] <--> tail["tail (sentinel)"]
+    end
+    idx -.->|"key c"| c
+    idx -.->|"key a"| a
+    idx -.->|"key d"| d
+```
+
+`get` moves the found node to just before `tail`, and eviction removes `head.next`.
 
 - The **HashMap** finds a node in O(1).
 - The **doubly linked list** keeps recency order. Because each node knows both neighbours, we can unlink it in O(1) without searching.
@@ -234,7 +331,7 @@ Admit if `estimate` is less than `limit`. It's O(1) memory and smooths the bound
 
 One file, Java 21. `javac Main.java && java Main`.
 
-```java
+```java run
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
@@ -599,7 +696,7 @@ check(hammer(limiter) == 100, "exact under 16 threads");
 
 Demo output (`java Main`):
 
-```
+```text output
 == LRU (hand-rolled), capacity 3 ==
 order LRU->MRU: [c, a, d]
 get(b) = Optional.empty, get(a) = Optional[1]

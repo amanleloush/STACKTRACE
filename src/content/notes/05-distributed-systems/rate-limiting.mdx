@@ -43,6 +43,16 @@ on request:
     deny
 ```
 
+The same logic as a flow, for one request:
+
+```mermaid
+flowchart TB
+    R["Request arrives"] --> F["Refill: tokens + elapsed x r, capped at C"]
+    F --> Q{"tokens at least 1?"}
+    Q -->|yes| A["Take 1 token, allow"]
+    Q -->|no| D["Deny or queue"]
+```
+
 Properties:
 - **Allows bursts** up to bucket capacity.
 - Smooth long-run rate.
@@ -107,13 +117,15 @@ In words: the full count of the current window, plus the share of the previous w
 
 ### Algorithms vs guarantees
 
-| Algorithm | Bursty? | Exact? | Memory | Notes |
+Every algorithm enforces its own rule exactly. The question that separates them is whether they guarantee "at most N requests in **any** rolling window of length W":
+
+| Algorithm | Bursty? | At most N in any rolling window? | Memory | Notes |
 |---|---|---|---|---|
-| Token bucket | Yes (up to C) | Approximate | O(1) per key | Most common |
-| Leaky bucket | No | Approximate | O(1) per key + queue | Shaping |
-| Fixed window | Yes (at boundary) | Exact within bucket | O(1) per key | Boundary effect |
-| Sliding log | No (strict per rolling window) | Exact | O(N) | Expensive |
-| Sliding counter | Modest | Approximate | O(1) per key | Best general fit |
+| Token bucket | Yes (up to C) | No: exact rate + burst, so up to C + r·W in a window | O(1) per key | Most common |
+| Leaky bucket | No | Close: output drains at a fixed rate | O(1) per key + queue | Shaping |
+| Fixed window | Yes (at boundary) | No: N per clock bucket, up to 2N across a boundary | O(1) per key | Boundary effect |
+| Sliding log | No (strict per rolling window) | Yes, exactly | O(N) | Expensive |
+| Sliding counter | Modest | Approximately (assumes even spread) | O(1) per key | Best general fit |
 
 ### Distributed rate limiting
 
@@ -157,6 +169,29 @@ redis.call("HSET", KEYS[1], "tokens", tokens, "ts", ARGV[1])  -- HMSET is deprec
 redis.call("EXPIRE", KEYS[1], 600)
 return allowed
 ```
+
+Where this script sits in a request, with the limit enforced at the gateway:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant G as API gateway
+    participant R as Redis
+    participant S as Service
+    C->>G: request
+    G->>R: run Lua script on rl:userid
+    R->>R: refill, then take 1 token if any
+    R-->>G: allowed 1 or 0
+    alt allowed is 1
+        G->>S: forward request
+        S-->>G: response
+        G-->>C: response
+    else allowed is 0
+        G-->>C: 429 with Retry-After
+    end
+```
+
+The whole read, refill and decrement runs inside Redis as one atomic script, so two gateways can't both spend the last token.
 
 ## Real-world examples
 

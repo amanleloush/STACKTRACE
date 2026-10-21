@@ -158,6 +158,24 @@ What happens on a negative ack:
 - `requeue=true` → the message goes back to the queue, to its original position if possible, otherwise nearer the head. It will be delivered again, with the **`redelivered` flag** set to true.
 - `requeue=false` → the message is **dead-lettered** if the queue has a DLX, otherwise **discarded**.
 
+The life of one message under manual ack:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Ready : enqueued
+    Ready --> Unacked : delivered with a delivery tag
+    Unacked --> Deleted : basic.ack
+    Unacked --> Ready : nack or reject, requeue=true
+    Unacked --> Ready : channel or connection closes
+    Unacked --> DeadLettered : requeue=false, queue has a DLX
+    Unacked --> Discarded : requeue=false, no DLX
+    Deleted --> [*]
+    DeadLettered --> [*]
+    Discarded --> [*]
+```
+
+A requeued message comes back with the `redelivered` flag set.
+
 The `redelivered` flag means "this message may have been seen before". It doesn't say how many times or whether processing actually happened, so it is a hint to check your idempotency store, not proof of a duplicate.
 
 **Auto-ack vs manual ack.** In auto-ack mode, the broker considers the message delivered the moment it's written to the socket. If the consumer crashes a millisecond later, the message is lost. The RabbitMQ docs call this mode unsafe, and it also ignores prefetch, so a fast broker can flood a slow consumer. With manual ack, every unacked message is automatically requeued when the channel or connection closes. That is what gives you **at-least-once** delivery.
@@ -317,6 +335,20 @@ queue q.billing.retry.30s   x-queue-type=quorum, no consumers
 
 queue q.billing.dlq x-queue-type=quorum           # parking lot, alert on depth > 0
   bind orders.dlx
+```
+
+The same topology as a picture, with every path a message can take:
+
+```mermaid
+flowchart TB
+    prod["Producer (confirms)"] --> ex["orders (topic)"]
+    ex -->|"order.created.*"| qb["q.billing (quorum)"]
+    qb --> cons["Consumer (manual ack)"]
+    cons -->|"transient: republish, then ack"| retry["q.billing.retry.30s"]
+    retry -->|"TTL expires, default exchange"| qb
+    cons -->|"permanent or retries exhausted: nack"| dlx["orders.dlx (fanout)"]
+    qb -->|"delivery-limit=10 exceeded"| dlx
+    dlx --> dlq["q.billing.dlq (parking lot)"]
 ```
 
 ```python

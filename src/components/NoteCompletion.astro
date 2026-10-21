@@ -6,9 +6,12 @@
  * a green success state, and a toast slides in with a link to the roadmap.
  * Click again (or "Undo") to revert.
  *
- * State lives in localStorage keyed by `<pillar>:<slug>`. Dispatches a
- * `stacktrace:progress` window event on toggle so the roadmap (or any
- * future view) can react without polling.
+ * State is keyed by `<pillar>:<slug>` in the completion store
+ * (src/lib/completion-store.ts): localStorage first, synced to KV for
+ * signed-in users, with a completion timestamp per item for /progress/.
+ * The store fires the `stacktrace:progress` window event on every change
+ * (local, other tab, or sync) so the roadmap (or any future view) can
+ * react without polling.
  */
 interface Props {
   pillar: 'notes' | 'dsa';
@@ -96,18 +99,12 @@ const hasNext = !!nextHref && !!nextTitle;
 </aside>
 
 <script>
-  type Detail = { key: string; value: boolean };
-
-  function readSet(): Set<string> {
-    try {
-      return new Set(JSON.parse(localStorage.getItem('stacktrace:completed') ?? '[]'));
-    } catch {
-      return new Set();
-    }
-  }
-  function writeSet(s: Set<string>): void {
-    localStorage.setItem('stacktrace:completed', JSON.stringify([...s]));
-  }
+  import {
+    initCompletionStore,
+    isCompleted,
+    onCompletionChange,
+    setCompleted,
+  } from '~/lib/completion-store';
 
   // Tiny confetti — radial burst of colored squares + circles. Triggered
   // only on a true unchecked → checked transition (not on undo, not on load).
@@ -221,18 +218,14 @@ const hasNext = !!nextHref && !!nextTitle;
       root.dataset.done = done ? 'true' : 'false';
       cta!.setAttribute('aria-pressed', done ? 'true' : 'false');
     }
-    paint(readSet().has(key));
+    paint(isCompleted(key));
 
     function toggle(force?: boolean): void {
-      const set = readSet();
-      const wasDone = set.has(key!);
+      const wasDone = isCompleted(key!);
       const next = force ?? !wasDone;
-      if (next) set.add(key!); else set.delete(key!);
-      writeSet(set);
+      // The store persists, syncs and fires `stacktrace:progress`.
+      if (next !== wasDone) setCompleted(key!, next);
       paint(next);
-      window.dispatchEvent(
-        new CustomEvent<Detail>('stacktrace:progress', { detail: { key: key!, value: next } }),
-      );
       // Only celebrate on the true off→on transition.
       if (!wasDone && next) {
         if (burst) {
@@ -247,11 +240,13 @@ const hasNext = !!nextHref && !!nextTitle;
     cta.addEventListener('click', () => toggle());
     undo.addEventListener('click', () => toggle(false));
 
-    window.addEventListener('storage', (e) => {
-      if (e.key === 'stacktrace:completed') paint(readSet().has(key));
+    // Another tab, or the server copy adopted on load: repaint quietly.
+    onCompletionChange((d) => {
+      if (d.key === key && d.source !== 'local') paint(d.entry?.done ?? false);
     });
   }
 
+  initCompletionStore();
   for (const el of document.querySelectorAll<HTMLElement>('.note-done')) init(el);
 </script>
 
@@ -501,6 +496,7 @@ const hasNext = !!nextHref && !!nextTitle;
     position: fixed;
     right: 1.25rem;
     bottom: 1.25rem;
+    max-width: calc(100vw - 2.5rem);
     display: inline-flex;
     align-items: center;
     gap: 0.7rem;

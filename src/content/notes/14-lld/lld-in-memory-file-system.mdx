@@ -98,6 +98,62 @@ Ask these early and write the answers as a comment at the top of your file.
                     InvalidPath, InvalidMove
 ```
 
+The same design as a class diagram. The loop from `DirectoryNode` back to `Node` is the Composite:
+
+```mermaid
+classDiagram
+    class FileSystem {
+        -DirectoryNode root
+        -ReadWriteLock lock
+        +mkdir(String path) void
+        +ls(String path) List~String~
+        +writeFile(String path, String content) void
+        +readFile(String path) String
+        +rm(String path, boolean recursive) void
+        +move(String src, String dst) void
+        +size(String path) long
+        +find(String start, SearchFilter filter) List~String~
+    }
+    class Node {
+        <<abstract>>
+        -String name
+        -DirectoryNode parent
+        +size()* long
+        +path() String
+        +isSelfOrAncestorOf(Node other) boolean
+        +relink(DirectoryNode newParent, String newName) void
+    }
+    class FileNode {
+        -ByteArrayOutputStream data
+        +read() String
+        +write(String content) void
+        +append(String content) void
+    }
+    class DirectoryNode {
+        -NavigableMap children
+        +child(String name) Node
+        +add(Node node) void
+        +remove(String name) void
+    }
+    class SearchFilter {
+        <<interface>>
+        +matches(Node node) boolean
+        +and(SearchFilter other) SearchFilter
+        +or(SearchFilter other) SearchFilter
+        +negate() SearchFilter
+    }
+    class PathParser {
+        +parse(String path)$ List~String~
+        +join(List~String~ parts)$ String
+    }
+    FileSystem *-- DirectoryNode : root
+    FileSystem ..> PathParser : uses
+    FileSystem ..> SearchFilter : find
+    Node <|-- FileNode
+    Node <|-- DirectoryNode
+    DirectoryNode o-- Node : children
+```
+
 - A `DirectoryNode` **has** children; each child is any `Node`. That recursive "has-a" is the Composite.
 - Each `Node` keeps a **parent** pointer. It is needed to build a node's full path, to unlink it on `rm` and `mv`, and to check "is the target inside the thing I'm moving?" by walking upwards.
 - The `FileSystem` never hands a `Node` to callers; its API takes and returns strings. That keeps every change behind the lock.
@@ -381,6 +437,25 @@ This is the method interviewers probe. In order:
 3. **Check for a name clash** at the target. If the clashing entry is the node itself (`mv /a/f /a`, moving a file into the folder it is already in), do nothing.
 4. **Unlink, relink, link.** Remove from the old parent's map, update the node's parent and name, add to the new parent. Because the node object is moved, not copied, the whole subtree moves in O(depth × log k) and every descendant's `path()` is automatically correct.
 
+The same checks as a decision flow:
+
+```mermaid
+flowchart TB
+    start["move(src, dst)"] --> rootq{"src is root?"}
+    rootq -->|"yes"| e1["InvalidMoveException"]
+    rootq -->|"no"| dstq{"What is dst?"}
+    dstq -->|"existing directory"| into["Target: inside dst, same name"]
+    dstq -->|"existing file"| e2["AlreadyExistsException"]
+    dstq -->|"missing"| ren["Target: parent of dst, new name"]
+    into --> loopq{"Target dir inside moved node?"}
+    ren --> loopq
+    loopq -->|"yes"| e1
+    loopq -->|"no"| clash{"Name taken at target?"}
+    clash -->|"by the node itself"| noop["No-op"]
+    clash -->|"by another node"| e2
+    clash -->|"free"| relink["Unlink, relink, link"]
+```
+
 Steps 1 to 4 all run under the one write lock, so no other thread can move a parent in between the check and the change.
 
 `List.getLast()` comes from Java 21's `SequencedCollection`; on older Java use `parts.get(parts.size() - 1)`.
@@ -416,7 +491,7 @@ List<String> find(String start, SearchFilter filter) {
 
 One file, `Main.java`, Java 21. Compile and run with `javac Main.java && java Main`.
 
-```java
+```java run
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
@@ -752,7 +827,7 @@ public class Main {
 
 **Demo output** (real output from running the program above):
 
-```text
+```text output
 ls /home/aman        -> [notes.txt, projects]
 ls via messy path   -> [stacktrace, todo.txt]
 ls on a file         -> [notes.txt]

@@ -43,6 +43,19 @@ For the high-level comparison with Kafka, RabbitMQ and Pulsar, see [Kafka vs Rab
                                country=IN)      own retries, own DLQ
 ```
 
+The same fan-out as a flow: one publish, one queue per consuming service.
+
+```mermaid
+flowchart TB
+    os["order-service"] -->|"Publish (once)"| topic["SNS topic: orders"]
+    topic --> qb["SQS q.billing"]
+    topic --> qs["SQS q.shipping"]
+    topic --> qa["SQS q.analytics"]
+    qb --> wb["billing workers"]
+    qs --> ws["shipping workers"]
+    qa --> la["Lambda"]
+```
+
 ## Core concepts
 
 ### Standard vs FIFO queues
@@ -101,16 +114,16 @@ The catch: high throughput only appears if traffic is spread over **many distinc
 
 This is the core SQS mechanic. A received message is **not removed**. It's hidden.
 
-```
-  SendMessage
-      │
-      ▼
- ┌─────────┐  ReceiveMessage   ┌────────────┐  DeleteMessage(receipt handle)   ┌─────────┐
- │ VISIBLE │ ────────────────► │ IN FLIGHT  │ ───────────────────────────────► │ DELETED │
- └─────────┘                   │ (invisible │                                  └─────────┘
-      ▲                        │  for VT s) │
-      │   timeout expires       └────────────┘
-      └──── (receive count +1; if count > maxReceiveCount → moved to DLQ)
+The life of one message (in flight = invisible for the visibility timeout):
+
+```mermaid
+stateDiagram-v2
+    [*] --> Visible : SendMessage
+    Visible --> InFlight : ReceiveMessage (count +1)
+    InFlight --> Deleted : DeleteMessage with receipt handle
+    InFlight --> Visible : timeout expires
+    InFlight --> DLQ : timeout after maxReceiveCount receives
+    Deleted --> [*]
 ```
 
 - **Default** visibility timeout: **30 seconds**. Range **0 seconds to 12 hours**.
@@ -309,6 +322,23 @@ while running:
             log.warning("delete failed %s", f)
 ```
 
+One loop of this worker, as calls to SQS:
+
+```mermaid
+sequenceDiagram
+    participant W as Worker
+    participant Q as SQS orders queue
+    W->>Q: ReceiveMessage (10 msgs, wait 20s)
+    Q-->>W: messages + receipt handles
+    loop every 60s per message, until done
+        W->>Q: ChangeMessageVisibility 120s
+    end
+    Note over W: skip if already processed, else handle
+    W->>Q: DeleteMessageBatch (succeeded only)
+    Q-->>W: Failed list (check it)
+    Note over Q: undeleted messages reappear after the timeout
+```
+
 Queue config to go with it: redrive policy with `maxReceiveCount=5` to a DLQ whose retention is 14 days, a CloudWatch alarm on the DLQ's `ApproximateNumberOfMessagesVisible` above 0, and an alarm on the source queue's `ApproximateAgeOfOldestMessage`.
 
 ## Real-world examples
@@ -339,7 +369,7 @@ Queue config to go with it: redrive policy with `maxReceiveCount=5` to a DLQ who
 
 <QA q="What is the visibility timeout in SQS and what happens when it expires?" level="easy">
 
-When a consumer receives a message, SQS doesn't delete it. It hides it from other consumers for the visibility timeout (default 30 s, max 12 h). If the consumer deletes the message (with its receipt handle) before the timeout, it's gone. If not, the message becomes **visible again**, its receive count goes up, and another consumer can get it. After `maxReceiveCount` receives it's moved to the DLQ, if one is configured.
+When a consumer receives a message, SQS doesn't delete it. It hides it from other consumers for the visibility timeout (default 30 s, max 12 h). If the consumer deletes the message (with its receipt handle) before the timeout, it's gone. If not, the message becomes **visible again** and another consumer can get it; its receive count goes up on that next receive (the count tracks `ReceiveMessage` deliveries, not timeouts). After `maxReceiveCount` receives it's moved to the DLQ, if one is configured.
 
 </QA>
 

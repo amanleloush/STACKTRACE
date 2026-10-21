@@ -177,10 +177,15 @@ Defences:
 
 **Non-blocking retry topics** — on failure, produce the record to a delay tier and move on:
 
-```
-orders ──fail──► orders-retry-5s ──fail──► orders-retry-1m ──fail──► orders-retry-10m ──fail──► orders-dlt
-   ▲                                                                                              │
-   └────────────────────────── manual / tooling replay after fix ◄─────────────────────────────────┘
+The retry tiers, with replay from the dead-letter topic:
+
+```mermaid
+flowchart TB
+    main["orders"] -->|fail| r5["orders-retry-5s"]
+    r5 -->|fail| r1["orders-retry-1m"]
+    r1 -->|fail| r10["orders-retry-10m"]
+    r10 -->|fail| dlt["orders-dlt"]
+    dlt -.->|"manual / tooling replay after fix"| main
 ```
 
 Each retry consumer waits until `record timestamp + delay` before processing (usually by pausing the partition). The main topic never blocks. The cost: **per-key ordering is gone** — event 2 for order 42 can be processed while event 1 is sitting in `orders-retry-1m`. Use it for independent events; for state-machine streams prefer blocking retries or park the *whole key* until the failed record succeeds. Spring Kafka's `@RetryableTopic` builds this topology for you.
@@ -240,6 +245,27 @@ Raising `fetch.min.bytes` to e.g. 64 KB–1 MB cuts request rate and CPU on brok
 5. commitSync(next offsets for p3, p7)          ← committed to __consumer_offsets
 6. heartbeat thread keeps pinging every 3s throughout
 7. rebalance announced → onPartitionsRevoked → finish in-flight, commitSync → give up partitions
+```
+
+The same flow as a sequence, from joining the group to giving partitions up:
+
+```mermaid
+sequenceDiagram
+    participant C as Consumer
+    participant Co as Group coordinator
+    participant L as Partition leaders
+    participant D as orders-dlt
+    C->>Co: FindCoordinator, JoinGroup, SyncGroup
+    Co-->>C: assigned p3, p7
+    Note over C: onPartitionsAssigned, optional seek to DB offsets
+    C->>L: poll() fetch p3, p7 (long-poll)
+    L-->>C: records
+    Note over C: handle each record (idempotent upsert), bounded retries
+    C->>D: permanent error, produce with error headers
+    C->>Co: commitSync next offsets to __consumer_offsets
+    Note over C,Co: heartbeat thread pings every 3s throughout
+    Note over C: rebalance: onPartitionsRevoked, finish in-flight
+    C->>Co: commitSync, then give up partitions
 ```
 
 ## Real-world examples

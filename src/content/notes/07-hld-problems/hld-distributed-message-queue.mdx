@@ -173,6 +173,23 @@ The client asks any broker for **metadata**, caches which broker leads each part
                        (optional) tiered storage: old segments → object store
 ```
 
+The same system with the per-partition detail left out:
+
+```mermaid
+flowchart TB
+    prod["Producers (client lib)"] -->|"Produce(batch)"| fleet
+    subgraph fleet["Broker fleet"]
+        b1["Broker 1 (leads orders-p0)"]
+        b2["Broker 2 (leads orders-p1)"]
+        b3["Broker 3 (leads orders-p2)"]
+        gc["Group coordinator"]
+    end
+    ctrl["Controller quorum (3/5)"] ---|"heartbeats, metadata, ISR changes"| fleet
+    fleet -->|"Fetch(offset) long-poll"| ga["Consumer group A (3)"]
+    fleet -->|"Fetch(offset) long-poll"| gb["Consumer group B (1)"]
+    fleet -.->|"old segments (optional)"| obj["Tiered object store"]
+```
+
 ### Write path
 
 1. The producer library picks a partition: `hash(key) % partitionCount`, or spreads keyless messages across partitions.
@@ -180,6 +197,24 @@ The client asks any broker for **metadata**, caches which broker leads each part
 3. The partition **leader** checks the batch, assigns offsets, and appends it to the **active segment** (written to the page cache, not forced to disk).
 4. **Followers** fetch from the leader and append the same bytes to their own logs.
 5. Once every ISR member has the batch, the leader moves the **high watermark** forward and, if `acks=all`, replies to the producer with the base offset.
+
+The write path with `acks=all`:
+
+```mermaid
+sequenceDiagram
+    participant P as Producer library
+    participant L as Partition leader
+    participant F as ISR followers
+    P->>P: pick partition, add to batch
+    P->>L: Produce(batch) when full or lingered
+    L->>L: assign offsets, append to active segment
+    F->>L: Fetch
+    L-->>F: batch bytes
+    F->>F: append to own log
+    Note over L,F: every ISR member has the batch
+    L->>L: advance high watermark
+    L-->>P: base offset
+```
 
 ### Read path
 
@@ -270,6 +305,25 @@ consumers may read offsets 0..99 only
 **Why ISR instead of a majority quorum?** A majority quorum needs 2f+1 replicas to survive f failures. An ISR waits for *all currently healthy* replicas, so f+1 replicas can survive f failures of committed data. That means less disk and less replication traffic for the same safety. The cost: a slow follower adds latency until it is dropped from the ISR, and the ISR can shrink. The Kafka design docs make exactly this argument.
 
 **Leader failure.** The controller notices the broker is gone, picks a new leader **from the ISR**, bumps the **leader epoch**, and publishes the change. Clients get `NOT_LEADER`, refresh metadata and retry. When the old leader comes back, it uses leader-epoch history to find where its log diverges from the new leader and **truncates** the extra, uncommitted tail before following again.
+
+Leader failover and the old leader's return:
+
+```mermaid
+sequenceDiagram
+    participant C as Controller
+    participant O as Old leader
+    participant N as ISR follower
+    participant P as Producer
+    Note over O: broker dies
+    C->>C: notice broker gone
+    C->>N: you lead now, leader epoch +1
+    Note over P: gets NOT_LEADER, refreshes metadata
+    P->>N: retry Produce
+    Note over O: comes back
+    O->>N: find divergence via leader epochs
+    O->>O: truncate uncommitted tail
+    O->>N: fetch as a follower
+```
 
 **Unclean leader election** (`unclean.leader.election.enable`, default false): if every ISR member is dead, should an out-of-sync replica become leader? Yes = available again but **committed data is lost**. No = the partition stays offline until an ISR member returns. This is a CAP choice; see [CAP and PACELC](/learn/notes/cap-pacelc-consistency/).
 

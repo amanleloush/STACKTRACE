@@ -148,6 +148,25 @@ Fixes: inject an `ObjectProvider` of `ReportBuilder` (written `ObjectProvider<Re
                           (not for prototypes — Spring never destroys them)
 ```
 
+The same lifecycle as states a bean moves through:
+
+```mermaid
+stateDiagram-v2
+    state "Instantiated" as Inst
+    state "Properties populated" as Pop
+    state "Aware callbacks done" as Aware
+    state "Initialized (raw object)" as Init
+    state "Proxied, ready" as Ready
+    state "Destroyed" as Dest
+    [*] --> Inst : constructor runs
+    Inst --> Pop : setter / field injection
+    Pop --> Aware : BeanNameAware etc.
+    Aware --> Init : BPP before-init, then PostConstruct, init methods
+    Init --> Ready : BPP after-init creates AOP proxy
+    Ready --> Dest : shutdown, singletons only
+    Dest --> [*]
+```
+
 Two consequences people get asked about:
 
 - **`@PostConstruct` runs on the raw object, before the proxy exists.** Calling a `@Transactional` method of the same bean from `@PostConstruct` runs with no transaction. If you need the fully proxied, fully started app, listen for `ApplicationReadyEvent` instead.
@@ -193,6 +212,24 @@ caller ──▶ [ proxy: begin tx → target.place() → commit ]   ✅ advice 
 target.placeAll() ──this.place()──▶ target.place()          ❌ proxy never involved
 ```
 
+Both calls side by side. Only the first one passes through the proxy:
+
+```mermaid
+sequenceDiagram
+    participant C as Caller
+    participant P as Proxy
+    participant T as Target OrderService
+    C->>P: place(o)
+    P->>P: begin tx
+    P->>T: place(o)
+    T-->>P: return
+    P->>P: commit
+    C->>P: placeAll(orders)
+    P->>T: placeAll(orders), no advice
+    T->>T: this.place(o)
+    Note over T: no proxy, so no transaction
+```
+
 Fixes, best first: move `place` into another bean; inject the bean into itself (self-injection, often with `@Lazy`) and call through that; use `TransactionTemplate` for programmatic control; or switch to AspectJ weaving, which modifies bytecode and has no proxy. `AopContext.currentProxy()` works but ties your code to Spring AOP.
 
 ### Auto-configuration: how Boot decides what to create
@@ -221,6 +258,17 @@ META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports
 | `@ConditionalOnExpression` | a SpEL expression is true |
 
 The key design rule is **`@ConditionalOnMissingBean`: your beans win.** Boot loads auto-configurations *after* your own bean definitions, so if you declare your own `ObjectMapper` or `DataSource`, Boot's default backs off.
+
+How one auto-configuration (say, Boot's default `ObjectMapper`) decides whether to create its bean:
+
+```mermaid
+flowchart TB
+    ac["Listed in AutoConfiguration.imports"] --> c1{"ConditionalOnClass: class on classpath?"}
+    c1 -->|"no"| skip["Skipped"]
+    c1 -->|"yes"| c2{"ConditionalOnMissingBean: you defined one?"}
+    c2 -->|"yes"| back["Boot's default backs off"]
+    c2 -->|"no"| make["Boot creates its default bean"]
+```
 
 Debugging: run with `--debug` (or `debug=true`) to print the **condition evaluation report** showing which auto-configurations matched and why. The Actuator `/actuator/conditions` endpoint shows the same at runtime. To turn one off: `@SpringBootApplication(exclude = DataSourceAutoConfiguration.class)` or `spring.autoconfigure.exclude=...`.
 
