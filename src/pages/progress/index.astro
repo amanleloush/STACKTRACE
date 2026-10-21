@@ -1,0 +1,441 @@
+---
+import { getCollection } from 'astro:content';
+import BaseLayout from '~/layouts/BaseLayout.astro';
+import { NOTES_PHASES } from '~/lib/notes-phases';
+import { PHASES as DSA_PHASES } from '~/lib/dsa-phases';
+import { formatPhaseLabel } from '~/lib/phase-label';
+import type { PhaseInfo, Topic } from '~/lib/completion';
+
+// Static shell. Topic lists are baked in at build time; completion,
+// streaks and the other counters are filled in the browser from the
+// completion store (localStorage + KV sync for signed-in users) and the
+// company-tracker / mistakes / mock-round stores.
+export const prerender = true;
+
+type Pillar = 'notes' | 'dsa';
+
+async function pillarData(pillar: Pillar, meta: PhaseInfo[]) {
+  const entries = await getCollection(pillar, (n) => !n.data.draft);
+  const topics: Topic[] = entries.map((e) => ({
+    key: `${pillar}:${e.id}`,
+    title: e.data.title,
+    href: `/learn/${pillar}/${e.id}/`,
+    phase: e.data.phase,
+    order: e.data.order,
+  }));
+  // Metadata order first; any phase missing from it goes last, by slug.
+  const known = new Set(meta.map((p) => p.slug));
+  const extra = [...new Set(topics.map((t) => t.phase))]
+    .filter((p) => !known.has(p))
+    .sort()
+    .map((slug) => ({ slug, num: slug.match(/^(\d+)-/)?.[1] ?? '··', title: formatPhaseLabel(slug) }));
+  const phases = [...meta, ...extra]
+    .map(({ slug, num, title }) => ({ slug, num, title }))
+    .map((p) => {
+      const list = topics.filter((t) => t.phase === p.slug).sort((a, b) => a.order - b.order);
+      return { ...p, total: list.length, first: list[0] ?? null };
+    })
+    .filter((p) => p.total > 0);
+  return { topics, phases };
+}
+
+const notes = await pillarData('notes', NOTES_PHASES);
+const dsa = await pillarData('dsa', DSA_PHASES);
+
+const data = {
+  notes: { topics: notes.topics, phases: notes.phases.map(({ slug, num, title }) => ({ slug, num, title })) },
+  dsa: { topics: dsa.topics, phases: dsa.phases.map(({ slug, num, title }) => ({ slug, num, title })) },
+};
+
+const sections = [
+  { pillar: 'notes' as const, heading: 'System design', phaseBase: '/notes/', phases: notes.phases, total: notes.topics.length },
+  { pillar: 'dsa' as const, heading: 'DSA', phaseBase: '/dsa/', phases: dsa.phases, total: dsa.topics.length },
+];
+---
+<BaseLayout
+  title="Your progress — StackTrace"
+  description="Completed topics per phase, your streak, a 12-week activity map, and where to pick up next."
+>
+  <nav class="crumbs" aria-label="Breadcrumb">
+    <a href="/roadmap/">Roadmap</a> <span aria-hidden="true">/</span>
+    <span aria-current="page">Progress</span>
+  </nav>
+
+  <header class="pg-head">
+    <h1>Your progress</h1>
+    <p class="pg-lede">
+      Every note and DSA page you mark as completed, by phase — plus your streak and where to pick up next.
+    </p>
+    <p class="pg-sync" aria-live="polite"></p>
+  </header>
+
+  <noscript>
+    <p class="pg-msg">Your progress lives in this browser, so this dashboard needs JavaScript to show it.</p>
+  </noscript>
+
+  <section class="pg-stats" aria-label="Overview">
+    <div class="pg-stat">
+      <p class="pg-stat__label">System design</p>
+      <p class="pg-stat__value"><span data-total-done="notes">–</span><span class="pg-stat__of"> / {notes.topics.length}</span></p>
+      <p class="pg-stat__sub" data-total-pct="notes"></p>
+    </div>
+    <div class="pg-stat">
+      <p class="pg-stat__label">DSA</p>
+      <p class="pg-stat__value"><span data-total-done="dsa">–</span><span class="pg-stat__of"> / {dsa.topics.length}</span></p>
+      <p class="pg-stat__sub" data-total-pct="dsa"></p>
+    </div>
+    <div class="pg-stat">
+      <p class="pg-stat__label">Current streak</p>
+      <p class="pg-stat__value"><span data-streak="current">–</span><span class="pg-stat__of" data-streak-unit="current"></span></p>
+      <p class="pg-stat__sub" data-streak-note></p>
+    </div>
+    <div class="pg-stat">
+      <p class="pg-stat__label">Longest streak</p>
+      <p class="pg-stat__value"><span data-streak="longest">–</span><span class="pg-stat__of" data-streak-unit="longest"></span></p>
+      <p class="pg-stat__sub">Days in a row with at least one completion</p>
+    </div>
+  </section>
+
+  <section class="pg-section" aria-labelledby="pg-activity-h">
+    <h2 id="pg-activity-h">Last 12 weeks</h2>
+    <p class="pg-hint" data-activity-summary>Completions per day, oldest on the left.</p>
+    <div class="pg-heat-wrap">
+      <div class="pg-heat-days" aria-hidden="true">
+        <span></span><span>Mon</span><span></span><span>Wed</span><span></span><span>Fri</span><span></span>
+      </div>
+      <ol class="pg-heat" aria-label="Completions per day over the last 12 weeks"></ol>
+    </div>
+    <p class="pg-legend" aria-hidden="true">
+      Less <span class="pg-cell" data-level="0"></span><span class="pg-cell" data-level="1"></span><span class="pg-cell" data-level="2"></span><span class="pg-cell" data-level="3"></span><span class="pg-cell" data-level="4"></span> More
+    </p>
+  </section>
+
+  <section class="pg-section" aria-labelledby="pg-else-h">
+    <h2 id="pg-else-h">Practice</h2>
+    <ul class="pg-else">
+      <li>
+        <a href="/dsa/companies/"><span class="pg-else__n" data-other="solved">–</span> company problems solved</a>
+      </li>
+      <li>
+        <a href="/review/mistakes/"><span class="pg-else__n" data-other="open">–</span> quiz mistakes open · <span class="pg-else__n" data-other="resolved">–</span> resolved</a>
+      </li>
+      <li>
+        <a href="/mock/"><span class="pg-else__n" data-other="mock">–</span> mock rounds</a>
+      </li>
+    </ul>
+  </section>
+
+  {sections.map((s) => (
+    <section class="pg-section" aria-labelledby={`pg-${s.pillar}-h`}>
+      <h2 id={`pg-${s.pillar}-h`}>{s.heading} <span class="pg-h-count">{s.total} topics</span></h2>
+      <ul class="pg-phases">
+        {s.phases.map((p) => (
+          <li class="pg-phase" data-pillar={s.pillar} data-phase={p.slug} data-complete="false">
+            <div class="pg-phase__top">
+              <a class="pg-phase__name" href={`${s.phaseBase}${p.slug}/`}>
+                <span class="pg-phase__num">{p.num}</span> {p.title}
+              </a>
+              <span class="pg-phase__count"><span data-done>–</span> / {p.total} · <span data-pct>–</span></span>
+            </div>
+            <div
+              class="pg-bar"
+              role="progressbar"
+              aria-label={`${p.title} completion`}
+              aria-valuemin="0"
+              aria-valuemax="100"
+              aria-valuenow="0"
+            >
+              <span class="pg-bar__fill"></span>
+            </div>
+            <p class="pg-phase__next">
+              {p.first && (
+                <a data-next href={p.first.href}>
+                  <span data-next-label>Start</span>: <span data-next-title>{p.first.title}</span> →
+                </a>
+              )}
+              <span class="pg-phase__all" data-all-done hidden>All done ✓</span>
+            </p>
+          </li>
+        ))}
+      </ul>
+    </section>
+  ))}
+
+  <script is:inline type="application/json" id="pg-data" set:html={JSON.stringify(data).replace(/</g, '\\u003c')} />
+</BaseLayout>
+
+<script>
+  import {
+    activityByDay,
+    aggregatePhases,
+    computeStreaks,
+    dayKey,
+    doneKeys,
+    heatmapCells,
+    totals,
+    type PhaseInfo,
+    type Topic,
+  } from '~/lib/completion';
+  import { initCompletionStore, onCompletionChange, onCompletionSync, readAllCompletion, type SyncState } from '~/lib/completion-store';
+  import { initProblemStore, onChange as onProblemChange, readAll as readAllProblems } from '~/lib/problem-store';
+  import { initMistakesStore, onMistakesChange, readAllMistakes } from '~/lib/mistakes-store';
+  import { coerceHistory } from '~/components/mock/mock-logic';
+
+  type Pillar = 'notes' | 'dsa';
+  type Data = Record<Pillar, { topics: Topic[]; phases: PhaseInfo[] }>;
+
+  const data: Data = JSON.parse(document.getElementById('pg-data')?.textContent ?? '{}');
+  const PILLARS: Pillar[] = ['notes', 'dsa'];
+  const $ = <T extends Element = HTMLElement>(sel: string, root: ParentNode = document) => root.querySelector<T>(sel);
+  const dateFmt = new Intl.DateTimeFormat(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+
+  function plural(n: number, one: string, many: string): string {
+    return `${n} ${n === 1 ? one : many}`;
+  }
+
+  function paintPhases(done: Set<string>): void {
+    const isDone = (k: string) => done.has(k);
+    for (const pillar of PILLARS) {
+      const d = data[pillar];
+      if (!d) continue;
+      const rows = aggregatePhases(d.phases, d.topics, isDone);
+      for (const p of rows) {
+        const li = $(`.pg-phase[data-pillar="${pillar}"][data-phase="${p.slug}"]`);
+        if (!li) continue;
+        $('[data-done]', li)!.textContent = String(p.done);
+        $('[data-pct]', li)!.textContent = `${p.pct}%`;
+        const bar = $('.pg-bar', li)!;
+        bar.setAttribute('aria-valuenow', String(p.pct));
+        bar.setAttribute('aria-valuetext', `${p.done} of ${p.total} topics`);
+        $<HTMLElement>('.pg-bar__fill', li)!.style.width = `${p.total ? (p.done / p.total) * 100 : 0}%`;
+        li.dataset.complete = p.next ? 'false' : 'true';
+        const link = $<HTMLAnchorElement>('[data-next]', li);
+        if (link) {
+          link.hidden = !p.next;
+          if (p.next) {
+            link.href = p.next.href;
+            $('[data-next-label]', li)!.textContent = p.done > 0 ? 'Continue' : 'Start';
+            $('[data-next-title]', li)!.textContent = p.next.title;
+          }
+        }
+        $<HTMLElement>('[data-all-done]', li)!.hidden = !!p.next;
+      }
+      const t = totals(rows);
+      $(`[data-total-done="${pillar}"]`)!.textContent = String(t.done);
+      $(`[data-total-pct="${pillar}"]`)!.textContent = `${t.pct}% complete`;
+    }
+  }
+
+  function paintActivity(): void {
+    const map = readAllCompletion();
+    const today = dayKey(Date.now());
+    const activity = activityByDay(map);
+    const streaks = computeStreaks(activity.keys(), today);
+    for (const k of ['current', 'longest'] as const) {
+      $(`[data-streak="${k}"]`)!.textContent = String(streaks[k]);
+      $(`[data-streak-unit="${k}"]`)!.textContent = streaks[k] === 1 ? ' day' : ' days';
+    }
+    $('[data-streak-note]')!.textContent =
+      streaks.current > 0 && !activity.has(today)
+        ? 'Complete a topic today to keep it going'
+        : streaks.current > 0
+          ? 'Done for today — nice'
+          : 'Complete a topic to start one';
+
+    const cells = heatmapCells(activity, today, 12);
+    const grid = $('.pg-heat')!;
+    const items: HTMLLIElement[] = [];
+    let sum = 0;
+    let days = 0;
+    for (const c of cells) {
+      const li = document.createElement('li');
+      li.className = 'pg-cell';
+      li.dataset.level = String(c.level);
+      if (c.future) {
+        li.dataset.future = 'true';
+        li.setAttribute('aria-hidden', 'true');
+      } else {
+        // Parse at noon so the label's date can't slip across midnight.
+        const label = `${dateFmt.format(new Date(`${c.day}T12:00:00`))}: ${plural(c.count, 'completion', 'completions')}`;
+        li.setAttribute('aria-label', label);
+        li.title = label;
+        sum += c.count;
+        if (c.count > 0) days++;
+      }
+      items.push(li);
+    }
+    grid.replaceChildren(...items);
+    $('[data-activity-summary]')!.textContent =
+      `${plural(sum, 'completion', 'completions')} on ${plural(days, 'day', 'days')} in the last 12 weeks.` +
+      (doneKeys(map).size > sum ? ' Topics completed before dates were recorded count in the totals, not here.' : '');
+  }
+
+  function paintCompletion(): void {
+    paintPhases(doneKeys(readAllCompletion()));
+    paintActivity();
+  }
+
+  function paintOthers(): void {
+    const solved = Object.values(readAllProblems()).filter((e) => e.solved).length;
+    let open = 0;
+    let resolved = 0;
+    for (const e of Object.values(readAllMistakes())) {
+      if (e.status === 'open') open++;
+      else resolved++;
+    }
+    let mock = 0;
+    try {
+      mock = coerceHistory(JSON.parse(localStorage.getItem('mock:v1:history') ?? 'null')).length;
+    } catch {
+      /* storage blocked or malformed: 0 */
+    }
+    $('[data-other="solved"]')!.textContent = String(solved);
+    $('[data-other="open"]')!.textContent = String(open);
+    $('[data-other="resolved"]')!.textContent = String(resolved);
+    $('[data-other="mock"]')!.textContent = String(mock);
+  }
+
+  const SYNC_TEXT: Record<SyncState, string> = {
+    local: 'Saved in this browser. Sign in to keep it in sync across devices.',
+    syncing: 'Syncing…',
+    synced: 'Synced across your devices.',
+    error: 'Saved in this browser; sync will retry.',
+  };
+
+  initCompletionStore();
+  initProblemStore();
+  initMistakesStore();
+  paintCompletion();
+  paintOthers();
+  onCompletionChange(paintCompletion);
+  onProblemChange(paintOthers);
+  onMistakesChange(paintOthers);
+  window.addEventListener('storage', (e) => {
+    if (e.key === 'mock:v1:history') paintOthers();
+  });
+  onCompletionSync((s) => {
+    $('.pg-sync')!.textContent = SYNC_TEXT[s];
+  });
+</script>
+
+<style>
+  .crumbs { font-size: 0.82rem; color: var(--fg-faint); margin-bottom: 1rem; }
+  .crumbs a { color: var(--fg-muted); }
+  .pg-head h1 { margin: 0 0 0.5rem; }
+  .pg-lede { color: var(--fg-muted); max-width: 72ch; line-height: 1.55; margin: 0; }
+  .pg-sync { margin: 0.5rem 0 0; font-family: var(--font-code); font-size: 0.78rem; color: var(--fg-muted); min-height: 1em; }
+  .pg-msg { color: var(--fg-muted); padding: 1rem 0 0; }
+
+  .pg-stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 0.75rem;
+    margin: 1.75rem 0 0;
+  }
+  .pg-stat {
+    padding: 0.85rem 1rem;
+    border: 1px solid var(--card-border);
+    border-radius: 12px;
+    background: var(--card-bg);
+    min-width: 0;
+  }
+  .pg-stat p { margin: 0; }
+  .pg-stat__label { font-size: 0.75rem; font-family: var(--font-code); letter-spacing: 0.04em; text-transform: uppercase; color: var(--fg-muted); }
+  .pg-stat__value { font-size: 1.7rem; font-weight: 700; line-height: 1.2; margin: 0.25rem 0 !important; font-variant-numeric: tabular-nums; }
+  .pg-stat__of { font-size: 0.95rem; font-weight: 500; color: var(--fg-muted); }
+  .pg-stat__sub { font-size: 0.78rem; color: var(--fg-faint); }
+
+  .pg-section { margin: 2.25rem 0 0; }
+  .pg-section h2 { font-size: 1.2rem; margin: 0 0 0.75rem; }
+  .pg-h-count { font-size: 0.8rem; font-weight: 500; color: var(--fg-faint); font-family: var(--font-code); margin-left: 0.3rem; }
+  .pg-hint { color: var(--fg-muted); font-size: 0.85rem; margin: 0 0 0.75rem; }
+
+  /* 12 weeks × 7 days, column by column. Sized off the container so it
+     fits a 375px screen without scrolling. */
+  .pg-heat-wrap { display: flex; gap: 0.4rem; max-width: 26rem; }
+  .pg-heat-days {
+    display: grid;
+    grid-template-rows: repeat(7, 1fr);
+    gap: 3px;
+    font-size: 0.65rem;
+    color: var(--fg-faint);
+    font-family: var(--font-code);
+  }
+  .pg-heat-days span { display: flex; align-items: center; }
+  .pg-heat {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    flex: 1;
+    min-width: 0;
+    display: grid;
+    grid-template-rows: repeat(7, auto);
+    grid-auto-flow: column;
+    grid-auto-columns: 1fr;
+    gap: 3px;
+  }
+  /* Heatmap cells are built in the browser, so they have no scoped attribute. */
+  :global(.pg-cell) {
+    display: inline-block;
+    aspect-ratio: 1;
+    min-width: 0;
+    border-radius: 3px;
+    background: var(--bg-soft);
+    box-shadow: inset 0 0 0 1px var(--card-border);
+  }
+  :global(.pg-cell[data-level='1']) { background: color-mix(in srgb, var(--anim-success) 30%, var(--bg-soft)); }
+  :global(.pg-cell[data-level='2']) { background: color-mix(in srgb, var(--anim-success) 55%, var(--bg-soft)); }
+  :global(.pg-cell[data-level='3']) { background: color-mix(in srgb, var(--anim-success) 78%, var(--bg-soft)); }
+  :global(.pg-cell[data-level='4']) { background: var(--anim-success); }
+  :global(.pg-cell[data-future='true']) { visibility: hidden; }
+  .pg-legend { display: flex; align-items: center; gap: 3px; font-size: 0.72rem; color: var(--fg-faint); margin: 0.6rem 0 0; }
+  .pg-legend .pg-cell { width: 11px; }
+  .pg-legend .pg-cell:first-child { margin-left: 0.3rem; }
+  .pg-legend .pg-cell:last-of-type { margin-right: 0.3rem; }
+
+  .pg-else { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 0.6rem; }
+  .pg-else a {
+    display: inline-block;
+    padding: 0.55rem 0.9rem;
+    border: 1px solid var(--card-border);
+    border-radius: 10px;
+    background: var(--card-bg);
+    color: var(--fg);
+    font-size: 0.9rem;
+    text-decoration: none;
+  }
+  .pg-else a:hover { border-color: var(--accent); }
+  .pg-else__n { font-weight: 700; font-family: var(--font-code); }
+
+  .pg-phases {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 0.75rem;
+  }
+  .pg-phase {
+    padding: 0.85rem 1rem;
+    border: 1px solid var(--card-border);
+    border-radius: 12px;
+    background: var(--card-bg);
+    min-width: 0;
+  }
+  .pg-phase[data-complete='true'] { border-color: color-mix(in srgb, var(--anim-success) 55%, var(--card-border)); }
+  .pg-phase__top { display: flex; justify-content: space-between; align-items: baseline; gap: 0.5rem; flex-wrap: wrap; }
+  .pg-phase__name { font-weight: 600; color: var(--fg); overflow-wrap: anywhere; }
+  .pg-phase__num { font-family: var(--font-code); font-size: 0.78rem; color: var(--fg-faint); }
+  .pg-phase__count { font-size: 0.78rem; color: var(--fg-muted); font-family: var(--font-code); white-space: nowrap; }
+  .pg-bar { height: 6px; margin: 0.6rem 0; border-radius: 999px; background: var(--bg-soft); box-shadow: inset 0 0 0 1px var(--card-border); overflow: hidden; }
+  .pg-bar__fill { display: block; height: 100%; width: 0; background: var(--anim-success); border-radius: inherit; transition: width 0.3s ease; }
+  .pg-phase__next { margin: 0; font-size: 0.82rem; overflow-wrap: anywhere; }
+  .pg-phase__next a { color: var(--primary-light); }
+  .pg-phase__all { color: var(--anim-success); font-weight: 600; }
+
+  a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .pg-bar__fill { transition: none; }
+  }
+</style>
