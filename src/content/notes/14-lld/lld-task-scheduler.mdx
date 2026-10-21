@@ -83,9 +83,81 @@ This problem comes up a lot because it tests real concurrency (locks, conditions
                                      nextRunAt, anchor, failures, runs, lastError
 
   JobState:  SCHEDULED ──dispatch──► RUNNING ──ok, recurring──► SCHEDULED
+                 │                      ├──threw, retry left (after backoff)──► SCHEDULED
                  │                      ├──ok, one-off──► COMPLETED
-                 │                      ├──threw, no retry left──► FAILED
-                 └──cancel()──► CANCELLED ◄──cancel() or shutdown──┘
+                 │                      ├──threw, no retry left (one-off or recurring)──► FAILED
+                 └──cancel()/shutdown──► CANCELLED ◄──cancel() or shutdown──┘
+```
+
+The classes from the full solution. Callers only ever see `JobHandle`, and `Job` is private inside `TaskScheduler`:
+
+```mermaid
+classDiagram
+    class TaskScheduler {
+        -ReentrantLock lock
+        -Condition wakeUp
+        -PriorityQueue~Job~ queue
+        -Executor workers
+        +start(SchedulerClock clock, int workerThreads)$ TaskScheduler
+        +manual(SchedulerClock clock)$ TaskScheduler
+        +submit(name, task, initialDelayMs, repeat, retry) JobHandle
+        +runDueTasks() int
+        +shutdown() List~JobHandle~
+        +shutdownNow() List~JobHandle~
+    }
+    class JobHandle {
+        <<interface>>
+        +state() JobState
+        +runs() int
+        +cancel() boolean
+    }
+    class Job {
+        -Runnable task
+        -AtomicReference~JobState~ state
+        -long nextRunAt
+        -long anchor
+        +run() void
+    }
+    class SchedulerClock {
+        <<interface>>
+        +millis() long
+        +onJump(Runnable listener) void
+    }
+    class SystemClock
+    class FakeClock {
+        +advance(long ms) void
+        +advanceTo(long t) void
+    }
+    class Repeat {
+        <<sealed interface>>
+    }
+    class RetryPolicy {
+        <<interface>>
+        +backoffMillis(int failures) long
+    }
+    TaskScheduler *-- Job : 0..*
+    JobHandle <|.. Job
+    TaskScheduler --> SchedulerClock
+    SchedulerClock <|.. SystemClock
+    SchedulerClock <|.. FakeClock
+    Job --> Repeat : Once, FixedRate, FixedDelay
+    Job --> RetryPolicy
+```
+
+The `JobState` machine as the code implements it. Every arrow is a compare-and-set on `state`:
+
+```mermaid
+stateDiagram-v2
+    [*] --> SCHEDULED : submit
+    SCHEDULED --> RUNNING : pollDue
+    RUNNING --> SCHEDULED : recurring, or retry left
+    RUNNING --> COMPLETED : ok, no next run
+    RUNNING --> FAILED : threw, no retry left
+    SCHEDULED --> CANCELLED : cancel or shutdown
+    RUNNING --> CANCELLED : cancel or shutdown
+    COMPLETED --> [*]
+    FAILED --> [*]
+    CANCELLED --> [*]
 ```
 
 - `TaskScheduler` **owns** the queue, the lock and the dispatcher thread. The worker `Executor` is created by a factory method, so tests can swap it.

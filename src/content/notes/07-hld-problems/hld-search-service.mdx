@@ -106,32 +106,32 @@ Use a **cursor** (encodes the last sort values) instead of `page=500`. Deep offs
 
 ## High-level architecture
 
-The write path (left) and read path (right) meet at the index cluster:
+The write path (steps W1 to W3) and read path (steps R1 to R3) meet at the index cluster:
 
 ```mermaid
 flowchart TB
   subgraph write["Write path"]
-    tsvc["Tweet / Catalog service"] -->|"(1) write"| db[("Primary DB")]
-    db -->|"(2) event / CDC"| kafka[["Kafka doc-events (keyed by doc_id)"]]
-    kafka --> idx["Indexer workers: enrich + bulk"]
+    tsvc["Tweet / Catalog service"] -->|"W1 write"| db[("Primary DB")]
+    db -->|"W2 event / CDC"| kafka[["Kafka doc-events (keyed by doc_id)"]]
+    kafka -->|"W3 consume, enrich"| idx["Indexer workers: enrich + bulk"]
   end
   subgraph read["Read path"]
     client["Client"] --> gw["API gateway"]
     gw --> search["Search service: parse, rewrite"]
     search <--> cache[("Query cache (Redis)")]
-    search -->|"(3) one request"| broker["Broker / coordinator"]
+    search -->|"R1 one request"| broker["Broker / coordinator"]
   end
-  idx -->|"(4) bulk index"| cluster[("Index cluster (daily, 10 shards)")]
-  broker -->|"(5) scatter"| cluster
-  cluster -->|"(6) local top K each"| merge["Merge top K, re-rank, hydrate"]
+  idx -->|"W3 bulk index"| cluster[("Index cluster (daily, 10 shards)")]
+  broker -->|"R2 scatter"| cluster
+  cluster -->|"R3 local top K each"| merge["Merge top K, re-rank, hydrate"]
   merge --> client
 ```
 
 The index cluster holds one index per day, 10 shards each, with 1+ replicas, and each shard is a small inverted index of its own. The broker does the merge.
 
-**Write path.** (1) The tweet service saves the tweet in its own database, the source of truth. (2) It publishes an event to Kafka (or a [change data capture](/learn/notes/change-data-capture/) connector does it from the DB log), keyed by `doc_id` so all changes to one document stay in order on one partition. (3) Indexer workers consume, enrich (language, author follower count, spam score), and send **bulk** requests to the index cluster. (4) Each shard writes the doc to its in-memory buffer; at the next **refresh** it becomes searchable.
+**Write path.** (W1) The tweet service saves the tweet in its own database, the source of truth. (W2) It publishes an event to Kafka (or a [change data capture](/learn/notes/change-data-capture/) connector does it from the DB log), keyed by `doc_id` so all changes to one document stay in order on one partition. (W3) Indexer workers consume, enrich (language, author follower count, spam score), and send **bulk** requests to the index cluster. (W4, inside the cluster) Each shard writes the doc to its in-memory buffer; at the next **refresh** it becomes searchable.
 
-**Read path.** The search service parses the query (phrases, filters), applies the same analyzer the index used, checks a short-lived query cache for very hot queries, then sends one request to a broker. The broker picks the indexes to search (for `mode=latest` maybe just today's), sends the query to one copy of every relevant shard, each shard scores its local matches and returns its top K, and the broker merges them. A second-stage ranker re-scores the merged top few hundred, then the service hydrates the final 20 (author info, media) and returns.
+**Read path.** The search service parses the query (phrases, filters), applies the same analyzer the index used, checks a short-lived query cache for very hot queries, then (R1) sends one request to a broker. The broker picks the indexes to search (for `mode=latest` maybe just today's), (R2) sends the query to one copy of every relevant shard, (R3) each shard scores its local matches and returns its top K, and the broker merges them. A second-stage ranker re-scores the merged top few hundred, then the service hydrates the final 20 (author info, media) and returns.
 
 ## Data model
 

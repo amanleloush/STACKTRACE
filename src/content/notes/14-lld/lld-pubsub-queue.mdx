@@ -78,6 +78,52 @@ This is a favourite because it tests three things at once: modelling (topic, par
  Message(topic, partition, offset, key, value) — immutable record
 ```
 
+The same classes as a class diagram, with the methods from the full solution:
+
+```mermaid
+classDiagram
+    class MessageQueue {
+        +List~Message~ deadLetters
+        +createTopic(name, partitions, maxLag)
+        +publish(topic, key, value) long
+        +subscribe(topic, group, members, fromBeginning, s)
+        +shutdown(Duration grace) boolean
+    }
+    class Topic {
+        +String name
+        +List~Partition~ partitions
+        +partitionFor(String key) Partition
+    }
+    class Partition {
+        -List~Message~ log
+        -Map committed
+        -ReentrantLock lock
+        +append(key, value) long
+        +poll(group, max, timeoutMs) List~Message~
+        +commit(group, nextOffset)
+        +register(group, fromBeginning)
+        +close()
+    }
+    class ConsumerWorker {
+        -String group
+        -int maxRetries
+        +run()
+        -deliver(Message m)
+        +stopNow()
+    }
+    class Subscriber {
+        <<interface>>
+        +onMessage(Message m)
+    }
+    MessageQueue "1" *-- "*" Topic
+    MessageQueue "1" *-- "*" ConsumerWorker
+    Topic "1" *-- "*" Partition
+    Partition "1" *-- "*" Message : log
+    ConsumerWorker --> "1..*" Partition : owns
+    ConsumerWorker --> Subscriber : calls
+    Runnable <|.. ConsumerWorker
+```
+
 **How a group maps onto partitions** (topic with 4 partitions):
 
 ```
@@ -163,6 +209,25 @@ while not (stopped or all my partitions drained):
     for each owned partition:
         batch = poll(group, max 50, wait up to 100 ms)
         for each message: deliver (with retries) → commit(offset + 1)
+```
+
+One message from publish to commit, for one group:
+
+```mermaid
+sequenceDiagram
+    participant Pr as Producer
+    participant P as Partition
+    participant W as ConsumerWorker
+    participant S as Subscriber
+    Pr->>P: append(key, value)
+    Note over P: append signals notEmpty
+    P-->>Pr: offset
+    W->>P: poll(group, 50, wait)
+    P-->>W: batch from committed offset
+    W->>S: onMessage(m)
+    S-->>W: returns normally (ack)
+    W->>P: commit(group, offset + 1)
+    Note over P: commit signals notFull for blocked producers
 ```
 
 - **Pull** gives natural flow control: a slow consumer simply polls less often; the broker never overwhelms it. Kafka consumers pull for the same reason.

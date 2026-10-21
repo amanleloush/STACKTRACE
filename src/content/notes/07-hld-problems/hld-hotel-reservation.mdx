@@ -280,6 +280,7 @@ A reservation moves through a small state machine:
 stateDiagram-v2
     [*] --> HELD : create (inventory taken)
     HELD --> CONFIRMED : payment ok
+    HELD --> CANCELLED : guest cancels hold (inventory back)
     CONFIRMED --> CANCELLED : cancel (inventory back)
     HELD --> EXPIRED : no payment by hold_expires_at (inventory back)
     CANCELLED --> [*]
@@ -317,6 +318,8 @@ UPDATE room_inventory i
 ```
 
 Both the confirm and the sweeper only act `WHERE status = 'HELD'`. The row lock plus the WHERE re-check means exactly one of them wins; they can never both happen.
+
+**Cancel.** `POST /reservations/{id}/cancel` works on a `HELD` reservation as well as a `CONFIRMED` one: the guest abandons checkout and the rooms go back straight away instead of waiting for the sweeper. It is the same guarded pattern (`WHERE status IN ('HELD', 'CONFIRMED')`) in the same transaction as giving the nights back, so a cancel racing a confirm or the sweeper still has exactly one winner. Cancelling a `CONFIRMED` booking also triggers a refund under the rate's cancellation policy. If a payment webhook lands after the hold was cancelled, treat it like a late payment.
 
 **Late payment.** If the webhook arrives after the sweeper expired the hold, the confirm updates 0 rows. Don't give up yet: try to take the inventory again with the same conditional update. If it still fits, confirm. If not, **void or refund** the payment and tell the guest. Never confirm just because money arrived.
 
@@ -565,7 +568,7 @@ The key benefit is single-shard ACID for the booking. City search is served by t
 - **Book**: one transaction on the hotel's shard: insert HELD reservation with idempotency key (`ON CONFLICT DO NOTHING`), then `UPDATE ... SET reserved = reserved + n WHERE ... AND reserved + n <= total_rooms + overbook_limit`; rows updated must equal nights, else roll back.
 - **Backstop**: `CHECK (reserved <= total_rooms + overbook_limit)`.
 - **Optimistic** `WHERE version = :v` works but retries too much on hot nights; `FOR UPDATE` locks in date order.
-- **Lifecycle**: HELD (15 min) → CONFIRMED by payment webhook; sweeper → EXPIRED and returns nights; both guarded by `status = 'HELD'`.
+- **Lifecycle**: HELD (15 min) → CONFIRMED by payment webhook; sweeper → EXPIRED and returns nights; both guarded by `status = 'HELD'`. Cancel works from HELD or CONFIRMED and returns the nights.
 - **Late payment**: re-take inventory or refund. Never confirm on payment alone.
 - **Idempotency**: client UUID per checkout; stored with the reservation; reservation_id as the provider's key.
 - **Overbooking**: explicit per-night allowance from no-show history; walk cost vs empty-room cost.

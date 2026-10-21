@@ -123,12 +123,12 @@ Real fixes: fetch what the endpoint needs inside the transaction (`JOIN FETCH`, 
 
 ### The N+1 problem
 
-You run **1** query to get N parents, then **N** more queries, one per parent, to load an association.
+You run **1** query to get N rows, then up to **N** more queries to load an association: one per **distinct** associated entity. The persistence context is an identity map, so once customer 7 is loaded, every other order of customer 7 gets it without SQL. The worst case, every order from a different customer, is the full N+1.
 
 ```java
 List<Order> orders = orderRepo.findByStatus(PENDING);       // 1 query
 for (Order o : orders) {
-    total += o.getCustomer().getCreditLimit();               // +1 query per order
+    total += o.getCustomer().getCreditLimit();               // +1 query per new customer
 }
 ```
 
@@ -142,7 +142,7 @@ select c.id, c.name, c.credit_limit from customer c where c.id=?     -- customer
 ... 497 more ...
 ```
 
-Each query is fast, so the slow-query log doesn't flag it; the endpoint is slow because of **500 round trips**.
+Here 500 orders came from 500 different customers. Each query is fast, so the slow-query log doesn't flag it; the endpoint is slow because of **501 round trips**.
 
 The round trips, side by side with the `JOIN FETCH` fix below:
 
@@ -152,7 +152,7 @@ sequenceDiagram
     participant D as Database
     A->>D: select orders where status=?
     D-->>A: N orders (customer proxies)
-    loop once per order
+    loop once per distinct customer
         A->>D: select customer where id=?
         D-->>A: one customer
     end
@@ -411,7 +411,7 @@ When Hibernate loads an entity it stores a snapshot of its state. At flush (befo
 
 <QA q="Explain the N+1 problem and four ways to fix it." level="medium">
 
-One query loads N parents, then accessing a lazy (or EAGER, with JPQL) association runs one more query per parent: N+1 round trips. Fixes:
+One query loads N parents, then accessing a lazy (or EAGER, with JPQL) association runs one more query per distinct associated entity (already-loaded ones come from the persistence context): up to N+1 round trips. Fixes:
 
 1. `JOIN FETCH` in JPQL to load parent and association in one SQL.
 2. `@EntityGraph(attributePaths = ...)` on the repository method.

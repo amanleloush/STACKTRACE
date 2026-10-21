@@ -82,6 +82,94 @@ The real test is the last two bullets. Everything else is CRUD. Interviewers wan
  Hold { bookingId, userId, seats, expiresAt }       BookingStatus: PENDING -> CONFIRMED | FAILED | EXPIRED
 ```
 
+The catalog records from the full solution. They are immutable, so nothing here needs a lock:
+
+```mermaid
+classDiagram
+    class Catalog {
+        -Map shows
+        +addShow(Show s) void
+        +show(String id) Show
+        +showsFor(String city, String movieId) List~Show~
+    }
+    class Show {
+        <<record>>
+        +LocalDateTime start
+        +Map pricePaise
+        +seat(String seatId) Seat
+    }
+    class Theatre {
+        <<record>>
+        +String city
+    }
+    class Screen {
+        <<record>>
+    }
+    class Seat {
+        <<record>>
+        +String id
+        +SeatType type
+    }
+    class Movie {
+        <<record>>
+    }
+    Catalog o-- Show
+    Show --> Movie
+    Show --> Theatre
+    Show --> Screen
+    Theatre *-- Screen
+    Screen *-- Seat
+```
+
+The booking side: `BookingService` is the facade over the lock manager, the payment gateway and the listeners.
+
+```mermaid
+classDiagram
+    class BookingService {
+        -Map bookings
+        -List~BookingListener~ listeners
+        +subscribe(BookingListener l) void
+        +holdSeats(String userId, String showId, List~String~ seatIds) Booking
+        +pay(String bookingId) BookingStatus
+        +sweepExpiredHolds() int
+    }
+    class SeatLockManager {
+        -Clock clock
+        -Duration ttl
+        +tryLock(showId, seatIds, bookingId, userId) LockResult
+        +isHeld(String showId, String bookingId) boolean
+        +confirm(String showId, String bookingId) boolean
+        +release(String showId, String bookingId) void
+        +evictAllExpired() List~Hold~
+    }
+    class Hold {
+        <<record>>
+        +Instant expiresAt
+        +expired(Instant now) boolean
+    }
+    class Booking {
+        -AtomicReference~BookingStatus~ status
+        +transition(BookingStatus from, BookingStatus to) boolean
+    }
+    class PaymentGateway {
+        <<interface>>
+        +charge(String bookingId, long amountPaise) PaymentStatus
+        +refund(String bookingId, long amountPaise) void
+    }
+    class BookingListener {
+        <<interface>>
+        +onConfirmed(Booking b) void
+        +onFailed(Booking b, String reason) void
+        +onLockExpired(Booking b) void
+    }
+    BookingService --> Catalog
+    BookingService --> SeatLockManager
+    BookingService --> PaymentGateway
+    BookingService o-- BookingListener : notifies
+    BookingService *-- Booking
+    SeatLockManager *-- Hold : per show
+```
+
 - **Catalog objects are immutable records.** They never change during a booking, so they need no locking.
 - **Seat state is per show**, not per seat object: seat A1 in the 6:30 show and A1 in the 9:30 show are different inventory. That's why the lock manager keys everything by `showId`.
 - A **Hold** groups the seats of one booking so they expire, release and confirm together.
@@ -139,6 +227,20 @@ holdSeats ──► PENDING ──pay──► charge() ──SUCCESS──► c
                  │                    │                     └─ hold lost ──► refund, EXPIRED (notify)
                  │                    └─FAILED / TIMED_OUT──► release ──► FAILED (notify)
                  └── TTL passes (lazy eviction or sweeper) ──► EXPIRED (notify)
+```
+
+The same flow as a `BookingStatus` state machine. Every arrow is a `transition(PENDING, X)` CAS, so only one can win:
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING : holdSeats
+    PENDING --> CONFIRMED : charge SUCCESS, confirm ok
+    PENDING --> EXPIRED : charge SUCCESS, hold lost, refund
+    PENDING --> FAILED : charge FAILED or TIMED_OUT
+    PENDING --> EXPIRED : TTL passes
+    CONFIRMED --> [*]
+    FAILED --> [*]
+    EXPIRED --> [*]
 ```
 
 Key rules:

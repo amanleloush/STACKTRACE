@@ -88,6 +88,86 @@ Interviewers like this problem because one round tests three things: clean model
  Receipt(txnId, maskedCard, amount, notes)
 ```
 
+The same structure as a class diagram. `Atm` is the context, and the bank and the hardware sit behind interfaces:
+
+```mermaid
+classDiagram
+    class Atm {
+        -AtmState state
+        -String card
+        -List pendingReversals
+        +insertCard(String card) void
+        +enterPin(String pin) PinCheck
+        +enterAmount(long amount) Receipt
+        +ejectCard() void
+        +retryPendingReversals() void
+        +withdraw(long amount) Receipt
+        +endSession(boolean retainCard) void
+    }
+    class AtmState {
+        <<interface>>
+        +name() String
+    }
+    class BankService {
+        <<interface>>
+        +isCardActive(String card) boolean
+        +verifyPin(String card, String pin) PinCheck
+        +balance(String card) long
+        +debit(String card, long amount, String txnId) DebitResult
+        +reverse(String txnId) void
+    }
+    class InMemoryBank
+    class CashDispenser {
+        +load(int denomination, int count) void
+        +plan(long amount) Optional
+        +dispense(Map plan) void
+        +isEmpty() boolean
+    }
+    class NoteHandler {
+        -int denomination
+        -int count
+        -NoteHandler next
+        +setNext(NoteHandler next) NoteHandler
+        +plan(long remaining, Map out) boolean
+    }
+    class DispenserHardware {
+        <<interface>>
+        +present(Map notes) void
+    }
+    Atm --> AtmState : current state
+    Atm --> BankService : uses
+    Atm *-- CashDispenser
+    BankService <|.. InMemoryBank
+    CashDispenser *-- NoteHandler : chain
+    NoteHandler --> NoteHandler : next
+    CashDispenser --> DispenserHardware : drives
+```
+
+The five states all implement `AtmState`. Every action is rejected by default, and each state overrides only what is legal in it:
+
+```mermaid
+classDiagram
+    class AtmState {
+        <<interface>>
+        +name() String
+        +insertCard(Atm atm, String card) void
+        +enterPin(Atm atm, String pin) PinCheck
+        +selectWithdrawal(Atm atm) void
+        +enterAmount(Atm atm, long amount) Receipt
+        +checkBalance(Atm atm) long
+        +cancel(Atm atm) void
+        +ejectCard(Atm atm) void
+        +takeOffline(Atm atm) void
+        +loadCash(Atm atm, int denomination, int n) void
+        +bringOnline(Atm atm) void
+    }
+    AtmState <|.. IdleState
+    AtmState <|.. CardInsertedState
+    AtmState <|.. AuthenticatedState
+    AtmState <|.. TransactionState
+    AtmState <|.. OutOfServiceState
+```
+
 The state machine:
 
 ```text
@@ -103,6 +183,27 @@ The state machine:
         └──────────────────────────────────────────────────────── TRANSACTION ─┘
    (eject when the cassettes are empty also lands in OUT_OF_SERVICE)
 ```
+
+The same machine as a state diagram. A new `Atm` starts out of service until cash is loaded:
+
+```mermaid
+stateDiagram-v2
+    [*] --> OUT_OF_SERVICE
+    OUT_OF_SERVICE --> OUT_OF_SERVICE : loadCash
+    OUT_OF_SERVICE --> IDLE : bringOnline
+    IDLE --> OUT_OF_SERVICE : takeOffline
+    IDLE --> CARD_INSERTED : insertCard, card active
+    CARD_INSERTED --> CARD_INSERTED : wrong PIN, tries left
+    CARD_INSERTED --> AUTHENTICATED : correct PIN
+    CARD_INSERTED --> IDLE : 3rd wrong PIN, card retained
+    CARD_INSERTED --> IDLE : eject or cancel
+    AUTHENTICATED --> TRANSACTION : selectWithdrawal
+    AUTHENTICATED --> IDLE : eject or cancel
+    TRANSACTION --> AUTHENTICATED : amount done, failed or cancel
+    TRANSACTION --> OUT_OF_SERVICE : jam after debit
+```
+
+Not drawn: ending a session when the cassettes are empty goes to `OUT_OF_SERVICE` instead of `IDLE`.
 
 - `Atm` **has** one current state, one dispenser and a reference to the bank. States hold no data; the session's card lives on the `Atm`.
 - `CashDispenser` **owns** a chain of `NoteHandler`s, largest note first, plus the hardware it drives.

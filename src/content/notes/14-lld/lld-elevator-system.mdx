@@ -88,6 +88,87 @@ Ask these in the first five minutes and write the answers at the top of your fil
                                                                           Idle  Up  Down DoorsOpen Maintenance
 ```
 
+The controller side of the full solution: one controller, many cars, and a swappable dispatch strategy.
+
+```mermaid
+classDiagram
+    class ElevatorController {
+        -List~ElevatorCar~ cars
+        -DispatchStrategy strategy
+        -Queue~Request~ inbox
+        -Deque~HallCall~ unassigned
+        +submit(Request r) void
+        +tick() void
+        +setStrategy(DispatchStrategy s) void
+    }
+    class DispatchStrategy {
+        <<interface>>
+        +choose(List~ElevatorCar~ cars, HallCall call) Optional~ElevatorCar~
+    }
+    class NearestCarStrategy
+    class LookDispatchStrategy {
+        +cost(ElevatorCar c, HallCall call)$ int
+    }
+    class ElevatorCar {
+        -TreeSet~Integer~ stops
+        -int floor
+        -Direction direction
+        -ElevatorState state
+        +addStop(int f) void
+        +arrive() void
+        +chooseNextState() void
+        +turnaroundFloor() int
+    }
+    class Request {
+        <<sealed interface>>
+    }
+    class HallCall {
+        <<record>>
+    }
+    class CarCall {
+        <<record>>
+    }
+    class MaintenanceCommand {
+        <<record>>
+    }
+    ElevatorController *-- ElevatorCar : 1..M
+    ElevatorController o-- DispatchStrategy
+    DispatchStrategy <|.. NearestCarStrategy
+    DispatchStrategy <|.. LookDispatchStrategy
+    Request <|.. HallCall
+    Request <|.. CarCall
+    Request <|.. MaintenanceCommand
+    ElevatorController ..> Request : submit
+```
+
+The State pattern inside each car: `ElevatorCar` is the context and delegates `tick()` to its current state.
+
+```mermaid
+classDiagram
+    class ElevatorState {
+        <<interface>>
+        +name() String
+        +tick(ElevatorCar car) void
+    }
+    class IdleState
+    class MovingUpState
+    class MovingDownState
+    class DoorsOpenState {
+        -int ticksLeft
+    }
+    class MaintenanceState
+    class ElevatorCar {
+        +tick() void
+        +setState(ElevatorState s) void
+    }
+    ElevatorState <|.. IdleState
+    ElevatorState <|.. MovingUpState
+    ElevatorState <|.. MovingDownState
+    ElevatorState <|.. DoorsOpenState
+    ElevatorState <|.. MaintenanceState
+    ElevatorCar --> ElevatorState : state
+```
+
 - The **controller** owns all cars, the input queue and the dispatch strategy. It is the only thing the outside world talks to.
 - A **car** holds its position, direction, a sorted set of stops and its current **state object**.
 - A **request** is one of three immutable records. Using a `sealed` interface lets the compiler check that every `switch` handles every kind.
@@ -145,6 +226,24 @@ if heading DOWN and there are stops below    -> keep MOVING_DOWN
 else if stops above                          -> turn, MOVING_UP
 else if stops below                          -> turn, MOVING_DOWN
 else                                         -> IDLE (or MAINTENANCE if requested)
+```
+
+How a car moves between its states, tick by tick:
+
+```mermaid
+stateDiagram-v2
+    [*] --> IDLE
+    IDLE --> DOORS_OPEN : stop at this floor
+    IDLE --> MOVING_UP : nearest stop above
+    IDLE --> MOVING_DOWN : nearest stop below
+    IDLE --> MAINTENANCE : no stops, maintenance requested
+    MOVING_UP --> DOORS_OPEN : arrive at a stop
+    MOVING_DOWN --> DOORS_OPEN : arrive at a stop
+    DOORS_OPEN --> MOVING_UP : countdown done, stops above
+    DOORS_OPEN --> MOVING_DOWN : countdown done, stops below
+    DOORS_OPEN --> IDLE : countdown done, no stops
+    DOORS_OPEN --> MAINTENANCE : no stops, maintenance requested
+    MAINTENANCE --> IDLE : exitMaintenance
 ```
 
 **SCAN vs LOOK.** Both come from disk-arm scheduling, where SCAN is literally nicknamed the "elevator algorithm". SCAN sweeps to the **end** of the range before reversing. LOOK is the practical variant: it reverses at the **last pending request** in the current direction, so a car never travels to floor 30 just because floor 30 exists. Both avoid starvation: a request behind the car is served on the return sweep, so it waits at most one round trip. The naive alternative, "always go to the closest stop" (SSTF, shortest seek time first), can starve far floors when nearby requests keep arriving.
