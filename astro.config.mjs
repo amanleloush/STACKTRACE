@@ -4,6 +4,7 @@ import sitemap from '@astrojs/sitemap';
 import cloudflare from '@astrojs/cloudflare';
 import rehypeSlug from 'rehype-slug';
 import rehypeAutolinkHeadings from 'rehype-autolink-headings';
+import remarkCodeTabs from './src/lib/remark-code-tabs.ts';
 
 const SITE_SLUG = process.env.SITE_SLUG ?? 'stacktrace';
 const SITE_URL = process.env.SITE_URL ?? 'https://example.com';
@@ -21,6 +22,9 @@ export default defineConfig({
   }),
   integrations: [
     mdx({
+      // <CodeTabs> on DSA pages: groups the fenced blocks inside it into
+      // C++ / Java / Python tabs and precomputes each godbolt.org run link.
+      remarkPlugins: [remarkCodeTabs],
       // Brain-detox-style heading permalinks: every h2/h3/h4 gets an id
       // + a clickable ¶ anchor on hover, so readers can deep-link
       // straight to a section.
