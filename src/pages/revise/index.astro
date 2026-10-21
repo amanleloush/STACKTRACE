@@ -39,6 +39,9 @@ const groups = [
     total: dsa.length,
   },
 ];
+
+// Every sheet URL, for the "Save for offline" button (public/sw.js caches them).
+const sheetUrls = groups.flatMap((g) => g.phases.map((p) => `${g.base}${p.slug}/`));
 ---
 <BaseLayout
   title="Revision mode — StackTrace"
@@ -59,6 +62,14 @@ const groups = [
       <a href="/review/mistakes/">mistakes notebook</a>. Ready to test yourself? Try a
       <a href="/mock/">timed mock round</a>.
     </p>
+    <!-- Revealed by the script below only when a service worker can run. -->
+    <div class="hub-offline" id="hub-offline" data-urls={JSON.stringify(sheetUrls)} hidden>
+      <button type="button" class="hub-offline__btn" id="hub-offline-btn">
+        Save all revision sheets for offline
+      </button>
+      <progress class="hub-offline__bar" id="hub-offline-bar" max={sheetUrls.length} value="0" hidden></progress>
+      <p class="hub-offline__status" id="hub-offline-status" aria-live="polite"></p>
+    </div>
   </header>
 
   {groups.map((g) => (
@@ -87,7 +98,122 @@ const groups = [
   ))}
 </BaseLayout>
 
+<script>
+  // "Save all for offline": asks the service worker (public/sw.js, message
+  // CACHE_URLS) to fetch and cache every sheet plus its CSS/JS, and shows
+  // progress. Cache Storage is read directly to say how many are saved.
+  const box = document.getElementById('hub-offline');
+  const btn = document.getElementById('hub-offline-btn') as HTMLButtonElement | null;
+  const bar = document.getElementById('hub-offline-bar') as HTMLProgressElement | null;
+  const statusEl = document.getElementById('hub-offline-status');
+
+  let urls: string[] = [];
+  try {
+    const parsed: unknown = JSON.parse(box?.dataset.urls ?? '[]');
+    if (Array.isArray(parsed)) urls = parsed.filter((u): u is string => typeof u === 'string');
+  } catch {
+    urls = [];
+  }
+
+  const say = (t: string): void => {
+    if (statusEl) statusEl.textContent = t;
+  };
+
+  async function countSaved(): Promise<number> {
+    let n = 0;
+    try {
+      for (const u of urls) if (await caches.match(new URL(u, location.origin).href)) n += 1;
+    } catch {
+      return 0;
+    }
+    return n;
+  }
+
+  /** The active worker, waiting at most a few seconds for a first install. */
+  async function activeWorker(): Promise<ServiceWorker | null> {
+    const timeout = new Promise<null>((r) => setTimeout(() => r(null), 8000));
+    const ready = navigator.serviceWorker.ready.then((reg) => reg.active).catch(() => null);
+    return Promise.race([ready, timeout]);
+  }
+
+  async function saveAll(): Promise<void> {
+    if (!btn || !bar) return;
+    btn.disabled = true;
+    say('Preparing…');
+    const worker = await activeWorker();
+    if (!worker) {
+      say('Offline saving is not available in this browser right now. Reload the page and try again.');
+      btn.disabled = false;
+      return;
+    }
+    bar.hidden = false;
+    bar.max = urls.length;
+    bar.value = 0;
+    const channel = new MessageChannel();
+    channel.port1.onmessage = (ev: MessageEvent) => {
+      const d = ev.data as { type?: string; done?: number; failed?: number; total?: number };
+      const done = Number(d.done) || 0;
+      const failed = Number(d.failed) || 0;
+      const total = Number(d.total) || urls.length;
+      bar.value = done;
+      if (d.type === 'done') {
+        btn.disabled = false;
+        btn.textContent = 'Update offline copies';
+        say(
+          failed === 0
+            ? `All ${total} revision sheets are saved on this device.`
+            : `Saved ${total - failed} of ${total} sheets. ${failed} failed; check your connection and try again.`,
+        );
+        channel.port1.close();
+      } else {
+        say(`Saving ${done} of ${total}…`);
+      }
+    };
+    worker.postMessage({ type: 'CACHE_URLS', urls }, [channel.port2]);
+  }
+
+  if (box && btn && 'serviceWorker' in navigator && 'caches' in window && urls.length > 0) {
+    box.hidden = false;
+    btn.addEventListener('click', () => void saveAll());
+    void countSaved().then((n) => {
+      if (n === urls.length) {
+        btn.textContent = 'Update offline copies';
+        say(`All ${n} revision sheets are saved on this device.`);
+      } else if (n > 0) {
+        say(`${n} of ${urls.length} revision sheets are saved on this device.`);
+      }
+    });
+  }
+</script>
+
 <style>
+  .hub-offline {
+    margin: 1.2rem auto 0;
+    max-width: 60ch;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .hub-offline__btn {
+    font: inherit;
+    font-weight: 600;
+    font-size: 0.9rem;
+    padding: 0.5rem 1rem;
+    border-radius: 10px;
+    border: 1px solid var(--accent);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--fg);
+    cursor: pointer;
+  }
+  .hub-offline__btn:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 22%, transparent); }
+  .hub-offline__btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .hub-offline__btn:disabled { opacity: 0.6; cursor: progress; }
+  .hub-offline[hidden],
+  .hub-offline__bar[hidden] { display: none; }
+  .hub-offline__bar { width: min(320px, 100%); accent-color: var(--accent); }
+  .hub-offline__status { margin: 0; min-height: 1.2em; color: var(--fg-muted); font-size: 0.85rem; }
+
   .hub-head { margin-bottom: 2.25rem; text-align: center; }
   .hub-head h1 {
     margin: 0;
