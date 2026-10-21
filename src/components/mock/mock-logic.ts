@@ -19,6 +19,17 @@ export const DURATION_MS: Record<Mode, number> = {
   lld: 90 * MIN,
 };
 
+/** Shortest round a problem may ask for. */
+const MIN_DURATION_MS = 15 * MIN;
+
+/** A problem's own length (e.g. a "60 min" mock) when it is sane, else the
+ *  mode's default. Never longer than the mode's default, so stored or
+ *  tampered values can't stretch a round. */
+export function clampDuration(mode: Mode, ms: unknown): number {
+  const max = DURATION_MS[mode];
+  return typeof ms === 'number' && Number.isInteger(ms) && ms >= MIN_DURATION_MS && ms <= max ? ms : max;
+}
+
 export interface Phase {
   label: string;
   minutes: number;
@@ -94,12 +105,12 @@ export interface Run {
   scores: number[];
 }
 
-export function newRun(id: string, slug: string, mode: Mode, now: number): Run {
+export function newRun(id: string, slug: string, mode: Mode, now: number, durationMs?: number): Run {
   return {
     id,
     slug,
     mode,
-    durationMs: DURATION_MS[mode],
+    durationMs: clampDuration(mode, durationMs),
     startedAt: now,
     pausedAt: null,
     pausedTotal: 0,
@@ -148,9 +159,24 @@ export function warnLevel(remaining: number): Warn {
   return 'none';
 }
 
+/** The mode's time boxes scaled to a round of `durationMs`, in whole
+ *  minutes that still add up to the round's length. */
+export function phasesFor(mode: Mode, durationMs: number = DURATION_MS[mode]): Phase[] {
+  const total = Math.round(durationMs / MIN);
+  const base = PHASES[mode];
+  if (total === DURATION_MS[mode] / MIN) return base;
+  const scale = total / (DURATION_MS[mode] / MIN);
+  const out = base.map((p) => ({ label: p.label, minutes: Math.max(1, Math.round(p.minutes * scale)) }));
+  // Rounding drift goes to the longest box.
+  const drift = total - out.reduce((s, p) => s + p.minutes, 0);
+  const longest = out.reduce((best, p, i) => (p.minutes > out[best]!.minutes ? i : best), 0);
+  out[longest]!.minutes += drift;
+  return out;
+}
+
 /** Index of the phase you should be in after `elapsed` ms. */
-export function phaseIndex(mode: Mode, elapsed: number): number {
-  const phases = PHASES[mode];
+export function phaseIndex(mode: Mode, elapsed: number, durationMs: number = DURATION_MS[mode]): number {
+  const phases = phasesFor(mode, durationMs);
   let end = 0;
   for (let i = 0; i < phases.length; i++) {
     end += phases[i]!.minutes * MIN;
@@ -229,8 +255,8 @@ export function coerceRun(v: unknown): Run | null {
     id: r.id,
     slug: r.slug,
     mode: r.mode,
-    // Always the mode's duration: a tampered value can't stretch the round.
-    durationMs: DURATION_MS[r.mode],
+    // Clamped to the mode's length: a tampered value can't stretch the round.
+    durationMs: clampDuration(r.mode, r.durationMs),
     startedAt: r.startedAt,
     pausedAt,
     pausedTotal: r.pausedTotal,

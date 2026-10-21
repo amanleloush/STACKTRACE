@@ -26,7 +26,8 @@ import {
   warnLevel,
   type Attempt,
 } from '../src/components/mock/mock-logic';
-import { briefSection, buildProblems, modeFor, stripMermaid, type NoteInput } from '../src/components/mock/mock-problems';
+import { briefSection, buildProblems, minutesIn, modeFor, stripMermaid, type NoteInput } from '../src/components/mock/mock-problems';
+import { clampDuration, newRun, phasesFor } from '../src/components/mock/mock-logic';
 import { sections } from '../src/lib/content-extract';
 
 const MIN = 60_000;
@@ -237,7 +238,9 @@ describe('mock problems from content', () => {
   });
 
   it('classifies modes', () => {
-    expect(modeFor({ phase: '07-hld-problems', slug: 'hld-framework' })).toBe('hld');
+    expect(modeFor({ phase: '07-hld-problems', slug: 'hld-url-shortener' })).toBe('hld');
+    expect(modeFor({ phase: '07-hld-problems', slug: 'hld-framework' })).toBeNull();
+    expect(modeFor({ phase: '07-hld-problems', slug: 'hld-failure-scenarios' })).toBeNull();
     expect(modeFor({ phase: '14-lld', slug: 'lld-mock-snake-ladder' })).toBe('lld');
     expect(modeFor({ phase: '14-lld', slug: 'solid-principles' })).toBeNull();
     expect(modeFor({ phase: '05-caching', slug: 'lld-x' })).toBeNull();
@@ -254,7 +257,7 @@ describe('mock problems from content', () => {
     const problems = buildProblems(notes);
     const hld = problems.filter((p) => p.mode === 'hld');
     const lld = problems.filter((p) => p.mode === 'lld');
-    expect(hld.length).toBe(notes.filter((n) => n.phase === '07-hld-problems').length);
+    expect(hld.length).toBe(notes.filter((n) => n.phase === '07-hld-problems' && !['hld-framework', 'hld-failure-scenarios'].includes(n.slug)).length);
     expect(lld.map((p) => p.slug)).toEqual(expect.arrayContaining(['lld-mock-cart-coupons', 'lld-mock-snake-ladder']));
     expect(lld.every((p) => p.slug.startsWith('lld-'))).toBe(true);
     for (const p of problems) {
@@ -264,5 +267,28 @@ describe('mock problems from content', () => {
       expect(p.definitionHtml, p.slug).toContain('One-liner');
       expect(p.tldrHtml, p.slug).not.toBe('');
     }
+  });
+});
+
+describe('per-problem durations', () => {
+  it('reads a stated length from the title', () => {
+    expect(minutesIn('Mock (60 min): Snake and Ladder')).toBe(60);
+    expect(minutesIn('HLD: URL Shortener')).toBeUndefined();
+  });
+
+  it('clamps to [15 min, mode default]', () => {
+    expect(clampDuration('lld', 60 * MIN)).toBe(60 * MIN);
+    expect(clampDuration('lld', 500 * MIN)).toBe(90 * MIN);
+    expect(clampDuration('hld', 5 * MIN)).toBe(45 * MIN);
+    expect(clampDuration('hld', 'x')).toBe(45 * MIN);
+    expect(newRun('a', 's', 'lld', 0, 60 * MIN).durationMs).toBe(60 * MIN);
+    expect(newRun('a', 's', 'lld', 0).durationMs).toBe(90 * MIN);
+  });
+
+  it('scales the phase guide and keeps the total', () => {
+    const p = phasesFor('lld', 60 * MIN);
+    expect(p.reduce((s, x) => s + x.minutes, 0)).toBe(60);
+    expect(p.every((x) => x.minutes >= 1)).toBe(true);
+    expect(phasesFor('hld')).toEqual(phasesFor('hld', 45 * MIN));
   });
 });

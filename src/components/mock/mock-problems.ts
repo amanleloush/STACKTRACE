@@ -22,6 +22,8 @@ export interface ProblemSummary {
   slug: string;
   title: string;
   mode: Mode;
+  /** The problem's own length when its title states one, e.g. "Mock (60 min)". */
+  minutes?: number;
 }
 
 /** Full problem, served from /mock/problems.json. */
@@ -33,10 +35,13 @@ export interface MockProblem extends ProblemSummary {
   tldrHtml: string;
 }
 
-/** HLD: every note in the HLD-problems phase. LLD: the `lld-*` problem
- *  notes (including the mocks), not the pattern/strategy notes. */
+/** HLD-phase notes that teach the round itself rather than pose a problem. */
+const NOT_PROBLEMS = new Set(['hld-framework', 'hld-failure-scenarios']);
+
+/** HLD: every design problem in the HLD-problems phase. LLD: the `lld-*`
+ *  problem notes (including the mocks), not the pattern/strategy notes. */
 export function modeFor(n: Pick<NoteInput, 'phase' | 'slug'>): Mode | null {
-  if (n.phase === HLD_PHASE) return 'hld';
+  if (n.phase === HLD_PHASE) return NOT_PROBLEMS.has(n.slug) ? null : 'hld';
   if (n.phase === LLD_PHASE && n.slug.startsWith('lld-')) return 'lld';
   return null;
 }
@@ -59,6 +64,11 @@ export function stripMermaid(html: string): string {
   return html.replace(/<pre><code class="language-mermaid">[\s\S]*?<\/code><\/pre>\n?/g, '');
 }
 
+export function minutesIn(title: string): number | undefined {
+  const m = title.match(/\((\d{2,3}) min\)/);
+  return m ? Number(m[1]) : undefined;
+}
+
 export function buildProblem(n: NoteInput): MockProblem | null {
   const mode = modeFor(n);
   if (!mode) return null;
@@ -70,6 +80,7 @@ export function buildProblem(n: NoteInput): MockProblem | null {
     slug: n.slug,
     title: n.title,
     mode,
+    ...(minutesIn(n.title) ? { minutes: minutesIn(n.title) } : {}),
     briefHeading: brief?.heading ?? 'Problem',
     briefHtml: stripMermaid(brief?.html ?? ''),
     definitionHtml: n.premium ? '' : (def?.html ?? ''),
