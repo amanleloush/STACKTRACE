@@ -1,5 +1,5 @@
 // Build-time builder for the one-liner review cards (/review/cards.json):
-// one card per note ("What is <title>?") and per DSA page ("How do you
+// one card per note ("Explain in one line: <title>") and per DSA page ("How do you
 // solve <title>?"), backed by the page's `**One-liner:**` as HTML. Kept
 // free of `astro:content` so tests can feed it plain entries.
 
@@ -36,7 +36,7 @@ export function buildOneLinerCards(notes: ContentEntry[], dsa: ContentEntry[]): 
         id: `${pillar === 'notes' ? 'n' : 'd'}:${e.id}`,
         phase: `${pillar}/${e.data.phase}`,
         title: e.data.title,
-        front: pillar === 'notes' ? `What is ${e.data.title}?` : `How do you solve ${e.data.title}?`,
+        front: pillar === 'notes' ? `Explain in one line: ${e.data.title}` : `How do you solve ${e.data.title}?`,
         backHtml: back,
         href: `/learn/${pillar}/${encodeURIComponent(e.id)}/`,
       });

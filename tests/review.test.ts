@@ -303,7 +303,7 @@ describe('one-liner card builder', () => {
       [{ id: 'two-sum-ii', body: '**One-liner:** Two pointers.', data: { title: 'Two Sum II', phase: '01-two-pointers', order: 1 } }],
     );
     expect(cards.map((c) => c.id)).toEqual(['n:dns', 'n:kafka-b', 'd:two-sum-ii']);
-    expect(cards[0]).toMatchObject({ front: 'What is DNS?', phase: 'notes/01-foundations', href: '/learn/notes/dns/' });
+    expect(cards[0]).toMatchObject({ front: 'Explain in one line: DNS', phase: 'notes/01-foundations', href: '/learn/notes/dns/' });
     expect(cards[1]!.backHtml).toBe('Kafka is a <code>log</code>.');
     expect(cards[2]).toMatchObject({ front: 'How do you solve Two Sum II?', phase: 'dsa/01-two-pointers', href: '/learn/dsa/two-sum-ii/' });
   });
