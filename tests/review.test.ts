@@ -307,6 +307,15 @@ describe('one-liner card builder', () => {
     expect(cards[1]!.backHtml).toBe('Kafka is a <code>log</code>.');
     expect(cards[2]).toMatchObject({ front: 'How do you solve Two Sum II?', phase: 'dsa/01-two-pointers', href: '/learn/dsa/two-sum-ii/' });
   });
+
+  it('asks pattern cheat sheets as concepts and gives guides no card', () => {
+    const cards = buildOneLinerCards(
+      [{ id: 'salary-negotiation', body: '## The short version\n\n- Never name a number first.', data: { title: 'Salary Negotiation', phase: '15-interview-readiness', order: 1 } }],
+      [{ id: 'sliding-window-cheatsheet', body: '**One-liner:** Two moving ends.', data: { title: 'Sliding Window Cheatsheet', phase: '02-sliding-window', order: 1 } }],
+    );
+    expect(cards.map((c) => c.id)).toEqual(['d:sliding-window-cheatsheet']);
+    expect(cards[0]!.front).toBe('Explain in one line: Sliding Window');
+  });
 });
 
 describe('KV doc', () => {

@@ -1,6 +1,7 @@
 // Build-time builder for the one-liner review cards (/review/cards.json):
 // one card per note ("Explain in one line: <title>") and per DSA page ("How do you
-// solve <title>?"), backed by the page's `**One-liner:**` as HTML. Kept
+// solve <title>?"), backed by the page's `**One-liner:**` as HTML. Guide
+// pages ("The short version", no one-liner) get no card. Kept
 // free of `astro:content` so tests can feed it plain entries.
 
 import { oneLinerHtml } from './content-extract';
@@ -17,6 +18,12 @@ export interface ContentEntry {
 /** Cards in course order: notes phases, then DSA phases, each by `order`. */
 export function buildOneLinerCards(notes: ContentEntry[], dsa: ContentEntry[]): OneLinerCard[] {
   const out: OneLinerCard[] = [];
+  // Pattern cheat sheets are concepts ("what is a sliding window?"), not
+  // problems to solve, so they get the notes-style prompt.
+  const frontFor = (pillar: 'notes' | 'dsa', e: ContentEntry): string =>
+    pillar === 'notes' || /-cheatsheet$/.test(e.id)
+      ? `Explain in one line: ${e.data.title.replace(/\s*cheat\s*sheet\s*$/i, '')}`
+      : `How do you solve ${e.data.title}?`;
   const add = (entries: ContentEntry[], pillar: 'notes' | 'dsa', phaseOrder: string[]): void => {
     const rank = (p: string): number => {
       const i = phaseOrder.indexOf(p);
@@ -36,7 +43,7 @@ export function buildOneLinerCards(notes: ContentEntry[], dsa: ContentEntry[]): 
         id: `${pillar === 'notes' ? 'n' : 'd'}:${e.id}`,
         phase: `${pillar}/${e.data.phase}`,
         title: e.data.title,
-        front: pillar === 'notes' ? `Explain in one line: ${e.data.title}` : `How do you solve ${e.data.title}?`,
+        front: frontFor(pillar, e),
         backHtml: back,
         href: `/learn/${pillar}/${encodeURIComponent(e.id)}/`,
       });
