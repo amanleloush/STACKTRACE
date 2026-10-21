@@ -29,14 +29,17 @@ Version context: Spring Boot 3.x/4.x, Spring Framework 6.x/7.x, Hibernate 6.x/7.
 
 ### Entity lifecycle states
 
-```
-          new Order()                       persist()                     commit / flush
- TRANSIENT ─────────────▶ (not tracked) ──────────────▶ MANAGED ──────────────▶ row in DB
-                                                       │   ▲
-                                      close / clear /   │   │ merge() returns a NEW managed copy
-                                      evict / tx ends   ▼   │
-                                                    DETACHED
- MANAGED ── remove() ──▶ REMOVED ── flush ──▶ DELETE executed
+How an entity moves between the four states:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Transient : new Order()
+    Transient --> Managed : persist()
+    Managed --> Detached : close, clear, evict, tx ends
+    Detached --> Managed : merge() returns a NEW managed copy
+    Managed --> Removed : remove()
+    Removed --> [*] : flush runs DELETE
+    note right of Managed : commit or flush writes the row to the DB
 ```
 
 | State | Has ID? | Tracked by a persistence context? | Meaning |
@@ -140,6 +143,23 @@ select c.id, c.name, c.credit_limit from customer c where c.id=?     -- customer
 ```
 
 Each query is fast, so the slow-query log doesn't flag it; the endpoint is slow because of **500 round trips**.
+
+The round trips, side by side with the `JOIN FETCH` fix below:
+
+```mermaid
+sequenceDiagram
+    participant A as App
+    participant D as Database
+    A->>D: select orders where status=?
+    D-->>A: N orders (customer proxies)
+    loop once per order
+        A->>D: select customer where id=?
+        D-->>A: one customer
+    end
+    Note over A,D: with JOIN FETCH instead
+    A->>D: select orders join customer
+    D-->>A: orders with customers, 1 query
+```
 
 **EAGER doesn't fix it.** With a JPQL query like `select o from Order o`, Hibernate runs your query as written, sees an EAGER `customer`, and loads it with **one extra select per distinct customer** anyway.
 
@@ -308,6 +328,27 @@ GET /orders?status=PENDING
       TransactionInterceptor: commit (read-only → no flush, no dirty checking)
         ↳ close persistence context, return connection to the pool
  → Jackson serializes DTOs (no DB access possible or needed)
+```
+
+The same request as a sequence of calls through the transactional proxy:
+
+```mermaid
+sequenceDiagram
+    participant C as OrderController
+    participant P as Proxy (TransactionInterceptor)
+    participant H as HikariCP
+    participant S as OrderService
+    participant D as Database
+    C->>P: list()
+    P->>H: borrow connection, setAutoCommit(false)
+    Note over P: open persistence context, bind to thread
+    P->>S: list()
+    S->>D: repo.summaries(PENDING), one SQL with join
+    D-->>S: rows as DTOs
+    S-->>P: DTOs
+    P->>D: commit (read-only, no flush)
+    P->>H: close context, return connection
+    P-->>C: DTOs for Jackson
 ```
 
 Compare with the anti-pattern: the service returns entities, OSIV keeps the context open, and Jackson triggers N lazy loads while holding the connection.

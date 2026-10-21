@@ -67,20 +67,15 @@ ThreadPoolExecutor pool = new ThreadPoolExecutor(
 
 `execute(task)` follows these steps, in this order:
 
-```
- submit task
-     │
-     ▼
- running threads less than core? ──yes──► start a NEW thread for this task
-     │ no                               (even if other threads are idle)
-     ▼
- queue.offer(task) succeeds? ──yes──► task waits in the queue
-     │ no (queue full)
-     ▼
- running threads less than max? ──yes──► start a NEW thread (above core)
-     │ no
-     ▼
- REJECT → RejectedExecutionHandler
+```mermaid
+flowchart TB
+    T["execute(task)"] --> C{"Running threads less than core?"}
+    C -->|yes| NC["Start a NEW thread, even if others idle"]
+    C -->|no| Q{"queue.offer(task) succeeds?"}
+    Q -->|yes| W["Task waits in the queue"]
+    Q -->|"no, queue full"| M{"Running threads less than max?"}
+    M -->|yes| NM["Start a NEW thread above core"]
+    M -->|no| R["REJECT: RejectedExecutionHandler"]
 ```
 
 The surprise: **the pool prefers queuing to adding threads beyond core.** With an unbounded `LinkedBlockingQueue`, the queue is never full, so the pool **never grows past `corePoolSize`** and `maximumPoolSize` does nothing. People set core=10, max=100 with an unbounded queue and wonder why only 10 threads ever run while latency climbs.
@@ -266,6 +261,21 @@ Thread vt = Thread.ofVirtual().name("worker-", 0).start(() -> work());
 - Most blocking operations in the JDK (sockets, `Thread.sleep`, `BlockingQueue.take`, `java.util.concurrent` locks) were reworked to unmount instead of blocking the carrier.
 - Virtual threads are always daemon threads and always have normal priority.
 
+The states a virtual thread moves through, including pinning (covered below):
+
+```mermaid
+stateDiagram-v2
+    [*] --> Runnable : started
+    Runnable --> Mounted : scheduler gives it a carrier
+    Mounted --> Parked : blocking call, unmounts
+    Parked --> Runnable : data ready, unparked
+    Mounted --> Pinned : blocks but cannot unmount
+    Pinned --> Mounted : blocking call returns
+    Mounted --> [*] : task finishes
+```
+
+While parked, its stack frames sit on the heap and the carrier runs other virtual threads. While pinned, it holds the carrier the whole time it blocks.
+
 **When they help:** high-concurrency, **I/O-bound** work where each task spends most of its time waiting: HTTP handlers calling databases and other services, fan-out calls, message consumers that call APIs. You get thread-per-request code with throughput close to async frameworks, plus readable stack traces and normal debugging.
 
 **When they don't:**
@@ -273,6 +283,19 @@ Thread vt = Thread.ofVirtual().name("worker-", 0).start(() -> work());
 - **CPU-bound work.** There are still only about as many carriers as cores. Virtual threads don't make computation faster; they make waiting cheaper.
 - **When the real limit is elsewhere.** A million virtual threads sharing a 50-connection DB pool still do 50 queries at a time. They will just queue in the pool.
 - Latency per request doesn't improve; throughput under concurrency does.
+
+Putting the pieces of this note together, which executor fits which work:
+
+```mermaid
+flowchart TB
+    S["What kind of work?"] --> Q1{"Divide and conquer, CPU-bound?"}
+    Q1 -->|yes| FJ["ForkJoinPool"]
+    Q1 -->|no| Q2{"CPU-bound tasks?"}
+    Q2 -->|yes| CP["ThreadPoolExecutor, about N_cpu threads"]
+    Q2 -->|"no, I/O-bound"| Q3{"Java 21 or newer?"}
+    Q3 -->|yes| VT["Virtual thread per task + Semaphore"]
+    Q3 -->|no| IO["Bounded ThreadPoolExecutor, sized by W/C"]
+```
 
 ### Pinning
 

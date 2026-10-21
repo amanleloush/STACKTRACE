@@ -45,6 +45,28 @@ Analogy: a process is a **house** (walls, kitchen, fridge). Threads are **people
 | Thread-local storage | No | Yes |
 | Pending signals / signal mask | Mask is per thread | Yes |
 
+One process with two threads: the shared part on top, the per-thread part below:
+
+```mermaid
+flowchart TB
+    subgraph proc["Process (shared by all threads)"]
+        code["Code (text)"]
+        heap["Heap + globals"]
+        fds["Open files, sockets"]
+        sig["Signal handlers, cwd, user ID"]
+    end
+    subgraph t1["Thread 1"]
+        s1["Own stack"]
+        r1["Registers, PC, SP"]
+    end
+    subgraph t2["Thread 2"]
+        s2["Own stack"]
+        r2["Registers, PC, SP"]
+    end
+    proc --- t1
+    proc --- t2
+```
+
 Consequences:
 
 - One thread can corrupt memory every other thread uses. One crashing thread (say a segfault) usually **kills the whole process**.
@@ -80,14 +102,16 @@ A TCB is the per-thread subset: registers, program counter, stack pointer, threa
 
 The classic five-state model:
 
-```
-         admitted          scheduler dispatch
-  NEW ────────────► READY ────────────────► RUNNING ──── exit ───► TERMINATED
-                      ▲   ◄──────────────────  │
-                      │      preempted /       │  waits for I/O,
-                      │      time slice over   │  lock, sleep
-                      │                        ▼
-                      └──── event done ──── BLOCKED (waiting)
+```mermaid
+stateDiagram-v2
+    [*] --> NEW
+    NEW --> READY : admitted
+    READY --> RUNNING : scheduler dispatch
+    RUNNING --> READY : preempted or time slice over
+    RUNNING --> BLOCKED : waits for I/O, lock, sleep
+    BLOCKED --> READY : event done
+    RUNNING --> TERMINATED : exit
+    TERMINATED --> [*]
 ```
 
 - **Ready**: could run, waiting for a CPU.
@@ -250,6 +274,24 @@ Some calls are so frequent (reading the clock) that even a mode switch is too ex
 5. Meanwhile bash is BLOCKED in wait4(). It uses no CPU.
 6. ls calls exit_group(). It becomes a ZOMBIE; the kernel sends SIGCHLD to bash.
 7. bash wakes (READY → RUNNING), wait4 returns the exit status, the zombie is reaped.
+```
+
+The same steps as a sequence between bash, the kernel and the child:
+
+```mermaid
+sequenceDiagram
+    participant B as bash
+    participant K as Kernel
+    participant C as Child (ls)
+    B->>K: fork() via clone()
+    K-->>C: new task_struct, COW page tables, READY
+    B->>K: wait4() (bash BLOCKED)
+    C->>K: execve("/bin/ls")
+    K-->>C: fresh address space for ls
+    C->>K: getdents64, write(1, ...)
+    C->>K: exit_group() (child is ZOMBIE)
+    K-->>B: SIGCHLD, wait4 returns status
+    Note over K,C: Zombie reaped
 ```
 
 ### Observing it

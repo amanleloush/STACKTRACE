@@ -5,6 +5,7 @@ import cloudflare from '@astrojs/cloudflare';
 import rehypeSlug from 'rehype-slug';
 import rehypeAutolinkHeadings from 'rehype-autolink-headings';
 import remarkCodeTabs from './src/lib/remark-code-tabs.ts';
+import remarkRunOnline from './src/lib/remark-run-online.ts';
 import rehypeKeepMermaid from './src/lib/rehype-keep-mermaid.ts';
 
 const SITE_SLUG = process.env.SITE_SLUG ?? 'stacktrace';
@@ -25,7 +26,9 @@ export default defineConfig({
     mdx({
       // <CodeTabs> on DSA pages: groups the fenced blocks inside it into
       // C++ / Java / Python tabs and precomputes each godbolt.org run link.
-      remarkPlugins: [remarkCodeTabs],
+      // remarkRunOnline: a godbolt.org "Run this program" link under each
+      // ```java run fence (the full programs on LLD notes).
+      remarkPlugins: [remarkCodeTabs, remarkRunOnline],
       // Note and DSA pages are server-rendered, so every MDX page ships in
       // the Worker bundle. Without this, each highlighted code token becomes
       // a JSX call, which tripled the bundle and slowed Worker startup.

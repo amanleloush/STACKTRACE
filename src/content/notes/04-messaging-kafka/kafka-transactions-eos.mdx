@@ -70,22 +70,44 @@ The consumer side uses `enable.auto.commit=false` (offsets go through the produc
 
 ### What happens on commit
 
-```
-Producer                  Txn coordinator               Partitions touched
-   │  initTransactions ───►  look up transactional.id
-   │                         epoch++ ; fence old PID/epoch
-   │  beginTransaction (client-side only)
-   │  AddPartitionsToTxn ──►  record {invoices-0, invoices-4} in __transaction_state
-   │  send(...) ─────────────────────────────────────────► invoices-0, invoices-4 (uncommitted data)
-   │  AddOffsetsToTxn ────►  add __consumer_offsets partition of the group
-   │  TxnOffsetCommit ───────────────────────────────────► __consumer_offsets (pending)
-   │  commitTransaction ─►  1. write PrepareCommit to __transaction_state   ← point of no return
-   │                        2. write COMMIT markers ─────► invoices-0, invoices-4, __consumer_offsets
-   │                        3. write CompleteCommit
-   │  ◄── success
+One transaction from `initTransactions` to a successful commit:
+
+```mermaid
+sequenceDiagram
+    participant P as Producer
+    participant C as Txn coordinator
+    participant T as invoices-0 and invoices-4
+    participant O as __consumer_offsets
+    P->>C: initTransactions
+    Note over C: look up transactional.id, bump epoch, fence old PID/epoch
+    Note over P: beginTransaction (client-side only)
+    P->>C: AddPartitionsToTxn
+    Note over C: record partitions in __transaction_state
+    P->>T: send (uncommitted data)
+    P->>C: AddOffsetsToTxn
+    P->>O: TxnOffsetCommit (pending)
+    P->>C: commitTransaction
+    Note over C: 1. write PrepareCommit (point of no return)
+    C->>T: 2. COMMIT markers
+    C->>O: 2. COMMIT marker
+    Note over C: 3. write CompleteCommit
+    C-->>P: success
 ```
 
 It is a two-phase commit, but **entirely inside Kafka**: the coordinator's durable log is the decision record, and once `PrepareCommit` is written the transaction *will* complete even if the producer or coordinator crashes (a new coordinator replays the log). Abort is identical with ABORT markers. `transaction.timeout.ms` (default 60 s) makes the coordinator abort a transaction whose producer went silent.
+
+The states a transaction moves through in `__transaction_state`:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Ongoing
+    Ongoing --> PrepareCommit : commitTransaction
+    Ongoing --> PrepareAbort : abortTransaction or timeout
+    PrepareCommit --> CompleteCommit : COMMIT markers written
+    PrepareAbort --> CompleteAbort : ABORT markers written
+    CompleteCommit --> [*]
+    CompleteAbort --> [*]
+```
 
 ### Zombie fencing
 
@@ -93,12 +115,20 @@ A **zombie** is an instance everyone believes is dead — long GC pause, network
 
 Fencing works through the epoch:
 
-```
-instance A  initTransactions(id="invoicer-3") → epoch 7
-   ...A freezes (GC pause)...
-instance B  initTransactions(id="invoicer-3") → epoch 8   (coordinator also aborts A's open txn)
-   ...A wakes up, sends / commits with epoch 7...
-coordinator / brokers: epoch 7 below current 8 → ProducerFencedException
+```mermaid
+sequenceDiagram
+    participant A as Instance A
+    participant C as Coordinator and brokers
+    participant B as Instance B
+    A->>C: initTransactions(invoicer-3)
+    C-->>A: epoch 7
+    Note over A: freezes (GC pause)
+    B->>C: initTransactions(invoicer-3)
+    Note over C: also aborts the open txn of A
+    C-->>B: epoch 8
+    Note over A: wakes up
+    A->>C: send or commit with epoch 7
+    C-->>A: ProducerFencedException (7 below 8)
 ```
 
 The rule this implies: **`transactional.id` must identify the logical work, not the process.** Two instances doing the *same* work must use the *same* id (so one fences the other); instances doing *different* work must use different ids (or they fence each other by accident).

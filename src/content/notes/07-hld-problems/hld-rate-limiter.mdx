@@ -48,19 +48,15 @@ Design a rate limiter that enforces request quotas per user/API key across many 
 
 ## High-level architecture
 
-```
-                   ┌────────────┐
-       Client ──►  │ API Gateway│ ──► App Tier
-                   └─────┬──────┘
-                         ▼
-                   ┌──────────────┐
-                   │ Rate Limiter │
-                   │   sidecar    │
-                   └──────┬───────┘
-                          ▼
-                   ┌──────────────┐
-                   │ Redis (Lua)  │ ──► (optional Kafka)
-                   └──────────────┘
+The components and where each check runs:
+
+```mermaid
+flowchart TB
+    client[Client] --> gw[API Gateway]
+    gw --> app[App Tier]
+    gw --> rl["Rate Limiter sidecar"]
+    rl --> redis[("Redis (Lua)")]
+    redis -.->|optional| kafka[Kafka]
 ```
 
 Two placement choices:
@@ -141,6 +137,27 @@ allowed = all([
 ])
 ```
 
+One request through the check path, from plan lookup to the 429:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant G as API Gateway
+    participant R as Redis
+    participant A as App Tier
+    C->>G: request with API key
+    G->>G: resolve plan from in-memory cache
+    G->>R: Lua token bucket per tier key
+    R-->>G: 1 or 0 for each tier
+    alt every tier returned 1
+        G->>A: forward request
+        A-->>G: response
+        G-->>C: response
+    else any tier returned 0
+        G-->>C: 429 with Retry-After
+    end
+```
+
 ### Multi-region strategy
 
 Two approaches:
@@ -167,6 +184,17 @@ Most teams use #1 with conservative per-region caps.
   - **Fail open**: allow all requests during outage. Risk: protected resource gets overwhelmed.
   - **Fail closed**: reject all. Risk: outage visible to all users.
   - **Practical**: degraded mode — local in-memory token bucket per gateway instance as fallback (no global view, but each instance limits itself).
+
+Choosing the behaviour when Redis is unreachable:
+
+```mermaid
+flowchart TB
+    down["Redis unreachable"] --> kind{"Which API?"}
+    kind -->|"low-risk, read-only"| open["Fail open: allow"]
+    kind -->|sensitive| sens{"Local bucket available?"}
+    sens -->|yes| local["Local token bucket per gateway"]
+    sens -->|no| closed["Fail closed: reject"]
+```
 
 ### Header propagation
 

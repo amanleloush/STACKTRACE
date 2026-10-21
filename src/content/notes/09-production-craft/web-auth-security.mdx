@@ -100,12 +100,23 @@ RFC 9700 (the OAuth 2.0 Security Best Current Practice, January 2025) says refre
 
 **Reuse detection:** if an attacker steals refresh token R1, then either the attacker or the real client will eventually present R1 *after* it was already rotated. An already-used token showing up again is proof of theft. The server can't tell which party is legitimate, so it **revokes the whole family** — both get logged out, the attacker loses access, and the user re-authenticates.
 
-```
-login           → AT1 + RT1        (family F)
-refresh RT1     → AT2 + RT2        RT1 marked used
-attacker uses RT1 (stolen earlier)
-                → RT1 already used! revoke family F (RT2 dies too)
-real client refresh RT2 → rejected → user logs in again
+Rotation and reuse detection, step by step:
+
+```mermaid
+sequenceDiagram
+    participant U as Real client
+    participant X as Attacker
+    participant S as Auth server
+    U->>S: login
+    S-->>U: AT1 + RT1 (family F)
+    U->>S: refresh with RT1
+    S-->>U: AT2 + RT2, RT1 marked used
+    Note over X: stole RT1 earlier
+    X->>S: refresh with RT1
+    S->>S: RT1 already used, revoke family F
+    Note over S: RT2 dies too
+    U->>S: refresh with RT2
+    S-->>U: rejected, user logs in again
 ```
 
 RFC 9700 also says refresh tokens should expire after a period of client inactivity. Handle the benign race (two browser tabs refreshing at the same moment) with a short grace window or by serialising refreshes in the client.
@@ -170,6 +181,20 @@ Each legitimate `<script nonce="r4nd0m">` gets a fresh random nonce per response
 <script>document.forms[0].submit()</script>
 ```
 
+The attack as a sequence:
+
+```mermaid
+sequenceDiagram
+    participant B as Victim browser
+    participant E as evil.com
+    participant K as bank.com
+    B->>E: visit page
+    E-->>B: hidden form + auto-submit script
+    B->>K: POST /transfer with bank cookies
+    K->>K: transfer runs
+    K-->>B: response, attacker cannot read it
+```
+
 The attacker can't read the response — they don't need to; the transfer already happened. CSRF exists **because of ambient credentials** (cookies, HTTP Basic auth, client certificates). APIs authenticated only by an `Authorization: Bearer` header that JS sets explicitly are not CSRF-able in this way — but then the token lives somewhere XSS can reach.
 
 **Defences:**
@@ -229,6 +254,21 @@ Access-Control-Allow-Headers: authorization, content-type
 Access-Control-Allow-Credentials: true
 Access-Control-Max-Age: 600
 Vary: Origin
+```
+
+The whole preflighted exchange:
+
+```mermaid
+sequenceDiagram
+    participant P as Page on app.com
+    participant Br as Browser
+    participant A as API server
+    P->>Br: fetch DELETE /orders/42
+    Br->>A: OPTIONS /orders/42 with Origin
+    A-->>Br: allowed origin, methods, headers
+    Br->>A: DELETE /orders/42
+    A-->>Br: response + Allow-Origin
+    Br-->>P: JS may read the response
 ```
 
 **Credentials** (cookies, HTTP auth): the client must opt in (`fetch(url, { credentials: 'include' })`), the response must include `Access-Control-Allow-Credentials: true`, and `Access-Control-Allow-Origin` must be an **explicit origin, never `*`**. Preflight requests themselves never carry credentials.

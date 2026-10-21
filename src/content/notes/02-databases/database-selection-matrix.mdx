@@ -41,6 +41,31 @@ update: find leaf page → modify → write page   update: write a new version; 
 (plus WAL record)                              dropped later by compaction
 ```
 
+The LSM write path, from one write down to the compacted levels:
+
+```mermaid
+flowchart TB
+    W[Write] --> WAL["WAL (append)"]
+    W --> MT["Memtable (RAM)"]
+    MT -->|"full: flush"| L0["L0 SSTables (overlapping)"]
+    L0 -->|compaction| L1["L1 SSTables"]
+    L1 -->|compaction| L2["L2 SSTables"]
+```
+
+And an LSM point read: memtable first, then files, with bloom filters skipping most of them:
+
+```mermaid
+flowchart TB
+    R[Point read] --> M{"In memtable?"}
+    M -->|yes| Hit[Return value]
+    M -->|no| BF{"Bloom filter for next file"}
+    BF -->|"definitely not here"| BF
+    BF -->|"maybe here"| S[Read the SSTable]
+    S -->|found| Hit
+    S -->|"not found"| BF
+    BF -->|"no files left"| Miss[Key not found]
+```
+
 - **B-tree**: data lives in fixed-size pages (16 KB by default in InnoDB, 8 KB in PostgreSQL). A lookup walks root → leaf, usually 3–4 levels even for very large tables, and upper levels sit in memory. An update rewrites the page that holds the row (and logs it in the WAL first). Full details: [MySQL/Postgres Internals](/learn/notes/mysql-postgres-internals/).
 - **LSM tree** (log-structured merge tree): writes go to a write-ahead log and an in-memory sorted table (**memtable**). When it fills, it's flushed to an immutable sorted file (**SSTable**). Background **compaction** merges files and discards overwritten or deleted values. Reads check the memtable and then possibly several files, using **bloom filters** (a compact structure that says "definitely not here" or "maybe here") to skip most of them. See [Cassandra / ScyllaDB](/learn/notes/cassandra-scylla/) and [Storage Fundamentals](/learn/notes/storage-fundamentals/).
 
@@ -152,18 +177,22 @@ This script hits what interviewers grade: requirements-driven reasoning, trade-o
 
 ### A quick decision flow
 
-```
-Need multi-row ACID?
- ├─ yes → fits one primary (+replicas, +partitioning)? → PostgreSQL / MySQL
- │        └─ no, or must be multi-region strongly consistent → Spanner / CockroachDB
- └─ no  → What is the main query?
-          ├─ get/put by key, sub-ms        → Redis (cache) / DynamoDB (durable)
-          ├─ huge write rate, by partition  → Cassandra / ScyllaDB
-          ├─ self-contained documents       → MongoDB
-          ├─ full-text relevance            → Elasticsearch (not source of truth)
-          ├─ metrics over time              → Prometheus / TimescaleDB / InfluxDB
-          ├─ aggregations over billions     → ClickHouse / Druid / BigQuery
-          └─ multi-hop relationships        → Neo4j
+The decision tree, starting from the transaction question:
+
+```mermaid
+flowchart LR
+    Q1{"Need multi-row ACID?"}
+    Q1 -->|yes| Q2{"Fits one primary + replicas?"}
+    Q2 -->|yes| PG["PostgreSQL / MySQL"]
+    Q2 -->|"no, or multi-region strong"| SP["Spanner / CockroachDB"]
+    Q1 -->|no| Q3{"Main query?"}
+    Q3 -->|"get/put by key, sub-ms"| KV["Redis (cache) / DynamoDB (durable)"]
+    Q3 -->|"huge write rate"| CS["Cassandra / ScyllaDB"]
+    Q3 -->|"self-contained documents"| MG["MongoDB"]
+    Q3 -->|"full-text relevance"| ES["Elasticsearch (not source of truth)"]
+    Q3 -->|"metrics over time"| TS["Prometheus / TimescaleDB / InfluxDB"]
+    Q3 -->|"aggregations over billions"| OL["ClickHouse / Druid / BigQuery"]
+    Q3 -->|"multi-hop relationships"| NJ["Neo4j"]
 ```
 
 ## Real-world examples

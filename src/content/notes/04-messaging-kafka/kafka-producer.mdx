@@ -32,17 +32,28 @@ Producer tuning is also where you trade **latency against throughput**. Changing
 
 ### The producer pipeline
 
-```
- app thread                        sender (I/O) thread
- ──────────                        ───────────────────
- send(record)                      loop:
-   → serializer (key, value)         drain batches that are full or have lingered
-   → interceptors.onSend             group them by leader broker
-   → partitioner                     ProduceRequest per broker
-   → RecordAccumulator               (≤ max.in.flight per connection)
-       ┌ orders-0: [batch ▢▢▢▢ ]     on response → complete futures/callbacks
-       ├ orders-1: [batch ▢▢    ]    on retriable error → re-queue batch
-       └ orders-2: [batch ▢     ]
+The app thread only fills per-partition batches. The sender thread does all the network work:
+
+```mermaid
+flowchart TB
+    subgraph app["App thread"]
+        send["send(record)"] --> ser["serializer (key, value)"]
+        ser --> icp["interceptors.onSend"]
+        icp --> part["partitioner"]
+    end
+    subgraph acc["RecordAccumulator"]
+        b0["orders-0 batch"]
+        b1["orders-1 batch"]
+        b2["orders-2 batch"]
+    end
+    part --> b1
+    subgraph sender["Sender (I/O) thread"]
+        drain["Drain full or lingered batches"] --> group["Group by leader broker"]
+        group --> req["ProduceRequest per broker"]
+        req -->|response| done["Complete futures/callbacks"]
+        req -->|retriable error| requeue["Re-queue batch"]
+    end
+    acc --> drain
 ```
 
 `send()` returns a `Future<RecordMetadata>` right away. You learn the outcome from that future or from a callback, **never** from the fact that `send()` returned.
@@ -81,6 +92,22 @@ With `enable.idempotence=true` (the default since 3.0, provided the configs are 
   - a sequence it has **already seen** → it acks the batch without writing it again, so a retry doesn't duplicate,
   - the **next expected** sequence → it appends the batch,
   - a **gap** (a sequence that's too far ahead) → `OutOfOrderSequenceException`, and the batch isn't accepted out of order.
+
+Why a retry after a lost ack doesn't write the batch twice:
+
+```mermaid
+sequenceDiagram
+    participant P as Producer (PID 7)
+    participant B as Partition leader
+    P->>B: batch seq 0-9
+    Note over B: Next expected seq, append
+    B--xP: ack lost (timeout)
+    P->>B: retry batch seq 0-9
+    Note over B: Seq already seen, skip write
+    B-->>P: ack (no duplicate)
+    P->>B: batch seq 10-19
+    B-->>P: ack (appended)
+```
 
 Idempotence requires `acks=all`, `retries > 0`, and `max.in.flight.requests.per.connection ≤ 5`. The "5" comes from the broker's dedupe window.
 
@@ -176,6 +203,23 @@ COMMIT;                                          -- atomic: both or neither
 relay ──reads outbox──▶ Kafka (key = aggregate_id)
   • polling relay: SELECT unpublished … FOR UPDATE SKIP LOCKED → send → mark sent
   • or CDC: Debezium tails the WAL/binlog, outbox event router → topic
+```
+
+The outbox flow with a polling relay, step by step:
+
+```mermaid
+sequenceDiagram
+    participant S as Order service
+    participant DB as Database
+    participant R as Relay
+    participant K as Kafka
+    S->>DB: BEGIN, INSERT order + outbox row, COMMIT
+    R->>DB: SELECT unpublished FOR UPDATE SKIP LOCKED
+    DB-->>R: outbox rows
+    R->>K: send (key = aggregate_id)
+    K-->>R: ack
+    R->>DB: mark sent
+    Note over R,K: Crash before mark sent means resend, so consumers dedupe on outbox id
 ```
 
 - An event exists **if and only if** the transaction committed.

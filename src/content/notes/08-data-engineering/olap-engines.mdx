@@ -36,9 +36,15 @@ Analytics used to mean "run a batch job overnight, look at the dashboard tomorro
 
 A Postgres table scans rows, so aggregating a billion of them takes minutes. A cloud warehouse handles the volume but is tuned for fewer, heavier queries and usually batch-loaded data. Real-time OLAP engines sit in between. In interviews they show up in "design an ad-click dashboard", "design analytics for a marketplace", or "why not just use Postgres / Snowflake for this?". See also [HLD: Ad Click Tracking](/learn/notes/hld-ad-click-tracking/).
 
-```
- apps ──► Kafka ──► OLAP engine (ClickHouse / Druid / Pinot) ──► dashboards, APIs (ms latency)
-                └─► data lake (Parquet / Iceberg) ──► warehouse / Trino / Spark (deep, ad hoc, batch)
+Where a real-time OLAP engine sits next to the lake and warehouse:
+
+```mermaid
+flowchart LR
+    apps["Apps"] --> kafka["Kafka"]
+    kafka --> olap["OLAP engine: ClickHouse / Druid / Pinot"]
+    olap --> dash["Dashboards, APIs (ms latency)"]
+    kafka --> lake["Data lake: Parquet / Iceberg"]
+    lake --> wh["Warehouse / Trino / Spark (ad hoc, batch)"]
 ```
 
 ## Core concepts
@@ -98,10 +104,17 @@ The fastest data to process is data you never read. OLAP engines skip with:
 
 **Parts and merges.** Every `INSERT` into a MergeTree table writes a new, immutable **part**: a directory with one compressed file per column (for "wide" parts), sorted by the table's `ORDER BY` key. Background threads continually **merge** smaller parts into bigger ones (within the same partition), much like an LSM tree's compaction. Inserts never modify shared structures, so they don't block each other or reads.
 
-```
-INSERT 10k rows → part_1      ┐
-INSERT 10k rows → part_2      ├── background merge ──► part_1_3 (30k rows, sorted)
-INSERT 10k rows → part_3      ┘
+Each insert becomes its own sorted part, and a background merge combines them:
+
+```mermaid
+flowchart LR
+    i1["INSERT 10k rows"] --> p1["part_1"]
+    i2["INSERT 10k rows"] --> p2["part_2"]
+    i3["INSERT 10k rows"] --> p3["part_3"]
+    p1 --> m["Background merge"]
+    p2 --> m
+    p3 --> m
+    m --> big["part_1_3 (30k rows, sorted)"]
 ```
 
 Because each insert creates a part, ClickHouse wants **big, infrequent inserts**: the docs recommend batches of at least 1,000 rows, ideally 10,000–100,000, and around one insert per second. Thousands of tiny inserts create thousands of parts, merges fall behind, and you hit the **"too many parts"** error. If clients can't batch, use **async inserts** (`async_insert=1`, with `wait_for_async_insert=1` so you don't lose data silently).
@@ -270,6 +283,19 @@ Rule of thumb: **known query shapes + fresh data + many users + tight latency �
 - **Druid**: event and time-series analytics where **rollup** shrinks data a lot, time-based queries dominate, and you value independently scalable ingestion and query tiers.
 - **Pinot**: **user-facing** analytics with very high QPS and strict p99, where star-tree pre-aggregation or **upserts** (latest state per key) are needed.
 - **None of them**: small data (Postgres with good indexes is enough), heavy multi-table joins (warehouse), or transactional updates (OLTP).
+
+The same advice as a decision tree:
+
+```mermaid
+flowchart TB
+    q0{"Small data, heavy joins or transactions?"}
+    q0 -->|yes| none["None: Postgres, warehouse or OLTP"]
+    q0 -->|no| q1{"User-facing, very high QPS, or upserts?"}
+    q1 -->|yes| pinot["Pinot"]
+    q1 -->|no| q2{"Time-series events where rollup shrinks data?"}
+    q2 -->|yes| druid["Druid"]
+    q2 -->|no| ch["ClickHouse (default pick)"]
+```
 
 ## How it works (designing an ad-campaign dashboard)
 

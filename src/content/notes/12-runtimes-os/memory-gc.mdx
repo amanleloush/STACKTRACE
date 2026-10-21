@@ -160,6 +160,20 @@ Generational collectors exploit that:
    survivors age; old enough ─────────────► promoted
 ```
 
+The life of one object in a generational heap:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Eden : allocated with new
+    Eden --> Garbage : dead at minor GC
+    Eden --> Survivor : survives minor GC
+    Survivor --> Survivor : survives again, ages
+    Survivor --> Garbage : dead at minor GC
+    Survivor --> Old : old enough, promoted
+    Old --> Garbage : dead at major GC
+    Garbage --> [*] : memory reclaimed
+```
+
 - **Minor GC** collects only the young generation, usually with copying. Since most objects are dead, there's little to copy. Fast.
 - Objects that survive several minor GCs are **promoted** to the old generation, which is collected rarely.
 - The catch: an old object can point to a young one. To avoid scanning the whole old generation on every minor GC, the runtime uses a **write barrier** (a small piece of code run on every reference store) to record old-to-young pointers in a **remembered set / card table**.
@@ -172,7 +186,19 @@ To shrink pauses, modern collectors mark **while the application keeps running**
 - **Grey**: reached, but its references haven't been scanned yet.
 - **Black**: reached and fully scanned.
 
-Marking moves objects white → grey → black until no grey objects remain. The danger: while marking runs, the application (the "mutator") could store a pointer to a white object into a black object and delete the only other path to it. The collector would never revisit the black object and would free a live object. **Barriers** prevent this: a **write barrier** (Go, G1, CMS, and the marking phase of Shenandoah and generational ZGC) records or shades pointers as they are written, so the invariant becomes "no black object points to a white object without the GC knowing". Collectors that also move objects concurrently (ZGC, Shenandoah) add a **load barrier**, which checks each reference as it is read and fixes it up if the object has moved.
+Marking moves objects white → grey → black until no grey objects remain:
+
+```mermaid
+stateDiagram-v2
+    [*] --> White : not yet seen
+    White --> Grey : reached by marking
+    Grey --> Black : its references scanned
+    White --> Freed : still white when marking ends
+    Black --> [*] : survives this cycle
+    Freed --> [*]
+```
+
+The danger: while marking runs, the application (the "mutator") could store a pointer to a white object into a black object and delete the only other path to it. The collector would never revisit the black object and would free a live object. **Barriers** prevent this: a **write barrier** (Go, G1, CMS, and the marking phase of Shenandoah and generational ZGC) records or shades pointers as they are written, so the invariant becomes "no black object points to a white object without the GC knowing". Collectors that also move objects concurrently (ZGC, Shenandoah) add a **load barrier**, which checks each reference as it is read and fixes it up if the object has moved.
 
 ### JVM collectors
 
@@ -255,6 +281,19 @@ Fix in this order:
 2. **Right-size the heap**: in containers use `-XX:MaxRAMPercentage` (JVM) or `GOMEMLIMIT` (Go) so the runtime knows the real limit. Leave room for off-heap memory, thread stacks and metaspace.
 3. **Pick the right collector**: latency-critical with big heaps → ZGC; throughput batch → Parallel; general → G1.
 4. Only then touch fine-grained flags.
+
+Step 3 as a decision, using the JVM collectors table above:
+
+```mermaid
+flowchart TB
+    S["Which JVM collector?"] --> Q1{"Small heap, single CPU?"}
+    Q1 -->|yes| SE["Serial"]
+    Q1 -->|no| Q2{"Latency-critical, big heap?"}
+    Q2 -->|yes| Z["ZGC (or Shenandoah)"]
+    Q2 -->|no| Q3{"Batch job, pauses don't matter?"}
+    Q3 -->|yes| P["Parallel"]
+    Q3 -->|no| G["G1 (the default)"]
+```
 
 ### Memory leaks in garbage-collected languages
 

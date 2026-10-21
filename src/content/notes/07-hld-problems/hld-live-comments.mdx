@@ -160,6 +160,25 @@ Notes:
              Viewers         Viewers   (SSE / WebSocket, batched every ~500 ms)
 ```
 
+The same architecture as a flow, from a posted comment to every viewer's screen:
+
+```mermaid
+flowchart TB
+    poster["Viewer (posting)"] -->|"HTTPS via API LB"| ws["Write service + sync moderation"]
+    ws --> store[("Comment store (Cassandra)")]
+    ws --> recent[("Recent cache (Redis)")]
+    ws --> bus["Pub/sub bus (Kafka, by videoId)"]
+    bus --> agg["Reaction aggregator"]
+    bus --> samp["Comment sampler"]
+    bus --> amod["Async moderation"]
+    agg --> disp["Dispatcher tier"]
+    samp --> disp
+    amod -.->|"delete events"| disp
+    disp <-->|lookup| reg[("Subscription registry")]
+    disp -->|"one copy per gateway"| gw["Gateways 1..N"]
+    gw -->|"SSE / WebSocket"| viewers["Viewers"]
+```
+
 **Write path (a comment):**
 
 1. Client sends `POST /comments` to the write service (any instance, behind a normal load balancer).
@@ -167,6 +186,27 @@ Notes:
 3. Assign a per-video sequence number, write to the comment store, push onto the recent-comments cache, and publish to the bus keyed by `videoId`.
 4. The comment sampler for that video picks which comments go out this tick; the dispatcher looks up the gateways in the registry and sends one batch to each.
 5. Each gateway writes the batch to every local connection subscribed to that video.
+
+The same write path as a sequence:
+
+```mermaid
+sequenceDiagram
+    participant V as Viewer (posting)
+    participant W as Write service
+    participant S as Store and Redis
+    participant K as Kafka bus
+    participant D as Sampler and dispatcher
+    participant G as Gateway
+    V->>W: POST /comments (clientCommentId)
+    Note over W: rate limit, then fast moderation
+    W->>S: INCR seq, store, push to recent
+    W->>K: publish keyed by videoId
+    W-->>V: 202 (commentId, seq)
+    K->>D: comment event
+    Note over D: sample this tick, then look up gateways
+    D->>G: one batch per gateway
+    Note over G: write to each local connection
+```
 
 **Reaction path:** write service increments a local counter for (video, type) and flushes counts every 100–500 ms to the aggregator, which sums them and publishes one count update per tick.
 
@@ -341,6 +381,24 @@ A viewer joining at minute 40 should see the last few dozen comments, not an emp
 ```
 
 Subscribing **before** fetching history closes the race where a comment posted between the fetch and the subscribe would be lost.
+
+The join, step by step:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant G as Gateway
+    participant R as Registry
+    participant B as Backfill API
+    C->>G: open stream, subscribe(V)
+    G->>R: add to subs:V (if first local viewer)
+    G-->>C: subscription confirmed
+    Note over C: buffer live events
+    C->>B: GET /comments?limit=50
+    B-->>C: items, latestSeq (from recent:V)
+    Note over C: render, then apply buffered events newer than latestSeq
+    Note over C: de-duplicate by commentId
+```
 
 **Reconnect:** with SSE, the gateway sets each event's `id:` to the batch's last `seq`, and the browser automatically sends `Last-Event-ID` when it reconnects. The new gateway reads `recent:V` and sends anything newer, then continues live. If the gap is large (phone was offline for minutes), skip the replay and just show the latest 50: nobody wants to scroll through 10 minutes of stale chat.
 

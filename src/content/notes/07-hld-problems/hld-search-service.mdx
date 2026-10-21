@@ -106,35 +106,28 @@ Use a **cursor** (encodes the last sort values) instead of `page=500`. Deep offs
 
 ## High-level architecture
 
-```
-                        WRITE PATH                                     READ PATH
+The write path (left) and read path (right) meet at the index cluster:
 
- Tweet / Catalog service                                     Client
-        │ (1) write to primary DB                               │
-        ▼                                                       ▼
- ┌──────────────┐  (2) event / CDC                     ┌────────────────┐
- │  Primary DB  │ ─────────────────┐                   │ API gateway    │
- └──────────────┘                  ▼                   └───────┬────────┘
-                         ┌──────────────────┐                  ▼
-                         │ Kafka doc-events │          ┌────────────────┐  query cache
-                         │ (keyed by doc_id)│          │ Search service │◄─► (Redis)
-                         └────────┬─────────┘          │ parse, rewrite │
-                                  ▼                    └───────┬────────┘
-                         ┌──────────────────┐                  ▼ (3) one request
-                         │ Indexer workers  │          ┌────────────────┐
-                         │ enrich + bulk    │          │ Broker /       │
-                         └────────┬─────────┘          │ coordinator    │
-                                  │ (4) bulk index     └──┬────┬────┬───┘
-                                  ▼                       │    │    │  (5) scatter
-          ┌─────────────────────────────────────────────────────────────────┐
-          │  Index cluster: one index per day, 10 shards each, 1+ replicas   │
-          │  [shard 0] [shard 1] ... [shard 9]   (each = small inverted index)│
-          └─────────────────────────────────────────────────────────────────┘
-                                                          │ (6) local top K each
-                                                          ▼
-                                            broker merges → global top K
-                                            → re-rank → hydrate → client
+```mermaid
+flowchart TB
+  subgraph write["Write path"]
+    tsvc["Tweet / Catalog service"] -->|"(1) write"| db[("Primary DB")]
+    db -->|"(2) event / CDC"| kafka[["Kafka doc-events (keyed by doc_id)"]]
+    kafka --> idx["Indexer workers: enrich + bulk"]
+  end
+  subgraph read["Read path"]
+    client["Client"] --> gw["API gateway"]
+    gw --> search["Search service: parse, rewrite"]
+    search <--> cache[("Query cache (Redis)")]
+    search -->|"(3) one request"| broker["Broker / coordinator"]
+  end
+  idx -->|"(4) bulk index"| cluster[("Index cluster (daily, 10 shards)")]
+  broker -->|"(5) scatter"| cluster
+  cluster -->|"(6) local top K each"| merge["Merge top K, re-rank, hydrate"]
+  merge --> client
 ```
+
+The index cluster holds one index per day, 10 shards each, with 1+ replicas, and each shard is a small inverted index of its own. The broker does the merge.
 
 **Write path.** (1) The tweet service saves the tweet in its own database, the source of truth. (2) It publishes an event to Kafka (or a [change data capture](/learn/notes/change-data-capture/) connector does it from the DB log), keyed by `doc_id` so all changes to one document stay in order on one partition. (3) Indexer workers consume, enrich (language, author follower count, spam score), and send **bulk** requests to the index cluster. (4) Each shard writes the doc to its in-memory buffer; at the next **refresh** it becomes searchable.
 
@@ -334,6 +327,26 @@ The Stanford IR book calls these partitioning by documents (local index) and par
 
 Why each shard returns K and not fewer: the global top 20 might all live on one shard, so every shard must offer its own top 20. The broker keeps a min-heap of size K while merging, so the merge is O(S · K · log K) for S shards. Elasticsearch splits this into a **query phase** (shards return only IDs and scores) and a **fetch phase** (load full documents only for the winners), so you never move 200 full documents.
 
+The two phases as a sequence (two shards shown, the rest behave the same):
+
+```mermaid
+sequenceDiagram
+    participant B as Broker
+    participant S0 as Shard 0
+    participant S9 as Shard 9
+    Note over B,S9: Query phase
+    B->>S0: top 20 for 'world cup'
+    B->>S9: top 20 for 'world cup'
+    S0-->>B: local top 20 (doc_id, score)
+    S9-->>B: local top 20 (doc_id, score)
+    B->>B: heap merge to global top 20
+    Note over B,S9: Fetch phase
+    B->>S0: get full docs for winners here
+    B->>S9: get full docs for winners here
+    S0-->>B: full docs
+    S9-->>B: full docs
+```
+
 **Deep pagination is the trap.** For page 500 with 20 per page, each shard must return its top 10,020, and the broker sorts S × 10,020 entries to throw almost all of them away. Elasticsearch caps `from + size` at 10,000 by default for this reason. Use cursor paging (`search_after`: "give me the next 20 after this last sort value"), which costs the same on page 1 and page 500.
 
 **Tail latency.** The query is as slow as the slowest shard. Mitigations: keep shards similar in size, send each shard request to the least-loaded replica (adaptive replica selection), set a per-shard timeout and return partial results with a flag rather than wait, and search fewer shards when you can (for `mode=latest`, today's index first, and expand only if there are not enough hits).
@@ -342,12 +355,12 @@ Why each shard returns K and not fewer: the global top 20 might all live on one 
 
 New documents follow this path inside each shard (this is how Lucene, and therefore Elasticsearch and OpenSearch, work):
 
-```
-bulk request → in-memory buffer (+ translog for durability)
-            → refresh (default every 1 s): buffer becomes a new small, immutable segment,
-              opened for search from the OS file cache
-            → flush (later): segments fsynced to disk, translog trimmed
-            → merge (background): many small segments combined into bigger ones
+```mermaid
+flowchart TB
+  bulk["Bulk request"] --> buf["In-memory buffer + translog (durability)"]
+  buf -->|"refresh, default every 1 s"| seg["New small immutable segment, searchable from OS file cache"]
+  seg -->|"flush, later"| disk["Segments fsynced, translog trimmed"]
+  disk -->|"merge, background"| big["Small segments combined into bigger ones"]
 ```
 
 - **Refresh** is what makes a doc visible. Elasticsearch and OpenSearch refresh every 1 second by default. If you have not set `refresh_interval` explicitly, that periodic refresh only runs on shards that received a search in the last 30 seconds (`index.search.idle.after`). An idle shard skips refreshes until the next search arrives, and that first search waits for a refresh. Setting `refresh_interval` explicitly, even to `1s`, turns this idle skipping off. This is why it is called **near** real time.

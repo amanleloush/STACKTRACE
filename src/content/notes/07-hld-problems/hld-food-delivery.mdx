@@ -166,6 +166,24 @@ Menu DB + Redis        (idempotent) (sharded)          │
                service       service    demand vs riders per zone)
 ```
 
+The main boxes and streams, simplified (discovery's stores and the ETA models are left out):
+
+```mermaid
+flowchart LR
+  apps["Customer, restaurant, rider apps"] --> gw["API + WebSocket gateway"]
+  gw --> disc["Discovery"]
+  gw --> cart["Cart/Pricing"]
+  gw --> order["Order service"]
+  gw --> loc["Location service"]
+  order --> pay["Payment svc"]
+  order --> odb[("Orders DB")]
+  order --> kafka[["Kafka: order-events, rider-locations"]]
+  loc --> redis[("Redis: rider:pos, cell sets")]
+  loc --> kafka
+  kafka --> disp["Dispatch (per zone)"]
+  kafka --> down["Tracking, Notification, Surge"]
+```
+
 **Write path: placing an order**
 
 1. The customer's app calls `PUT /cart`; pricing reads the menu from cache, applies coupons and the current zone surge fee, and returns a quote with an ETA.
@@ -174,6 +192,30 @@ Menu DB + Redis        (idempotent) (sharded)          │
 4. The restaurant app gets the order pushed to it. The restaurant accepts with a prep time, and the order moves to `ACCEPTED`.
 5. Dispatch picks up the order in its zone, scores candidate riders and sends an offer. The rider accepts; the order gets a rider.
 6. The rider's pickup and delivery (confirmed with a customer OTP) are state transitions too, each an event.
+
+The same write path as a sequence:
+
+```mermaid
+sequenceDiagram
+    participant C as Customer app
+    participant O as Order service
+    participant Pay as Payment service
+    participant K as Kafka order-events
+    participant R as Restaurant app
+    participant D as Dispatch
+    participant Rd as Rider
+    C->>O: POST /orders (Idempotency-Key)
+    O->>O: write order as PAYMENT_PENDING
+    O->>Pay: charge (same key)
+    Pay-->>O: payment succeeded
+    O->>K: order_placed via outbox
+    K-->>R: order pushed to restaurant
+    R->>O: accept with prep time
+    O->>K: order now ACCEPTED
+    K-->>D: dispatch picks up order
+    D->>Rd: offer
+    Rd-->>D: accept
+```
 
 **Read path: discovery**
 
@@ -246,21 +288,28 @@ How to say it: "Discovery is a read-heavy, location-keyed problem, so I cache pe
 
 An order is touched by four actors (customer, restaurant, rider, system timers). If each one updates `status` freely, you get impossible states like "delivered but never picked up". So every change goes through one **transition function** with an allowed-transitions table.
 
+The allowed transitions:
+
+```mermaid
+stateDiagram-v2
+    [*] --> PAYMENT_PENDING
+    PAYMENT_PENDING --> PLACED : pay ok
+    PAYMENT_PENDING --> PAYMENT_FAILED : pay fails or timeout
+    PLACED --> ACCEPTED : restaurant accepts
+    PLACED --> REJECTED : reject or accept timeout
+    REJECTED --> [*] : refund
+    PLACED --> CANCELLED : customer cancel
+    ACCEPTED --> CANCELLED : customer cancel
+    CANCELLED --> [*] : refund
+    ACCEPTED --> PREPARING
+    PREPARING --> READY_FOR_PICKUP : food ready
+    READY_FOR_PICKUP --> PICKED_UP : rider picks up
+    PICKED_UP --> DELIVERED : delivered + OTP
+    DELIVERED --> [*]
+    PAYMENT_FAILED --> [*]
 ```
-PAYMENT_PENDING ──pay ok──► PLACED ──restaurant accepts──► ACCEPTED ──► PREPARING
-      │                       │                                            │
-   pay fails /             restaurant rejects                         food ready
-   timeout                 or accept timeout                              ▼
-      ▼                       ▼                                      READY_FOR_PICKUP
-  PAYMENT_FAILED       REJECTED ─► refund                                   │
-                                                                     rider picks up
- customer cancel (only before PREPARING without fee)                        ▼
-      ─► CANCELLED ─► refund                                          PICKED_UP
-                                                                            │
-                                                                    delivered + OTP
-                                                                            ▼
-                                                                       DELIVERED
-```
+
+A customer can cancel without a fee only before `PREPARING`.
 
 Rider assignment is a **parallel sub-state** on the order (`UNASSIGNED → OFFERED → ASSIGNED → AT_RESTAURANT`), because dispatch can happen while the food is cooking. Keeping it separate means a rider cancelling doesn't roll the food state backwards.
 

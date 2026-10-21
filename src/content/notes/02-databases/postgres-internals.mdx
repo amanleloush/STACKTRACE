@@ -139,6 +139,19 @@ A **HOT update** avoids it. It happens when **both**:
 1. the update changes **no indexed column** (columns used only by BRIN, a "summarizing" index, don't count — PostgreSQL 16+), and
 2. the **same page has free space** for the new version.
 
+The decision Postgres makes on every UPDATE:
+
+```mermaid
+flowchart TB
+    U["UPDATE writes new tuple"] --> Q1{"Any indexed column changed?"}
+    Q1 -->|yes| N["Normal update"]
+    Q1 -->|no| Q2{"Free space on same page?"}
+    Q2 -->|no| N
+    Q2 -->|yes| H["HOT update"]
+    N --> NI["New entry in every index"]
+    H --> HI["Indexes untouched, old tuple redirects"]
+```
+
 Then the new tuple lives on the same page, the old one points to it, and the indexes keep pointing at the old entry, which redirects. HOT chains can also be pruned during normal page access, without waiting for VACUUM.
 
 How to get more HOT updates:
@@ -159,6 +172,21 @@ Postgres ships six index access methods. B-tree is the default and right most of
 | **GiST** (generalized search tree) | Balanced tree of bounding "summaries"; often lossy | Overlap, containment, nearest-neighbour `ORDER BY ... <->` | Geometry/PostGIS, range types, exclusion constraints (no overlapping bookings) | Plain scalar equality |
 | **SP-GiST** (space-partitioned GiST) | Non-balanced partitioning: quadtrees, k-d trees, radix tries | Points, ranges, text prefixes | Data that splits naturally into non-overlapping regions (e.g. IP or phone prefixes, points) | General-purpose use |
 | **BRIN** (block range index) | Stores min/max per range of table blocks (128 pages by default) | `=`, `<`, `>` on linear-sortable types | Huge append-only tables where the column follows physical order (event time, log ID) | Columns with random order on disk; small tables |
+
+A quick way to pick one, following the table:
+
+```mermaid
+flowchart TB
+    S["What does the query do?"] --> J{"JSONB, arrays or full-text?"}
+    J -->|yes| GIN["GIN"]
+    J -->|no| G{"Geometry, ranges or no-overlap?"}
+    G -->|yes| GIST["GiST"]
+    G -->|no| B{"Huge append-only, physically ordered?"}
+    B -->|yes| BRIN["BRIN"]
+    B -->|no| P{"Points or prefixes in regions?"}
+    P -->|yes| SPG["SP-GiST"]
+    P -->|no| BT["B-tree (default)"]
+```
 
 Examples:
 
@@ -319,6 +347,27 @@ COMMIT;
 7. Later, checkpointer / background writer flush the dirty heap and index pages.
 8. Later still, once no snapshot needs balance=100, (auto)vacuum or page pruning removes
    the old tuple and marks the space reusable. Eventually VACUUM freezes the new tuple.
+```
+
+The same steps as a sequence:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant B as Backend process
+    participant H as Heap and indexes
+    participant W as WAL
+    participant S as Standby
+    C->>B: UPDATE accounts id=7
+    B->>B: get XID 205
+    B->>H: set xmax=205 on old tuple
+    B->>H: insert new tuple xmin=205
+    B->>W: WAL records into WAL buffers
+    C->>B: COMMIT
+    B->>W: commit record, flush WAL
+    B-->>C: OK
+    W->>S: WAL sender streams changes
+    Note over H,W: Later, checkpointer flushes pages and VACUUM removes old tuple
 ```
 
 ## Real-world examples

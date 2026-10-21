@@ -42,14 +42,21 @@ Think of a recipe written in French:
 - **Interpreter**: a translator stands next to you and translates one line at a time, every time. Flexible, but slow, and the same line gets re-translated on every pass.
 - **JIT**: the translator starts line by line, notices you make this cake every day, and writes down a polished English version of the steps you actually use.
 
-```
-source ──► [AOT compiler] ──► native machine code ───────────────► CPU      (C, Rust, Go)
+The four paths from source code to the CPU:
 
-source ──► [compiler] ──► bytecode ──► [VM: interpreter] ─────────► CPU      (CPython)
-                                            │
-                                            └─► [JIT: hot code] ──► CPU      (JVM, V8, .NET)
-
-source ──► [transpiler] ──► another source language ──► ...                 (TypeScript → JS)
+```mermaid
+flowchart TB
+    src[Source] --> aot["AOT compiler"]
+    aot --> native["Native machine code"]
+    native --> cpu1["CPU: C, Rust, Go"]
+    src --> comp[Compiler]
+    comp --> bc[Bytecode]
+    bc --> interp["VM: interpreter"]
+    interp --> cpu2["CPU: CPython"]
+    interp -->|"hot code"| jit[JIT]
+    jit --> cpu3["CPU: JVM, V8, .NET"]
+    src --> tr[Transpiler]
+    tr --> other["Another source language, e.g. TS to JS"]
 ```
 
 ### What bytecode is
@@ -131,6 +138,18 @@ CPython's real loop lives in `Python/ceval.c`, and since 3.12 the instruction bo
 2. Once warm, the interpreter swaps in a **specialized** version for the types it actually saw, plus a small inline cache stored right after the instruction.
 3. Each specialized instruction checks its assumption cheaply. If the assumption keeps failing, it **de-specializes** back to the adaptive form and can re-specialize later.
 
+The life of one instruction under quickening:
+
+```mermaid
+stateDiagram-v2
+    state "Adaptive (counting)" as Adaptive
+    state "Specialized + inline cache" as Specialized
+    [*] --> Adaptive
+    Adaptive --> Specialized : warm, types observed
+    Specialized --> Specialized : assumption holds
+    Specialized --> Adaptive : assumption keeps failing
+```
+
 You can see it with `dis.dis(add, adaptive=True)` after calling `add(1, 2)` a thousand times (CPython 3.14):
 
 ```
@@ -179,12 +198,17 @@ Other mechanisms worth naming:
 
 Speculation plus deoptimization is the JIT's superpower: it can make optimizations an AOT compiler can't safely make, because it can always back out.
 
-```
- calls/loops ──► counters cross threshold
-                       │
- interpreter (L0) ──► C1 + profiling (L3) ──► C2 optimized (L4)
-       ▲                                           │
-       └────────── deoptimize (assumption broken) ─┘
+A hot method's path through the tiers, and the way back:
+
+```mermaid
+stateDiagram-v2
+    state "Interpreter (L0)" as L0
+    state "C1 + profiling (L3)" as L3
+    state "C2 optimized (L4)" as L4
+    [*] --> L0
+    L0 --> L3 : counters cross threshold
+    L3 --> L4 : profile rich enough
+    L4 --> L0 : deoptimize, assumption broken
 ```
 
 Useful flags: `-XX:+PrintCompilation` shows methods as they compile; `-XX:-TieredCompilation` turns tiering off; the code cache that stores compiled code has its own size limit (`-XX:ReservedCodeCacheSize`), and if it fills up the JIT stops compiling.

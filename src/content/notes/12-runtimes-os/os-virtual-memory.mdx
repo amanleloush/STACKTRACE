@@ -82,6 +82,17 @@ The fix is a **tree** of tables. x86-64 uses **4 levels**, each indexed by 9 bit
  CR3 → L4 table → L3 table → L2 table → L1 table → frame + offset
 ```
 
+The page walk, one 9-bit index per level:
+
+```mermaid
+flowchart TB
+    cr3["CR3 register"] --> l4["L4 table (PGD)"]
+    l4 -->|"L4 index (9 bits)"| l3["L3 table (PUD)"]
+    l3 -->|"L3 index (9 bits)"| l2["L2 table (PMD)"]
+    l2 -->|"L2 index (9 bits)"| l1["L1 table (PTE)"]
+    l1 -->|"L1 index (9 bits)"| fr["Frame + 12-bit offset"]
+```
+
 - Only tables for address ranges that are actually used exist. A sparse address space costs a few pages of tables, not gigabytes.
 - The cost: a TLB miss needs up to **4 memory reads** just to find the translation (the "page walk").
 - 4-level paging allows 256 TiB of virtual address space. CPUs with **5-level paging** extend that to 128 PiB, and Linux supports it on such hardware.
@@ -164,6 +175,21 @@ When a process calls `fork()`, the kernel doesn't copy its memory. It copies the
    child PTE ──► frame 97 (writable)
    parent PTE ──► frame 42 (still read-only; refcount is now 1, so the parent's
                             next write just flips it writable, no copy)
+```
+
+The same steps as a sequence:
+
+```mermaid
+sequenceDiagram
+    participant P as Parent
+    participant K as Kernel
+    participant C as Child
+    P->>K: fork()
+    Note over K: copy page tables, both PTEs point to frame 42, read-only, refcount 2
+    C->>K: write to page (fault)
+    Note over K: COW page, copy frame 42 to frame 97
+    K-->>C: PTE now frame 97 (writable)
+    Note over P,K: frame 42 refcount 1, next parent write just flips it writable
 ```
 
 - `fork` + `exec` stays cheap because the child replaces its memory almost immediately.
@@ -257,6 +283,24 @@ CPU executes: mov rax, [0x7f3a12345678]
 4. If no free frame: kswapd or direct reclaim evicts pages
    (drop clean, write back dirty, swap anonymous). If that fails → OOM killer.
 5. Return from the fault; the instruction re-runs and now hits.
+```
+
+The same decision path as a flow:
+
+```mermaid
+flowchart TB
+    acc["CPU accesses a virtual address"] --> tlb{"TLB hit?"}
+    tlb -->|yes| phys["Physical address: frame + offset"]
+    tlb -->|no| walk["Page walk from CR3"]
+    walk --> pte{"Present and allowed?"}
+    pte -->|yes| fill["Load into TLB, retry"]
+    fill --> phys
+    pte -->|no| fault["Page fault: kernel checks VMAs"]
+    fault -->|"not mapped"| segv["SIGSEGV"]
+    fault -->|"first touch, cached file, COW"| minor["Minor fault: map a frame"]
+    fault -->|"file not cached, swapped out"| major["Major fault: read from disk"]
+    minor --> retry["Instruction re-runs"]
+    major --> retry
 ```
 
 ## Real-world examples

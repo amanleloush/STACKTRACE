@@ -39,20 +39,30 @@ A running JVM splits its memory into several **run-time data areas**. The JVM sp
 
 ### The big picture
 
-```
-                         one JVM process
- ┌──────────────────────────────────────────────────────────────────┐
- │  Java heap (-Xms / -Xmx)                                         │
- │  ┌──────────────── young ───────────────┐ ┌────── old ────────┐  │
- │  │  eden            │ S0     │ S1       │ │ long-lived objects │  │
- │  └──────────────────────────────────────┘ └────────────────────┘  │
- ├──────────────────────────────────────────────────────────────────┤
- │  native memory (outside -Xmx)                                    │
- │   metaspace + compressed class space   code cache (JIT output)   │
- │   thread stacks (-Xss each)            direct ByteBuffers        │
- │   GC bookkeeping, JIT compiler arenas, symbol table, JNI libs    │
- └──────────────────────────────────────────────────────────────────┘
- per thread: JVM stack (frames) · PC register · native method stack
+One JVM process: the heap that `-Xmx` caps, the native memory outside it, and the per-thread areas:
+
+```mermaid
+flowchart TB
+    subgraph heap["Java heap (-Xms / -Xmx)"]
+        subgraph young["Young"]
+            eden["Eden"]
+            s0["S0"]
+            s1["S1"]
+        end
+        old["Old: long-lived objects"]
+    end
+    subgraph native["Native memory (outside -Xmx)"]
+        meta["Metaspace + compressed class space"]
+        cc["Code cache (JIT output)"]
+        stacks["Thread stacks (-Xss each)"]
+        direct["Direct ByteBuffers"]
+        misc["GC bookkeeping, JIT arenas, symbol table, JNI libs"]
+    end
+    subgraph thread["Per thread"]
+        jstack["JVM stack (frames)"]
+        pc["PC register"]
+        nstack["Native method stack"]
+    end
 ```
 
 ### The heap: young and old generations
@@ -63,6 +73,19 @@ The heap holds every object created with `new`, every array, and (since JDK 7) t
 - **Survivor spaces (S0 and S1)**: objects that survive a young (minor) GC are copied here. Only one survivor space is in use at a time; each young GC copies live objects from eden and the active survivor into the other one.
 - **Age and promotion**: each survival increments the object's age. Once it reaches the tenuring threshold (at most 15, `-XX:MaxTenuringThreshold`; the age is stored in 4 bits of the object header) or survivors fill up, the object is **promoted** to the old generation.
 - **Old (tenured) generation**: long-lived objects such as caches, pools and singletons. Collected less often and more expensively.
+
+The life of one object across the generations:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Eden : new (TLAB pointer bump)
+    Eden --> Survivor : survives young GC
+    Survivor --> Survivor : survives again (age + 1)
+    Survivor --> Old : age hits threshold or survivors full
+    Eden --> [*] : dead at young GC
+    Survivor --> [*] : dead at young GC
+    Old --> [*] : dead at old GC
+```
 
 With **G1** (the default since JDK 9), the heap is a set of equal-sized **regions**, and each region is tagged eden, survivor, old or humongous, so the generations are logical rather than two fixed blocks. Generational ZGC (JDK 21+) also separates young and old. How each collector cleans these spaces is in [Memory and Garbage Collection](/learn/notes/memory-gc/).
 
@@ -173,12 +196,19 @@ The default `ClassLoader.loadClass(name)` does three steps, in order:
 2. **Ask the parent** (the bootstrap loader if the parent is `null`).
 3. Only if the parent can't find it, call this loader's own **`findClass(name)`**.
 
-```
- loadClass("com.shop.Order")
-   app loader ──asks──▶ platform loader ──asks──▶ bootstrap
-                                                    │ not found
-                         platform: not found ◀──────┘
-   app loader: findClass → reads com/shop/Order.class from the class path ✔
+Loading an application class, step by step:
+
+```mermaid
+sequenceDiagram
+    participant A as App loader
+    participant P as Platform loader
+    participant B as Bootstrap
+    Note over A: loadClass("com.shop.Order")
+    A->>P: ask parent
+    P->>B: ask parent
+    B-->>P: not found
+    P-->>A: not found
+    Note over A: findClass reads com/shop/Order.class from class path
 ```
 
 Why parent-first:

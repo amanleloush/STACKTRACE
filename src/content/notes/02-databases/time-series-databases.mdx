@@ -201,22 +201,19 @@ InfluxDB's own docs (1.x/2.x) name high series cardinality as a primary driver o
 
 ### A write and a query in Prometheus
 
-```
-scrape every 15s
-      │
-      ▼
- ┌─────────────── head block (memory) ───────────────┐
- │ series lookup: labels → series ref (create if new)│
- │ append (t, v) to that series' open XOR chunk      │
- │ also appended to the WAL (128 MB segments on disk)│
- └───────────────────────────────────────────────────┘
-      │ every 2h the head is cut into an immutable block
-      ▼
- block dir: chunks/ + index (symbols, postings) + meta.json + tombstones
-      │ background compaction merges blocks into larger ones
-      │ (up to 10% of retention or 31 days, whichever is smaller)
-      ▼
- retention: whole blocks older than 15d (default) are deleted
+The life of a sample, from scrape to deletion:
+
+```mermaid
+flowchart TB
+    scrape["Scrape every 15s"]
+    subgraph head["Head block (memory)"]
+        lookup["Labels → series ref (create if new)"] --> append["Append (t, v) to open XOR chunk"]
+    end
+    scrape --> lookup
+    append --> wal["WAL on disk (128 MB segments)"]
+    append -->|"every 2h, cut"| block["Immutable block: chunks/, index, meta.json, tombstones"]
+    block -->|"background compaction"| big["Larger blocks (up to 10% of retention or 31d)"]
+    big -->|"older than 15d (default)"| del["Whole block deleted"]
 ```
 
 A query such as `rate(http_requests_total{status="500"}[5m])`:
@@ -224,6 +221,20 @@ A query such as `rate(http_requests_total{status="500"}[5m])`:
 1. Look up the **postings** (sorted series IDs) for `__name__="http_requests_total"` and for `status="500"`, then intersect the two lists.
 2. For each matching series, find chunks overlapping the time range, in the head and in persisted blocks.
 3. Decode the chunks (delta-of-delta + XOR), compute `rate` per series, return the results.
+
+The same three query steps as a picture:
+
+```mermaid
+flowchart TB
+    p1["Postings for __name__"] --> inter["Intersect series ID lists"]
+    p2["Postings for status=500"] --> inter
+    inter --> chunks["Find overlapping chunks"]
+    hb["Head block"] --> chunks
+    pb["Persisted blocks"] --> chunks
+    chunks --> decode["Decode delta-of-delta + XOR"]
+    decode --> rate["rate() per series"]
+    rate --> out["Return results"]
+```
 
 The Prometheus docs are explicit that local storage is **not clustered or replicated**. For durability and long-term storage you use **remote write** to a system such as Thanos, Cortex/Mimir or VictoriaMetrics, or run two identical Prometheus servers for HA.
 
@@ -293,6 +304,18 @@ SELECT add_retention_policy('metrics', INTERVAL '30 days');
 - Already on Postgres, need time series joined with business tables, moderate scale → **TimescaleDB**.
 - Huge volumes, high-cardinality dimensions, ad-hoc analytics over events or logs → **ClickHouse**.
 - A dedicated TSDB with SQL for IoT or sensor data → **InfluxDB 3**.
+
+The same choice as a decision tree:
+
+```mermaid
+flowchart TB
+    q1{"Kubernetes or service metrics with alerting?"} -->|"yes"| prom["Prometheus (+ Thanos/Mimir)"]
+    q1 -->|"no"| q2{"Already on Postgres, need joins?"}
+    q2 -->|"yes, moderate scale"| ts["TimescaleDB"]
+    q2 -->|"no"| q3{"Huge, high-cardinality ad-hoc analytics?"}
+    q3 -->|"yes"| ch["ClickHouse"]
+    q3 -->|"no, IoT or sensor TSDB with SQL"| inf["InfluxDB 3"]
+```
 
 More on picking a database in general: [Choosing a Database](/learn/notes/database-selection-matrix/).
 

@@ -70,6 +70,29 @@ How you split the keyspace across nodes (hash-slot sharding, a fixed-partition c
                        Cluster bus (gossip) ──────► cluster state, failover
 ```
 
+The same cluster with each node's replica drawn out:
+
+```mermaid
+flowchart TB
+    client["Client SDK"] --> router["Proxy / cluster client"]
+    router -->|"CRC16(key) to slot"| slots["16,384 hash slots"]
+    slots --> p1
+    slots --> p2
+    slots --> p20
+    subgraph n1["N1"]
+        p1["primary"] -->|async| r1["replica"]
+    end
+    subgraph n2["N2"]
+        p2["primary"] -->|async| r2["replica"]
+    end
+    subgraph n20["N20"]
+        p20["primary"] -->|async| r20["replica"]
+    end
+    bus["Cluster bus (gossip)"] -.->|"state, failover"| n1
+    bus -.-> n2
+    bus -.-> n20
+```
+
 ## Detailed design
 
 ### Sharding via hash slots (Redis Cluster model)
@@ -86,11 +109,44 @@ How you split the keyspace across nodes (hash-slot sharding, a fixed-partition c
 - On primary failure: replica is promoted (gossip-based election).
 - Clients discover topology via `CLUSTER NODES` or `CLUSTER SLOTS`.
 
+What happens when a primary dies:
+
+```mermaid
+sequenceDiagram
+    participant P as Primary N1
+    participant R as Replica of N1
+    participant O as Other primaries
+    participant C as Client
+    Note over P: crashes
+    O->>O: gossip on cluster bus
+    Note over O: majority agree N1 failed
+    Note over R: promoted to primary
+    Note over P,R: writes not yet replicated are lost
+    C->>R: next request (after topology refresh)
+    R-->>C: reply
+```
+
 ### Client topology awareness
 
 - Smart clients (e.g., redis-py's `RedisCluster`, lettuce, redisson) cache the slot map.
 - On `MOVED` / `ASK` response, refresh slot map.
 - One round trip in the steady state.
+
+A stale slot map costs one redirect, then the client is back to one hop:
+
+```mermaid
+sequenceDiagram
+    participant C as Smart client
+    participant A as Node A (old owner)
+    participant B as Node B (new owner)
+    C->>A: GET key (cached slot map)
+    A-->>C: MOVED slot to B
+    Note over C: refresh slot map
+    C->>B: GET key
+    B-->>C: value
+    C->>B: next GET for that slot
+    B-->>C: value (one round trip)
+```
 
 ### Memory + eviction
 

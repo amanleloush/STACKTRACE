@@ -69,6 +69,19 @@ Think of OS threads as hiring full-time employees (expensive desk, onboarding, t
 
 Why have P at all? Go 1.0 had only G and M, with one global run queue behind one global lock. It scaled badly. Dmitry Vyukov's 2012 "Scalable Go Scheduler" design (shipped in Go 1.1) added P so that most scheduling uses **per-P state without locks**, and so the number of threads running Go code is capped independently of the number of threads blocked in syscalls.
 
+The main states a G moves through:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Runnable : go f()
+    Runnable --> Running : scheduled on an M + P
+    Running --> Runnable : preempted
+    Running --> Waiting : blocks (channel, mutex, I/O)
+    Waiting --> Runnable : woken (netpoller, other G)
+    Running --> Dead : function returns
+    Dead --> [*] : struct reused
+```
+
 **How to say it in an interview:** "M is the worker, P is the permission slip plus the work queue, G is the work. You need an M plus a P to run a G. There are exactly GOMAXPROCS Ps, but the number of Ms can grow when threads get stuck in syscalls."
 
 ### Run queues: local, global and runnext
@@ -90,6 +103,22 @@ When an M's current goroutine blocks or finishes, the M asks its P for the next 
 4. The **netpoller**, non-blocking: are any sockets ready? Make those goroutines runnable.
 5. **Steal** from other Ps.
 6. Nothing found: give up the P, park the thread (sleep). Before sleeping it may block in the netpoller waiting for I/O or the next timer.
+
+The same search order as a flow:
+
+```mermaid
+flowchart TB
+  s1["Every 61 ticks: global queue"] -->|"none"| s2["runnext, then local queue"]
+  s2 -->|"none"| s3["Global queue (batch)"]
+  s3 -->|"none"| s4["Netpoller, non-blocking"]
+  s4 -->|"none"| s5["Steal from other Ps"]
+  s5 -->|"none"| s6["Release P, park thread"]
+  s1 -->|"found"| run["Run the G"]
+  s2 -->|"found"| run
+  s3 -->|"found"| run
+  s4 -->|"found"| run
+  s5 -->|"found"| run
+```
 
 ### Work stealing
 
@@ -113,6 +142,24 @@ Two mechanisms:
 
 - **Fast syscalls**: on entry the runtime just marks the P as "in syscall" and doesn't immediately hand it off (that would be wasteful for a 1 microsecond call).
 - **sysmon** (a special runtime thread that runs **without** a P) wakes periodically, starting at 20 microseconds and backing off up to 10 ms when idle. If a P has been stuck in the same syscall for at least one sysmon tick and there's other work to do, sysmon **retakes** the P and hands it to another M (`handoffp`).
+
+The handoff for a slow syscall, step by step:
+
+```mermaid
+sequenceDiagram
+    participant M0 as M0 (thread)
+    participant P0
+    participant SM as sysmon
+    participant M5 as M5 (thread)
+    M0->>M0: G1 enters blocking read()
+    Note over M0,P0: P0 marked in syscall
+    SM->>P0: stuck for a sysmon tick, retake
+    SM->>M5: handoffp, P0 goes to M5
+    M5->>P0: run other Gs
+    M0->>M0: syscall returns for G1
+    M0->>P0: try to get old P back
+    Note over M0: Else any idle P, else G1 to global queue and M0 sleeps
+```
 
 That's why a Go program can have more OS threads than `GOMAXPROCS`: threads blocked in syscalls or cgo calls don't count. The default ceiling is 10,000 threads (`runtime/debug.SetMaxThreads`); exceeding it crashes the program.
 

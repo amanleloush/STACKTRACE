@@ -42,6 +42,19 @@ A SQL query says **what** you want, not **how** to get it. Even so, every `SELEC
                                      8. LIMIT/OFFSET  cut
 ```
 
+The logical order as a pipeline, with what each step does to the rows:
+
+```mermaid
+flowchart TB
+    f["Step 1, FROM / JOIN: build the row set"] --> w["Step 2, WHERE: keep TRUE rows"]
+    w --> g["Step 3, GROUP BY: fold rows into groups"]
+    g --> h["Step 4, HAVING: keep TRUE groups"]
+    h --> s["Step 5, SELECT: expressions, aliases, windows"]
+    s --> d["Step 6, DISTINCT: drop duplicate rows"]
+    d --> ob["Step 7, ORDER BY: sort"]
+    ob --> l["Step 8, LIMIT / OFFSET: cut"]
+```
+
 The PostgreSQL manual describes `SELECT` processing in this order (with `WITH` queries computed first and `UNION`/`INTERSECT`/`EXCEPT` applied after `DISTINCT`). Window functions run during step 5, after grouping, which is why they can't appear in `WHERE`, `GROUP BY` or `HAVING`.
 
 What follows from this order:
@@ -168,6 +181,16 @@ LEFT JOIN departments d ON e.dept_id = d.id AND d.name = 'Eng';   -- RIGHT
 
 Rule: a condition on the **optional** (right) side of a `LEFT JOIN` belongs in `ON`. A condition on the **preserved** (left) side can go in `WHERE`.
 
+Where a filter belongs, as a quick decision tree:
+
+```mermaid
+flowchart TB
+    q1{"Does the condition use an aggregate?"} -->|yes| hv["HAVING"]
+    q1 -->|no| q2{"Is it on the optional side of a LEFT JOIN?"}
+    q2 -->|yes| on["ON"]
+    q2 -->|"no, preserved side or inner join"| wh["WHERE"]
+```
+
 ### NULL in joins and comparisons
 
 SQL uses **three-valued logic**: a comparison can be TRUE, FALSE or UNKNOWN. Anything compared with `NULL` using `=`, `<>`, `<` and so on is UNKNOWN, and `WHERE`/`ON`/`HAVING` keep only TRUE.
@@ -219,6 +242,17 @@ Why does `NOT IN` return nothing? Dev's `dept_id` is `NULL`. For HR, `30 NOT IN 
 | `NOT EXISTS` | Yes | Planned as an anti-join in Postgres; MySQL 8.0.17+ also turns it into an antijoin. |
 | `LEFT JOIN ... WHERE right.pk IS NULL` | Yes | Check a column that can't be NULL in the right table, such as its primary key. |
 | `NOT IN (subquery)` | **No**, if the subquery can return NULL | Fine for a literal list without NULLs. Postgres 18 and older can't plan it as an anti-join (19 can, but only when both sides are provably non-NULL), so it may be slow on large subqueries. |
+
+Choosing an anti-join form:
+
+```mermaid
+flowchart TB
+    s0["Rows in A with no match in B"] --> ne["NOT EXISTS (default, NULL-safe)"]
+    s0 --> lj["LEFT JOIN, then right.pk IS NULL"]
+    s0 --> q{"NOT IN: can the subquery return NULL?"}
+    q -->|yes| bad["Zero rows (the trap)"]
+    q -->|"no, e.g. a literal list"| ok["Correct"]
+```
 
 **How to say it:** "For an anti-join I default to `NOT EXISTS`. `NOT IN` returns no rows if the subquery yields a single NULL, because the comparison with NULL is unknown."
 

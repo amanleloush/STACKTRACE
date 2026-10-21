@@ -46,6 +46,18 @@ then × headroom (2–3× expected growth), rounded to a highly divisible number
 - Producer side needs 60 / 10 = 6. Consumer side needs 60 / 4 = **15**, so the consumer is the bottleneck.
 - Allow 2x growth → 30. Round to a divisible number → **30** (divides by 1, 2, 3, 5, 6, 10, 15 and 30, so consumer counts balance evenly). 24 or 36 would also be reasonable.
 
+The same calculation as a flow:
+
+```mermaid
+flowchart TB
+    T["Peak T = 60 MB/s"] --> PP["Producer side: 60 / 10 = 6"]
+    T --> PC["Consumer side: 60 / 4 = 15"]
+    PP --> MX["Take the max: 15"]
+    PC --> MX
+    MX --> HR["2x headroom: 30"]
+    HR --> RD["Round to divisible: 30 partitions"]
+```
+
 **Other forces on the number:**
 - **Key cardinality and skew.** You need enough distinct keys to spread load. A few hot keys will dominate a few partitions regardless of the count.
 - **Per-partition cost.** Every partition replica means open file handles (segments and indexes), replica fetcher work, client memory (per-partition batches in the producer), and controller work during failover. Keep it to **low thousands of partition replicas per broker**. KRaft raised the *cluster-wide* metadata ceiling into the millions, but per-broker resource costs are unchanged.
@@ -93,6 +105,23 @@ Internals are covered in [Kafka internals](/learn/notes/kafka-internals/).
 Each partition's log is split into two tiers:
 - a **local hot tier**: recent segments on broker disks, served from the page cache.
 - a **remote cold tier**: older, closed segments uploaded to object storage (S3, GCS, Azure Blob).
+
+Where the data lives and how old reads are served:
+
+```mermaid
+flowchart LR
+    P["Producer"] --> B["Broker"]
+    B --> hot
+    subgraph hot["Local hot tier"]
+        seg["Recent segments, page cache"]
+    end
+    subgraph cold["Remote cold tier"]
+        obj["Older closed segments, object storage"]
+    end
+    seg -->|"upload closed segments"| obj
+    C["Consumer"] -->|"read old offsets"| B
+    B -.->|"fetch remote segments"| obj
+```
 
 Consumers reading old offsets are served transparently, with the broker fetching remote segments. It became generally available in Apache Kafka **3.9**; vendors (Confluent, MSK and others) offered it earlier.
 
@@ -162,6 +191,18 @@ Trade-offs: reads from the cold tier have object-store latency, and there are li
 
 7. SAFETY    While fixing: is retention.ms > worst-case catch-up time?
              If lag outruns retention, data is deleted unread.
+```
+
+The seven checks in order, with what each one tells you:
+
+```mermaid
+flowchart TB
+    S1["1. Scope: all or few partitions?"] --> S2["2. Churn: constant rebalancing? Fix first"]
+    S2 --> S3["3. Handler: time per record"]
+    S3 --> S4["4. Math: add consumers or partitions"]
+    S4 --> S5["5. Errors: poison pill to DLQ"]
+    S5 --> S6["6. Sink: downstream at capacity?"]
+    S6 --> S7["7. Safety: retention vs catch-up time"]
 ```
 
 ### Runbook 2: producer throughput drops and latency spikes

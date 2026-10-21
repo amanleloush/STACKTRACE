@@ -88,6 +88,31 @@ Group "search"   (1 instance)   → P0..P3 → S1                ← every group
 Group "analytics"(4 instances)  → one partition each          ← pub-sub semantics across groups
 ```
 
+The same topic, drawn as who reads which partition:
+
+```mermaid
+flowchart LR
+    subgraph topic["Topic orders"]
+        P0
+        P1
+        P2
+        P3
+    end
+    subgraph billing["Group billing"]
+        B1
+        B2
+    end
+    subgraph search["Group search"]
+        S1
+    end
+    P0 --> B1
+    P1 --> B1
+    P2 --> B2
+    P3 --> B2
+    topic -->|"all 4 partitions"| S1
+    topic -->|"one partition per instance"| analytics["Group analytics (4 instances)"]
+```
+
 Inside a group, partitions are divided among members — competing consumers. Across groups, each group reads the full stream independently with its own offsets. You choose the semantics by choosing the `group.id`, not by choosing a different kind of topic.
 
 ### Message broker vs event streaming platform
@@ -180,15 +205,22 @@ Why it matters more in async systems: a single checkout may touch six services o
 
 Sometimes you need an answer but still want the broker in between (e.g., a long-running pricing calculation, or a team that only exposes a Kafka interface).
 
-```
-Requester                              Responder
-  │ produce → pricing.requests
-  │   headers: correlation-id=abc, reply-to=pricing.replies.instance-7
-  │                                        │ consume, compute
-  │                                        │ produce → pricing.replies.instance-7
-  │                                        │   headers: correlation-id=abc
-  │ consume pricing.replies.instance-7
-  │ pending["abc"].complete(result)
+One request and its reply, through the broker:
+
+```mermaid
+sequenceDiagram
+    participant Q as Requester
+    participant K as Kafka
+    participant R as Responder
+    Note over Q: pending map abc → future, with timeout
+    Q->>K: produce to pricing.requests
+    Note over Q,K: headers correlation-id=abc, reply-to=pricing.replies.instance-7
+    K->>R: consume request
+    Note over R: compute
+    R->>K: produce to pricing.replies.instance-7
+    Note over R,K: headers correlation-id=abc
+    K->>Q: consume pricing.replies.instance-7
+    Note over Q: complete pending future abc with result
 ```
 
 1. The requester keeps a map `correlationId → pending future` with a timeout.
@@ -215,6 +247,25 @@ Spring Kafka's `ReplyingKafkaTemplate` packages this. The caveats are what inter
 5. Email provider is down → email group's lag grows; checkout is unaffected.
    Provider recovers → group drains backlog. No messages lost, none double-sent.
 6. Support searches logs for correlation-id=c-91 → sees the whole flow.
+```
+
+Steps 1–4 as a sequence. Note the client gets its answer before any consumer runs:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant O as OrderService
+    participant DB as Order DB
+    participant RL as Outbox relay / CDC
+    participant T as orders.events
+    participant G as Consumer groups
+    C->>O: POST /orders (correlation-id c-91)
+    O->>DB: INSERT order 42 + outbox row (one tx)
+    O-->>C: 201 Created
+    RL->>DB: pick up outbox row
+    RL->>T: publish OrderPlaced (key 42)
+    T->>G: billing, inventory, email, analytics
+    Note over G: each group reacts at its own pace
 ```
 
 ## Real-world examples

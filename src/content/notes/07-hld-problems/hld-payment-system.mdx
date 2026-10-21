@@ -46,26 +46,16 @@ Design a payment system that processes money movement (debit A, credit B) with s
 
 ## High-level architecture
 
-```
-                ┌──────────────┐
-   Merchant ──► │   API GW     │ ──► AuthN + rate limit + idem key
-                └──────┬───────┘
-                       ▼
-                ┌──────────────┐
-                │ Payment Svc  │ ── saga orchestrator
-                └──┬─────┬─────┘
-                   ▼     ▼
-            ┌──────────┐ ┌──────────┐
-            │ Ledger   │ │ Vault    │ (PCI-scoped)
-            │  Service │ │ (card    │
-            └──────────┘ │ tokens)  │
-                         └──────────┘
-                   │
-                   ▼
-            ┌──────────────┐
-            │ Provider     │ (Stripe / Adyen / banks)
-            │  Adapters    │
-            └──────────────┘
+The services a payment request passes through:
+
+```mermaid
+flowchart TB
+    m["Merchant"] --> gw["API GW: AuthN, rate limit, idem key"]
+    gw --> ps["Payment Svc (saga orchestrator)"]
+    ps --> led["Ledger Service"]
+    ps --> vault["Vault: card tokens (PCI-scoped)"]
+    ps --> pa["Provider Adapters"]
+    pa --> prov["Stripe / Adyen / banks"]
 ```
 
 ## Detailed design
@@ -76,6 +66,28 @@ Every mutation API takes an `Idempotency-Key`:
 1. Atomically reserve the key in the idempotency store (for example `INSERT` into a Postgres table with a unique constraint, or Redis `SET NX`). This stops two concurrent retries from both executing.
 2. If the key already exists with a stored response: return that response, with no new action. If it exists but is still in progress, return a conflict (Stripe returns 409) so the client retries later. If it was reused with different request parameters, reject it.
 3. If the reservation succeeded: execute, store the response against the key, return.
+
+The idempotency check on every mutation, with each possible outcome:
+
+```mermaid
+sequenceDiagram
+    participant M as Merchant
+    participant P as Payment API
+    participant S as Idempotency store
+    M->>P: request + Idempotency-Key
+    P->>S: atomically reserve key (unique insert or SET NX)
+    alt reservation succeeded
+        Note over P: execute the payment
+        P->>S: store response against key
+        P-->>M: response
+    else key exists with stored response
+        P-->>M: stored response, no new action
+    else key exists, still in progress
+        P-->>M: 409 conflict, retry later
+    else key reused with different params
+        P-->>M: reject
+    end
+```
 
 Window: 24h+ (Stripe keeps keys for at least 24 hours). Forwarded to upstream providers as their idempotency key too (Stripe and Adyen both accept an `Idempotency-Key` header).
 
@@ -125,11 +137,20 @@ State machine in a saga orchestrator (Temporal). Each step is idempotent.
 
 ### State machine
 
-```
-NEW → AUTHORIZED → CAPTURED → SETTLED
- ↓        ↓            ↓          ↓
-FAILED  VOIDED         └─ REFUNDED ┘
-(terminal) (terminal)   (full / partial)
+The payment states and the moves between them:
+
+```mermaid
+stateDiagram-v2
+    [*] --> NEW
+    NEW --> AUTHORIZED : authorize (hold on card)
+    NEW --> FAILED : fails
+    AUTHORIZED --> CAPTURED : capture
+    AUTHORIZED --> VOIDED : capture fails, release auth
+    CAPTURED --> SETTLED : provider settles
+    CAPTURED --> REFUNDED : refund (full or partial)
+    SETTLED --> REFUNDED : refund (full or partial)
+    FAILED --> [*]
+    VOIDED --> [*]
 ```
 
 Persisted with every state change.

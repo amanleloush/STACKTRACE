@@ -84,6 +84,24 @@ The drills. Each one follows the same shape so you can recall it under pressure.
 - Connection pools and drivers that handle endpoint changes quickly (short DNS TTL, proxies like PgBouncer or ProxySQL).
 - Practise failovers regularly so they're boring.
 
+The failover, step by step:
+
+```mermaid
+sequenceDiagram
+    participant App
+    participant FM as Failover manager
+    participant Old as Old primary
+    participant Rep as Most up-to-date replica
+    App-xOld: writes fail
+    FM->>Old: health check fails
+    FM->>Rep: promote to primary
+    FM->>Old: fence (revoke writer role)
+    FM->>FM: move writer endpoint to new primary
+    App->>Rep: reconnect, retry idempotent writes
+    Rep-->>App: OK
+    Note over Old,Rep: Async replication means unshipped writes are lost
+```
+
 **Go deeper:** [replication and sharding](/learn/notes/replication-sharding/), [consensus](/learn/notes/consensus-raft-paxos/), [transactions](/learn/notes/transactions-isolation/).
 
 ### 2. Replica lag
@@ -170,6 +188,16 @@ The drills. Each one follows the same shape so you can recall it under pressure.
 
 **What breaks.** "Slow" is often worse than "down". By **Little's law**, the number of requests in flight = arrival rate × time each one takes. If a dependency goes from 50 ms to 5 s, each caller holds 100× more threads, connections and memory. Thread pools fill up, and the caller stops serving **everything**, including requests that never touch the slow dependency. That's a **cascading failure**.
 
+How one slow dependency turns into a cascading failure:
+
+```mermaid
+flowchart TB
+    slow["Dependency: 50 ms to 5 s"] --> held["Each caller holds 100x threads"]
+    held --> full["Thread and connection pools fill"]
+    full --> all["Caller stops serving everything"]
+    all --> cascade["Cascading failure"]
+```
+
 **Detect.** Per-dependency latency (p99), in-flight request counts, thread/connection pool saturation, timeouts.
 
 **Mitigate now.**
@@ -219,6 +247,18 @@ The drills. Each one follows the same shape so you can recall it under pressure.
 **Fix for good.**
 - **Bounded retries, then DLQ**, as standard: SQS redrive policies (`maxReceiveCount`), RabbitMQ dead-letter exchanges, retry and DLT topics in Kafka clients like Spring Kafka.
 - Separate **retryable** errors (timeout, dependency down: retry with backoff) from **non-retryable** ones (validation failure: straight to DLQ).
+
+What a consumer should do when a message fails:
+
+```mermaid
+flowchart TB
+    fail["Message processing fails"] --> kind{"Retryable error?"}
+    kind -->|"no, e.g. validation"| dlq["Publish to DLQ and skip"]
+    kind -->|"yes, e.g. timeout"| left{"Retries left?"}
+    left -->|yes| retry["Retry with backoff"]
+    left -->|no| dlq
+    dlq --> alert["Alert owner, fix, replay DLQ"]
+```
 - Schema validation at the producer (schema registry, compatibility checks).
 - DLQ alerting, ownership and a replay tool. A DLQ nobody watches is just a slower way to lose data.
 - If per-key order matters, decide whether skipping one message breaks the entity's state; you may need to park all later messages for that key.

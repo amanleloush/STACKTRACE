@@ -151,12 +151,49 @@ Notes:
                            fill + snapshots)       surveillance, audit
 ```
 
+The same components as a flow, from order entry down to the outputs:
+
+```mermaid
+flowchart TB
+    F["Member firms (FIX or binary)"] --> G["Order gateways + risk checks"]
+    G -->|"accepted orders"| S["Sequencer, one per partition"]
+    S --> J[("Journal, append-only, replicated")]
+    S -->|"sequenced events"| ME["Matching engine (primary)"]
+    S --> HS["Hot standby, output muted"]
+    S --> DR["DR replica, other site"]
+    ME --> ER["Execution reports via gateways"]
+    ME --> MD["Market data publisher (multicast)"]
+    ME --> DC["Drop copy, trade capture"]
+```
+
 **Write path (an order arrives):**
 1. Firm sends `NewOrder` over its TCP session to a gateway.
 2. Gateway parses, checks the session, rejects duplicates, runs risk checks (in memory, microseconds). Rejected orders get a reject report immediately and never reach the engine.
 3. Gateway forwards to the **sequencer** for that symbol's partition. The sequencer gives it the next sequence number and appends it to the journal; the event is replicated to the standby.
 4. The **matching engine** takes events strictly in sequence order, matches against the book, and emits output events (ack, fills, book updates).
 5. Execution reports go back to the firms through their gateways; market data publishers multicast book changes and trades to all subscribers.
+
+The write path, step by step:
+
+```mermaid
+sequenceDiagram
+    participant F as Firm
+    participant G as Gateway
+    participant S as Sequencer
+    participant J as Journal
+    participant E as Matching engine
+    participant M as Market data
+    F->>G: NewOrder
+    G->>G: session, dedupe, risk checks
+    G->>S: accepted order
+    S->>J: append with next seqNo
+    Note over S,J: Replicated to standby before any ack
+    S->>E: sequenced event
+    E->>E: match against book
+    E->>G: ack and fills
+    G-->>F: ExecutionReport
+    E->>M: book changes and trades
+```
 
 **Read path (market data):** subscribers join multicast groups (one per symbol range), apply each sequenced message to their own copy of the book, and use gap requests or snapshots if they miss packets. Nobody "queries" the matching engine for prices; querying would steal its time.
 
@@ -331,6 +368,21 @@ Market data is a firehose that thousands of firms want at the same instant, with
 - **Snapshots**: a subscriber that joins late, or is too far behind, fetches a book snapshot at some seqNo, then applies the live feed from there. Nasdaq offers a separate snapshot service (GLIMPSE) for this alongside its TotalView-ITCH feed.
 - **Order-level feed**: Nasdaq's TotalView-ITCH tracks each order's life with messages such as Add Order, Order Executed, Order Cancel, Order Delete and Order Replace; subscribers rebuild the full book from them. Timestamps are nanoseconds since midnight.
 - **Tiers**: full depth (every order), top N levels, top of book only. Internet-facing apps get a conflated feed (latest state every few ms) over WebSocket from a separate fan-out tier, never from the core. See [Realtime push: WebSockets and SSE](/learn/notes/realtime-push-websockets-sse/).
+
+How a subscriber recovers from a missed packet:
+
+```mermaid
+sequenceDiagram
+    participant P as Publisher
+    participant Sub as Subscriber
+    participant R as Retransmission server
+    P->>Sub: multicast seqNo 1000
+    P->>Sub: multicast seqNo 1005
+    Note over Sub: Gap detected, 1001 to 1004 missing
+    Sub->>R: request 1001 to 1004 (unicast)
+    R-->>Sub: messages 1001 to 1004
+    Note over Sub: Too far behind? Fetch snapshot, then resume
+```
 
 Fairness note: market data is published from the engine's output stream, after each event is processed, through the same path for everyone. So no subscriber gets the information earlier than any other.
 

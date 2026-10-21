@@ -150,6 +150,20 @@ Before Kafka 0.11, a follower that restarted **truncated its log to its own high
 
 The fix is the **leader epoch**, a number that goes up by one every time the partition gets a new leader. Each replica records which epoch began at which offset (in the `leader-epoch-checkpoint` file). A recovering replica no longer guesses from the HW. Instead it asks the current leader: "my last epoch was 5; where does epoch 5 end in your log?" (`OffsetForLeaderEpoch`). It then truncates exactly at the point where the two logs diverge and fetches from there. Replicas are guaranteed to end up with **byte-identical logs** with no loss of committed data. It's the same idea as Raft terms.
 
+How a recovering replica finds where to truncate:
+
+```mermaid
+sequenceDiagram
+    participant R as Recovering replica
+    participant L as Current leader
+    R->>R: read leader-epoch-checkpoint
+    R->>L: OffsetForLeaderEpoch (epoch 5)
+    L-->>R: where epoch 5 ends in my log
+    R->>R: truncate at the divergence point
+    R->>L: fetch from there
+    Note over R,L: Logs end up byte-identical
+```
+
 ### Large messages
 
 The default limit is about **1 MB** per batch. The relevant settings are `message.max.bytes` (broker and topic), `max.request.size` (producer), and `max.partition.fetch.bytes` / `fetch.max.bytes` (consumer). You can raise all of them, but big records:
@@ -170,6 +184,25 @@ Better options, roughly from most to least preferred:
 2. It sends a **Metadata request**. The response lists every broker (host:port) and, for each topic partition, its current leader and replicas.
 3. The client opens connections **straight to the leaders** and sends produce or fetch requests to the right broker. There's no proxy or router layer; the clients themselves know the cluster layout.
 4. If leadership moves, requests fail with `NOT_LEADER_OR_FOLLOWER`. The client refreshes metadata and retries against the new leader. Clients also refresh metadata every `metadata.max.age.ms` (5 min).
+
+Discovery and a leader move, as a sequence:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant B as Bootstrap broker
+    participant L1 as Old leader
+    participant L2 as New leader
+    C->>B: Metadata request
+    B-->>C: brokers and partition leaders
+    C->>L1: produce or fetch
+    Note over L1,L2: Leadership moves
+    C->>L1: produce or fetch
+    L1-->>C: NOT_LEADER_OR_FOLLOWER
+    C->>B: refresh metadata
+    B-->>C: new leader is L2
+    C->>L2: retry the request
+```
 
 **`advertised.listeners`** is the address each broker *tells* clients to use. If it says `localhost:9092` or a private Docker hostname, clients outside the box receive a valid metadata response and then fail to connect to the address it contains. This is the classic "works on the broker host, times out everywhere else" bug in Docker and Kubernetes setups. Use separate listeners for internal (broker-to-broker) and external (client) traffic.
 
@@ -212,6 +245,27 @@ Leader broker
 Consumers
   7. fetch requests see the record once HW > its offset
      (read_committed consumers also wait for the transaction to resolve)
+```
+
+The same `acks=all` path as a sequence:
+
+```mermaid
+sequenceDiagram
+    participant App as Producer app thread
+    participant S as Sender thread
+    participant L as Leader broker
+    participant F as ISR followers
+    participant C as Consumer
+    App->>App: serialize, partition, append to batch
+    S->>L: ProduceRequest (ready batches)
+    L->>L: validate, append to active segment
+    Note over L: acks=all, request parked in purgatory
+    F->>L: fetch past the batch offset
+    L->>L: advance high watermark
+    L-->>S: produce response
+    S-->>App: complete Future or callback
+    C->>L: fetch
+    L-->>C: record, once HW passes its offset
 ```
 
 The producer side (batching, idempotence, retries) is covered in depth in [Kafka Producer Deep Dive](/learn/notes/kafka-producer/).

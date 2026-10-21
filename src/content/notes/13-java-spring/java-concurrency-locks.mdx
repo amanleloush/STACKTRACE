@@ -44,6 +44,20 @@ It also comes up in system design: caches, rate limiters and connection pools ar
 
 A lock fixes all three. `volatile` fixes visibility and ordering but **not** atomicity. Atomics fix all three, but only for a single variable (their reads and writes have `volatile` semantics).
 
+Picking the right tool, using the rules from the rest of this note:
+
+```mermaid
+flowchart TB
+    start["Shared mutable state"] --> one{"One writer, others only read?"}
+    one -->|yes| vol["volatile"]
+    one -->|no| single{"A single variable?"}
+    single -->|"yes, hot counter"| adder["LongAdder"]
+    single -->|"yes, exact read-modify-write"| atomic["AtomicInteger / AtomicLong"]
+    single -->|no| extra{"Need tryLock, timeout, fairness?"}
+    extra -->|no| sync["synchronized"]
+    extra -->|yes| rl["ReentrantLock"]
+```
+
 ### Intrinsic locks (monitors) and `synchronized`
 
 Every Java object has a built-in lock called its **monitor**. `synchronized` acquires it on entry and releases it on exit, even if an exception is thrown.
@@ -223,6 +237,22 @@ class Stats {
 
 Two threads both read 5, both write 6. One increment is lost. Fixes: `synchronized`, `AtomicInteger.incrementAndGet()`, or `LongAdder.increment()`.
 
+The lost update, step by step:
+
+```mermaid
+sequenceDiagram
+    participant T1 as Thread 1
+    participant C as count (volatile)
+    participant T2 as Thread 2
+    T1->>C: read
+    C-->>T1: 5
+    T2->>C: read
+    C-->>T2: 5
+    T1->>C: write 6
+    T2->>C: write 6
+    Note over T1,T2: Two increments ran, count is 6 not 7
+```
+
 Where `volatile` is the right tool:
 
 ```java
@@ -327,6 +357,22 @@ table (array of bins, power-of-two size)
 - **Atomic compound operations**: `putIfAbsent`, `computeIfAbsent`, `computeIfPresent`, `compute`, `merge`, `replace(k, old, new)`, `remove(k, v)`. Each runs atomically for that key. The function you pass runs while the bin is locked, so keep it **short** and **never modify the same map inside it**. Recursive updates can throw `IllegalStateException` or deadlock.
 - **Iterators are weakly consistent.** They never throw `ConcurrentModificationException`. They reflect the map at some point at or after the iterator was created, and may or may not show later changes.
 - The `concurrencyLevel` constructor argument still exists for compatibility, but in Java 8+ it's only a sizing hint. There's an unused `Segment` class kept only for serialization compatibility with Java 7.
+
+What a `put` does, depending on the state of its bin:
+
+```mermaid
+flowchart TB
+    put["put(k, v)"] --> empty{"Bin empty?"}
+    empty -->|yes| cas["CAS new node in, no lock"]
+    empty -->|no| fwd{"ForwardingNode?"}
+    fwd -->|yes| help["Help the resize, then retry"]
+    fwd -->|no| sync["synchronized on bin's first node"]
+    sync --> big{"More than 8 nodes?"}
+    big -->|no| done["Done"]
+    big -->|yes| t64{"Table has 64+ bins?"}
+    t64 -->|yes| tree["Treeify the bin"]
+    t64 -->|no| resize["Resize the table instead"]
+```
 
 **The check-then-act trap:**
 

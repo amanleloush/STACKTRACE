@@ -107,6 +107,22 @@ At runtime, a **union filesystem** stacks the layers into one view. On Linux the
    layer 1: base image (debian)
 ```
 
+How reads and the first write move through those layers:
+
+```mermaid
+flowchart TB
+    proc["Container process"] --> merged["merged/ (one view)"]
+    upper["upperdir/ (writable, per container)"]
+    subgraph lower["lowerdir/ (read-only, shared)"]
+        l3["layer 3: COPY app.jar"]
+        l2["layer 2: RUN apt-get install"]
+        l1["layer 1: base image (debian)"]
+    end
+    merged -->|"read: topmost wins"| upper
+    merged -->|"read falls through"| lower
+    lower -.->|"copy-up on first write"| upper
+```
+
 - **Reads**: the topmost layer that has the file wins.
 - **First write to an image file**: **copy-up** — the whole file is copied from `lowerdir` into `upperdir`, then modified. Copy-up works per file, so writing one byte of a 1 GB file copies the whole file once.
 - **Deleting an image file**: a **whiteout** file is created in `upperdir` that hides it. The bytes still exist in the lower layer.
@@ -289,6 +305,24 @@ docker stop  → SIGTERM (or the image's STOPSIGNAL) to PID 1
 Kubernetes   → preStop hook, then SIGTERM, wait terminationGracePeriodSeconds (30 s default), then SIGKILL
 ```
 
+Why exec form shuts down cleanly and shell form gets killed:
+
+```mermaid
+sequenceDiagram
+    participant D as docker stop
+    participant P as PID 1
+    participant A as App (child of shell)
+    alt exec form: PID 1 is the app
+        D->>P: SIGTERM
+        Note over P: handler drains, flushes, exits
+    else shell form: PID 1 is /bin/sh
+        D->>P: SIGTERM
+        Note over P,A: shell does not forward it
+        Note over D: wait grace period (10 s default)
+        D->>P: SIGKILL
+    end
+```
+
 Fixes:
 
 - **Exec-form** ENTRYPOINT so your app is PID 1.
@@ -347,6 +381,26 @@ docker run (or kubelet via containerd)
   8. runc creates namespaces + cgroups, applies seccomp/capabilities, sets USER
   9. execs ENTRYPOINT + CMD as PID 1 inside the new namespaces
  10. on stop: SIGTERM → grace period → SIGKILL
+```
+
+The same pipeline as a flow from source to running process:
+
+```mermaid
+flowchart TB
+    subgraph b["docker build"]
+        ctx["Build context (minus .dockerignore)"] --> bk["BuildKit: graph of stages"]
+        bk --> img["Layers + config + manifest"]
+    end
+    subgraph p["docker push"]
+        reg["Registry: tag to digest"]
+    end
+    subgraph r["docker run"]
+        pull["Pull manifest + missing layers"] --> snap["overlay2: layers + writable layer"]
+        snap --> runc["runc: namespaces, cgroups, seccomp"]
+        runc --> pid1["ENTRYPOINT + CMD as PID 1"]
+    end
+    img -->|"upload missing layers"| reg
+    reg --> pull
 ```
 
 ## Real-world examples

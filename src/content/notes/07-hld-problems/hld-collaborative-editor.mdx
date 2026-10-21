@@ -149,6 +149,22 @@ server → client
   Kafka ──▶ search indexing, notifications, history compaction
 ```
 
+The same components as a diagram, with HTTP on one side and the live WebSocket path on the other:
+
+```mermaid
+flowchart TB
+    client["Browser / app"] -->|"HTTP"| apigw["API gateway"]
+    apigw --> meta["Doc metadata svc"]
+    meta --> metadb[("Metadata DB: docs, ACLs")]
+    client -->|"WebSocket"| wsgw["WS gateway fleet"]
+    wsgw <-->|"doc_id → owner"| reg["Session registry (etcd / ZK)"]
+    wsgw -->|"RPC stream by doc_id"| owner["Doc session servers (OT owner)"]
+    owner -->|"append op"| oplog[("Op log store")]
+    owner -->|"snapshot every N ops"| snap[("Snapshot store")]
+    oplog -->|"change events"| kafka["Kafka"]
+    kafka --> down["Search, notifications, compaction"]
+```
+
 ### Open a document (read path)
 
 1. Client calls `GET /v1/docs/{id}`. The metadata service checks the ACL, then returns the latest snapshot plus the ops after it, or asks the owner server for its current in-memory state, with the current `rev`.
@@ -162,6 +178,27 @@ server → client
 3. The owner transforms the op against any ops committed after `base_rev`, assigns the next `rev`, and appends it to the op log.
 4. Once the append is durable, the owner sends `ack` to the author and broadcasts the transformed op to every other session on that document.
 5. Every few hundred ops, or every few seconds of activity, the owner writes a snapshot.
+
+The write path, step by step:
+
+```mermaid
+sequenceDiagram
+    participant A as Author client
+    participant G as WS gateway
+    participant O as Owner server
+    participant L as Op log
+    participant B as Other clients
+    A->>A: apply edit locally (optimistic)
+    A->>G: op with base_rev
+    G->>O: forward to doc owner
+    O->>O: transform vs ops after base_rev, assign rev
+    O->>L: append op at new rev
+    L-->>O: durable
+    O-->>G: ack + transformed op
+    G-->>A: ack (rev)
+    G-->>B: transformed op
+    Note over O: snapshot every few hundred ops or seconds
+```
 
 ## Data model
 
@@ -216,6 +253,25 @@ Alice's op arrives saying `insert(3, "s")` with `base_rev = 7`. If the server ap
 OT fixes this by **transforming** Alice's op against every op she had not seen (here, only revision 8). Bob inserted one character at position 1, which is before Alice's position 3, so Alice's position shifts right by one: `insert(4, "s")`. Applied to `chat`, that gives `chats`. It becomes revision 9 and is broadcast.
 
 Meanwhile Bob receives Alice's transformed op `insert(4, "s")` and gets `chats`. Alice receives Bob's op. She has a pending op Bob had not seen, so her client transforms Bob's `insert(1, "h")` against her own `insert(3, "s")`. Bob's position 1 is before 3, so it is unchanged, and she also ends up with `chats`. Everyone converges.
+
+The same example as messages over time:
+
+```mermaid
+sequenceDiagram
+    participant B as Bob
+    participant S as Server
+    participant A as Alice
+    Note over B,A: doc is cat at rev 7
+    B->>S: insert h at 1, base_rev 7
+    A->>S: insert s at 3, base_rev 7
+    Note over S: Bob's op is rev 8, doc is chat
+    Note over S: Alice's op transformed, 3 becomes 4
+    Note over S: rev 9, doc is chats
+    S-->>B: insert s at 4 (rev 9)
+    S-->>A: insert h at 1 (rev 8)
+    Note over A: transform vs own pending op, stays at 1
+    Note over B,A: both show chats
+```
 
 The core transform for two inserts is small:
 

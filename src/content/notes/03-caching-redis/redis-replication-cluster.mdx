@@ -52,20 +52,21 @@ Every primary has a **replication ID**, a large random string that names one *hi
 
 #### PSYNC: partial vs full resynchronization
 
+What the primary decides when a replica reconnects:
+
+```mermaid
+flowchart TB
+    R["Replica sends PSYNC replid offset+1"] --> Q{"replid known AND offset in backlog?"}
+    Q -->|yes| C["+CONTINUE"]
+    C --> C1["Send only missing bytes (cheap, seconds)"]
+    Q -->|no| F["+FULLRESYNC replid offset"]
+    F --> F1["1. Primary forks, produces RDB"]
+    F1 --> F2["2. Buffers new writes meanwhile"]
+    F2 --> F3["3. Ships RDB, replica flushes and loads"]
+    F3 --> F4["4. Streams buffered writes"]
 ```
-replica reconnects ──> PSYNC <replid> <offset+1>
-                          │
-          ┌───────────────┴────────────────┐
-  replid known AND offset             replid unknown OR offset
-  still inside the backlog            fell out of the backlog
-          │                                │
-   +CONTINUE                          +FULLRESYNC <replid> <offset>
-   send only the missing bytes        1. primary forks, produces an RDB
-   (cheap, seconds)                   2. buffers new writes meanwhile
-                                      3. ships RDB; replica flushes + loads it
-                                      4. streams the buffered writes
-                                      (expensive: fork + CPU + network + replica blocked while loading)
-```
+
+A full resync is expensive: a fork, CPU, network, and a replica that is blocked while loading.
 
 The **replication backlog** is a circular buffer on the primary that holds the most recent stream bytes.
 
@@ -100,15 +101,20 @@ The docs spell out this trap. Suppose the primary runs with persistence disabled
 
 ### 2. Consistency limits of async replication
 
-```
-Client      Primary P            Replica R
-  │  SET k v   │                     │
-  │──────────> │ apply locally       │
-  │ <── OK ─── │                     │
-  │            │──── stream "SET" ──>│  (in flight)
-  │            X  P crashes here     │
-  │                                  │  R promoted, never saw SET k v
-  │                                  │  → acknowledged write is gone
+How an acknowledged write gets lost:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant P as Primary P
+    participant R as Replica R
+    C->>P: SET k v
+    P->>P: apply locally
+    P-->>C: OK
+    P-xR: stream SET (still in flight)
+    Note over P: P crashes here
+    Note over R: R promoted, never saw SET k v
+    Note over C,R: The acknowledged write is gone
 ```
 
 This is the main fact to remember: **an OK from the primary does not mean any replica has the write.**
@@ -342,6 +348,27 @@ time ─────────────────────────
  Clients        errors / retries ──────────────── reconnect via +switch-master
  P (restarts)                                     demoted → replica of R1, its writes discarded
  Downtime  ≈ down-after-milliseconds + election + promotion + client reconnect
+```
+
+The same failover as messages between the nodes:
+
+```mermaid
+sequenceDiagram
+    participant P as Primary P
+    participant S1 as Sentinel S1
+    participant S23 as Sentinels S2, S3
+    participant R1 as Replica R1
+    participant C as Clients
+    Note over P: P crashes
+    Note over S1,S23: No reply for 5s, S1 and S2 mark +sdown
+    Note over S1: +odown (2 Sentinels meet quorum)
+    S1->>S23: +try-failover, ask for votes
+    S23-->>S1: vote S1 (epoch 7)
+    Note over S1: +elected-leader, selects R1
+    S1->>R1: REPLICAOF NO ONE
+    S1->>C: +switch-master P to R1
+    C->>R1: reconnect
+    Note over P: Restarts, demoted to replica of R1
 ```
 
 ### Write path in Cluster with a stale client
