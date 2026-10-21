@@ -1,0 +1,335 @@
+---
+import { getCollection } from 'astro:content';
+import BaseLayout from '~/layouts/BaseLayout.astro';
+import { NOTES_PHASES } from '~/lib/notes-phases';
+import { PHASES as DSA_PHASES } from '~/lib/dsa-phases';
+import { formatPhaseLabel } from '~/lib/phase-label';
+import { HL_COLORS, type PageMeta, type PhaseMeta } from '~/lib/highlights';
+
+// Static shell. Page titles and phases are baked in at build time; the
+// highlights and page notes themselves live in the browser (localStorage +
+// KV sync for signed-in users) and are filled in client-side.
+export const prerender = true;
+
+type Pillar = 'notes' | 'dsa';
+
+const pages: Record<string, PageMeta> = {};
+const phases: PhaseMeta[] = [];
+for (const [pillar, meta] of [
+  ['notes', NOTES_PHASES],
+  ['dsa', DSA_PHASES],
+] as const) {
+  const entries = await getCollection(pillar as Pillar, (n) => !n.data.draft);
+  for (const e of entries) {
+    pages[`${pillar}:${e.id}`] = { title: e.data.title, href: `/learn/${pillar}/${e.id}/`, phase: e.data.phase };
+  }
+  const known = new Set(meta.map((p) => p.slug));
+  for (const p of meta) phases.push({ pillar, slug: p.slug, num: p.num, title: p.title });
+  const extra = [...new Set(entries.map((e) => e.data.phase))].filter((p) => !known.has(p)).sort();
+  for (const slug of extra) {
+    phases.push({ pillar, slug, num: slug.match(/^(\d+)-/)?.[1] ?? '··', title: formatPhaseLabel(slug) });
+  }
+}
+const label: Record<string, string> = { yellow: 'Yellow', green: 'Green', blue: 'Blue', pink: 'Pink' };
+---
+<BaseLayout
+  title="Your highlights — StackTrace"
+  description="Every passage you highlighted and every note you wrote on StackTrace, grouped by phase and page."
+>
+  <nav class="crumbs" aria-label="Breadcrumb">
+    <a href="/roadmap/">Roadmap</a> <span aria-hidden="true">/</span>
+    <span aria-current="page">Highlights</span>
+  </nav>
+
+  <header class="hi-head">
+    <h1>Your highlights</h1>
+    <p class="hi-lede">
+      Everything you highlighted and every note you wrote, grouped by phase and page. Select text on any note or DSA
+      page to add more.
+    </p>
+    <p class="hi-sync" aria-live="polite" data-hi-sync></p>
+  </header>
+
+  <noscript>
+    <p class="hi-msg">Your highlights live in this browser, so this page needs JavaScript to show them.</p>
+  </noscript>
+
+  <div class="hi-tools" data-hi-tools hidden>
+    <label class="hi-search">
+      <span class="hi-sr">Search highlights and notes</span>
+      <input type="search" placeholder="Search text, notes or page titles" autocomplete="off" data-hi-q />
+    </label>
+    <div class="hi-colors" role="group" aria-label="Filter by colour">
+      {HL_COLORS.map((c) => (
+        <button type="button" class="hi-color" data-hi-color={c} aria-pressed="false">
+          <span class={`hi-dot hi-dot--${c}`} aria-hidden="true"></span>{label[c]}
+        </button>
+      ))}
+    </div>
+    <button type="button" class="hi-export" data-hi-export>Export all as Markdown</button>
+  </div>
+
+  <p class="hi-summary" aria-live="polite" data-hi-summary></p>
+  <div class="hi-groups" data-hi-groups></div>
+
+  <script
+    is:inline
+    type="application/json"
+    id="hi-data"
+    set:html={JSON.stringify({ pages, phases }).replace(/</g, '\\u003c')}
+  />
+</BaseLayout>
+
+<script>
+  import {
+    groupHighlights,
+    highlightHref,
+    isColor,
+    liveHighlights,
+    toMarkdown,
+    type HlColor,
+    type PageMeta,
+    type PhaseGroup,
+    type PhaseMeta,
+  } from '~/lib/highlights';
+  import {
+    initHighlightsStore,
+    onHighlightsChange,
+    onHighlightsSync,
+    readAllHighlights,
+    type SyncState,
+  } from '~/lib/highlights-store';
+
+  type Data = { pages: Record<string, PageMeta>; phases: PhaseMeta[] };
+  let data: Data = { pages: {}, phases: [] };
+  try {
+    data = JSON.parse(document.getElementById('hi-data')?.textContent ?? '{}') as Data;
+  } catch {
+    /* keep the empty fallback */
+  }
+
+  const $ = <T extends Element = HTMLElement>(sel: string) => document.querySelector<T>(sel)!;
+  const groupsEl = $('[data-hi-groups]');
+  const summary = $('[data-hi-summary]');
+  const q = $<HTMLInputElement>('[data-hi-q]');
+  const colorBtns = [...document.querySelectorAll<HTMLButtonElement>('[data-hi-color]')];
+  const colors = new Set<HlColor>();
+  $('[data-hi-tools]').hidden = false;
+
+  function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls: string, text?: string): HTMLElementTagNameMap[K] {
+    const e = document.createElement(tag);
+    e.className = cls;
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+
+  function renderGroups(groups: PhaseGroup[]): void {
+    const out: HTMLElement[] = [];
+    for (const g of groups) {
+      const sec = el('section', 'hi-phase');
+      sec.append(el('h2', 'hi-phase__h', g.title));
+      for (const p of g.pages) {
+        const art = el('article', 'hi-page');
+        const h = el('h3', 'hi-page__h');
+        const a = el('a', '', p.title);
+        a.href = p.href;
+        h.append(a);
+        art.append(h);
+        if (p.note) {
+          const note = el('div', 'hi-pnote');
+          note.append(el('p', 'hi-pnote__label', 'My notes'), el('p', 'hi-pnote__text', p.note));
+          art.append(note);
+        }
+        if (p.highlights.length) {
+          const ul = el('ul', 'hi-list');
+          for (const x of p.highlights) {
+            const li = el('li', `hi-item hi-item--${x.color}`);
+            const link = el('a', 'hi-item__quote', x.exact);
+            link.href = highlightHref(p.href, x.id);
+            li.append(link);
+            if (x.note) li.append(el('p', 'hi-item__note', x.note));
+            if (x.detached) {
+              li.append(el('p', 'hi-item__flag', 'Detached: this passage changed on the page and can’t be shown in place.'));
+            }
+            ul.append(li);
+          }
+          art.append(ul);
+        }
+        sec.append(art);
+      }
+      out.push(sec);
+    }
+    groupsEl.replaceChildren(...out);
+  }
+
+  function paint(): void {
+    const all = readAllHighlights();
+    const total = liveHighlights(all).length;
+    const groups = groupHighlights(all, data.pages, data.phases, { query: q.value, colors });
+    renderGroups(groups);
+    const shownHl = groups.reduce((s, g) => s + g.pages.reduce((t, p) => t + p.highlights.length, 0), 0);
+    const notes = groups.reduce((s, g) => s + g.pages.filter((p) => p.note).length, 0);
+    const filtered = q.value.trim() !== '' || colors.size > 0;
+    if (groups.length === 0) {
+      summary.textContent = filtered
+        ? 'Nothing matches that search or colour.'
+        : 'No highlights or notes yet. Select any text on a note or DSA page to highlight it, or open “My notes” at the end of a page.';
+      return;
+    }
+    summary.textContent =
+      `${shownHl} highlight${shownHl === 1 ? '' : 's'}` +
+      (filtered ? ` of ${total}` : '') +
+      ` and ${notes} page note${notes === 1 ? '' : 's'}.`;
+  }
+
+  let qTimer: number | undefined;
+  q.addEventListener('input', () => {
+    if (qTimer !== undefined) window.clearTimeout(qTimer);
+    qTimer = window.setTimeout(paint, 150);
+  });
+  for (const b of colorBtns) {
+    b.addEventListener('click', () => {
+      const c = b.dataset.hiColor;
+      if (!isColor(c)) return;
+      if (colors.has(c)) colors.delete(c);
+      else colors.add(c);
+      b.setAttribute('aria-pressed', String(colors.has(c)));
+      paint();
+    });
+  }
+
+  $('[data-hi-export]').addEventListener('click', () => {
+    const groups = groupHighlights(readAllHighlights(), data.pages, data.phases);
+    const d = new Date();
+    const day = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    const md = toMarkdown(groups, location.origin, day);
+    const url = URL.createObjectURL(new Blob([md], { type: 'text/markdown;charset=utf-8' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `stacktrace-highlights-${day}.md`;
+    document.body.append(a);
+    a.click();
+    a.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  });
+
+  const SYNC_TEXT: Record<SyncState, string> = {
+    local: 'Saved in this browser. Sign in to keep them in sync across devices.',
+    syncing: 'Syncing…',
+    synced: 'Synced across your devices.',
+    error: 'Saved in this browser; sync will retry.',
+  };
+
+  initHighlightsStore();
+  paint();
+  let queued = false;
+  onHighlightsChange(() => {
+    if (queued) return;
+    queued = true;
+    requestAnimationFrame(() => {
+      queued = false;
+      paint();
+    });
+  });
+  onHighlightsSync((s) => {
+    $('[data-hi-sync]').textContent = SYNC_TEXT[s];
+  });
+</script>
+
+<style>
+  .crumbs { font-size: 0.82rem; color: var(--fg-faint); margin-bottom: 1rem; }
+  .crumbs a { color: var(--fg-muted); }
+  .hi-head h1 { margin: 0 0 0.5rem; }
+  .hi-lede { color: var(--fg-muted); max-width: 72ch; line-height: 1.55; margin: 0; }
+  .hi-sync { margin: 0.5rem 0 0; font-family: var(--font-code); font-size: 0.78rem; color: var(--fg-muted); min-height: 1em; }
+  .hi-msg { color: var(--fg-muted); padding: 1rem 0 0; }
+
+  .hi-tools {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.6rem;
+    align-items: center;
+    margin: 1.5rem 0 0;
+  }
+  .hi-tools[hidden] { display: none; }
+  .hi-search { flex: 1 1 16rem; min-width: 0; }
+  .hi-search input {
+    box-sizing: border-box;
+    width: 100%;
+    padding: 0.55rem 0.75rem;
+    border: 1px solid var(--card-border);
+    border-radius: 8px;
+    background: var(--card-bg);
+    color: var(--fg);
+    font: inherit;
+  }
+  .hi-colors { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+  .hi-color,
+  .hi-export {
+    font: inherit;
+    font-size: 0.82rem;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.4rem 0.7rem;
+    border: 1px solid var(--card-border);
+    border-radius: 999px;
+    background: var(--card-bg);
+    color: var(--fg-muted);
+    cursor: pointer;
+  }
+  .hi-color[aria-pressed='true'] { color: var(--fg); border-color: var(--accent); background: var(--bg-soft); }
+  .hi-export { border-radius: 8px; color: var(--fg); }
+  .hi-search input:focus-visible,
+  .hi-color:focus-visible,
+  .hi-export:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .hi-dot { width: 0.8rem; height: 0.8rem; border-radius: 50%; background: #facc15; display: inline-block; }
+  .hi-dot--green { background: #4ade80; }
+  .hi-dot--blue { background: #60a5fa; }
+  .hi-dot--pink { background: #f472b6; }
+
+  .hi-summary { color: var(--fg-muted); font-size: 0.9rem; margin: 1.25rem 0 0; }
+
+  /* Groups are built in the browser, so they have no scoped attribute. */
+  .hi-groups :global(.hi-phase) { margin: 2rem 0 0; }
+  .hi-groups :global(.hi-phase__h) { font-size: 1.15rem; margin: 0 0 0.75rem; }
+  .hi-groups :global(.hi-page) {
+    border: 1px solid var(--card-border);
+    border-radius: 12px;
+    background: var(--card-bg);
+    padding: 0.85rem 1rem;
+    margin: 0 0 0.75rem;
+    min-width: 0;
+  }
+  .hi-groups :global(.hi-page__h) { font-size: 1rem; margin: 0 0 0.5rem; overflow-wrap: anywhere; }
+  .hi-groups :global(.hi-pnote) { background: var(--bg-soft); border-radius: 8px; padding: 0.5rem 0.7rem; margin: 0 0 0.6rem; }
+  .hi-groups :global(.hi-pnote__label) { margin: 0; font-size: 0.72rem; font-family: var(--font-code); text-transform: uppercase; letter-spacing: 0.05em; color: var(--fg-muted); }
+  .hi-groups :global(.hi-pnote__text) { margin: 0.25rem 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.92rem; }
+  .hi-groups :global(.hi-list) { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.5rem; }
+  .hi-groups :global(.hi-item) {
+    border-left: 4px solid var(--hl-c, #facc15);
+    padding: 0.35rem 0.6rem;
+    border-radius: 0 8px 8px 0;
+    background: var(--bg-soft);
+    min-width: 0;
+  }
+  .hi-groups :global(.hi-item--green) { --hl-c: #22c55e; }
+  .hi-groups :global(.hi-item--blue) { --hl-c: #3b82f6; }
+  .hi-groups :global(.hi-item--pink) { --hl-c: #ec4899; }
+  .hi-groups :global(.hi-item__quote) { color: var(--fg); text-decoration: none; font-size: 0.92rem; line-height: 1.45; overflow-wrap: anywhere; }
+  .hi-groups :global(.hi-item__quote:hover) { text-decoration: underline; }
+  .hi-groups :global(.hi-item__note) { margin: 0.25rem 0 0; font-size: 0.85rem; color: var(--fg-muted); white-space: pre-wrap; overflow-wrap: anywhere; }
+  .hi-groups :global(.hi-item__flag) { margin: 0.25rem 0 0; font-size: 0.75rem; color: var(--anim-danger); }
+
+  .hi-sr {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+</style>

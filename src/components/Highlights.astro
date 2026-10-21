@@ -1,0 +1,867 @@
+---
+/**
+ * Highlights + "My notes" for one note / DSA page. Rendered once by
+ * NoteLayout, after the article body.
+ *
+ * - Select text in `.note__body` → a small toolbar appears near it:
+ *   "Highlight" (last colour used), four colour swatches, and "Add note".
+ *   Keyboard: after selecting, press Tab to move into the toolbar; Escape
+ *   dismisses it.
+ * - Click a highlight (or Enter on it — the first piece of each highlight
+ *   is focusable) to change its colour, edit its note, or remove it.
+ * - "My notes" at the end: a collapsible, autosaved free-text box for the
+ *   whole page, plus this page's highlights (click one to scroll to it) and
+ *   any "detached" ones whose text the page no longer contains.
+ * - `#hl-<id>` in the URL scrolls to and flashes that highlight.
+ *
+ * Storage: src/lib/highlights-store.ts (localStorage first, synced to KV
+ * for signed-in users). Anchoring: src/lib/highlights-anchor.ts (pure) and
+ * src/lib/highlights-dom.ts (marks). User text is only ever set with
+ * textContent / value.
+ *
+ * With JS off the whole widget stays hidden: highlights need the browser.
+ */
+import { HL_COLORS, MAX_NOTE_CHARS, MAX_PAGE_NOTE_CHARS } from '~/lib/highlights';
+
+interface Props {
+  pillar: 'notes' | 'dsa';
+  slug: string;
+}
+const { pillar, slug } = Astro.props;
+const page = `${pillar}:${slug}`;
+const label: Record<string, string> = { yellow: 'Yellow', green: 'Green', blue: 'Blue', pink: 'Pink' };
+---
+<section class="hlp hl-ui" data-hl-page={page} aria-labelledby="hlp-title" hidden>
+  <details class="hlp__box" data-hlp-details>
+    <summary class="hlp__summary">
+      <span id="hlp-title" class="hlp__title">My notes</span>
+      <span class="hlp__count" data-hlp-count></span>
+    </summary>
+    <div class="hlp__body">
+      <label class="hlp__label" for="hlp-text">Notes on this page</label>
+      <textarea
+        id="hlp-text"
+        class="hlp__text"
+        rows="6"
+        maxlength={MAX_PAGE_NOTE_CHARS}
+        placeholder="Anything you want to remember about this page. Saved as you type."
+        data-hlp-text
+      ></textarea>
+      <p class="hlp__meta">
+        <span data-hlp-chars></span>
+        <span aria-hidden="true">·</span>
+        <span data-hlp-status aria-live="polite"></span>
+      </p>
+
+      <h3 class="hlp__h">Highlights on this page</h3>
+      <p class="hlp__hint" data-hlp-locked hidden>Highlights appear in the text once you can read this page.</p>
+      <p class="hlp__hint" data-hlp-empty>Select any text in the article above to highlight it or add a note.</p>
+      <ul class="hlp__list" data-hlp-list></ul>
+
+      <div data-hlp-detached-wrap hidden>
+        <h3 class="hlp__h">Detached</h3>
+        <p class="hlp__hint">
+          This page was edited and these passages can no longer be found. They are kept here with your notes.
+        </p>
+        <ul class="hlp__list" data-hlp-detached></ul>
+      </div>
+
+      <p class="hlp__all"><a href="/highlights/">All your highlights and notes →</a></p>
+    </div>
+  </details>
+</section>
+
+<div class="hl-toolbar hl-ui" role="toolbar" aria-label="Highlight selection" hidden data-hl-toolbar>
+  <button type="button" class="hl-toolbar__main" data-hl-apply>
+    <span class="hl-swatch" data-hl-main-swatch aria-hidden="true"></span>
+    Highlight<span class="hl-sr"> selection</span>
+  </button>
+  <span class="hl-toolbar__swatches">
+    {HL_COLORS.map((c) => (
+      <button type="button" class="hl-toolbar__color" data-hl-color={c} aria-label={`Highlight ${label[c]}`} title={label[c]}>
+        <span class={`hl-swatch hl-swatch--${c}`} aria-hidden="true"></span>
+      </button>
+    ))}
+  </span>
+  <button type="button" class="hl-toolbar__note" data-hl-note>Add note</button>
+  <span class="hl-toolbar__msg" data-hl-msg hidden></span>
+</div>
+
+<div class="hl-pop hl-ui" role="dialog" aria-labelledby="hl-pop-title" hidden data-hl-pop>
+  <p id="hl-pop-title" class="hl-pop__title">Highlight</p>
+  <blockquote class="hl-pop__quote" data-hl-pop-quote></blockquote>
+  <div class="hl-pop__colors" role="group" aria-label="Colour">
+    {HL_COLORS.map((c) => (
+      <button type="button" class="hl-pop__color" data-hl-pop-color={c} aria-pressed="false" aria-label={label[c]} title={label[c]}>
+        <span class={`hl-swatch hl-swatch--${c}`} aria-hidden="true"></span>
+      </button>
+    ))}
+  </div>
+  <label class="hl-pop__label" for="hl-pop-note">Note</label>
+  <textarea id="hl-pop-note" class="hl-pop__note" rows="3" maxlength={MAX_NOTE_CHARS} data-hl-pop-note></textarea>
+  <p class="hl-pop__chars" data-hl-pop-chars></p>
+  <div class="hl-pop__actions">
+    <button type="button" class="hl-pop__btn hl-pop__btn--danger" data-hl-pop-remove>Remove</button>
+    <button type="button" class="hl-pop__btn hl-pop__btn--primary" data-hl-pop-done>Done</button>
+  </div>
+</div>
+
+<p class="hl-sr" aria-live="polite" data-hl-live></p>
+
+<script>
+  import { describeSpan, findQuote, type Span, type TextQuote } from '~/lib/highlights-anchor';
+  import { buildIndex, isIgnored, markSelector, rangeToSpan, recolor, unwrap, wrapSpan } from '~/lib/highlights-dom';
+  import {
+    byPosition,
+    isColor,
+    MAX_HIGHLIGHTS,
+    MAX_NOTE_CHARS,
+    MAX_PAGE_NOTE_CHARS,
+    type HighlightEntry,
+    type HlColor,
+  } from '~/lib/highlights';
+  import {
+    addHighlight,
+    initHighlightsStore,
+    onHighlightsChange,
+    onHighlightsSync,
+    pageHighlights,
+    readHighlight,
+    readPageNote,
+    removeHighlight,
+    setPageNote,
+    updateHighlight,
+    type SyncState,
+  } from '~/lib/highlights-store';
+
+  const panel = document.querySelector<HTMLElement>('.hlp[data-hl-page]');
+  const body = document.querySelector<HTMLElement>('.note__body');
+  const toolbar = document.querySelector<HTMLElement>('[data-hl-toolbar]');
+  const pop = document.querySelector<HTMLElement>('[data-hl-pop]');
+  const live = document.querySelector<HTMLElement>('[data-hl-live]');
+  if (panel && body && toolbar && pop && live) setup(panel, body, toolbar, pop, live);
+
+  function setup(panel: HTMLElement, body: HTMLElement, toolbar: HTMLElement, pop: HTMLElement, live: HTMLElement): void {
+    const PAGE = panel.dataset.hlPage!;
+    const $ = <T extends Element = HTMLElement>(sel: string, root: ParentNode = document) => root.querySelector<T>(sel)!;
+    const reduceMotion = (() => {
+      try {
+        return matchMedia('(prefers-reduced-motion: reduce)').matches;
+      } catch {
+        return false;
+      }
+    })();
+    // The whole note is behind the paywall: nothing to anchor to, and its
+    // highlights must not be flagged as detached.
+    const locked = !!body.querySelector('.paywall--note');
+
+    // Absolutely positioned against the page, not the article.
+    document.body.append(toolbar, pop);
+    panel.hidden = false;
+    initHighlightsStore();
+
+    const announce = (msg: string) => {
+      live.textContent = '';
+      window.setTimeout(() => (live.textContent = msg), 30);
+    };
+
+    // --- Colour memory ------------------------------------------------------------
+    const COLOR_KEY = 'hl-last-color';
+    let lastColor: HlColor = 'yellow';
+    try {
+      const c = localStorage.getItem(COLOR_KEY);
+      if (isColor(c)) lastColor = c;
+    } catch {
+      /* storage blocked: default colour */
+    }
+    const mainSwatch = $('[data-hl-main-swatch]', toolbar);
+    const paintMain = () => (mainSwatch.className = `hl-swatch hl-swatch--${lastColor}`);
+    paintMain();
+    function rememberColor(c: HlColor): void {
+      lastColor = c;
+      paintMain();
+      try {
+        localStorage.setItem(COLOR_KEY, c);
+      } catch {
+        /* fine */
+      }
+    }
+
+    // --- Rendering marks ------------------------------------------------------------
+    const markLabel = (h: HighlightEntry) => {
+      const t = h.exact.length > 60 ? `${h.exact.slice(0, 60)}…` : h.exact;
+      return `Highlight${h.note ? ' with note' : ''}: ${t}. Press Enter to edit.`;
+    };
+
+    /** (Re)draw one highlight; flag it detached / attached when that changes. */
+    function renderOne(id: string): void {
+      unwrap(body, id);
+      const h = readHighlight(id);
+      if (!h || h.page !== PAGE || locked) return;
+      const index = buildIndex(body);
+      const span = findQuote(index.text, h, index.headings);
+      if (!span) {
+        if (!h.detached) updateHighlight(id, { detached: true });
+        return;
+      }
+      const marks = wrapSpan(index, span, id, h.color);
+      const first = marks[0];
+      if (first) {
+        first.id = `hl-${id}`;
+        if (h.note) first.dataset.hlNote = '';
+        // Inside a link the link keeps the click and the focus; edit it from
+        // the panel instead.
+        if (!first.closest('a')) {
+          first.tabIndex = 0;
+          first.setAttribute('role', 'button');
+          first.setAttribute('aria-label', markLabel(h));
+        }
+      }
+      if (h.detached && marks.length > 0) updateHighlight(id, { detached: false });
+    }
+
+    function renderAll(): void {
+      for (const h of pageHighlights(PAGE).sort(byPosition)) renderOne(h.id);
+    }
+
+    function flash(id: string): void {
+      const marks = body.querySelectorAll<HTMLElement>(markSelector(id));
+      if (!marks.length) return;
+      marks[0]!.scrollIntoView({ behavior: reduceMotion ? 'auto' : 'smooth', block: 'center' });
+      for (const m of marks) {
+        m.classList.remove('hl--flash');
+        void m.offsetWidth; // restart the animation
+        m.classList.add('hl--flash');
+      }
+      window.setTimeout(() => marks.forEach((m) => m.classList.remove('hl--flash')), 1800);
+    }
+
+    function goToHash(): void {
+      const m = /^#hl-([a-z0-9]{8,24})$/.exec(location.hash);
+      if (!m) return;
+      const id = m[1]!;
+      if (body.querySelector(markSelector(id))) {
+        flash(id);
+        const first = document.getElementById(`hl-${id}`);
+        if (first && first.tabIndex === 0) first.focus({ preventScroll: true });
+        return;
+      }
+      // Detached or locked: show it in the panel instead.
+      const item = panel.querySelector<HTMLElement>(`[data-hlp-item="${id}"]`);
+      if (item) {
+        $<HTMLDetailsElement>('[data-hlp-details]', panel).open = true;
+        item.scrollIntoView({ behavior: reduceMotion ? 'auto' : 'smooth', block: 'center' });
+        item.classList.add('is-flash');
+        window.setTimeout(() => item.classList.remove('is-flash'), 1800);
+      }
+    }
+
+    // --- Panel -----------------------------------------------------------------------
+    const list = $('[data-hlp-list]', panel);
+    const detachedList = $('[data-hlp-detached]', panel);
+    const detachedWrap = $('[data-hlp-detached-wrap]', panel);
+    const empty = $('[data-hlp-empty]', panel);
+    const count = $('[data-hlp-count]', panel);
+    const textArea = $<HTMLTextAreaElement>('[data-hlp-text]', panel);
+    const chars = $('[data-hlp-chars]', panel);
+    const status = $('[data-hlp-status]', panel);
+    $('[data-hlp-locked]', panel).hidden = !locked;
+
+    function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls: string, text?: string): HTMLElementTagNameMap[K] {
+      const e = document.createElement(tag);
+      e.className = cls;
+      if (text !== undefined) e.textContent = text;
+      return e;
+    }
+
+    function item(h: HighlightEntry & { id: string }, detached: boolean): HTMLLIElement {
+      const li = el('li', `hlp__item hlp__item--${h.color}`);
+      li.dataset.hlpItem = h.id;
+      const quote = h.exact.length > 220 ? `${h.exact.slice(0, 220)}…` : h.exact;
+      if (detached || locked) {
+        li.append(el('p', 'hlp__quote', quote));
+      } else {
+        const go = el('button', 'hlp__quote hlp__go', quote);
+        go.type = 'button';
+        go.title = 'Scroll to this highlight';
+        go.addEventListener('click', () => {
+          history.replaceState(null, '', `#hl-${h.id}`);
+          flash(h.id);
+        });
+        li.append(go);
+      }
+      if (h.note) li.append(el('p', 'hlp__note', h.note));
+      const actions = el('p', 'hlp__actions');
+      if (!detached && !locked) {
+        const edit = el('button', 'hlp__btn', 'Edit');
+        edit.type = 'button';
+        edit.setAttribute('aria-label', 'Edit this highlight');
+        edit.addEventListener('click', () => openPop(h.id, edit));
+        actions.append(edit);
+      }
+      const rm = el('button', 'hlp__btn', 'Remove');
+      rm.type = 'button';
+      rm.setAttribute('aria-label', 'Remove this highlight');
+      rm.addEventListener('click', () => {
+        removeHighlight(h.id);
+        announce('Highlight removed.');
+        textArea.focus();
+      });
+      actions.append(rm);
+      li.append(actions);
+      return li;
+    }
+
+    function paintPanel(): void {
+      const all = pageHighlights(PAGE).sort(byPosition);
+      const attached = all.filter((h) => locked || !h.detached);
+      const detached = locked ? [] : all.filter((h) => h.detached);
+      list.replaceChildren(...attached.map((h) => item(h, false)));
+      detachedList.replaceChildren(...detached.map((h) => item(h, true)));
+      detachedWrap.hidden = detached.length === 0;
+      empty.hidden = all.length > 0 || locked;
+      const note = readPageNote(PAGE).trim() !== '';
+      const n = all.length;
+      count.textContent = n || note ? `${n} highlight${n === 1 ? '' : 's'}${note ? ' · notes' : ''}` : '';
+    }
+
+    let paintQueued = false;
+    function queuePaint(): void {
+      if (paintQueued) return;
+      paintQueued = true;
+      requestAnimationFrame(() => {
+        paintQueued = false;
+        paintPanel();
+      });
+    }
+
+    // Page note: autosaved after a short pause, and on leaving the field.
+    const paintChars = () => (chars.textContent = `${textArea.value.length.toLocaleString()} / ${MAX_PAGE_NOTE_CHARS.toLocaleString()}`);
+    textArea.value = readPageNote(PAGE);
+    paintChars();
+    let noteTimer: number | undefined;
+    const saveNote = () => {
+      if (noteTimer !== undefined) window.clearTimeout(noteTimer);
+      noteTimer = undefined;
+      setPageNote(PAGE, textArea.value);
+      status.textContent = 'Saved';
+    };
+    textArea.addEventListener('input', () => {
+      paintChars();
+      status.textContent = 'Saving…';
+      if (noteTimer !== undefined) window.clearTimeout(noteTimer);
+      noteTimer = window.setTimeout(saveNote, 600);
+    });
+    textArea.addEventListener('blur', () => {
+      if (noteTimer !== undefined) saveNote();
+    });
+    window.addEventListener('pagehide', () => {
+      if (noteTimer !== undefined) saveNote();
+    });
+    const details = $<HTMLDetailsElement>('[data-hlp-details]', panel);
+    if (textArea.value.trim() !== '' || pageHighlights(PAGE).length > 0) details.open = true;
+
+    const SYNC_TEXT: Record<SyncState, string> = {
+      local: 'Saved in this browser',
+      syncing: 'Syncing…',
+      synced: 'Synced',
+      error: 'Saved in this browser; sync will retry',
+    };
+    onHighlightsSync((s) => {
+      if (noteTimer === undefined) status.textContent = SYNC_TEXT[s];
+    });
+
+    // --- Toolbar (new highlight from a selection) -----------------------------------
+    let pending: (TextQuote & Span) | null = null;
+    const msg = $('[data-hl-msg]', toolbar);
+    const actionButtons = [...toolbar.querySelectorAll<HTMLButtonElement>('button')];
+
+    function hideToolbar(): void {
+      toolbar.hidden = true;
+      pending = null;
+    }
+
+    function placeNear(box: HTMLElement, rect: DOMRect, below: boolean): void {
+      const margin = 8;
+      const w = box.offsetWidth;
+      const h = box.offsetHeight;
+      const vw = document.documentElement.clientWidth;
+      let left = rect.left + rect.width / 2 - w / 2;
+      left = Math.max(margin, Math.min(left, vw - w - margin));
+      let top = below ? rect.bottom + margin : rect.top - h - margin;
+      if (!below && top < margin) top = rect.bottom + margin;
+      box.style.left = `${left + window.scrollX}px`;
+      box.style.top = `${top + window.scrollY}px`;
+    }
+
+    function selectionInBody(): Range | null {
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return null;
+      const range = sel.getRangeAt(0);
+      const common = range.commonAncestorContainer;
+      if (!body.contains(common) || isIgnored(common, body)) return null;
+      return range;
+    }
+
+    function evaluateSelection(): void {
+      if (locked) return;
+      if (toolbar.contains(document.activeElement)) return;
+      const range = selectionInBody();
+      if (!range) return hideToolbar();
+      const index = buildIndex(body);
+      const span = rangeToSpan(index, range);
+      if (!span) return hideToolbar();
+      const q = describeSpan(index.text, span.start, span.end, index.headings);
+      const tooLong = !q && index.text.slice(span.start, span.end).trim() !== '';
+      if (!q && !tooLong) return hideToolbar();
+      pending = q;
+      msg.hidden = !tooLong;
+      msg.textContent = tooLong ? 'Selection is too long to highlight' : '';
+      for (const b of actionButtons) b.disabled = tooLong;
+      const wasHidden = toolbar.hidden;
+      toolbar.hidden = false;
+      // Phones show their own selection menu above the text: go below.
+      let coarse = false;
+      try {
+        coarse = matchMedia('(pointer: coarse)').matches;
+      } catch {
+        /* default: above */
+      }
+      placeNear(toolbar, range.getBoundingClientRect(), coarse);
+      if (wasHidden && !tooLong) announce('Highlight toolbar available. Press Tab to use it.');
+    }
+
+    let selTimer: number | undefined;
+    document.addEventListener('selectionchange', () => {
+      if (selTimer !== undefined) window.clearTimeout(selTimer);
+      selTimer = window.setTimeout(evaluateSelection, 180);
+    });
+    // Clicking a toolbar button must not clear the selection first.
+    toolbar.addEventListener('mousedown', (e) => e.preventDefault());
+
+    function apply(color: HlColor, withNote: boolean): void {
+      if (!pending) return;
+      const fromKeyboard = toolbar.contains(document.activeElement);
+      const r = addHighlight(PAGE, pending, color);
+      if (!r.ok) {
+        msg.hidden = false;
+        msg.textContent =
+          r.reason === 'limit' ? `You have ${MAX_HIGHLIGHTS.toLocaleString()} highlights, the most we can keep.` : 'Could not save that highlight.';
+        return;
+      }
+      rememberColor(color);
+      hideToolbar();
+      try {
+        window.getSelection()?.removeAllRanges();
+      } catch {
+        /* fine */
+      }
+      const first = document.getElementById(`hl-${r.id}`);
+      if (withNote) {
+        openPop(r.id, first ?? undefined, true);
+      } else {
+        announce('Highlighted.');
+        if (fromKeyboard) (first && first.tabIndex === 0 ? first : textArea).focus({ preventScroll: true });
+      }
+    }
+
+    $('[data-hl-apply]', toolbar).addEventListener('click', () => apply(lastColor, false));
+    $('[data-hl-note]', toolbar).addEventListener('click', () => apply(lastColor, true));
+    for (const b of toolbar.querySelectorAll<HTMLButtonElement>('[data-hl-color]')) {
+      b.addEventListener('click', () => {
+        const c = b.dataset.hlColor;
+        if (isColor(c)) apply(c, false);
+      });
+    }
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        if (!pop.hidden) {
+          e.preventDefault();
+          closePop(true);
+        } else if (!toolbar.hidden) {
+          hideToolbar();
+        }
+        return;
+      }
+      // Keyboard path into the toolbar: Tab right after selecting.
+      if (e.key === 'Tab' && !e.shiftKey && !toolbar.hidden && pending && !toolbar.contains(document.activeElement) && pop.hidden) {
+        const firstBtn = toolbar.querySelector<HTMLButtonElement>('button:not(:disabled)');
+        if (firstBtn) {
+          e.preventDefault();
+          firstBtn.focus();
+        }
+      }
+    });
+    toolbar.addEventListener('focusout', (e) => {
+      const to = e.relatedTarget as Node | null;
+      if (to && toolbar.contains(to)) return;
+      if (!selectionInBody()) hideToolbar();
+    });
+    window.addEventListener('resize', () => {
+      if (!toolbar.hidden) evaluateSelection();
+    });
+
+    // --- Popover (edit an existing highlight) -------------------------------------
+    let popId: string | null = null;
+    let popReturn: HTMLElement | null = null;
+    let popTimer: number | undefined;
+    const popQuote = $('[data-hl-pop-quote]', pop);
+    const popNote = $<HTMLTextAreaElement>('[data-hl-pop-note]', pop);
+    const popChars = $('[data-hl-pop-chars]', pop);
+    const popColors = [...pop.querySelectorAll<HTMLButtonElement>('[data-hl-pop-color]')];
+
+    const paintPopColors = (c: HlColor) => {
+      for (const b of popColors) b.setAttribute('aria-pressed', String(b.dataset.hlPopColor === c));
+    };
+    const paintPopChars = () => (popChars.textContent = `${popNote.value.length} / ${MAX_NOTE_CHARS}`);
+
+    function savePopNote(): void {
+      if (popTimer !== undefined) window.clearTimeout(popTimer);
+      popTimer = undefined;
+      if (popId) updateHighlight(popId, { note: popNote.value });
+    }
+
+    function openPop(id: string, returnTo?: HTMLElement, focusNote = false): void {
+      const h = readHighlight(id);
+      if (!h) return;
+      if (popId && popId !== id) savePopNote();
+      hideToolbar();
+      popId = id;
+      popReturn = returnTo ?? null;
+      popQuote.textContent = h.exact.length > 160 ? `${h.exact.slice(0, 160)}…` : h.exact;
+      popNote.value = h.note;
+      paintPopChars();
+      paintPopColors(h.color);
+      pop.hidden = false;
+      const anchor = document.getElementById(`hl-${id}`) ?? returnTo;
+      if (anchor) placeNear(pop, anchor.getBoundingClientRect(), true);
+      (focusNote ? popNote : popColors.find((b) => b.getAttribute('aria-pressed') === 'true') ?? popNote).focus({
+        preventScroll: true,
+      });
+    }
+
+    function closePop(restoreFocus: boolean): void {
+      if (pop.hidden) return;
+      savePopNote();
+      pop.hidden = true;
+      const id = popId;
+      popId = null;
+      if (!restoreFocus) return;
+      const target = (id && document.getElementById(`hl-${id}`)) || popReturn;
+      if (target && target.isConnected && (target.tabIndex >= 0 || target instanceof HTMLButtonElement)) {
+        target.focus({ preventScroll: true });
+      }
+    }
+
+    for (const b of popColors) {
+      b.addEventListener('click', () => {
+        const c = b.dataset.hlPopColor;
+        if (!popId || !isColor(c)) return;
+        updateHighlight(popId, { color: c });
+        rememberColor(c);
+        paintPopColors(c);
+      });
+    }
+    popNote.addEventListener('input', () => {
+      paintPopChars();
+      if (popTimer !== undefined) window.clearTimeout(popTimer);
+      popTimer = window.setTimeout(savePopNote, 500);
+    });
+    $('[data-hl-pop-done]', pop).addEventListener('click', () => closePop(true));
+    $('[data-hl-pop-remove]', pop).addEventListener('click', () => {
+      const id = popId;
+      if (popTimer !== undefined) window.clearTimeout(popTimer);
+      popTimer = undefined;
+      pop.hidden = true;
+      popId = null;
+      if (id) removeHighlight(id);
+      announce('Highlight removed.');
+      textArea.focus({ preventScroll: true });
+    });
+    document.addEventListener('mousedown', (e) => {
+      const t = e.target as Node;
+      if (!pop.hidden && !pop.contains(t) && !(t instanceof Element && t.closest('mark.hl'))) closePop(false);
+    });
+
+    // Click / Enter on a mark opens the editor for the innermost highlight.
+    body.addEventListener('click', (e) => {
+      const mark = (e.target as Element | null)?.closest?.('mark.hl') as HTMLElement | null;
+      if (!mark || mark.closest('a')) return;
+      // A click that ends a drag-selection is a new selection, not an edit.
+      if (!(window.getSelection()?.isCollapsed ?? true)) return;
+      const id = mark.dataset.hlId;
+      if (id) openPop(id, document.getElementById(`hl-${id}`) ?? mark);
+    });
+    body.addEventListener('keydown', (e) => {
+      const t = e.target as HTMLElement;
+      if (!t.matches?.('mark.hl[role="button"]') || (e.key !== 'Enter' && e.key !== ' ')) return;
+      e.preventDefault();
+      const id = t.dataset.hlId;
+      if (id) openPop(id, t);
+    });
+
+    // --- Store changes (this page, other tabs, sync) -------------------------------
+    onHighlightsChange((d) => {
+      if (d.key.startsWith('h:')) {
+        const id = d.key.slice(2);
+        const onPage = d.entry?.page === PAGE || !!body.querySelector(markSelector(id));
+        if (!onPage) return;
+        const h = readHighlight(id);
+        const marks = body.querySelectorAll(markSelector(id));
+        // Colour / note edits redraw in place; anything else re-anchors.
+        if (h && marks.length > 0 && !h.detached && d.source === 'local') {
+          recolor(body, id, h.color);
+          const first = document.getElementById(`hl-${id}`);
+          if (first) {
+            if (h.note) first.dataset.hlNote = '';
+            else delete first.dataset.hlNote;
+            if (first.tabIndex === 0) first.setAttribute('aria-label', markLabel(h));
+          }
+        } else {
+          renderOne(id);
+        }
+        if (popId === id && !h) {
+          pop.hidden = true;
+          popId = null;
+        }
+        queuePaint();
+      } else if (d.key === `p:${PAGE}`) {
+        if (document.activeElement !== textArea && noteTimer === undefined) {
+          textArea.value = readPageNote(PAGE);
+          paintChars();
+        }
+        queuePaint();
+      }
+    });
+
+    renderAll();
+    paintPanel();
+    goToHash();
+    window.addEventListener('hashchange', goToHash);
+  }
+</script>
+
+<style>
+  .hlp { margin: 2.5rem 0 0; }
+  .hlp__box {
+    border: 1px solid var(--card-border);
+    border-radius: 12px;
+    background: var(--card-bg);
+  }
+  .hlp__summary {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.25rem 0.75rem;
+    padding: 0.85rem 1rem;
+    cursor: pointer;
+    list-style-position: inside;
+  }
+  .hlp__summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 12px; }
+  .hlp__title { font-weight: 700; font-size: 1.05rem; }
+  .hlp__count { font-family: var(--font-code); font-size: 0.75rem; color: var(--fg-muted); }
+  .hlp__body { padding: 0 1rem 1rem; min-width: 0; }
+  .hlp__label { display: block; font-size: 0.85rem; color: var(--fg-muted); margin: 0 0 0.35rem; }
+  .hlp__text {
+    box-sizing: border-box;
+    width: 100%;
+    min-height: 8rem;
+    resize: vertical;
+    padding: 0.6rem 0.7rem;
+    border: 1px solid var(--card-border);
+    border-radius: 8px;
+    background: var(--bg-soft);
+    color: var(--fg);
+    font: inherit;
+    font-size: 0.95rem;
+    line-height: 1.5;
+  }
+  .hlp__text:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .hlp__meta { margin: 0.35rem 0 0; font-family: var(--font-code); font-size: 0.72rem; color: var(--fg-faint); display: flex; gap: 0.4rem; flex-wrap: wrap; }
+  .hlp__h { font-size: 0.95rem; margin: 1.25rem 0 0.5rem; }
+  .hlp__hint { color: var(--fg-muted); font-size: 0.85rem; margin: 0 0 0.5rem; }
+  .hlp__list { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.5rem; }
+  .hlp__all { margin: 1rem 0 0; font-size: 0.9rem; }
+
+  /* Items are built in the browser, so they have no scoped attribute. */
+  .hlp :global(.hlp__item) {
+    border-left: 4px solid var(--hl-c, #facc15);
+    padding: 0.4rem 0.6rem;
+    background: var(--bg-soft);
+    border-radius: 0 8px 8px 0;
+    min-width: 0;
+    transition: box-shadow 0.3s ease;
+  }
+  .hlp :global(.hlp__item.is-flash) { box-shadow: 0 0 0 2px var(--accent); }
+  .hlp :global(.hlp__item--green) { --hl-c: #22c55e; }
+  .hlp :global(.hlp__item--blue) { --hl-c: #3b82f6; }
+  .hlp :global(.hlp__item--pink) { --hl-c: #ec4899; }
+  .hlp :global(.hlp__quote) {
+    display: block;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--fg);
+    font: inherit;
+    font-size: 0.9rem;
+    line-height: 1.45;
+    text-align: left;
+    overflow-wrap: anywhere;
+  }
+  .hlp :global(button.hlp__quote) { cursor: pointer; width: 100%; }
+  .hlp :global(button.hlp__quote:hover) { text-decoration: underline; }
+  .hlp :global(.hlp__note) {
+    margin: 0.3rem 0 0;
+    font-size: 0.85rem;
+    color: var(--fg-muted);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .hlp :global(.hlp__actions) { margin: 0.3rem 0 0; display: flex; gap: 0.4rem; }
+  .hlp :global(.hlp__btn) {
+    font: inherit;
+    font-size: 0.75rem;
+    padding: 0.15rem 0.55rem;
+    border-radius: 6px;
+    border: 1px solid var(--card-border);
+    background: var(--card-bg);
+    color: var(--fg-muted);
+    cursor: pointer;
+  }
+  .hlp :global(.hlp__btn:hover) { color: var(--fg); }
+  .hlp :global(button:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .hl-toolbar,
+  .hl-pop {
+    position: absolute;
+    z-index: 60;
+    background: var(--card-bg);
+    border: 1px solid var(--card-border);
+    border-radius: 10px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.22);
+    color: var(--fg);
+  }
+  .hl-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.25rem;
+    padding: 0.3rem;
+    max-width: calc(100vw - 16px);
+    box-sizing: border-box;
+  }
+  .hl-toolbar[hidden], .hl-pop[hidden] { display: none; }
+  .hl-toolbar button,
+  .hl-pop button {
+    font: inherit;
+    font-size: 0.82rem;
+    border: 1px solid transparent;
+    border-radius: 7px;
+    background: transparent;
+    color: var(--fg);
+    cursor: pointer;
+    min-height: 2rem;
+  }
+  .hl-toolbar button:hover:not(:disabled),
+  .hl-pop button:hover { background: var(--bg-soft); }
+  .hl-toolbar button:focus-visible,
+  .hl-pop button:focus-visible,
+  .hl-pop textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .hl-toolbar button:disabled { opacity: 0.45; cursor: not-allowed; }
+  .hl-toolbar__main,
+  .hl-toolbar__note { display: inline-flex; align-items: center; gap: 0.35rem; padding: 0 0.55rem; font-weight: 600; }
+  .hl-toolbar__swatches { display: inline-flex; gap: 0.1rem; padding: 0 0.15rem; border-inline: 1px solid var(--card-border); }
+  .hl-toolbar__color,
+  .hl-pop__color { width: 2rem; display: inline-flex; align-items: center; justify-content: center; padding: 0; }
+  .hl-toolbar__msg { font-size: 0.75rem; color: var(--fg-muted); padding: 0 0.4rem; }
+
+  .hl-swatch {
+    display: inline-block;
+    width: 0.95rem;
+    height: 0.95rem;
+    border-radius: 50%;
+    background: #facc15;
+    box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.18);
+  }
+  .hl-swatch--green { background: #4ade80; }
+  .hl-swatch--blue { background: #60a5fa; }
+  .hl-swatch--pink { background: #f472b6; }
+
+  .hl-pop {
+    width: min(20rem, calc(100vw - 16px));
+    box-sizing: border-box;
+    padding: 0.75rem;
+  }
+  .hl-pop__title { margin: 0 0 0.35rem; font-size: 0.72rem; font-family: var(--font-code); text-transform: uppercase; letter-spacing: 0.05em; color: var(--fg-muted); }
+  .hl-pop__quote {
+    margin: 0 0 0.5rem;
+    padding: 0 0 0 0.6rem;
+    border-left: 3px solid var(--card-border);
+    font-size: 0.85rem;
+    color: var(--fg-muted);
+    max-height: 5.5rem;
+    overflow: auto;
+    overflow-wrap: anywhere;
+  }
+  .hl-pop__colors { display: flex; gap: 0.25rem; margin: 0 0 0.5rem; }
+  .hl-pop__color[aria-pressed='true'] { border-color: var(--accent); background: var(--bg-soft); }
+  .hl-pop__label { display: block; font-size: 0.8rem; color: var(--fg-muted); margin: 0 0 0.25rem; }
+  .hl-pop__note {
+    box-sizing: border-box;
+    width: 100%;
+    resize: vertical;
+    padding: 0.45rem 0.55rem;
+    border: 1px solid var(--card-border);
+    border-radius: 7px;
+    background: var(--bg-soft);
+    color: var(--fg);
+    font: inherit;
+    font-size: 0.88rem;
+  }
+  .hl-pop__chars { margin: 0.2rem 0 0.5rem; font-size: 0.7rem; font-family: var(--font-code); color: var(--fg-faint); text-align: right; }
+  .hl-pop__actions { display: flex; justify-content: space-between; gap: 0.5rem; }
+  .hl-pop__btn { padding: 0 0.75rem; border-color: var(--card-border) !important; }
+  .hl-pop__btn--primary { background: var(--accent) !important; color: #fff !important; border-color: transparent !important; font-weight: 600; }
+  .hl-pop__btn--danger { color: var(--anim-danger) !important; }
+
+  .hl-sr {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+</style>
+
+<style is:global>
+  /* Marks are created in the browser inside MDX content. */
+  mark.hl {
+    color: inherit;
+    border-radius: 2px;
+    padding: 0.05em 0;
+    cursor: pointer;
+    background: rgba(250, 204, 21, 0.4);
+    -webkit-box-decoration-break: clone;
+    box-decoration-break: clone;
+  }
+  mark.hl--green { background: rgba(74, 222, 128, 0.36); }
+  mark.hl--blue { background: rgba(96, 165, 250, 0.36); }
+  mark.hl--pink { background: rgba(244, 114, 182, 0.36); }
+  mark.hl[data-hl-note] { text-decoration: underline dotted; text-underline-offset: 0.2em; }
+  mark.hl:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  mark.hl { scroll-margin-top: 6rem; }
+  mark.hl--flash { animation: hl-flash 1.6s ease-out; }
+  @keyframes hl-flash {
+    0%, 30% { box-shadow: 0 0 0 3px var(--accent); }
+    100% { box-shadow: 0 0 0 0 transparent; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    mark.hl--flash { animation: none; outline: 2px solid var(--accent); }
+  }
+</style>
