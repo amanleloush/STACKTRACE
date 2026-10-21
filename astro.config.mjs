@@ -26,6 +26,11 @@ export default defineConfig({
       // <CodeTabs> on DSA pages: groups the fenced blocks inside it into
       // C++ / Java / Python tabs and precomputes each godbolt.org run link.
       remarkPlugins: [remarkCodeTabs],
+      // Note and DSA pages are server-rendered, so every MDX page ships in
+      // the Worker bundle. Without this, each highlighted code token becomes
+      // a JSX call, which tripled the bundle and slowed Worker startup.
+      // optimize collapses static subtrees into plain HTML strings.
+      optimize: true,
       // Highlight code at build time with both themes; global.css picks
       // the one matching the site's data-theme. @astrojs/mdx 4.0 only
       // turns Shiki on for the string form, so it is set explicitly here.
