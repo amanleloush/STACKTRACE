@@ -15,9 +15,11 @@ summary: "What at-most-once, at-least-once and exactly-once really mean, and how
 **Delivery semantics** describe what guarantees a messaging system gives between producer, broker, and consumer:
 - **At-most-once**: message may be lost, never duplicated.
 - **At-least-once**: message never lost, may be duplicated.
-- **Exactly-once**: message delivered exactly once (only possible under specific constraints).
+- **Exactly-once**: each message's effect is applied exactly once (only possible under specific constraints, such as a transactional boundary or an idempotent consumer).
 
 **Idempotency** is the property that processing the same message multiple times yields the same result — the practical fix that makes at-least-once delivery safe. A **dead-letter queue (DLQ)** holds messages that can't be processed after retries.
+
+**One-liner:** At-most-once can lose messages, at-least-once can duplicate them, and exactly-once only holds inside a transactional boundary such as Kafka-to-Kafka, so most real systems use at-least-once delivery with idempotent consumers and a DLQ for poison messages.
 
 ## Why it matters
 
@@ -35,12 +37,12 @@ sequenceDiagram
     B->>C: deliver msg (offset=120)
     C->>DB: INSERT id=42 ... ON CONFLICT DO NOTHING
     DB-->>C: 1 row (first time)
-    C->>B: commit offset 120
-    Note over P,DB: replay (network blip) — duplicate delivery
+    C-xB: commit offset 121 (lost: crash or rebalance)
+    Note over P,DB: consumer restarts from the last committed offset — duplicate delivery
     B->>C: redeliver msg (offset=120)
     C->>DB: INSERT id=42 ON CONFLICT DO NOTHING
-    DB-->>C: 0 rows (already processed)
-    C->>B: commit offset 120 (no-op)
+    DB-->>C: 0 rows (already processed, skip the effect)
+    C->>B: commit offset 121 (the next offset to read)
 ```
 
 ## Core concepts
@@ -77,8 +79,8 @@ A handler is idempotent if `handle(msg)` produces the same outcome whether calle
 Patterns:
 - **Idempotency key**: the message has a unique ID; consumer tracks seen IDs in a store (`Redis SET NX EX` or DB unique index).
 - **Conditional updates**: `UPDATE ... WHERE version = X` — second call no-ops.
-- **CRDT / commutative operations**: counter increments, set adds — order and duplication don't matter.
-- **Upsert with natural key**: `INSERT ... ON CONFLICT DO NOTHING`.
+- **Idempotent, order-insensitive operations**: set adds, "keep the max" updates, CRDT merges — order and duplication don't matter. Careful: a plain counter increment is commutative but **not** idempotent, because a duplicate counts twice.
+- **Upsert with natural key**: `INSERT ... ON CONFLICT DO NOTHING` (or `DO UPDATE`).
 
 ### Consumer offset commit timing
 
@@ -91,7 +93,7 @@ Patterns:
 
 - `acks=0`: at-most-once. Producer doesn't wait. Fast, lossy.
 - `acks=1`: leader-only. Loss possible on leader failure before replication.
-- `acks=all` + `enable.idempotence=true`: at-least-once with broker-side dedupe (effectively exactly-once into the broker).
+- `acks=all` + `enable.idempotence=true` (the producer defaults since Kafka 3.0): at-least-once with broker-side dedupe of retries (effectively exactly-once into the broker, per partition, for one producer session).
 
 See [Producer deep dive](/learn/notes/kafka-producer/) for batching, retries, `delivery.timeout.ms` and ordering under retries.
 
@@ -123,13 +125,14 @@ Consumer side:
   Begin DB transaction:
     INSERT INTO processed_events (order_id, type) VALUES ('o123','created')
        ON CONFLICT DO NOTHING       -- idempotency check
-    Apply business effect
+    If 0 rows were inserted: skip (already processed)
+    Else: apply business effect
   Commit DB
   Commit Kafka offset
   Loop
 ```
 
-On duplicate delivery: the `INSERT` fails on conflict; business effect not applied; offset committed normally.
+On duplicate delivery: the `INSERT` inserts 0 rows because of the conflict, the business effect is skipped, and the offset is committed normally.
 
 ## Real-world examples
 
@@ -142,7 +145,7 @@ On duplicate delivery: the `INSERT` fails on conflict; business effect not appli
 - **Assuming exactly-once exists for free**: no, it requires application work or strict boundary (Kafka-to-Kafka transactional).
 - **Idempotency only at the API layer, not internally**: a retry deep in the system bypasses the API layer's dedupe. Pass the idempotency key through.
 - **Idempotency store with TTL too short**: client retries after TTL → duplicate processed. TTLs should exceed all retry windows.
-- **Side effects in non-idempotent external systems** (emails, webhooks, payment providers): keep a sent-flag in the same transaction as the state update.
+- **Side effects in non-idempotent external systems** (emails, webhooks, payment providers): you can't put the external call in your DB transaction. Pass an idempotency key if the provider accepts one, and record a sent-flag in your DB right after the call. A crash between the call and the flag can still cause one duplicate.
 - **DLQ as black hole**: nobody reviews. Set up alerting and a runbook.
 - **Auto-commit + processing in worker thread**: race condition — offset committed before work done, work fails, message lost.
 - **Mistaken "kafka exactly-once = no app work"**: only Kafka-to-Kafka. If you write to a DB or call an external service, you still need idempotency.

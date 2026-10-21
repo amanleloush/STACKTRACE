@@ -11,7 +11,13 @@ prerequisites: []
 
 ## Definition (interview-ready)
 
-**Apache Airflow** is a workflow orchestrator: schedules and runs **DAGs** (directed acyclic graphs) of tasks. A **DAG run** is one execution of a DAG for a specific **logical date**. Tasks must be **idempotent** to support retries and backfills. **Deferrable operators** yield long waits to a "triggerer" service to free up workers — critical for scale.
+**Apache Airflow** is a workflow orchestrator. You define pipelines in Python as **DAGs** (directed acyclic graphs) of tasks, and Airflow schedules them, runs each task once its upstream tasks finish, retries failures and records every state in a metadata database.
+
+- A **DAG run** is one execution of a DAG, identified by its **logical date**. With the classic data-interval schedule (the Airflow 2 default), that is the *start* of the data window the run processes, not the time it actually runs.
+- Tasks must be **idempotent** (rerunning them gives the same result), because retries and backfills rerun them.
+- **Deferrable operators** hand long waits to a lightweight **triggerer** service, so a task that is only waiting doesn't occupy a worker slot.
+
+**One-liner:** Airflow is a Python-defined scheduler for DAGs of tasks: each DAG run processes one logical date, tasks must be idempotent so retries and backfills are safe, and deferrable operators let waits run in a triggerer instead of blocking workers.
 
 ## Why it matters
 
@@ -114,19 +120,19 @@ Classic sensor: poll in a loop in the worker. Problem: **blocks a worker slot** 
 
 **Deferrable operators** (Airflow 2.2+): a sensor "yields" to the **triggerer** — a lightweight async event loop. When the condition is met, the triggerer wakes the task up and reattaches a worker.
 
-Result: instead of 1000 idle workers, one triggerer can monitor 10000 conditions concurrently.
+Result: instead of 1000 idle worker slots, a single triggerer process runs thousands of waits concurrently (up to its `capacity` setting, 1000 triggers by default), and you add triggerers to scale further.
 
 ### Task states
 
 ```
 NONE → SCHEDULED → QUEUED → RUNNING → SUCCESS
-                                  ↓
-                              UP_FOR_RETRY (after delay) → QUEUED
-                                  ↓
-                              FAILED
-                                  ↓
-                         UPSTREAM_FAILED / SKIPPED
-                         (depending on trigger rules)
+                               │
+                               ├─ fails, retries left → UP_FOR_RETRY → (after retry_delay) SCHEDULED
+                               ├─ fails, no retries   → FAILED
+                               └─ waits on a trigger  → DEFERRED → (event fires) SCHEDULED
+
+Downstream tasks of a FAILED task become UPSTREAM_FAILED
+(or SKIPPED / still run, depending on their trigger rules).
 ```
 
 ### Trigger rules
@@ -210,7 +216,7 @@ A trigger rule decides when a task runs based on its upstreams' states. The defa
 
 <QA q="What's a deferrable operator and why does it matter?" level="medium">
 
-A task that yields to the **triggerer** (a lightweight async event loop) during long waits, freeing its worker slot. When the condition is met, the triggerer resumes the task on a worker. It replaces classic poll-in-worker sensors: one triggerer can watch 10,000+ conditions, whereas classic sensors would need that many busy worker slots.
+A task that yields to the **triggerer** (a lightweight async event loop) during long waits, freeing its worker slot. When the condition is met, the triggerer resumes the task on a worker. It replaces classic poll-in-worker sensors: one triggerer can watch thousands of conditions (default capacity 1,000 triggers per triggerer, and you can run several), whereas classic sensors would need that many busy worker slots.
 
 </QA>
 

@@ -14,6 +14,8 @@ summary: "What actually happens inside a Kafka cluster — how partitions replic
 
 Internally, every Kafka partition is a **replicated, append-only log**. One replica is the **leader** and handles all writes; the **followers** copy from it by fetching, the same way consumers do. The replicas that are fully caught up form the **In-Sync Replica set (ISR)**. A record is **committed** once every ISR member has it, and the **high watermark** marks that boundary: consumers only ever see records below it. Cluster metadata, such as who leads which partition, is owned by a **controller**. That used to be one broker coordinated through ZooKeeper; today it's a Raft quorum built into Kafka itself (**KRaft**). On disk, each partition is a directory of **segment files** that are only ever appended to, served out of the OS page cache, and sent to consumers with zero-copy.
 
+**One-liner:** Each Kafka partition is a replicated append-only log: the leader takes writes, followers fetch from it, a record is committed once every in-sync replica has it (the high watermark), a KRaft controller quorum manages metadata and elections, and speed comes from sequential segment files, the page cache and zero-copy.
+
 ## Why it matters
 
 The basic API (topics, partitions, consumer groups) tells you how to *use* Kafka. The internals tell you what Kafka *promises*: when an acknowledged write can still be lost, why a partition can go offline, why consumers sometimes lag a few hundred milliseconds behind producers, and why one broker can push gigabytes per second on ordinary disks. Senior interviews almost always probe this layer. Expect questions like "you set `acks=all`, can you still lose data?" or "what does `min.insync.replicas` actually protect?".
@@ -67,7 +69,7 @@ Enable it only for data where uptime beats completeness and loss is tolerable: c
 
 ### ZooKeeper → KRaft
 
-Before Kafka 3.x, **ZooKeeper** held the cluster's metadata: which brokers are alive (ephemeral znodes), topic and partition configs, leaders and ISRs, ACLs, and which broker is the controller. Problems with that:
+Before KRaft, **ZooKeeper** held the cluster's metadata: which brokers are alive (ephemeral znodes), topic and partition configs, leaders and ISRs, ACLs, and which broker is the controller. Problems with that:
 
 - **Two distributed systems to run**, secure, monitor, and upgrade.
 - **Scalability ceiling.** Metadata lived in znodes, and a new controller had to load all of it from ZooKeeper on failover. Practical limits were around 200k partitions per cluster, and failover on big clusters took tens of seconds or minutes.
@@ -179,7 +181,7 @@ In a shared cluster, one backfill job can starve everyone else. Kafka lets you s
 - **Request-rate quotas**: the share of broker network and I/O thread time a client may use.
 - **Controller mutation quotas**, which limit how fast clients can create or delete topics and partitions.
 
-When a client goes over its quota, the broker doesn't return an error. It **delays the response** for a computed throttle time (and mutes the channel), so a well-behaved client simply slows down. The client-side metric `produce-throttle-time-avg` / `fetch-throttle-time-avg` greater than 0 tells you it's happening.
+When a client goes over a byte-rate or request quota, the broker doesn't return an error. It **delays the response** for a computed throttle time (and mutes the channel), so a well-behaved client simply slows down. (Controller mutation quotas are the exception: an over-quota topic or partition creation is rejected with a `THROTTLING_QUOTA_EXCEEDED` error that tells the client how long to wait.) The client-side metric `produce-throttle-time-avg` / `fetch-throttle-time-avg` greater than 0 tells you it's happening.
 
 ## How it works (one `send()` end to end)
 
@@ -328,7 +330,7 @@ It connects to any broker in `bootstrap.servers` and sends a **Metadata request*
 
 <QA q="What are Kafka quotas and why do multi-tenant clusters need them?" level="medium">
 
-Per-user and per-client-id limits on produce and fetch bytes per second, on the share of broker request-handler time a client may use, and on how fast clients can create or delete topics and partitions. When a client goes over its quota, the broker **delays responses** instead of returning errors, so clients slow down without any code changes. On a shared, org-wide cluster, quotas keep one team's backfill or a misconfigured client (for example, one flooding the cluster with metadata requests) from starving latency-sensitive production traffic.
+Per-user and per-client-id limits on produce and fetch bytes per second, on the share of broker request-handler time a client may use, and on how fast clients can create or delete topics and partitions. When a client goes over a byte-rate or request quota, the broker **delays responses** instead of returning errors, so clients slow down without any code changes. (Controller mutation quotas instead reject the request with a throttling error.) On a shared, org-wide cluster, quotas keep one team's backfill or a misconfigured client (for example, one flooding the cluster with metadata requests) from starving latency-sensitive production traffic.
 
 </QA>
 
@@ -436,7 +438,7 @@ Each segment has a sparse .index mapping offsets to byte positions, roughly ever
 - Storage = append-only **segments** + sparse offset and time indexes; speed = sequential I/O + page cache + zero-copy + batches.
 - Large payloads → **claim check**.
 - Clients bootstrap → Metadata request → talk straight to leaders; get **`advertised.listeners`** right.
-- **Quotas** throttle by delaying responses, not by returning errors.
+- **Byte-rate and request quotas** throttle by delaying responses, not by returning errors.
 
 ## Go deeper
 

@@ -13,6 +13,8 @@ prerequisites: []
 
 **mTLS (mutual TLS)** is TLS where **both** sides present certificates: the server proves its identity to the client (regular TLS) AND the client proves its identity to the server. **Certificate management** is the lifecycle of issuing, deploying, rotating, and revoking certs at scale — often automated via PKI infrastructure (Vault, AWS Private CA, smallstep, cert-manager).
 
+**One-liner:** mTLS is TLS where the client also presents a certificate and proves it holds the matching private key, so both services know exactly who is on the other end; the hard part in production is automating issuance and rotation of short-lived certs.
+
 ## Why it matters
 
 Service-to-service identity at scale demands stronger auth than shared secrets or bearer tokens. mTLS gives you encryption + cryptographic identity in one step, with no central token issuer to fail. The hard part isn't TLS itself — it's the lifecycle: rotation, revocation, expiry monitoring.
@@ -23,11 +25,10 @@ sequenceDiagram
     participant C as Client (svc-A)
     participant S as Server (svc-B)
     C->>S: ClientHello
-    S->>C: ServerHello + cert (signed by org CA)
-    C->>C: verify server cert chain → CA root
-    S->>C: CertificateRequest
-    C->>S: client cert (signed by org CA)
-    S->>S: verify client cert chain → CA root
+    S->>C: ServerHello + CertificateRequest + server cert (signed by org CA) + CertificateVerify
+    C->>C: verify server cert chain → CA root, and its signature
+    C->>S: client cert (signed by org CA) + CertificateVerify (signed with client private key)
+    S->>S: verify client cert chain → CA root, and its signature
     Note over C,S: both sides authenticated · symmetric session key
     C->>S: encrypted application data
 ```
@@ -78,7 +79,7 @@ Now both sides are cryptographically identified.
 ### vs bearer tokens
 
 - Bearer token: anyone with the token is "authenticated" — token can be stolen, replayed (until rotation).
-- mTLS: requires the private key, which never leaves the device. Stronger.
+- mTLS: the client must prove it holds the private key, and that key is never sent over the network, so a copied certificate or a sniffed handshake is useless. Stronger.
 - Bearer is simpler to issue/revoke; mTLS requires PKI.
 
 Modern systems often combine: mTLS for service identity + JWT for user identity carried in headers.
@@ -114,7 +115,7 @@ Certificates expire. At scale:
 If a cert is compromised before expiry:
 - **CRL** (Certificate Revocation List): downloaded periodically, lists revoked serial numbers.
 - **OCSP** (Online Certificate Status Protocol): real-time lookup per validation. (Public CAs are retreating from it for privacy/cost reasons; Let's Encrypt ended OCSP in 2025 in favor of CRLs.)
-- **OCSP Stapling**: server stapled OCSP response to the handshake; client doesn't have to call.
+- **OCSP Stapling**: the server attaches (staples) a recent, CA-signed OCSP response to the handshake, so the client doesn't have to call the CA.
 - **Short cert lifetimes**: arguably the best revocation — just don't renew the compromised cert.
 
 For internal PKI: prefer short lifetimes over CRL/OCSP. CRL/OCSP are operationally painful.
@@ -213,7 +214,7 @@ Validation walks the chain leaf → intermediate(s) → root. Servers must send 
 
 <QA q="Why use mTLS over bearer tokens for service-to-service auth?" level="medium">
 
-Tokens are bearer credentials: anyone holding one can authenticate, and they leak via logs, memory dumps or interception, then get replayed until they expire. mTLS requires the **private key**, which never leaves the host. Stronger identity binding, less leakable, and encryption in the same step. Bearer tokens are simpler to issue and revoke; mTLS needs a PKI.
+Tokens are bearer credentials: anyone holding one can authenticate, and they leak via logs, memory dumps or interception, then get replayed until they expire. mTLS requires proof of the **private key**, which is never sent over the network. Stronger identity binding, less leakable, and encryption in the same step. Bearer tokens are simpler to issue and revoke; mTLS needs a PKI.
 
 </QA>
 
@@ -355,7 +356,7 @@ Soft fail keeps availability at the cost of a security gap; hard fail is the rev
 
 - **TLS** = server identity. **mTLS** = both sides identified.
 - Use mTLS for service-to-service, B2B, IoT, internal zero-trust.
-- Stronger than bearer tokens (key never leaks).
+- Stronger than bearer tokens (the private key is never sent over the wire).
 - **PKI**: root CA → intermediate → leaf. Internal PKI for service certs.
 - **Cert lifecycle**: issue → deploy → rotate → expire. Automate everything.
 - **Short-lived certs** > CRL/OCSP for internal PKI.

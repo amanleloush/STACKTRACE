@@ -13,6 +13,8 @@ prerequisites: []
 
 **Rate limiting** caps the number of operations a client (user, IP, key) can perform in a time window. **Token bucket** maintains a bucket of tokens refilled at a rate; each request consumes a token. **Leaky bucket** treats requests like water in a fixed-size bucket leaking at a constant rate. **Fixed window** counts in discrete buckets; **sliding window** counts over a rolling time interval to avoid boundary spikes.
 
+**One-liner:** Rate limiting caps how many requests a client can make per unit of time; I'd usually use a token bucket per user or API key in Redis, which allows short bursts up to the bucket size while holding the long-run rate, and return 429 with Retry-After when the client is over.
+
 ## Why it matters
 
 Rate limiting is the front line for: API abuse protection, DoS mitigation, fair resource sharing, cost control on expensive operations, defending downstream services. Done wrong, it punishes good users; done right, it's invisible.
@@ -73,11 +75,14 @@ if count > limit: deny
 Track timestamps of each request in a sorted set; count entries within the window.
 
 ```
-ZADD rl:user42 <ts> <ts>
+-- run atomically (Lua script or MULTI/EXEC)
 ZREMRANGEBYSCORE rl:user42 0 (now - window)
 n = ZCARD rl:user42
-if n > limit: deny
+if n >= limit: deny
+else: ZADD rl:user42 <now> <unique_request_id>; allow
 ```
+
+Use a unique member (such as a request ID), not the timestamp itself: two requests in the same millisecond would otherwise collapse into one entry.
 
 - Exact, no boundary effect.
 - Memory: O(requests in window) per user — expensive at scale.
@@ -87,11 +92,11 @@ if n > limit: deny
 Combine fixed windows with weighted overlap.
 
 ```
-count = current_window * elapsed_in_current_window / window
-      + previous_window * (1 - elapsed_in_current_window / window)
+estimated = current_window_count
+          + previous_window_count * (1 - elapsed_in_current_window / window)
 ```
 
-Roughly: count in current window + weighted slice of previous. Cheap (two counters) and avoids boundary spikes.
+In words: the full count of the current window, plus the share of the previous window that still overlaps the sliding window (this assumes the previous window's requests were spread evenly). Cheap (two counters) and avoids boundary spikes.
 
 ### Where to enforce
 
@@ -107,12 +112,12 @@ Roughly: count in current window + weighted slice of previous. Cheap (two counte
 | Token bucket | Yes (up to C) | Approximate | O(1) per key | Most common |
 | Leaky bucket | No | Approximate | O(1) per key + queue | Shaping |
 | Fixed window | Yes (at boundary) | Exact within bucket | O(1) per key | Boundary effect |
-| Sliding log | Configurable | Exact | O(N) | Expensive |
+| Sliding log | No (strict per rolling window) | Exact | O(N) | Expensive |
 | Sliding counter | Modest | Approximate | O(1) per key | Best general fit |
 
 ### Distributed rate limiting
 
-Single-node Redis fronts most APIs.
+A shared Redis (single node or cluster) is the most common backing store for counters.
 
 Challenges at scale:
 - **Lua scripts** for atomicity (compute + check + increment in one).

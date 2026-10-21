@@ -9,6 +9,14 @@ estimatedMinutes: 6
 prerequisites: []
 ---
 
+## Definition (interview-ready)
+
+A **URL shortener** maps a long URL to a short code (such as `sho.rt/xY3qZ`) and redirects anyone who opens the code back to the original URL, usually while counting clicks. It is extremely read-heavy (about 100 redirects per creation). Writes go to a stateless API that takes the next ID from a **counter** (a DB sequence or pre-allocated ranges per server or region), encodes it in **base62** (7 characters give about 3.5 trillion codes) and stores code → URL in a key-value or sharded SQL table. Reads check **Redis** first, fall back to the database, return a **302 redirect** and emit a click event to Kafka asynchronously, so analytics never slow the redirect. A CDN can absorb viral links.
+
+Key decisions: counter plus base62 (no collisions) versus hashing (stable, but collisions to resolve), and 302 rather than 301 so browsers don't cache the redirect and hide clicks. The main trade-off is that sequential codes are guessable, so private links need random codes.
+
+**One-liner:** Allocate IDs from range-partitioned counters, base62-encode them into 7-character codes, store code → URL in a sharded KV store behind Redis and a CDN, serve 302 redirects, and stream click events to Kafka for analytics.
+
 ## Problem statement
 
 Build a service that converts long URLs to short ones (`bit.ly/xY3qZ`) and redirects users back to the original URL on access. Track click counts.
@@ -73,7 +81,7 @@ Two approaches:
 
 ### Hash-based (md5/sha256 → base62)
 - Hash long URL, take first N base62 chars.
-- Collision risk → check DB, increment if collision.
+- Collision risk → check the DB; on a collision, append a salt or counter to the input and hash again.
 - Pro: stable mapping (same URL → same code if desired).
 - Con: collisions, predictability.
 
@@ -83,7 +91,7 @@ Two approaches:
 - Pro: no collisions, simple.
 - Con: predictable (security issue if URLs are meant to be unguessable — add salt or use UUID-derived codes).
 
-Multi-region: per-region counters with non-overlapping ranges (region A gets 0–1B, B gets 1–2B). Or generate codes via a snowflake-like ID generator.
+Multi-region: per-region counters with non-overlapping ranges (region A gets 0–1B, B gets 1–2B). Or generate codes via a Snowflake-like ID generator, accepting longer codes (a 64-bit ID is up to 11 base62 characters).
 
 ## High-level architecture
 
@@ -183,7 +191,7 @@ For analytics (clicks), use a separate store — never the OLTP DB.
 - **App tier**: stateless, behind LB, autoscale.
 - **DB**: shard by code prefix or hash once one Postgres can't hold.
 - **Redis**: cluster mode.
-- **Geo**: CDN at edge for very hot codes (CloudFront / Cloudflare); analytics CDN handles cookie-less hits cheaply.
+- **Geo**: CDN at edge for very hot codes (CloudFront / Cloudflare). Clicks served by the CDN never reach your servers, so count them from CDN logs or edge functions.
 - **Multi-region active-active**: per-region counter ranges; eventual cross-region read.
 
 ## Bottlenecks & optimizations
@@ -223,7 +231,7 @@ Cache codes in Redis. Codes are immutable so a long TTL is safe. Traffic is heav
 
 <QA q="How would you generate short codes uniquely at scale?" level="medium">
 
-Counter-based encoded in base62. For multi-region, partition counter ranges per region. Alternative: Twitter Snowflake-style 64-bit IDs (time + machine + sequence) — every ID unique without coordination.
+Counter-based encoded in base62. For multi-region, partition counter ranges per region. Alternative: Twitter Snowflake-style 64-bit IDs (time + machine + sequence) — unique without per-request coordination once each machine has a distinct ID. The catch: a 64-bit ID needs up to 11 base62 characters, longer than the 6–8 you wanted.
 
 </QA>
 
@@ -326,9 +334,9 @@ Disjoint ranges let each region allocate locally with no collisions. A shared co
 
 </MCQ>
 
-<MCQ q="A short link expired yesterday. What should GET on its code return?" options={["404 Not Found", "410 Gone", "302 to the original URL", "500 Internal Server Error"]} answer={1}>
+<MCQ q="A short link expired yesterday. Which status code most precisely tells the client it existed but was deliberately removed?" options={["404 Not Found", "410 Gone", "302 to the original URL", "500 Internal Server Error"]} answer={1}>
 
-410 Gone states that the resource existed and was removed deliberately. 404 is less precise, redirecting ignores the expiry, and 500 signals a server bug.
+410 Gone states that the resource existed and was removed deliberately (RFC 9110). 404 is also common in practice but only says nothing is there, redirecting ignores the expiry, and 500 signals a server bug.
 
 </MCQ>
 
@@ -353,7 +361,7 @@ Cached redirects at the edge and in Redis bypass the new flag until purged. Inde
 ## Go deeper
 
 - **ByteByteGo**: ["URL Shortener course"](https://bytebytego.com/courses/system-design-interview/design-a-url-shortener).
-- **System Design Primer**: [shortlink](https://github.com/donnemartin/system-design-primer/tree/master/solutions/system_design/pastebin).
-- **Alex Xu, *System Design Interview Vol 1*** — Chapter 8.
+- **System Design Primer**: ["Design Pastebin.com (or Bit.ly)"](https://github.com/donnemartin/system-design-primer/tree/master/solutions/system_design/pastebin).
+- **Alex Xu, *System Design Interview Vol 1*** — Chapter 8 (Design a URL shortener).
 - **Twitter Snowflake**: [github.com/twitter-archive/snowflake](https://github.com/twitter-archive/snowflake) — distributed ID generation.
 - **bit.ly engineering blog** for production stories.

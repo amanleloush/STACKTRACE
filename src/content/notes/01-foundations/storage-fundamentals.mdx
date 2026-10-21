@@ -11,7 +11,9 @@ prerequisites: []
 
 ## Definition (interview-ready)
 
-**HDD** (hard disk) stores data on rotating platters — slow random access (~10 ms seek), fast sequential. **SSD** (solid-state drive) stores data in flash cells — fast random access (~150 μs), faster sequential, finite write endurance. The **page cache** is the kernel's in-memory copy of disk pages, transparently caching reads and buffering writes. **fsync** forces buffered writes from page cache to durable storage.
+**HDD** (hard disk) stores data on rotating platters — slow random access (~10 ms seek), fast sequential. **SSD** (solid-state drive) stores data in flash cells — fast random access (~150 μs), faster sequential, finite write endurance. The **page cache** is the kernel's in-memory copy of disk pages, transparently caching reads and buffering writes. **fsync** forces a file's buffered writes from the page cache to durable storage and waits until the device confirms them.
+
+**One-liner:** A successful `write()` only puts data in the kernel's page cache, which a crash can wipe; `fsync` makes it durable but costs milliseconds, so databases append to a sequential write-ahead log and batch fsyncs, because sequential I/O is far cheaper than random I/O on both HDDs and SSDs.
 
 ## Why it matters
 
@@ -23,7 +25,7 @@ flowchart LR
     L1 --> L2[L2 cache<br/>~3 ns]
     L2 --> L3[L3 cache<br/>~10 ns]
     L3 --> RAM[RAM<br/>~100 ns]
-    RAM --> SSD[NVMe SSD<br/>~150 µs]
+    RAM --> SSD[SSD random read<br/>~50–150 µs]
     SSD --> HDD[HDD seek<br/>~10 ms]
     HDD --> NET[Cross-region net<br/>~150 ms]
     style CPU fill:#10b981,color:#fff
@@ -55,9 +57,9 @@ sequenceDiagram
 
 | | HDD | SATA SSD | NVMe SSD |
 |---|---|---|---|
-| Seek time | ~10 ms | ~150 μs | ~50 μs |
+| Random read latency | ~10 ms (seek + rotation) | ~100–150 μs | ~50–100 μs |
 | Sequential read | 100-200 MB/s | 500 MB/s | 3-7 GB/s |
-| Random IOPS | ~100 | ~50K | ~500K+ |
+| Random IOPS | ~100 | ~50–100K | ~500K+ |
 | $/GB | very low | low | moderate |
 | Endurance | high (mechanical) | finite (DWPD) | finite (DWPD) |
 
@@ -139,7 +141,7 @@ Used by: Postgres (WAL), MySQL InnoDB (redo log), Kafka (commit log), SQLite (WA
 5. Device firmware acknowledges write (and may itself have a volatile cache —
    look for "write barrier" support).
 6. fsync returns.
-7. If you skip step 2, a crash before step 4 = lost data.
+7. If you skip step 2, a crash before the kernel's background writeback reaches the device = lost data.
 ```
 
 ## Real-world examples
@@ -227,7 +229,7 @@ Flash writes in **pages** (~4–16 KB) but erases only whole **erase blocks** (h
 - **Replicate**: with 3 replicas you can ack once a majority has the write and lean on cluster redundancy instead of a per-node fsync for every record.
 - **Front with a replicated log** such as Kafka.
 
-Realistic answer: combine batching, group commit and replication. One fsync per record caps you around 1K writes/sec.
+Realistic answer: combine batching, group commit and replication. One fsync per record caps you at around 1K writes/sec at best (100–1,000 at 1–10 ms per fsync).
 
 </QA>
 
@@ -316,8 +318,8 @@ Postgres reads through the page cache, so starving the OS cache hurts performanc
 
 - **Book**: DDIA (Kleppmann), Chapter 3 ("Storage and Retrieval") — the canonical chapter.
 - **Hussein Nasser**: [Database Engineering playlist](https://www.youtube.com/playlist?list=PLQnljOFTspQXjD0HOzN7P2tgzu7scWpl2) — fsync, WAL, page cache deep dives.
-- **OSTEP** (free book), Chapters 36–44 on persistence — file systems, journaling, crash consistency.
+- **OSTEP** (free book), Chapters 36–45 on persistence — file systems, journaling, crash consistency.
 - **Postgres docs**: [Reliability and the Write-Ahead Log](https://www.postgresql.org/docs/current/wal-intro.html).
 - **Linux Kernel doc**: [VM sysctls — dirty page writeback tunables](https://www.kernel.org/doc/html/latest/admin-guide/sysctl/vm.html).
-- **Paper**: ["Files are hard"](https://danluu.com/file-consistency/) by Dan Luu — a humbling read on what fsync does and doesn't promise across filesystems.
+- **Essay**: ["Files are hard"](https://danluu.com/file-consistency/) by Dan Luu — a humbling read on what fsync does and doesn't promise across filesystems.
 - **RocksDB wiki**: best practical write-up of LSM internals.

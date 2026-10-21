@@ -13,6 +13,8 @@ prerequisites: []
 
 **Consensus** is the problem of getting multiple distributed processes to agree on a single value (or sequence of values) despite failures and network partitions. **Paxos** (Lamport; written 1989, published 1998) is the original algorithm — correct but notoriously hard to understand. **Raft** (Ongaro & Ousterhout, 2014) is a more understandable redesign with the same safety guarantees, used by etcd, Consul, CockroachDB, TiDB, and Kafka KRaft (a pull-based Raft variant); MongoDB replica sets use a Raft-inspired protocol.
 
+**One-liner:** Consensus lets a group of nodes agree on one value or one ordered log even when a minority crash, by requiring a majority quorum for every decision; Raft does it with an elected leader per term that replicates log entries and commits them once a majority has them.
+
 ## Why it matters
 
 Every system that needs leader election, distributed locks, atomic config updates, or replicated state machines uses consensus under the hood. Knowing what consensus guarantees (and the cost of providing it) lets you decide when to lean on Raft/Paxos vs softer designs (gossip, CRDTs, last-write-wins).
@@ -83,7 +85,7 @@ Each node is one of: **Follower**, **Candidate**, **Leader**.
 #### Safety invariants
 
 - **Log matching**: if two logs have the same `(term, index)`, all preceding entries match.
-- **Leader completeness**: a committed entry is in the log of every future leader's term ≥ that term.
+- **Leader completeness**: if an entry is committed in some term, it is present in the log of every leader of every later term.
 - **State machine safety**: if a server has applied an entry at index i, no other server applies a different entry at i.
 
 #### Snapshotting
@@ -92,13 +94,13 @@ Logs grow unboundedly. Periodically take a snapshot of state and discard log ent
 
 #### Cluster membership changes
 
-The Raft paper does this in two steps via **joint consensus** to avoid two majority cliques: old config + new config briefly both active until the transition commits. Ongaro's dissertation adds a simpler **single-server change** (add/remove one node at a time), which most implementations (e.g., etcd) use.
+The Raft paper does this in two steps via **joint consensus** to avoid two majority cliques: old config + new config briefly both active until the transition commits. Ongaro's dissertation adds a simpler **single-server change** (add/remove one node at a time), which many implementations use (etcd's member add/remove changes one member at a time).
 
 ### Paxos (overview)
 
 - **Proposers, Acceptors, Learners** roles.
 - Two phases: **Prepare** (numbered proposal, gather promises) and **Accept** (with majority).
-- Original Paxos proves a single value; **Multi-Paxos** extends to a log of values by amortizing prepare via a stable leader.
+- Basic Paxos decides a single value; **Multi-Paxos** extends to a log of values by amortizing prepare via a stable leader.
 - Hard to implement correctly; many subtle variants (Fast Paxos, Cheap Paxos, Egalitarian Paxos).
 
 Paxos is **algorithmically equivalent in safety/availability to Raft** but harder to understand and implement. Hence Raft's popularity.
@@ -108,12 +110,12 @@ Paxos is **algorithmically equivalent in safety/availability to Raft** but harde
 - **Multi-Paxos**: Paxos for a log of decisions.
 - **Egalitarian Paxos (EPaxos)**: lets any node serve as leader for non-conflicting operations.
 - **Zab** (ZooKeeper): a Paxos-like atomic broadcast protocol (its authors stress it is distinct from Paxos).
-- **Viewstamped Replication**: an academic ancestor to Raft/Paxos.
+- **Viewstamped Replication** (Oki & Liskov, 1988): developed independently of Paxos at about the same time; Raft closely resembles it.
 - **PBFT / Tendermint / HotStuff**: Byzantine fault tolerant — handle malicious nodes (blockchain).
 
 ### Liveness vs safety
 
-- **Safety**: nothing bad happens (no two leaders, no committed-then-lost entry). Always preserved by Raft/Paxos.
+- **Safety**: nothing bad happens (no two leaders in the same term, no committed-then-lost entry). Always preserved by Raft/Paxos.
 - **Liveness**: progress eventually. Depends on timely networks; can stall during long partitions or split votes.
 
 ## How it works (Raft log replication)
@@ -141,12 +143,12 @@ Paxos is **algorithmically equivalent in safety/availability to Raft** but harde
 
 ## Common pitfalls
 
-- **Even number of voters**: split votes more likely; choose odd.
+- **Even number of voters**: no extra fault tolerance over N − 1 voters, and a bigger majority to reach; choose odd.
 - **Single-node "consensus"**: not consensus, no fault tolerance.
 - **Network partitions and minority side**: minority can't make progress (correct — it must give up availability to preserve consistency).
 - **Long election timeouts**: slow failover. Too short: false elections. Tune to network RTTs.
 - **Disk fsync per log append**: critical for safety but slow → group commit.
-- **Snapshot blocking**: take asynchronously or you stall the cluster.
+- **Snapshot blocking**: take snapshots asynchronously, or that node stalls (and a stalled leader stalls the whole cluster).
 - **Joint consensus implementation bugs**: many Raft bugs in cluster reconfiguration; use a battle-tested library.
 - **Believing consensus is cheap**: every committed entry is one RTT to a majority. Cross-DC = expensive. Place voters in same region.
 
@@ -213,7 +215,7 @@ FLP (Fischer, Lynch, Paterson, 1985) proves that in a fully asynchronous network
 
 <QA q="How does Raft change cluster membership safely?" level="hard">
 
-A naive switch from the old to the new configuration could let two disjoint majorities exist at once. The Raft paper uses **joint consensus** — both old and new configurations must agree during the transition until it commits. Ongaro's dissertation adds a simpler **single-server change** (add or remove one node at a time), which most implementations such as etcd use. Reconfiguration is a common source of Raft bugs, so use a battle-tested library.
+A naive switch from the old to the new configuration could let two disjoint majorities exist at once. The Raft paper uses **joint consensus** — both old and new configurations must agree during the transition until it commits. Ongaro's dissertation adds a simpler **single-server change** (add or remove one node at a time), which many implementations such as etcd use. Reconfiguration is a common source of Raft bugs, so use a battle-tested library.
 
 </QA>
 

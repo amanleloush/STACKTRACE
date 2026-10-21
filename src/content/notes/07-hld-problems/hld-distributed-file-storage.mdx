@@ -9,6 +9,16 @@ estimatedMinutes: 5
 prerequisites: []
 ---
 
+## Definition (interview-ready)
+
+A **distributed object store** (S3-style, or the storage behind Dropbox) lets clients upload, download and delete files of any size under a global bucket/key namespace, and keeps them safe for years despite constant disk and node failures.
+
+The design in one breath: **separate metadata from data**. A sharded **metadata service** maps `(bucket, key, version)` to a list of chunks and where they live. The bytes themselves are split into **chunks** (each identified by a content hash) and spread across **data nodes** in different racks and zones, protected by **replication** for hot data or **erasure coding** (for example 10+4: survive any 4 losses at 1.4× storage) for colder data. Large files use **resumable multipart upload**, a **CDN** serves hot objects, and background **integrity checks and repair** rebuild lost chunks.
+
+The main trade-off is **cost vs repair speed and latency**: erasure coding saves a lot of storage but makes repair and degraded reads more expensive than plain replicas.
+
+**One-liner:** Keep a sharded metadata service that maps each key to content-addressed chunks, store those chunks across failure domains with replication or erasure coding, and add multipart upload, a CDN and background repair for scale and durability.
+
 ## Problem statement
 
 Design an object storage system: users can upload, download, and delete files of any size, with durability, availability, and a global namespace.
@@ -76,10 +86,10 @@ POST /buckets/{bucket}/keys/{key}?uploadId=... → complete upload
                   │  Service    │
                   └──────┬──────┘
                          ▼
-                  ┌──────────────────────┐
+                  ┌───────────────────────┐
                   │ Object Placement      │
                   │ (chunking + erasure)  │
-                  └──────────────────────┘
+                  └───────────────────────┘
                          ▼
                 ┌──────┬────────┬──────┐
                 │ DN-1 │ DN-2   │ DN-N │ ── data nodes
@@ -135,7 +145,7 @@ S3 uses erasure coding internally. HDFS started with 3 replicas, now supports EC
 ### Consistency model
 
 - S3 became strongly consistent for read-after-write in 2020 (used to be eventual for overwrites). Big engineering effort: write succeeds only when metadata is updated atomically with placement durability.
-- Most homegrown systems are read-after-write consistent for new keys, eventually consistent for overwrites unless explicit care.
+- Many homegrown systems are read-after-write consistent for new keys but only eventually consistent for overwrites, unless they take explicit care.
 
 ### Versioning
 
@@ -171,7 +181,7 @@ S3 uses erasure coding internally. HDFS started with 3 replicas, now supports EC
 
 ## Trade-offs
 
-- **Replication vs EC**: replication is fast and simple; EC is space-efficient but CPU-heavy.
+- **Replication vs EC**: replication is fast and simple; EC is space-efficient, but repairs and degraded reads must fetch k fragments over the network and decode them.
 - **Strong vs eventual consistency on overwrites**: strong is hard at scale; eventual is the historical default.
 - **Hot/cold tiering** vs uniform: tiering is cost-effective for large datasets with skewed access.
 
@@ -211,7 +221,7 @@ Replication: N copies, simple, fast reads, N× storage cost. EC: data split into
 
 <QA q="What consistency does an object store give for reads after a write?" level="medium">
 
-S3 has been strongly read-after-write consistent since 2020; before that, overwrites and deletes were eventually consistent. Doing this at scale means a write succeeds only once metadata is updated atomically with durable placement. Most homegrown systems are read-after-write consistent for new keys but eventually consistent for overwrites unless they take explicit care.
+S3 has been strongly read-after-write consistent since 2020; before that, overwrites and deletes were eventually consistent. Doing this at scale means a write succeeds only once metadata is updated atomically with durable placement. Many homegrown systems are read-after-write consistent for new keys but eventually consistent for overwrites unless they take explicit care.
 
 </QA>
 

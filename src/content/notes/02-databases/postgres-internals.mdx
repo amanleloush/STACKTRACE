@@ -14,6 +14,8 @@ summary: "How PostgreSQL versions rows in the heap, why VACUUM exists, which of 
 
 **PostgreSQL** stores each table as a **heap** — an unordered set of 8 KB pages — and every index points into it. It implements MVCC (multi-version concurrency control — keeping several versions of a row so readers don't block writers) by **never updating a row in place**: an `UPDATE` writes a brand-new row version (a *tuple*) and marks the old one as expired using hidden transaction-ID fields `xmin` and `xmax`. Expired tuples that nobody can see anymore are **dead tuples**, and **VACUUM** (usually run by the **autovacuum** daemon) reclaims them and also "freezes" old rows to prevent **transaction ID wraparound**. Durability and replication come from the **WAL** (write-ahead log). Each client connection is a separate OS **process**, which is why production Postgres almost always sits behind a pooler like **PgBouncer**.
 
+**One-liner:** Postgres does MVCC by writing a new row version on every UPDATE and stamping the old one with `xmax`, so VACUUM must clean up dead versions and freeze old ones to avoid XID wraparound; the WAL gives durability and replication, and its process-per-connection model needs a pooler like PgBouncer.
+
 ## Why it matters
 
 The basics (heap vs clustered storage, the planner, EXPLAIN) are in [MySQL/Postgres Internals](/learn/notes/mysql-postgres-internals/). This note covers what bites teams running Postgres at scale:
@@ -100,7 +102,7 @@ ALTER TABLE orders SET (autovacuum_vacuum_scale_factor = 0.01,
 **What blocks VACUUM** from removing dead tuples: anything that holds an old snapshot —
 
 - long-running or **idle-in-transaction** sessions,
-- abandoned **replication slots**,
+- abandoned **replication slots** (a physical slot whose standby used `hot_standby_feedback` holds back cleanup on every table; a logical slot holds back cleanup of system-catalog rows and keeps WAL),
 - old **prepared transactions** (two-phase commit),
 - standbys with `hot_standby_feedback = on` running long queries.
 
@@ -247,7 +249,7 @@ Trade-off: frequent checkpoints = faster recovery but more WAL (more full-page i
 | Granularity | Entire cluster | Per table, via `PUBLICATION` / `SUBSCRIPTION` (PostgreSQL 10+) |
 | Major version | Must match | Can differ → used for near-zero-downtime upgrades |
 | DDL | Replicated (it's all WAL) | **Not** replicated; apply schema changes yourself |
-| Sequences | Replicated | Not replicated; sync them before cutover |
+| Sequences | Replicated | Ongoing changes not replicated; sync them before cutover (PostgreSQL 19 adds a one-off `ALTER SUBSCRIPTION ... REFRESH SEQUENCES`) |
 | Typical use | HA failover, read replicas | Upgrades, migrations, partial replication, CDC (Debezium uses logical decoding) |
 
 Both are **asynchronous by default**. For synchronous replication set `synchronous_standby_names` and choose `synchronous_commit`:
@@ -256,7 +258,7 @@ Both are **asynchronous by default**. For synchronous replication set `synchrono
 - `on` — standby has flushed it to disk,
 - `remote_apply` — standby has replayed it, so reads on the standby see it.
 
-**Replication slots** make the primary keep WAL until a consumer has received it. Great for not losing data — dangerous when a consumer disappears: WAL accumulates until the disk fills, and logical slots also hold back VACUUM. Cap it with `max_slot_wal_keep_size` (PostgreSQL 13+) and alert on slot lag.
+**Replication slots** make the primary keep WAL until a consumer has received it. Great for not losing data — dangerous when a consumer disappears: WAL accumulates until the disk fills. Slots also pin an XID horizon: a logical slot stops VACUUM from cleaning system-catalog rows, and a physical slot used with `hot_standby_feedback` stops it cleaning any table. Either can eventually push the database towards wraparound. Cap it with `max_slot_wal_keep_size` (PostgreSQL 13+) and alert on slot lag.
 
 On a hot standby, a long query can be **cancelled** when replay must remove rows it still needs. `hot_standby_feedback = on` prevents that by telling the primary to keep those rows — at the cost of bloat on the primary.
 
@@ -278,7 +280,7 @@ Transaction-mode caveats (they bite every team once):
 - **Session-level advisory locks** (`pg_advisory_lock`) — use the transaction-level ones (`pg_advisory_xact_lock`).
 - **`LISTEN`** doesn't work.
 - **SQL-level `PREPARE`/`DEALLOCATE`**, `WITH HOLD` cursors, and temp tables that outlive a transaction don't work.
-- **Protocol-level prepared statements** (what most drivers use) work only since PgBouncer **1.21**, when `max_prepared_statements` is non-zero. On older versions, disable server-side prepares in the driver (e.g. JDBC `prepareThreshold=0`).
+- **Protocol-level prepared statements** (what most drivers use) work only since PgBouncer **1.21**, when `max_prepared_statements` is non-zero (it defaults to 200 since 1.24; earlier versions default to 0, meaning off). On older versions, disable server-side prepares in the driver (e.g. JDBC `prepareThreshold=0`).
 
 Sizing intuition: the database needs only roughly as many active connections as it can actually execute in parallel (a small multiple of CPU cores), not one per client.
 
@@ -421,7 +423,7 @@ Each connection is a separate OS process with its own memory, so thousands of co
 
 <QA q="What breaks when you move an app to PgBouncer transaction pooling?" level="hard">
 
-Anything that relies on session state: `SET` of session variables (use `SET LOCAL` or role defaults), session-level advisory locks (use `pg_advisory_xact_lock`), `LISTEN`, SQL `PREPARE`, `WITH HOLD` cursors, and temp tables that outlive a transaction. Protocol-level prepared statements need PgBouncer 1.21+ with `max_prepared_statements` greater than 0; otherwise disable server-side prepares in the driver.
+Anything that relies on session state: `SET` of session variables (use `SET LOCAL` or role defaults), session-level advisory locks (use `pg_advisory_xact_lock`), `LISTEN`, SQL `PREPARE`, `WITH HOLD` cursors, and temp tables that outlive a transaction. Protocol-level prepared statements need PgBouncer 1.21+ with `max_prepared_statements` greater than 0 (the default is 200 since 1.24); otherwise disable server-side prepares in the driver.
 
 </QA>
 
@@ -455,9 +457,9 @@ Postgres keeps versions in the heap: new tuple, old tuple stamped with xmax, and
 
 </MCQ>
 
-<MCQ q="Which of these does NOT prevent VACUUM from removing dead tuples?" options={["A session idle in transaction for hours", "An inactive logical replication slot", "A high fillfactor setting", "An old prepared transaction"]} answer={2}>
+<MCQ q="Which of these does NOT prevent VACUUM from removing dead tuples?" options={["A session idle in transaction for hours", "An abandoned replication slot", "A high fillfactor setting", "An old prepared transaction"]} answer={2}>
 
-Fillfactor affects free space per page and HOT, not snapshot horizons. The others hold back the oldest XID that VACUUM must respect.
+Fillfactor affects free space per page and HOT, not snapshot horizons. The others pin an old XID horizon that VACUUM must respect (a logical slot pins it for system-catalog rows; a physical slot with hot_standby_feedback pins it for all tables).
 
 </MCQ>
 
@@ -485,9 +487,9 @@ Only the default jsonb_ops supports ?, ?| and ?&. jsonb_path_ops covers @>, @? a
 
 </MCQ>
 
-<MCQ q="Which is true about logical replication in Postgres?" options={["It replicates DDL automatically", "It requires the same major version on both sides", "It does not replicate sequence values", "It produces a read-only byte-identical standby"]} answer={2}>
+<MCQ q="Which is true about logical replication in Postgres?" options={["It replicates DDL automatically", "It requires the same major version on both sides", "It does not continuously replicate sequence changes", "It produces a read-only byte-identical standby"]} answer={2}>
 
-Sequences and DDL are not replicated; versions can differ; the subscriber is a normal writable database. Byte-identical read-only standbys are physical replication.
+Ongoing sequence changes and DDL are not replicated (PostgreSQL 19 only adds an on-demand sequence refresh); versions can differ; the subscriber is a normal writable database. Byte-identical read-only standbys are physical replication.
 
 </MCQ>
 

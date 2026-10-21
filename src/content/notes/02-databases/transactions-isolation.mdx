@@ -13,6 +13,8 @@ prerequisites: []
 
 A **transaction** is a unit of work that is **A**tomic, **C**onsistent, **I**solated, **D**urable (ACID). **Isolation levels** are tunable contracts that trade strictness for performance, defining which concurrent anomalies (dirty reads, non-repeatable reads, phantoms, write skew) a transaction can observe. **MVCC** (multi-version concurrency control) implements isolation by keeping multiple row versions, so readers and writers don't block each other. **WAL** (write-ahead log) makes atomicity + durability cheap.
 
+**One-liner:** A transaction is an all-or-nothing unit of work with ACID guarantees; the isolation level decides which concurrency anomalies (dirty reads, non-repeatable reads, phantoms, lost updates, write skew) can still happen, and databases implement it with MVCC snapshots and locks, using a write-ahead log for durability.
+
 ## Why it matters
 
 Subtle bugs from isolation level choices have caused real outages (lost updates in inventory systems, double-spend in payments). If you can name the anomaly each level prevents and what's still possible, you can read existing code defensively and reason about new transactional logic.
@@ -33,6 +35,8 @@ sequenceDiagram
     Note over T1,T2: A's -10 lost. Fix: SELECT ... FOR UPDATE,<br/>or SERIALIZABLE, or compare-and-set
 ```
 
+✓ = prevented, ✗ = can happen, ~ = depends on the implementation.
+
 | Level | Dirty read | Non-repeatable | Phantom | Write skew |
 |---|---|---|---|---|
 | Read Uncommitted | ✗ | ✗ | ✗ | ✗ |
@@ -45,14 +49,14 @@ sequenceDiagram
 
 ### ACID
 
-- **Atomic**: all-or-nothing — either all writes commit, or none. Implemented via the WAL + rollback log.
+- **Atomic**: all-or-nothing — either all writes commit, or none. Implemented via the WAL plus a way to undo or hide uncommitted changes (InnoDB's undo log; in Postgres, aborted row versions are simply never visible).
 - **Consistent**: transitions one valid DB state to another (constraints satisfied). The application's job too.
 - **Isolated**: concurrent transactions appear sequential (to varying degrees).
 - **Durable**: committed writes survive crash. Implemented via fsync of the WAL on commit.
 
 ### Anomalies (what isolation prevents)
 
-- **Dirty read**: read a value another (uncommitted) transaction wrote. If that transaction rolls back, you saw a phantom write.
+- **Dirty read**: read a value another (uncommitted) transaction wrote. If that transaction rolls back, you saw data that never existed.
 - **Non-repeatable read**: same row read twice in one transaction returns different values (committed write between).
 - **Phantom read**: same range query in one transaction returns different *set* of rows.
 - **Lost update**: T1 reads X=10, T2 reads X=10, both write X=11. One increment lost.
@@ -64,13 +68,13 @@ sequenceDiagram
 |---|---|---|---|---|---|
 | Read uncommitted | ✘ allowed | ✘ | ✘ | ✘ | ✘ |
 | Read committed | ✓ prevented | ✘ | ✘ | ✘ | ✘ |
-| Repeatable read | ✓ | ✓ | ✘ (ANSI) / ✓ (MySQL gap locks) | ✓ (PG snapshot) | ✘ |
+| Repeatable read | ✓ | ✓ | ✘ (ANSI) / ✓ (PG snapshot, MySQL gap locks) | ✓ in PG (aborts the second writer) / ✘ in MySQL plain reads | ✘ |
 | Serializable | ✓ | ✓ | ✓ | ✓ | ✓ |
 
 **Real-world defaults**:
 - Postgres: **read committed** by default.
 - MySQL InnoDB: **repeatable read** by default (with gap locks → blocks phantoms).
-- Many ORMs ship with read committed.
+- Most ORMs and drivers simply inherit the database default.
 
 ### Snapshot isolation (Postgres "repeatable read")
 
@@ -78,7 +82,7 @@ The transaction sees a snapshot of the DB as of its first statement. Other commi
 
 ### Serializable (SSI in Postgres)
 
-Postgres "Serializable Snapshot Isolation" detects dangerous read/write patterns at commit time and aborts one transaction (with a serialization failure — application must retry). The toughest guarantee — equivalent to running transactions one at a time — without the cost of strict 2-phase locking.
+Postgres "Serializable Snapshot Isolation" tracks read/write dependencies between concurrent transactions and, when it spots a dangerous pattern, aborts one of them (at a statement or at commit) (with a serialization failure — application must retry). The toughest guarantee — equivalent to running transactions one at a time — without the cost of strict 2-phase locking.
 
 ### MVCC
 
@@ -91,13 +95,13 @@ Postgres "Serializable Snapshot Isolation" detects dangerous read/write patterns
 
 Even with MVCC, writes still take row locks (`SELECT ... FOR UPDATE`). Types:
 - **Shared lock (S)**: many readers.
-- **Exclusive lock (X)**: one writer, no readers.
-- **Predicate lock**: range — needed to prevent phantoms (e.g., InnoDB gap locks).
+- **Exclusive lock (X)**: one holder, no other locks on that row (with MVCC, plain non-locking reads still proceed).
+- **Predicate lock**: locks a condition or range — needed to prevent phantoms. InnoDB approximates it with gap / next-key locks on index ranges; Postgres SSI uses non-blocking predicate locks to detect conflicts.
 - **Intent locks** (table-level coarse, on top of row-level fine).
 
 ### Two-phase locking (2PL)
 
-Classic serializability: each transaction acquires all locks before releasing any. Strict 2PL holds locks until commit. Strong but blocks readers and writers heavily. Most modern DBs prefer MVCC + selective locking.
+Classic serializability: each transaction acquires all locks before releasing any. Strict 2PL holds write locks until commit; strong strict (rigorous) 2PL holds all locks until commit. Strong but blocks readers and writers heavily. Most modern DBs prefer MVCC + selective locking.
 
 ### WAL (write-ahead log)
 
@@ -113,7 +117,7 @@ WAL also supports point-in-time recovery (PITR) and physical replication (Postgr
 ```
 BEGIN;
    ↓
-acquire txn ID, take MVCC snapshot
+take MVCC snapshot (Postgres assigns a txn ID lazily, at the first write)
    ↓
 SELECT ...  → read consistent snapshot, no locks
 UPDATE ...  → write new row version, take row-level X lock
@@ -130,12 +134,12 @@ visible to new snapshots
 
 - **Postgres SSI in practice**: the Postgres docs require apps using `SERIALIZABLE` to retry on serialization failures (SQLSTATE `40001`) — teams that adopt it wire retry-on-conflict into their data layer.
 - **MySQL repeatable read in practice**: most apps stay at the InnoDB default; for inventory checks where write skew matters, upgrade to serializable or use explicit `SELECT FOR UPDATE`.
-- **Spanner**: globally distributed serializability using TrueTime — atomic clocks + uncertainty windows.
+- **Spanner**: globally distributed, externally consistent (strictly serializable) transactions using TrueTime — GPS and atomic clocks that give each timestamp a bounded uncertainty window.
 
 ## Common pitfalls
 
 - **Read-modify-write at read committed**: classic lost update. Use `SELECT FOR UPDATE`, or compare-and-swap (`UPDATE ... WHERE version = ?`).
-- **Long transactions**: hold MVCC snapshots, prevent VACUUM, bloat tables. Even an idle BEGIN can lock a table for hours.
+- **Long transactions**: hold MVCC snapshots or an old transaction ID, prevent VACUUM, bloat tables. A session left *idle in transaction* also keeps every lock it took, so a later `ALTER TABLE` waits on it — and every query queued behind that `ALTER` waits too.
 - **Misunderstanding "repeatable read"**: ANSI repeatable read still allows phantoms. Postgres' RR (snapshot isolation) does not — but allows write skew.
 - **DDL inside transactions**: MySQL implicitly commits on DDL (8.0 made each DDL statement atomic, but it still can't be rolled back with the transaction); Postgres treats most DDL as transactional. Know your DB.
 - **Distributed transactions**: 2PC is slow and fragile. Prefer sagas + idempotency.
@@ -189,7 +193,7 @@ Two transactions read overlapping data and write **non-overlapping** rows in a w
 
 <QA q="Why are long-running transactions harmful in an MVCC database?" level="medium">
 
-A long transaction holds an old snapshot, so the database can't remove row versions that snapshot might still need. In Postgres, VACUUM can't reclaim those dead tuples and tables bloat; any locks it took are held too. Even an idle `BEGIN` left open by a connection can cause this for hours. Keep transactions short and kill idle-in-transaction sessions.
+A long transaction holds an old snapshot (or an old transaction ID if it has written), so the database can't remove row versions that it might still need. In Postgres, VACUUM can't reclaim those dead tuples and tables bloat; any locks it took are held too. A connection that wrote something and then sits *idle in transaction* can cause this for hours. Keep transactions short and kill idle-in-transaction sessions.
 
 </QA>
 
@@ -275,9 +279,9 @@ Postgres SSI detects dangerous patterns and aborts a transaction with SQLSTATE 4
 
 </MCQ>
 
-<MCQ q="A connection runs BEGIN and then sits idle for hours. What is the main risk in Postgres?" options={["The WAL is deleted", "All other sessions see dirty reads", "The database switches to 2PL", "VACUUM cannot clean dead row versions, so tables bloat"]} answer={3}>
+<MCQ q="A connection runs BEGIN, updates one row, then sits idle in transaction for hours. What is the main risk in Postgres?" options={["The WAL is deleted", "All other sessions see dirty reads", "The database switches to 2PL", "VACUUM cannot clean dead row versions, so tables bloat"]} answer={3}>
 
-The open transaction holds an old snapshot, so dead tuples it might still see can't be reclaimed. It also holds any locks it took. It does not change isolation for others.
+The open transaction's ID is still running, which holds back the cleanup horizon for the whole database, so dead tuples newer than it can't be reclaimed. It also holds any locks it took. It does not change isolation for others.
 
 </MCQ>
 
@@ -292,7 +296,7 @@ SSI keeps full serializability but detects conflicts and aborts one transaction 
 ## TL;DR cheat sheet
 
 - ACID: Atomic, Consistent, Isolated, Durable.
-- Anomalies in order of severity: dirty read → non-repeatable → phantom → lost update → write skew.
+- Anomalies, roughly in the order stronger levels prevent them: dirty read → non-repeatable → phantom → lost update → write skew.
 - Read Committed (PG default) prevents dirty reads only. Repeatable Read in PG = snapshot isolation (prevents phantoms, allows write skew). Serializable prevents all (with retry on conflict).
 - MVCC: row versions, no read locks. Postgres `xmin/xmax`. MySQL undo log.
 - WAL: sequential log, fsync on commit, lazy flush of data. Enables PITR + replication.
@@ -305,6 +309,6 @@ SSI keeps full serializability but detects conflicts and aborts one transaction 
 - **Jepsen consistency models**: [jepsen.io/consistency](https://jepsen.io/consistency) — visual hierarchy.
 - **"A Critique of ANSI SQL Isolation Levels"** by Berenson et al — original paper showing ANSI levels are under-specified.
 - **Postgres docs**: [Transaction Isolation](https://www.postgresql.org/docs/current/transaction-iso.html).
-- **MySQL docs**: [InnoDB Transaction Model](https://dev.mysql.com/doc/refman/8.0/en/innodb-transaction-model.html).
+- **MySQL docs**: [InnoDB Transaction Model](https://dev.mysql.com/doc/refman/8.4/en/innodb-transaction-model.html).
 - **Martin Kleppmann talks** on YouTube — accessible deep dives.
 - **Postgres SSI paper** (Ports & Grittner) — short, readable.

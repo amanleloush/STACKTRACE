@@ -9,6 +9,16 @@ estimatedMinutes: 6
 prerequisites: []
 ---
 
+## Definition (interview-ready)
+
+A **flash sale system** sells a small, fixed stock (say 10K units) to a huge crowd that arrives at the same second (say 1M buyers), without ever selling more units than exist and without letting the spike take the site down.
+
+The design in one breath: keep the spike away from the database. A **CDN-cached pre-sale page**, a **waiting room** or rate limiter and **bot protection** shrink the crowd. The buy API then does an **atomic conditional decrement**, usually on a Redis counter (`DECR`, or a Lua script that decrements only if stock is positive), and rejects everyone instantly once stock hits zero. Winners are written to **Kafka**, and an order service creates orders and runs payment as a **saga** with a reservation TTL that returns stock if payment fails or times out. A **database constraint** (conditional update or unique key) stays the final guarantee in case Redis fails over. Seat booking adds per-seat holds with TTLs and a unique (show, seat) key.
+
+The main trade-off is **throughput vs strict fairness and simplicity**: a Redis counter is fast but needs a durable path behind it, while a single ordered queue is perfectly fair but serial.
+
+**One-liner:** Filter the crowd at the edge, do an atomic decrement-if-positive on a Redis counter so sold-out buyers are rejected instantly, queue the winners through Kafka into a payment saga with a reservation TTL, and keep a database constraint as the final guard against overselling.
+
 ## Problem statement
 
 Design a system that sells limited-quantity items (a "flash sale") at high concurrency without overselling. Example: 10K units released; in the first second, 1M users try to buy.
@@ -75,7 +85,7 @@ POST /api/flash-sale/{id}/buy
 UPDATE inventory
 SET available = available - 1
 WHERE product_id = ? AND available > 0
-RETURNING available;
+RETURNING available;   -- PostgreSQL syntax; in MySQL, check rows affected
 ```
 
 If `available` was 0 before, the row update doesn't happen → 0 rows affected → reject.
@@ -95,10 +105,10 @@ else:
    return SUCCESS
 ```
 
-Redis is single-threaded — no race. ~100K ops/sec/node. Use Lua for atomicity if compensation isn't enough.
+Redis executes commands one at a time, so each `DECR` is atomic and exactly the first 10K callers get a result of 0 or more. A single node handles on the order of 100K simple ops/sec (more with pipelining). Use a Lua script if you need decrement-if-enough-stock as one step (for example, buying 3 units at once).
 
 Pros: high throughput.
-Cons: requires Kafka-backed durability for the order.
+Cons: requires a durable path (Kafka) for the order. Redis replication is asynchronous, so a failover can lose the latest decrements and let a few extra buyers through; keep a database-side check (conditional update or unique constraint) when orders are written.
 
 ### 3. Pre-allocated tokens / queue
 
@@ -110,7 +120,7 @@ Cons: requires Kafka-backed durability for the order.
 LPOP sale:product:42:tokens
 ```
 
-Single-threaded Redis ensures only first 10K pops succeed.
+Redis runs each `LPOP` atomically, so only the first 10K pops get a token.
 
 ### 4. Stream-based: ordered consumption
 
@@ -461,7 +471,7 @@ Each command runs atomically, so two DECRs never interleave.
 - Atomic conditional decrement is non-negotiable: `DECR + compensate if negative` or `UPDATE WHERE qty > 0`.
 - Redis counter handles high throughput; Kafka durably records orders.
 - Sharded counters when one shard isn't enough.
-- Token / queue model for strict ordering.
+- Token pool (`LPOP`) caps winners exactly; a single-partition stream gives strict ordering.
 - Saga for payment with reservation TTL for compensation.
 - Bot mitigation at the edge.
 - One-purchase-per-user via additional Redis check.
@@ -472,8 +482,6 @@ Each command runs atomically, so two DECRs never interleave.
 
 ## Go deeper
 
-- **High Scalability**: ["Alibaba flash sale"](http://highscalability.com/) architecture posts.
-- **Taobao engineering blog**: flash sale stories.
 - **Shopify**: BFCM (Black Friday Cyber Monday) architecture posts.
 - **ByteByteGo**: flash sale and inventory videos.
 - [Rate Limiting](/learn/notes/rate-limiting/) and [Distributed Transactions (sagas)](/learn/notes/distributed-transactions/) in this collection.

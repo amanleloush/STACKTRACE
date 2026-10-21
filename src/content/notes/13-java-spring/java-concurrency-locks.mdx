@@ -18,7 +18,7 @@ Java gives you three layers of tools for sharing data between threads:
 2. The **Java Memory Model (JMM)**, defined in JLS chapter 17, says when a write made by one thread is guaranteed to be **visible** to another. The key idea is **happens-before**: if action A happens-before action B, then B sees A's effects. Unlocking a lock, writing a `volatile` field, starting a thread and joining a thread all create happens-before edges.
 3. **Lock-free building blocks**: `volatile` fields (visibility and ordering, but no atomic read-modify-write), atomic classes like `AtomicInteger` built on **CAS** (compare-and-swap, a CPU instruction that updates a value only if it still equals what you expect), and concurrent collections like `ConcurrentHashMap`.
 
-How to say it in an interview: "A lock gives me atomicity and visibility. `volatile` gives me visibility and ordering only. Atomics give me atomic single-variable updates without blocking. And `ConcurrentHashMap` uses CAS for empty buckets and a per-bucket lock otherwise, so threads writing different buckets don't block each other."
+**One-liner:** A lock gives atomicity, visibility and ordering; `volatile` gives only visibility and ordering; atomics give lock-free atomic updates of a single variable via CAS. `ConcurrentHashMap` combines these: lock-free reads, CAS into empty buckets and a per-bucket lock otherwise, so writers to different buckets don't block each other.
 
 ## Why it matters
 
@@ -42,7 +42,7 @@ It also comes up in system design: caches, rate limiters and connection pools ar
 - **Visibility**: a write sitting in one core's cache or a register may not be seen by another thread for a long time, or ever, unless something forces it.
 - **Ordering**: the compiler, the JIT and the CPU may reorder independent instructions to go faster. Inside one thread you can't tell. Another thread can.
 
-A lock fixes all three. `volatile` fixes visibility and ordering but **not** atomicity. Atomics fix atomicity and visibility for one variable.
+A lock fixes all three. `volatile` fixes visibility and ordering but **not** atomicity. Atomics fix all three, but only for a single variable (their reads and writes have `volatile` semantics).
 
 ### Intrinsic locks (monitors) and `synchronized`
 
@@ -313,14 +313,14 @@ table (array of bins, power-of-two size)
  └────┴─┬──┴────┴────┴─┬──┴────┴─┬──┴────┘
         │              │         │
         N2→N3      TreeBin     N5     ← list or red-black tree per bin
-                (≥ 8 nodes, table ≥ 64)
+                (> 8 nodes, table ≥ 64)
  FWD = ForwardingNode during resize: "this bin moved to the new table"
 ```
 
 - **Reads (`get`) take no lock.** Node values and next pointers are `volatile`, so a reader sees the latest completed update.
 - **Putting into an empty bin uses CAS.** No lock at all. With a decent hash spread, this is the most common case.
 - **Updating a non-empty bin locks only that bin**, using `synchronized` on the bin's first node. Threads writing to other bins don't wait.
-- **Treeification**: a bin with 8 or more nodes turns into a red-black tree, but only once the table has at least 64 bins (otherwise the map resizes instead). Trees turn back into lists at 6 or fewer during a resize. This limits the damage from many keys colliding.
+- **Treeification**: a bin that grows past 8 nodes (a 9th is added to a bin of 8) turns into a red-black tree, but only once the table has at least 64 bins (otherwise the map resizes instead). Trees turn back into lists at 6 or fewer during a resize. This limits the damage from many keys colliding.
 - **Resizing is cooperative.** When the table grows, threads claim ranges of bins to move. A moved bin gets a `ForwardingNode` so readers look in the new table. Other writers that run into a resize help with it instead of waiting.
 - **Size is counted with a `LongAdder`-style scheme** (a base count plus `CounterCell`s), so `put` doesn't contend on one counter. `size()` and `mappingCount()` are estimates while writes are happening. Prefer `mappingCount()`, which returns a `long`.
 - **No null keys or values.** `get(k)` returning `null` must mean "absent". If null values were allowed, you couldn't tell "absent" from "mapped to null" without a second call, and between the two calls another thread could change the map.
@@ -458,7 +458,7 @@ CAS atomically sets a variable to a new value only if it still holds the expecte
 
 <QA q="How does `ConcurrentHashMap` achieve thread safety in Java 8+?" level="medium">
 
-Reads take no lock; fields are volatile so `get` sees completed updates. Inserting into an empty bin uses CAS. Updating a non-empty bin uses `synchronized` on that bin's first node, so only writers to the same bin contend. Long bins (8 or more, table of 64 or more) become red-black trees. Resizing is shared: threads move ranges of bins and leave `ForwardingNode`s behind. The size is tracked with a `LongAdder`-like counter. Java 7's segment locks are gone; `concurrencyLevel` is now just a sizing hint.
+Reads take no lock; fields are volatile so `get` sees completed updates. Inserting into an empty bin uses CAS. Updating a non-empty bin uses `synchronized` on that bin's first node, so only writers to the same bin contend. Long bins (more than 8 nodes, table of 64 or more) become red-black trees. Resizing is shared: threads move ranges of bins and leave `ForwardingNode`s behind. The size is tracked with a `LongAdder`-like counter. Java 7's segment locks are gone; `concurrencyLevel` is now just a sizing hint.
 
 </QA>
 
@@ -570,7 +570,7 @@ computeIfAbsent runs the whole check-and-insert atomically for that key and call
 - **`volatile`**: right for flags and safe publication; wrong for `count++`.
 - **DCL**: field must be `volatile`; holder class idiom is simpler.
 - **CAS**: lock-free retry loop; watch contention and ABA. **`LongAdder`** for hot counters, **`AtomicLong`** for exact sequences.
-- **`ConcurrentHashMap`**: lock-free `get`, CAS on empty bin, `synchronized` on bin head, trees at 8 (table at least 64), cooperative resize, `LongAdder`-style size, no nulls, atomic `compute*` / `merge`, weakly consistent iterators.
+- **`ConcurrentHashMap`**: lock-free `get`, CAS on empty bin, `synchronized` on bin head, trees past 8 nodes (table at least 64), cooperative resize, `LongAdder`-style size, no nulls, atomic `compute*` / `merge`, weakly consistent iterators.
 - **Never** check-then-act on a concurrent map; never lock in different orders; never do I/O inside a lock or a `compute` function.
 
 ## Go deeper

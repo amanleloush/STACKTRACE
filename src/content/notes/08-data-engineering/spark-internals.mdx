@@ -13,6 +13,8 @@ prerequisites: []
 
 **Apache Spark** is a distributed computation engine that represents jobs as a **DAG** of transformations on resilient distributed datasets (RDDs / DataFrames). It executes lazily, splits into **stages** at **shuffle** boundaries, and parallelizes work across **partitions**. The performance killer is **shuffle** (cross-node data exchange) and its enemy: **data skew** (uneven partition sizes).
 
+**One-liner:** Spark lazily turns your DataFrame code into an optimized DAG, cuts it into stages at every shuffle, and runs one task per partition across the cluster, so tuning Spark mostly means avoiding shuffles and keeping partitions evenly sized.
+
 ## Why it matters
 
 Spark powers most modern big-data pipelines (ETL, ML, Kafka-stream-to-warehouse). Understanding shuffle, partitioning, and skew is the difference between "10 min job" and "10 hour job that fails."
@@ -39,20 +41,20 @@ flowchart LR
 
 Operations are **transformations** (`map`, `filter`, `join`) that build a DAG, not executed. **Actions** (`collect`, `count`, `write`) trigger execution.
 
-The Spark Catalyst optimizer:
-1. Parses SQL or DataFrame ops.
-2. Builds a logical plan.
-3. Optimizes (predicate pushdown, projection pruning, join reordering).
-4. Generates a physical plan.
-5. Splits into stages at shuffle boundaries.
-6. Sends tasks to executors.
+What happens when an action runs:
+1. The Catalyst optimizer parses SQL or DataFrame ops.
+2. Catalyst builds a logical plan.
+3. Catalyst optimizes it (predicate pushdown, projection pruning, constant folding; join reordering only when cost-based optimization is enabled).
+4. Catalyst generates a physical plan (choosing join strategies, etc.).
+5. The DAG scheduler splits the job into stages at shuffle boundaries.
+6. The task scheduler sends one task per partition to executors.
 
 ### Partitions
 
 - Data split into partitions; one task per partition.
 - Partition count = parallelism unit.
 - Defaults: 200 shuffle partitions (`spark.sql.shuffle.partitions`).
-- Tune: target 100-500 MB per partition is a healthy heuristic.
+- Tune: roughly 100-200 MB of shuffle data per partition is a common heuristic (input splits default to 128 MB via `spark.sql.files.maxPartitionBytes`).
 
 ### Narrow vs wide transformations
 
@@ -87,7 +89,7 @@ Mitigations:
 - **Broadcast join**: if one side is small, broadcast it to all executors (no shuffle).
 - **Adaptive query execution (AQE)** (Spark 3.0+): detects skew at runtime, splits skewed partitions automatically.
 - **Bucketing**: pre-bucket data on a key in storage; shuffle skipped for matching joins.
-- **Skew hints**: explicit hints to the optimizer.
+- **Skew hints**: Databricks offers a `SKEW` join hint; open-source Spark relies on AQE skew handling instead.
 
 ### Broadcast join
 
@@ -101,7 +103,7 @@ For "big × big" join: shuffle both sides on the join key, sort each partition, 
 
 ### Shuffle hash join
 
-For "big × medium" join: shuffle both sides; smaller side built as a hash table per partition. Faster than sort-merge if memory allows.
+For "big × medium" join: shuffle both sides; smaller side built as a hash table per partition. Can be faster than sort-merge because it skips the sort, but each partition's hash table must fit in memory, so Spark prefers sort-merge by default (`spark.sql.join.preferSortMergeJoin=true`).
 
 ### Caching / persistence
 
@@ -195,7 +197,7 @@ df1.join(df2, "user_id"):
 
 ## Real-world examples
 
-- **Databricks**: commercial Spark; pretty much every Fortune 500 data team.
+- **Databricks**: commercial Spark platform, used by a large share of Fortune 500 companies.
 - **Netflix Iceberg + Spark**: petabyte-scale ETL.
 - **Uber, Pinterest, Lyft**: huge Spark fleets for ETL + ML.
 - **dbt over Spark SQL**: SQL-driven ETL on top of Spark.

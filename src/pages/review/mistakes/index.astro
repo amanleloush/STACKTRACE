@@ -1,0 +1,529 @@
+---
+import BaseLayout from '~/layouts/BaseLayout.astro';
+import { NOTES_PHASES } from '~/lib/notes-phases';
+
+// Static shell; everything below the header is rendered in the browser
+// from the mistakes store (localStorage + KV sync) and /review/mcqs.json.
+export const prerender = true;
+
+const phases = NOTES_PHASES.map(({ slug, num, title }) => ({ slug, num, title }));
+---
+<BaseLayout
+  title="Mistakes notebook — StackTrace"
+  description="Every quiz question you got wrong, in one place. Re-answer them until you get them right."
+>
+  <nav class="crumbs" aria-label="Breadcrumb">
+    <a href="/notes/">Notes</a> <span aria-hidden="true">/</span>
+    <span aria-current="page">Mistakes notebook</span>
+  </nav>
+
+  <header class="mk-head">
+    <h1>Mistakes notebook</h1>
+    <p class="mk-lede">
+      Every quiz question you answer wrong on a note is saved here automatically. Re-answer it until you
+      get it right — then it moves to <em>Resolved</em>.
+    </p>
+    <p class="mk-sync" aria-live="polite"></p>
+  </header>
+
+  <noscript>
+    <p class="mk-msg">The mistakes notebook needs JavaScript: your saved questions live in this browser.</p>
+  </noscript>
+
+  <div class="mk-app" hidden>
+    <div class="mk-bar">
+      <div class="mk-tabs" role="tablist" aria-label="Show">
+        <button type="button" role="tab" class="mk-tab" id="mk-tab-open" data-tab="open" aria-selected="true" aria-controls="mk-panel">
+          Open <span class="mk-tab__n" data-count="open">0</span>
+        </button>
+        <button type="button" role="tab" class="mk-tab" id="mk-tab-resolved" data-tab="resolved" aria-selected="false" aria-controls="mk-panel" tabindex="-1">
+          Resolved <span class="mk-tab__n" data-count="resolved">0</span>
+        </button>
+      </div>
+      <button type="button" class="mk-clear" hidden>Clear resolved</button>
+    </div>
+
+    <div class="mk-panel" id="mk-panel" role="tabpanel" aria-labelledby="mk-tab-open" tabindex="-1">
+      <p class="mk-msg mk-loading">Loading your questions…</p>
+    </div>
+  </div>
+
+  <script is:inline type="application/json" id="mk-phases" set:html={JSON.stringify(phases).replace(/</g, '\\u003c')} />
+</BaseLayout>
+
+<script>
+  import {
+    clearResolved,
+    getClearedAt,
+    initMistakesStore,
+    onMistakesChange,
+    onMistakesSync,
+    readAllMistakes,
+    readMistake,
+    recordAnswer,
+    resolveMistake,
+    type SyncState,
+  } from '~/lib/mistakes-store';
+  import { bucketMistakes, inlineParts, slugOfId, type McqRecord, type MistakeEntry } from '~/lib/mistakes';
+
+  type Tab = 'open' | 'resolved';
+  interface Phase {
+    slug: string;
+    num: string;
+    title: string;
+  }
+
+  const app = document.querySelector<HTMLElement>('.mk-app')!;
+  const panel = document.querySelector<HTMLElement>('#mk-panel')!;
+  const tabs = Array.from(document.querySelectorAll<HTMLButtonElement>('.mk-tab'));
+  const clearBtn = document.querySelector<HTMLButtonElement>('.mk-clear')!;
+  const syncLine = document.querySelector<HTMLElement>('.mk-sync')!;
+  const phases: Phase[] = JSON.parse(document.getElementById('mk-phases')?.textContent ?? '[]');
+  const phaseOrder = new Map(phases.map((p, i) => [p.slug, i]));
+  const LETTERS = 'ABCDEFGH';
+
+  let tab: Tab = 'open';
+  let index: Record<string, McqRecord> | null = null;
+  /** Position of each id in mcqs.json — i.e. its order within its note. */
+  let position = new Map<string, number>();
+  /** Set while this page writes, so its own change events don't rebuild
+   *  the card the user is looking at. */
+  let selfWrite = false;
+
+  app.hidden = false;
+  initMistakesStore();
+
+  function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls?: string, text?: string): HTMLElementTagNameMap[K] {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = text;
+    return n;
+  }
+
+  /** Question / option text: backticks become <code>, everything else is text. */
+  function inline(s: string): Node[] {
+    return inlineParts(s).map((p) => (p.code ? el('code', undefined, p.text) : document.createTextNode(p.text)));
+  }
+
+  function noteHref(slug: string): string {
+    return `/learn/notes/${encodeURIComponent(slug)}/#quiz`;
+  }
+
+  /** Title / phase for a note, from any of its questions still in the index. */
+  function noteInfo(slug: string): { title: string; phase: string } {
+    for (const r of Object.values(index ?? {})) {
+      if (r.noteSlug === slug) return { title: r.noteTitle, phase: r.phase };
+    }
+    return { title: slug, phase: '' };
+  }
+
+  function buckets() {
+    return bucketMistakes(readAllMistakes(), (id) => !!index && Object.prototype.hasOwnProperty.call(index, id), getClearedAt());
+  }
+
+  function updateCounts(): void {
+    const b = buckets();
+    document.querySelector('[data-count="open"]')!.textContent = String(b.open.length + b.orphans.length);
+    document.querySelector('[data-count="resolved"]')!.textContent = String(b.resolved.length);
+    clearBtn.hidden = tab !== 'resolved' || b.resolved.length === 0;
+  }
+
+  function missesText(e: MistakeEntry): string {
+    const when = e.updatedAt > 0 ? ` · ${new Date(e.updatedAt).toLocaleDateString(undefined, { dateStyle: 'medium' })}` : '';
+    return `Missed ${e.misses}×${when}`;
+  }
+
+  /** A re-answerable question, with the same look and verdict as MCQ.astro. */
+  function questionCard(id: string, rec: McqRecord, entry: MistakeEntry): HTMLElement {
+    const card = el('fieldset', 'mcq');
+    const legend = el('legend', 'mcq__q');
+    legend.append(...inline(rec.q));
+    card.append(legend);
+
+    const meta = el('p', 'mk-meta', missesText(entry));
+    if (entry.status === 'resolved') meta.prepend(el('span', 'mk-resolved', '✓ Resolved · '));
+    card.append(meta);
+
+    const opts = el('div', 'mcq__opts');
+    const buttons = rec.options.map((opt, i) => {
+      const b = el('button', 'mcq__opt');
+      b.type = 'button';
+      b.append(el('span', 'mcq__letter', LETTERS[i] ?? '?'));
+      const t = el('span');
+      t.append(...inline(opt));
+      b.append(t);
+      return b;
+    });
+    opts.append(...buttons);
+    card.append(opts);
+
+    const why = el('div', 'mcq__why');
+    why.hidden = true;
+    const verdict = el('p', 'mcq__verdict');
+    verdict.setAttribute('role', 'status');
+    const after = el('p', 'mk-after');
+    const body = el('div', 'mk-expl');
+    // Our own build output (MDX → HTML in mcqs.json), never user input.
+    body.innerHTML = rec.explanationHtml;
+    const retry = el('button', 'mk-btn', 'Try again');
+    retry.type = 'button';
+    retry.hidden = true;
+    why.append(verdict, after, body, retry);
+    card.append(why);
+
+    buttons.forEach((btn, picked) => {
+      btn.addEventListener('click', () => {
+        if (card.dataset.picked != null) return;
+        card.dataset.picked = String(picked);
+        const right = picked === rec.answer;
+        buttons.forEach((o, i) => {
+          o.disabled = true;
+          o.dataset.state = i === rec.answer ? 'correct' : i === picked ? 'wrong' : 'dim';
+          if (i === rec.answer) o.dataset.tag = i === picked ? 'Your answer ✓' : 'Correct answer';
+          else if (i === picked) o.dataset.tag = 'Your answer';
+        });
+        verdict.dataset.ok = String(right);
+        verdict.textContent = right
+          ? '✓ Correct!'
+          : `✗ Not quite — the correct answer is ${LETTERS[rec.answer]}: ${rec.options[rec.answer] ?? ''}`.replace(/`/g, '');
+        const wasOpen = readMistake(id)?.status === 'open';
+        selfWrite = true;
+        try {
+          recordAnswer(id, rec.noteSlug, picked, right);
+        } finally {
+          selfWrite = false;
+        }
+        const now = readMistake(id);
+        if (now) meta.textContent = missesText(now);
+        if (right && wasOpen) {
+          after.textContent = 'Resolved — it’s moved to the Resolved tab.';
+          meta.prepend(el('span', 'mk-resolved', '✓ Resolved · '));
+        } else if (!right) {
+          after.textContent = 'Still open. Read the explanation, then try again.';
+        } else {
+          after.textContent = '';
+        }
+        after.hidden = !after.textContent;
+        retry.hidden = right;
+        why.hidden = false;
+        updateCounts();
+      });
+    });
+
+    retry.addEventListener('click', () => {
+      delete card.dataset.picked;
+      buttons.forEach((o) => {
+        o.disabled = false;
+        delete o.dataset.state;
+        delete o.dataset.tag;
+      });
+      why.hidden = true;
+      buttons[0]?.focus();
+    });
+    return card;
+  }
+
+  /** An open question whose text was edited since it was saved. */
+  function orphanCard(id: string, entry: MistakeEntry): HTMLElement {
+    const card = el('div', 'mcq mk-orphan');
+    const p = el('p', 'mk-orphan__msg');
+    p.append('This question was updated since you missed it. ');
+    const a = el('a', undefined, 'Retake the note’s quiz');
+    a.href = noteHref(entry.noteSlug || slugOfId(id));
+    p.append(a, '.');
+    card.append(p, el('p', 'mk-meta', missesText(entry)));
+    const rm = el('button', 'mk-btn', 'Remove');
+    rm.type = 'button';
+    rm.addEventListener('click', () => {
+      resolveMistake(id);
+      render();
+      panel.focus();
+    });
+    card.append(rm);
+    return card;
+  }
+
+  function emptyState(): HTMLElement {
+    const box = el('div', 'mk-empty');
+    if (tab === 'open') {
+      const p = el('p');
+      p.append(el('strong', undefined, 'No mistakes yet — take a quiz on any note.'));
+      const p2 = el('p');
+      const a = el('a', undefined, 'Browse the notes →');
+      a.href = '/notes/';
+      p2.append('Questions you answer wrong are saved here automatically. ', a);
+      box.append(p, p2);
+    } else {
+      box.append(el('p', undefined, 'Nothing resolved yet. Answer an open question correctly to resolve it.'));
+    }
+    return box;
+  }
+
+  function render(): void {
+    if (!index) return;
+    const b = buckets();
+    const all = readAllMistakes();
+    const ids = tab === 'open' ? [...b.open, ...b.orphans] : b.resolved;
+    updateCounts();
+    if (ids.length === 0) {
+      panel.replaceChildren(emptyState());
+      return;
+    }
+
+    // phase → note → ids, in course order; questions in note order.
+    const byNote = new Map<string, string[]>();
+    for (const id of ids) {
+      const slug = all[id]!.noteSlug || slugOfId(id);
+      byNote.set(slug, [...(byNote.get(slug) ?? []), id]);
+    }
+    const notes = [...byNote.keys()].map((slug) => ({ slug, ...noteInfo(slug) }));
+    notes.sort(
+      (a, b) =>
+        (phaseOrder.get(a.phase) ?? 99) - (phaseOrder.get(b.phase) ?? 99) || a.title.localeCompare(b.title),
+    );
+
+    const out: HTMLElement[] = [];
+    let curPhase: string | null = null;
+    let phaseList: HTMLElement | null = null;
+    for (const n of notes) {
+      if (n.phase !== curPhase || !phaseList) {
+        curPhase = n.phase;
+        const p = phases.find((x) => x.slug === n.phase);
+        const section = el('section', 'mk-phase');
+        const h = el('h2', 'mk-phase__title', p ? `${p.num} · ${p.title}` : 'Other');
+        section.append(h);
+        phaseList = el('div', 'mk-phase__notes');
+        section.append(phaseList);
+        out.push(section);
+      }
+      const group = el('section', 'mk-note');
+      const head = el('div', 'mk-note__head');
+      const h3 = el('h3', 'mk-note__title');
+      const a = el('a', undefined, n.title);
+      a.href = noteHref(n.slug);
+      h3.append(a);
+      const noteIds = byNote.get(n.slug)!;
+      noteIds.sort((x, y) => (position.get(x) ?? 1e9) - (position.get(y) ?? 1e9));
+      head.append(h3, el('span', 'mk-note__n', `${noteIds.length} ${noteIds.length === 1 ? 'question' : 'questions'}`));
+      group.append(head);
+      for (const id of noteIds) {
+        const rec = index[id];
+        group.append(rec ? questionCard(id, rec, all[id]!) : orphanCard(id, all[id]!));
+      }
+      phaseList.append(group);
+    }
+    panel.replaceChildren(...out);
+  }
+
+  function selectTab(next: Tab, focus = false): void {
+    tab = next;
+    for (const t of tabs) {
+      const on = t.dataset.tab === next;
+      t.setAttribute('aria-selected', String(on));
+      t.tabIndex = on ? 0 : -1;
+      if (on) {
+        panel.setAttribute('aria-labelledby', t.id);
+        if (focus) t.focus();
+      }
+    }
+    render();
+  }
+
+  tabs.forEach((t, i) => {
+    t.addEventListener('click', () => selectTab(t.dataset.tab as Tab));
+    t.addEventListener('keydown', (e) => {
+      if (e.key !== 'ArrowRight' && e.key !== 'ArrowLeft') return;
+      e.preventDefault();
+      const next = tabs[(i + (e.key === 'ArrowRight' ? 1 : tabs.length - 1)) % tabs.length]!;
+      selectTab(next.dataset.tab as Tab, true);
+    });
+  });
+
+  clearBtn.addEventListener('click', () => {
+    selfWrite = true;
+    try {
+      clearResolved();
+    } finally {
+      selfWrite = false;
+    }
+    render();
+    panel.focus();
+  });
+
+  // Another tab, another device (sync) or a clear: rebuild, batched.
+  let pending = false;
+  onMistakesChange(() => {
+    if (selfWrite) return;
+    if (pending) return;
+    pending = true;
+    requestAnimationFrame(() => {
+      pending = false;
+      render();
+    });
+  });
+
+  const SYNC_TEXT: Record<SyncState, string> = {
+    local: 'Saved in this browser. Sign in to keep it in sync across devices.',
+    syncing: 'Syncing…',
+    synced: 'Synced across your devices.',
+    error: 'Saved in this browser; sync will retry.',
+  };
+  onMistakesSync((s) => {
+    syncLine.textContent = SYNC_TEXT[s];
+  });
+
+  fetch('/review/mcqs.json')
+    .then((r) => {
+      if (!r.ok) throw new Error(String(r.status));
+      return r.json() as Promise<Record<string, McqRecord>>;
+    })
+    .then((data) => {
+      index = data;
+      position = new Map(Object.keys(data).map((id, i) => [id, i]));
+      render();
+    })
+    .catch(() => {
+      panel.replaceChildren(el('p', 'mk-msg', 'Couldn’t load the questions. Check your connection and reload the page.'));
+    });
+</script>
+
+<style>
+  .crumbs { font-size: 0.82rem; color: var(--fg-faint); margin-bottom: 1rem; }
+  .crumbs a { color: var(--fg-muted); }
+  .mk-head h1 { margin: 0 0 0.5rem; }
+  .mk-lede { color: var(--fg-muted); max-width: 72ch; line-height: 1.55; margin: 0; }
+  .mk-sync { margin: 0.5rem 0 0; font-family: var(--font-code); font-size: 0.78rem; color: var(--fg-muted); min-height: 1em; }
+  .mk-msg { color: var(--fg-muted); padding: 1.5rem 0; }
+
+  .mk-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.6rem;
+    margin: 1.75rem 0 1rem;
+  }
+  .mk-tabs {
+    display: inline-flex;
+    gap: 0.25rem;
+    padding: 0.25rem;
+    border: 1px solid var(--card-border);
+    border-radius: 999px;
+    background: var(--bg-soft);
+  }
+  .mk-tab {
+    font: inherit;
+    font-size: 0.88rem;
+    font-weight: 600;
+    color: var(--fg-muted);
+    background: transparent;
+    border: 0;
+    border-radius: 999px;
+    padding: 0.35rem 0.9rem;
+    cursor: pointer;
+  }
+  .mk-tab[aria-selected='true'] { color: var(--fg); background: var(--card-bg); box-shadow: 0 0 0 1px var(--card-border); }
+  .mk-tab:focus-visible, .mk-clear:focus-visible, .mk-panel:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .mk-tab__n { font-family: var(--font-code); font-size: 0.78rem; color: var(--fg-muted); margin-left: 0.2rem; }
+  .mk-clear, .mk-panel :global(.mk-btn) {
+    font: inherit;
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: var(--primary-light);
+    background: transparent;
+    border: 1px solid var(--card-border);
+    border-radius: 999px;
+    padding: 0.3rem 0.85rem;
+    cursor: pointer;
+  }
+  .mk-clear:hover, .mk-panel :global(.mk-btn:hover) { border-color: var(--accent); }
+  .mk-panel :global(.mk-btn:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .mk-panel { outline: none; }
+
+  .mk-panel :global(.mk-phase) { margin: 0 0 2rem; }
+  .mk-panel :global(.mk-phase__title) {
+    font-size: 0.8rem;
+    font-family: var(--font-code);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--fg-muted);
+    margin: 0 0 0.6rem;
+  }
+  .mk-panel :global(.mk-note) { margin: 0 0 1.4rem; }
+  .mk-panel :global(.mk-note__head) { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.3rem 0.6rem; }
+  .mk-panel :global(.mk-note__title) { font-size: 1.05rem; margin: 0; overflow-wrap: anywhere; }
+  .mk-panel :global(.mk-note__title a) { color: var(--fg); }
+  .mk-panel :global(.mk-note__title a::after) { content: ' →'; color: var(--fg-faint); }
+  .mk-panel :global(.mk-note__n) { font-size: 0.75rem; color: var(--fg-faint); }
+  .mk-panel :global(.mk-meta) { clear: both; margin: 0 0 0.55rem; font-size: 0.75rem; color: var(--fg-faint); }
+  .mk-panel :global(.mk-resolved) { color: var(--anim-success); font-weight: 600; }
+  .mk-panel :global(.mk-after) { margin: 0 0 0.6rem; font-size: 0.85rem; color: var(--fg-muted); }
+  .mk-panel :global(.mk-expl) { overflow-wrap: anywhere; }
+  .mk-panel :global(.mk-expl > :first-child) { margin-top: 0; }
+  .mk-panel :global(.mk-expl pre) { overflow-x: auto; max-width: 100%; }
+  .mk-panel :global(.mk-expl code) { font-family: var(--font-code); }
+  .mk-panel :global(.mk-orphan__msg) { margin: 0 0 0.4rem; }
+  .mk-panel :global(.mk-orphan__msg a) { color: var(--primary-light); }
+  .mk-panel :global(.mk-empty) { color: var(--fg-muted); padding: 2rem 0; text-align: center; }
+  .mk-panel :global(.mk-empty a) { color: var(--primary-light); }
+
+  /* Same look as MCQ.astro (its styles are scoped to that component). */
+  .mk-panel :global(.mcq) {
+    border: 1px solid var(--card-border);
+    border-radius: 10px;
+    background: var(--card-bg);
+    margin: 0.8rem 0;
+    padding: 0.9rem 1rem;
+    min-width: 0;
+  }
+  .mk-panel :global(.mcq__q) { font-weight: 600; line-height: 1.45; padding: 0 0.2rem; float: left; width: 100%; margin-bottom: 0.4rem; }
+  .mk-panel :global(.mcq__opts) { clear: both; display: grid; gap: 0.45rem; }
+  .mk-panel :global(.mcq__opt) {
+    display: flex;
+    gap: 0.6rem;
+    align-items: baseline;
+    text-align: left;
+    font: inherit;
+    color: var(--fg);
+    background: transparent;
+    border: 1px solid var(--card-border);
+    border-radius: 8px;
+    padding: 0.55rem 0.75rem;
+    cursor: pointer;
+    min-width: 0;
+    overflow-wrap: anywhere;
+    transition: border-color 0.15s ease, background 0.15s ease;
+  }
+  .mk-panel :global(.mcq__opt:hover:not(:disabled)) { border-color: var(--accent); }
+  .mk-panel :global(.mcq__opt:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .mk-panel :global(.mcq__opt:disabled) { cursor: default; }
+  .mk-panel :global(.mcq__letter) { font-family: var(--font-code); font-size: 0.8rem; color: var(--fg-muted); flex-shrink: 0; }
+  .mk-panel :global(.mcq__opt[data-state='correct']) {
+    border-color: var(--anim-success);
+    background: color-mix(in srgb, var(--anim-success) 14%, transparent);
+  }
+  .mk-panel :global(.mcq__opt[data-state='wrong']) {
+    border-color: var(--anim-danger);
+    background: color-mix(in srgb, var(--anim-danger) 14%, transparent);
+  }
+  .mk-panel :global(.mcq__opt[data-state='dim']) { opacity: 0.6; }
+  .mk-panel :global(.mcq__opt[data-tag]::after) {
+    content: attr(data-tag);
+    margin-left: auto;
+    flex-shrink: 0;
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  .mk-panel :global(.mcq__opt[data-state='correct']::after) { color: var(--anim-success); }
+  .mk-panel :global(.mcq__opt[data-state='wrong']::after) { color: var(--anim-danger); }
+  .mk-panel :global(.mcq__verdict) { font-weight: 700; margin-top: 0; }
+  .mk-panel :global(.mcq__verdict[data-ok='true']) { color: var(--anim-success); }
+  .mk-panel :global(.mcq__verdict[data-ok='false']) { color: var(--anim-danger); }
+  .mk-panel :global(.mcq__why) {
+    margin-top: 0.8rem;
+    padding-top: 0.6rem;
+    border-top: 1px dashed var(--card-border);
+  }
+</style>

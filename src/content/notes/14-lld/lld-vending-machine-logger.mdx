@@ -10,6 +10,16 @@ prerequisites: ["machine-coding-strategy", "behavioral-patterns", "creational-pa
 summary: "Two classic machine-coding rounds in Java 21: a vending machine built on the State pattern with escrow, refunds and correct change-making (greedy vs bounded DP), and a logging framework with levels, a Chain of Responsibility of handlers, pluggable formatters and sinks, and a thread-safe async writer on a BlockingQueue."
 ---
 
+## Definition (interview-ready)
+
+This note covers two classic machine-coding problems, each built around one behavioral pattern.
+
+**Vending machine:** a machine that takes coins, sells a product by code, and returns change or a refund. The core entities are `VendingMachine` (the context holding `Inventory`, `CashBox` and an escrow of inserted coins), `Product`, `Denomination` and a `MachineState` interface with `Idle`, `HasMoney`, `Dispensing` and `OutOfStock` states. **State** fits because every action behaves differently per phase, and each state decides the next one. Change-making is a **Strategy**: greedy is optimal only for canonical coin systems with unlimited coins, so a machine with limited coins uses a bounded DP. A purchase is planned first and committed only if change can be made.
+
+**Logger:** a mini Log4j with levels, a **Chain of Responsibility** of handlers (each picks a level range), a **Strategy** formatter, and appenders (sinks) that each handler fans out to. Writes go through a bounded `BlockingQueue` to one worker thread, so callers stay fast and lines never interleave.
+
+**One-liner:** The vending machine is a State machine with escrow and a bounded-DP change maker, and the logger is a level-filtered handler chain feeding pluggable formatters and sinks through a bounded async queue.
+
 ## Problem statement
 
 These two problems are paired because each one is the "textbook" case for one behavioral pattern, and interviewers often use them to check whether you reach for that pattern naturally.
@@ -227,7 +237,7 @@ If the interviewer wants the **classic GoF** flavour ("exactly one handler handl
 - The worker loops on `take()` and runs the chain. Because **one** thread writes, appenders see no contention and **per-thread order is preserved** (the queue is FIFO, and each thread enqueues its own records in order).
 - **Shutdown with a poison pill:** `close()` marks the dispatcher closed, enqueues a special `POISON` record and `join`s the worker. Everything queued before the pill is written first — so no log line is lost on a clean shutdown.
 
-Real libraries make the same choices. Log4j 2's `AsyncAppender` defaults to an `ArrayBlockingQueue` of 1024 events and `blocking=true`; with blocking off, a full queue sends events to an error appender. Logback's `AsyncAppender` defaults to a queue of 256, blocks when full unless `neverBlock=true`, and by default starts **discarding TRACE, DEBUG and INFO** when less than 20% of the queue is free.
+Real libraries make the same choices. Log4j 2's `AsyncAppender` defaults to an `ArrayBlockingQueue` of 1024 events and `blocking=true`; with blocking off, an event that finds the queue full goes to the error appender (`errorRef`) if one is configured, and is otherwise dropped. Logback's `AsyncAppender` defaults to a queue of 256, blocks when full unless `neverBlock=true`, and by default starts **discarding TRACE, DEBUG and INFO** when less than 20% of the queue is free.
 
 ### Step 5 — singleton vs dependency injection
 
@@ -688,6 +698,7 @@ public class Main {
 
 - **Interleaved lines** — prevented by one writer thread (async) or `synchronized` appenders (sync).
 - **Logging after close** throws `IllegalStateException`; alternatively drop silently — pick one and say so.
+- **Race at close.** The `closed` check and the enqueue are not atomic, so a record logged at the exact moment `close()` runs can land *after* the poison pill and never be written (and in block mode, a `put` on a full queue after the worker exits waits forever). Records logged before `close()` starts are safe. If that window matters, guard `dispatch` and `close` with a read-write lock, or have the worker drain whatever is left after the pill.
 - **Interrupt while blocked in `put`** — restore the interrupt flag (`Thread.currentThread().interrupt()`) instead of swallowing it.
 - **Slow sink** (network down) — with block mode, callers eventually stall; with drop mode they don't but you lose lines. Log4j and Logback both let you choose; production setups often drop low levels first.
 - **An appender throws** — the worker catches it per record so one bad line doesn't kill the logging thread forever.
@@ -948,6 +959,6 @@ Disabled DEBUG calls in a hot loop should cost almost nothing; formatting first 
 - [Log4j 2 — AsyncAppender and delegating appenders](https://logging.apache.org/log4j/2.x/manual/appenders/delegating.html)
 - [Logback — AsyncAppender](https://logback.qos.ch/manual/appenders-async-sift.html)
 - [Java 21 `BlockingQueue` API](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/BlockingQueue.html)
-- [Kozen and Zaks — Optimal Bounds for the Change-Making Problem](https://tidsskrift.dk/daimipb/article/view/6603)
+- [Kozen and Zaks — Optimal Bounds for the Change-Making Problem (PDF)](https://www.cs.cornell.edu/~kozen/Papers/change.pdf)
 - [Change-making problem (overview)](https://en.wikipedia.org/wiki/Change-making_problem)
 - Related notes: [Behavioral Patterns](/learn/notes/behavioral-patterns/) · [Machine-Coding Strategy](/learn/notes/machine-coding-strategy/) · [Executors and Virtual Threads](/learn/notes/java-executors-virtual-threads/)

@@ -19,6 +19,8 @@ The **Kafka ecosystem** is the set of components built on top of the core broker
 - **Schema Registry.** A service that stores versioned schemas (Avro, Protobuf, JSON Schema) for topics and **enforces compatibility rules**, so a producer deploy can't silently break consumers.
 - **MirrorMaker 2.** A Connect-based tool that **replicates topics, configs and consumer offsets between clusters**, for disaster recovery, migration and geo-aggregation.
 
+**One-liner:** Around the broker, Kafka Streams handles stateful processing inside your app, Connect moves data in and out through config-driven connectors, Schema Registry enforces payload contracts, and MirrorMaker 2 replicates topics and offsets between clusters.
+
 ## Why it matters
 
 The broker on its own is just a durable log of bytes. Real systems also need to:
@@ -110,6 +112,8 @@ Wire format of a registry-serialized record value:
   magic    big-endian int  (no field names, very compact)
 ```
 
+(Protobuf adds a short list of message indexes between the schema ID and the body, to say which message type in the `.proto` file was used.)
+
 1. When a producer serializes a record, the serializer registers or looks up the schema under a **subject**, by default `<topic>-value`, and gets an ID. IDs are cached, so this isn't a network call per message.
 2. The registry checks the new schema against the subject's **compatibility mode**. If it's incompatible, registration fails and the producer can't publish. The bad deploy fails fast.
 3. The consumer reads the 5-byte header, fetches schema ID `N` once and caches it, then decodes the body. Avro also resolves the **writer schema** against the consumer's **reader schema**.
@@ -163,7 +167,7 @@ MirrorMaker 2 (MM2) is a set of Connect connectors:
 2. **Aggregation.** Regional clusters feed a central analytics cluster.
 3. **Migration.** Mirror old to new, move consumers, then move producers, then decommission.
 
-**Limits to state in an interview.** Replication is **asynchronous**, so failover loses whatever hadn't been mirrored: **RPO > 0**. Offset translation is approximate, so expect some reprocessing and design consumers to be idempotent. Exactly-once does not hold across clusters.
+**Limits to state in an interview.** Replication is **asynchronous**, so failover loses whatever hadn't been mirrored: **RPO > 0**. Offset translation is approximate, so expect some reprocessing and design consumers to be idempotent. Exactly-once does not hold end to end across a failover. Since Kafka 3.5 MM2 can copy records into the target exactly once, but consumer positions are still translated approximately.
 
 **Alternatives.** **Confluent Cluster Linking** replicates at the broker level and keeps offsets identical, so there's no translation and no Connect cluster. **Stretched clusters** spread one cluster across 3 AZs (or nearby regions) with synchronous replication and `min.insync.replicas`, giving RPO = 0 at the cost of cross-zone latency on every write.
 
@@ -299,7 +303,7 @@ MM2 is built on Connect. It replicates **topics, configs, ACLs and consumer grou
 
 Uses: **DR** (active-passive across regions), **aggregation** (regional → central analytics) and **migrations** between clusters or providers.
 
-Limitations: replication is **asynchronous**, so failover has RPO > 0. Offset translation is approximate, so consumers reprocess some records and must be idempotent. There's no cross-cluster exactly-once. Remote topics are prefixed (`us.orders`), which prevents cycles in active-active but means consumers must subscribe to the prefixed names.
+Limitations: replication is **asynchronous**, so failover has RPO > 0. Offset translation is approximate, so consumers reprocess some records and must be idempotent. There's no end-to-end exactly-once across a failover (Kafka 3.5+ can copy records exactly once, but offsets are still translated approximately). Remote topics are prefixed (`us.orders`), which prevents cycles in active-active but means consumers must subscribe to the prefixed names.
 
 Alternatives are Confluent Cluster Linking (offset-preserving, broker-level) or a stretched multi-AZ cluster for synchronous RPO = 0.
 

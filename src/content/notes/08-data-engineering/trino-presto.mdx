@@ -11,7 +11,9 @@ prerequisites: []
 
 ## Definition (interview-ready)
 
-**Trino** (formerly PrestoSQL) and **Presto** (now PrestoDB) are open-source **MPP (Massively Parallel Processing) SQL query engines**. They federate queries across heterogeneous sources (S3, Postgres, MongoDB, Kafka, ...) via connectors, with work pipelined in memory by default (optional fault-tolerant execution spools intermediate data to object storage), leveraging distributed planning and execution for sub-second to minutes-scale queries on huge datasets.
+**Trino** (formerly PrestoSQL) and **Presto** (now PrestoDB) are open-source **MPP (Massively Parallel Processing) SQL query engines**. They run SQL over many kinds of sources (S3, Postgres, MongoDB, Kafka, ...) through pluggable **connectors**, and can join across them in one query (**federation**). They store no data themselves. A coordinator plans each query and workers execute it in parallel, pipelining data through memory by default (optional fault-tolerant execution spools intermediate data to object storage). Typical queries take sub-second to minutes on very large datasets.
+
+**One-liner:** Trino is a distributed SQL engine with no storage of its own: a coordinator plans the query, workers read data in place through connectors (S3/Iceberg, Postgres, Kafka...) and process it in memory in parallel, which makes it the go-to for interactive SQL over a data lake or across several sources.
 
 ## Why it matters
 
@@ -87,16 +89,16 @@ Trino fetches from Postgres + S3, joins in workers.
 
 ### Predicate / projection pushdown
 
-For Parquet/ORC: column pruning (only read needed columns) + row-group skipping (use min/max stats). Massive savings — often 100× speedup over column-scan.
+For Parquet/ORC: column pruning (only read needed columns) + row-group skipping (use min/max stats). The savings can be orders of magnitude for selective queries on wide tables.
 
 For JDBC connectors: WHERE pushed to the source DB.
 
 ### Exchange operators
 
 Stages exchange data via **exchange operators**:
-- **GATHER**: all → coordinator (final result).
-- **HASH** / **REPARTITION**: hash-based redistribution by key (for joins, groupBy).
-- **BROADCAST**: small data to all workers (broadcast join).
+- **GATHER**: all data to a single task (for example a final ORDER BY ... LIMIT); results then stream to the client through the coordinator.
+- **REPARTITION** (hash): redistribute rows by key (for partitioned joins, group-bys).
+- **REPLICATE** (broadcast): copy a small input to every worker (broadcast join).
 
 Each exchange is a network shuffle — minimize.
 
@@ -139,7 +141,7 @@ LIMIT 100;
 1. Coordinator plans: Scan → Filter (pushdown) → HashAggregate → SortLimit.
 2. Stage 1 (scan + partial aggregate): workers read S3 Parquet, prune columns, skip row groups, aggregate per worker.
 3. Stage 2 (final aggregate): hash-shuffle by customer_id, sum per key.
-4. Stage 3 (sort + limit): gather to coordinator.
+4. Stage 3 (sort + limit): each task keeps only its top 100 (partial TopN), then everything is gathered to a single task for the final TopN; results stream to the client through the coordinator.
 5. Return.
 
 ## Real-world examples
@@ -206,7 +208,7 @@ Each table names its catalog (for example a Postgres catalog and an S3/Hive cata
 
 <QA q="What are exchange operators and why minimize them?" level="medium">
 
-Stages pass data through exchanges: **GATHER** (everything to one place for the final result), **HASH/REPARTITION** (redistribute by key for joins and group-bys), and **BROADCAST** (copy a small table to every worker for a broadcast join). Each exchange is a network shuffle, so fewer and smaller exchanges mean faster queries.
+Stages pass data through exchanges: **GATHER** (everything to one task for the final result), **REPARTITION** (hash-redistribute by key for joins and group-bys), and **REPLICATE** (broadcast: copy a small table to every worker for a broadcast join). Each exchange is a network shuffle, so fewer and smaller exchanges mean faster queries.
 
 </QA>
 
@@ -301,7 +303,7 @@ The creators forked Presto as PrestoSQL in 2019 and renamed it Trino in Dec 2020
 - In-memory, low-latency; fault-tolerant execution (spooling to object storage) for big batch queries.
 - Coordinator plans + distributes; workers execute in parallel.
 - Predicate + projection pushdown crucial for performance.
-- Joins via hash, broadcast, or merge — same as Spark.
+- Joins are hash joins, distributed either partitioned (both sides shuffled by key) or broadcast (small side copied to every worker).
 - Best for interactive SQL over lakehouse / federated sources.
 - Spark for ETL; Trino for analytics. Pair them up.
 - Resource groups for multi-tenancy.

@@ -9,6 +9,16 @@ estimatedMinutes: 6
 prerequisites: []
 ---
 
+## Definition (interview-ready)
+
+A **chat system** delivers messages between users in real time, 1:1 and in groups, stores history, and shows delivery and read receipts and online presence, even when the recipient is offline or on several devices.
+
+The design in one breath: each client keeps a **persistent WebSocket** to a stateful **chat server**, and a **directory** (user to server, in Redis) tells the sender's server where to forward a message. Every message gets a **unique, time-ordered message ID** and is **persisted first** in a wide-column store (Cassandra/Scylla) partitioned by **(channel, day bucket)**, then pushed to online recipients or sent as a **mobile push** (APNs/FCM) if they're offline. Delivery is **at-least-once** with client-side dedup by message ID; reconnecting clients sync everything after their last-seen message ID. Presence is a TTL'd heartbeat, and media goes straight to object storage via pre-signed URLs.
+
+The main trade-offs are **stateful connections** (harder to scale and fail over, but needed for real-time push) and **end-to-end encryption vs server-side features** like search.
+
+**One-liner:** Clients hold WebSockets to chat servers, a Redis directory routes each message to the recipient's server, messages are stored first in Cassandra partitioned by channel and day and then pushed live or via APNs/FCM, with at-least-once delivery deduped by message ID.
+
 ## Problem statement
 
 Design a real-time messaging system supporting 1-to-1 and group chats, with delivery, read receipts, presence, and message history.
@@ -78,9 +88,9 @@ flowchart LR
 ## Connection management
 
 - **WebSocket** (or persistent HTTPS/QUIC) from client to a chat server.
-- Server identified by **consistent hash** of user ID → user always connects to same server set (sticky session).
+- Either route by **consistent hash** of user ID (the user always lands on the same server), or let any healthy server accept the connection and record user → server in a **directory** (Redis). The directory approach is what the rest of this design uses for routing.
 - Edge load balancer with TCP-aware routing or app-level routing after auth.
-- Long-lived connections: thousands per server with epoll/kqueue. Erlang's WhatsApp famously hit 2M concurrent per server.
+- Long-lived connections: hundreds of thousands per server with epoll/kqueue. WhatsApp (Erlang on FreeBSD) famously hit 2M concurrent connections per server in 2012.
 
 ## Data model
 
@@ -146,8 +156,8 @@ Channel = 1:1 chat ID or group ID. Bucketed by day to avoid mega-partitions.
 
 ### Offline & sync
 
-- When user reconnects, server sends missed messages since last_read.
-- Cassandra range query: `WHERE channel_id = ? AND bucket = ? AND message_id > last_read`, walking day buckets forward.
+- When a device reconnects, the server sends messages newer than that device's **sync cursor** (the last message ID it received). Using `last_read_id` as the cursor also works but is more conservative: it re-sends delivered-but-unread messages, which client dedup drops.
+- Cassandra range query: `WHERE channel_id = ? AND bucket = ? AND message_id > cursor`, walking day buckets forward.
 - Mobile: paginate efficiently to avoid bulk transfer.
 
 ### Media
@@ -166,7 +176,7 @@ Channel = 1:1 chat ID or group ID. Bucketed by day to avoid mega-partitions.
 
 ## Trade-offs
 
-- **WebSocket vs HTTP/2 SSE**: WebSocket = bidirectional, well-supported. SSE = simpler but server → client only.
+- **WebSocket vs SSE**: WebSocket = bidirectional, well-supported. SSE = simpler but server → client only.
 - **Push notifications**: Apple APNs and Google FCM are effectively the only mobile delivery paths when app is killed (plus OEM push services on Android devices without Google services).
 - **E2E vs server-readable**: business needs (search, compliance) vs privacy.
 - **At-most-once vs at-least-once delivery**: client-side dedup by message ID lets you use at-least-once safely.
@@ -213,7 +223,7 @@ Store a single **last-read message ID** per (user, channel) — the `last_read_i
 
 <QA q="How does a client catch up after being offline?" level="medium">
 
-On reconnect, the server sends everything since the user's last-read ID: a Cassandra range query `WHERE channel_id = ? AND bucket = ? AND message_id > last_read`, walking day buckets forward. On mobile, paginate and batch the catch-up so a long absence doesn't mean one huge transfer.
+On reconnect, the server sends everything after the device's sync cursor (the last message ID it received; the last-read ID is a simpler, more conservative cursor): a Cassandra range query `WHERE channel_id = ? AND bucket = ? AND message_id > cursor`, walking day buckets forward. On mobile, paginate and batch the catch-up so a long absence doesn't mean one huge transfer.
 
 </QA>
 
@@ -255,7 +265,7 @@ Cassandra/Scylla, partitioned by `(channel_id, day_bucket)` so hot channels don'
 
 - Clients detect the disconnect and reconnect.
 - They land on a new chat server (consistent-hashed by user ID, or any healthy server), and the user → server directory is updated.
-- Messages were persisted before delivery, so the client syncs anything missed since its last-read ID.
+- Messages were persisted before delivery, so the client syncs anything missed since its sync cursor (last received message ID).
 - No data loss; just a brief reconnection delay (typically under a second).
 
 </QA>
@@ -346,7 +356,7 @@ Coalescing respects APNs and FCM quotas and the user's attention. Twenty pushes 
 ## Go deeper
 
 - **WhatsApp engineering**: famous Erlang scale stories (2M connections per box).
-- **Discord engineering**: [How Discord Handles Two and Half Million Concurrent Voice Users using WebRTC](https://discord.com/blog/how-discord-handles-two-and-half-million-concurrent-voice-users-using-webrtc), Trillions of messages blog.
+- **Discord engineering**: [How Discord Handles Two and Half Million Concurrent Voice Users using WebRTC](https://discord.com/blog/how-discord-handles-two-and-half-million-concurrent-voice-users-using-webrtc), [How Discord Stores Trillions of Messages](https://discord.com/blog/how-discord-stores-trillions-of-messages).
 - **Signal docs**: [Double Ratchet](https://signal.org/docs/specifications/doubleratchet/), [X3DH](https://signal.org/docs/specifications/x3dh/).
 - **High Scalability**: [WhatsApp architecture](http://highscalability.com/blog/2014/2/26/the-whatsapp-architecture-facebook-bought-for-19-billion.html).
 - **ByteByteGo**: Design WhatsApp series.

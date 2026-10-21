@@ -9,6 +9,14 @@ estimatedMinutes: 6
 prerequisites: []
 ---
 
+## Definition (interview-ready)
+
+A **distributed rate limiter** caps how many requests each client (user, API key or IP) may make per time window across a whole fleet of servers, and rejects the excess with `429 Too Many Requests` and a `Retry-After` header. The standard design runs the check at the API gateway (plus sidecars for sensitive endpoints). Each check runs a **token-bucket** algorithm as a **Lua script in Redis**, so read, refill, consume and write happen atomically in one round trip of about a millisecond. Limits come from a cached plan table, and several tiers (per user, per endpoint, per IP) must all pass.
+
+The key decisions: token bucket because it allows short bursts while enforcing the average rate; Redis sharded by key for scale; per-region counters rather than global synchronization; and an explicit failure mode when Redis is down (fail open for low-risk reads, fail closed or fall back to local buckets for sensitive writes). The trade-off is accuracy versus latency: small drift is accepted to keep every check fast.
+
+**One-liner:** Gateway-level token buckets stored in Redis and updated atomically by a Lua script, with tiered per-user, per-endpoint and per-IP limits, per-region counters, and a deliberate fail-open or fail-closed policy when Redis is unavailable.
+
 ## Problem statement
 
 Design a rate limiter that enforces request quotas per user/API key across many app servers and regions, returning `429 Too Many Requests` when exceeded, with low latency.
@@ -68,7 +76,7 @@ Most production setups use **gateway-level for ingress + per-service for sensiti
 - O(1) per check via Lua script.
 - See [Rate Limiting](/learn/notes/rate-limiting/).
 
-For exact limits, sliding-window counter is the next choice.
+For stricter limits with no burst, use a **sliding-window counter** (cheap, a close approximation) or a **sliding-window log** (exact, but stores a timestamp per request).
 
 ## Detailed design
 
@@ -79,20 +87,24 @@ For exact limits, sliding-window counter is the next choice.
 -- ARGV: now_ms, refill_rate (per ms), capacity
 local b = redis.call("HMGET", KEYS[1], "tokens", "ts")
 local tokens = tonumber(b[1]) or tonumber(ARGV[3])
-local ts = tonumber(b[2]) or tonumber(ARGV[1])
-local elapsed = tonumber(ARGV[1]) - ts
+local now = tonumber(ARGV[1])
+local ts = tonumber(b[2]) or now
+-- a caller with a lagging clock must not make elapsed negative
+-- (that would drive tokens below zero and starve the key)
+if now < ts then now = ts end
+local elapsed = now - ts
 tokens = math.min(tonumber(ARGV[3]), tokens + elapsed * tonumber(ARGV[2]))
 local ok = 0
 if tokens >= 1 then
   tokens = tokens - 1
   ok = 1
 end
-redis.call("HSET", KEYS[1], "tokens", tokens, "ts", ARGV[1])  -- HMSET is deprecated since Redis 4.0
+redis.call("HSET", KEYS[1], "tokens", tokens, "ts", now)  -- HMSET is deprecated since Redis 4.0
 redis.call("EXPIRE", KEYS[1], 600)
 return ok
 ```
 
-One round-trip, atomic, ~1 ms.
+One round-trip, atomic, ~1 ms. The script takes `now_ms` from the caller, so app-server clocks should be NTP-synced; alternatively read the clock inside the script with `redis.call("TIME")` (allowed in scripts since Redis 5, where script effects are replicated instead of the script itself).
 
 ### Plan lookup
 
@@ -111,6 +123,8 @@ Content-Type: application/json
 
 { "error": "rate_limit_exceeded", "retry_after": 30 }
 ```
+
+`429` is defined in RFC 6585 and `Retry-After` in RFC 9110. The `X-RateLimit-*` headers are a widely used convention (GitHub, Twitter/X), not a standard; the IETF has a draft for standard `RateLimit` headers.
 
 ### Multi-tier limits
 
@@ -258,7 +272,7 @@ Per-region limits with sum-of-regions ≤ global is the most common. Each region
 
 - Check actual recent request rate from logs vs the limit.
 - Look at all rate-limit tiers (user, endpoint, IP) — which one tripped?
-- Clock skew: the script takes `now_ms` from the caller, so app servers with skewed clocks can miscompute refill.
+- Clock skew: the script takes `now_ms` from the caller, so app servers with skewed clocks can miscompute refill (a clock running behind can even push the bucket negative unless the script clamps elapsed time at zero).
 - Plan misconfig: was their plan downgraded, or is the plan cache stale?
 - Bug in the Lua script under an edge case (for example very small intervals).
 - NAT'd IP shared with an abuser?
@@ -335,7 +349,7 @@ Local state cuts Redis round trips and latency, but instances don't see each oth
 
 - **Stripe blog**: ["Scaling your API with rate limiters"](https://stripe.com/blog/rate-limiters).
 - **ByteByteGo**: ["Design a Rate Limiter"](https://www.youtube.com/watch?v=YXkOdWBwqaA).
-- **Alex Xu Vol 1** Ch. 4.
+- **Alex Xu, *System Design Interview Vol 1*** Ch. 4 (Design a rate limiter).
 - **Cloudflare blog**: counting algorithms, sliding window counter.
 - **GitHub**: secondary rate limits explanation.
 - [Rate Limiting](/learn/notes/rate-limiting/) in this collection for the algorithmic deep dive.

@@ -14,6 +14,8 @@ summary: "Stream every committed row change out of the database log (binlog / WA
 
 **Change Data Capture (CDC)** is the practice of streaming every row-level change in a database (INSERT, UPDATE, DELETE) as an event to a downstream system, typically by tailing the database's replication log (binlog / WAL). Tools like **Debezium** (Kafka Connect) and **Maxwell** read the log directly so the source app doesn't need to know it's emitting events.
 
+**One-liner:** CDC turns a database's own replication log (MySQL binlog, Postgres WAL) into a stream of row-change events in Kafka, so every committed insert, update, and delete reaches caches, search, and other services without risky dual writes.
+
 ## Why it matters
 
 CDC is how modern systems propagate the source of truth (a database) to caches, search indexes, data warehouses, ML feature stores, downstream services, and audit logs — without dual writes (which would be race-prone) and without rewriting the app. It powers the "event-driven architecture" most teams talk about.
@@ -90,14 +92,14 @@ CDC tools subscribe to that log as if they were a replica:
 3. **DB → Warehouse**: stream into Snowflake/BigQuery/S3 (modern ELT).
 4. **DB → Microservices**: other services consume events instead of querying the DB.
 5. **Audit log**: every change captured with metadata.
-6. **DB migration / replatform**: dual-write transitional period.
+6. **DB migration / replatform**: keep the new datastore in sync from the old database's change stream during the transition, instead of dual writes.
 
 ### Outbox pattern (CDC's best friend)
 
 For when you want **app-emitted** events (not just raw row changes), but still atomically with the DB write:
 1. In the same DB transaction: write business data + insert into `outbox` table.
 2. CDC tails the `outbox` table.
-3. Downstream consumes nicely typed business events; failure-free because DB commit is the boundary.
+3. Downstream consumes nicely typed business events. An event is published if and only if the transaction committed, because the DB commit is the atomic boundary. Delivery is still at-least-once, so consumers dedupe on the event ID.
 
 This is the standard pattern in microservices that need to emit events on writes.
 
@@ -144,7 +146,7 @@ Consumer:
 
 - **Replication slot retention** (Postgres): an unconsumed slot keeps WAL files forever → disk fills. Monitor lag and slot age.
 - **Schema changes**: ALTER TABLE during snapshot or active streaming can break the connector. Use connector's schema-history handling; coordinate DDL.
-- **DELETE handling**: CDC emits a "delete" event; downstream must process it (else stale rows linger). Some configs add a **tombstone** event for compaction.
+- **DELETE handling**: CDC emits a "delete" event; downstream must process it (else stale rows linger). By default Debezium also follows it with a **tombstone** (same key, null value) so log compaction can drop the key (`tombstones.on.delete`).
 - **Capturing too much**: every column change creates events. Filter columns/tables you actually need (`column.exclude.list`).
 - **Long transactions**: Postgres WAL can't be truncated past oldest active txn → unbounded WAL growth. Keep transactions short.
 - **Reordering on partition boundaries**: partition by primary key, never round-robin.

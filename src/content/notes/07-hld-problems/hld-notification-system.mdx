@@ -9,6 +9,14 @@ estimatedMinutes: 5
 prerequisites: []
 ---
 
+## Definition (interview-ready)
+
+A **notification system** lets any internal service send a message to a user over email, SMS, mobile push or in-app, while respecting the user's preferences, avoiding duplicates and surviving provider failures. Callers hit a **Notify API** that checks an idempotency key and the user's preferences, renders a template and publishes to a **per-channel Kafka topic**, then returns 202 Accepted. **Channel worker pools** consume each topic, rate-limit to each provider's quota, call the provider (SES or SendGrid, Twilio, APNs or FCM), retry with backoff and send poison messages to a dead-letter queue. Provider webhooks and send responses feed delivery status back.
+
+The key decisions are asynchronous, per-channel queues (so a slow SMS provider can't block email, and bursts are absorbed) and idempotency at both the API and the worker. The main trade-off is latency: urgent messages such as OTPs need their own priority lane.
+
+**One-liner:** An idempotent Notify API checks preferences and enqueues to per-channel Kafka topics; rate-limited worker pools deliver through external providers with retries, a DLQ, failover and a separate fast lane for transactional messages.
+
 ## Problem statement
 
 Design a system that delivers notifications (email, SMS, push, in-app) to users at scale, respecting preferences, deduplication, rate limits, and delivery retries.
@@ -205,7 +213,7 @@ Channels differ in volume, latency needs, provider limits and failure modes. Sep
 
 <QA q="How do you guarantee no duplicate notifications?" level="medium">
 
-Idempotency key from the caller; dedupe table (`idempotency_key UNIQUE`) at the API boundary, kept for hours to days. Workers also dedupe by notification ID before calling the provider. At-least-once delivery + idempotent send = effectively exactly-once visible behavior.
+Idempotency key from the caller; dedupe table (`idempotency_key UNIQUE`) at the API boundary, kept for hours to days. Workers also dedupe by notification ID before calling the provider. At-least-once delivery + idempotent send = effectively exactly-once visible behavior in almost all cases. The remaining gap: if a worker crashes after the provider accepted the message but before recording it as sent, the retry sends again. Most SMS and email providers have no idempotency key, so you can narrow that window but not close it fully.
 
 </QA>
 
@@ -323,7 +331,7 @@ Kafka buffers the burst and workers rate-limit to the provider's contracted thro
 
 </MCQ>
 
-<MCQ q="Why is SMS usually the last channel tried?" options={["It has the lowest delivery rate", "It can't carry links", "It needs user consent and email does not", "It costs real money per message"]} answer={3}>
+<MCQ q="Why is SMS usually the last channel tried?" options={["It has the lowest delivery rate", "It can't carry links", "It only works on smartphones", "It costs real money per message"]} answer={3}>
 
 SMS costs roughly $0.01–0.10 per message, so systems prefer push or email and keep SMS for cases like auth codes. The other claims aren't the reason.
 
@@ -331,7 +339,7 @@ SMS costs roughly $0.01–0.10 per message, so systems prefer push or email and 
 
 <MCQ q="What does at-least-once delivery plus an idempotent send by notification ID give you?" options={["Lower provider costs", "Effectively exactly-once behavior as the user sees it", "Strict global ordering", "No need for retries"]} answer={1}>
 
-Retries may redeliver, but deduping by ID before calling the provider means the user gets one message. It doesn't order messages, cut costs or remove the need for retries.
+Retries may redeliver, but deduping by ID before calling the provider means the user normally gets one message (a crash right after the provider call is the rare exception). It doesn't order messages, cut costs or remove the need for retries.
 
 </MCQ>
 
@@ -350,7 +358,7 @@ Retries may redeliver, but deduping by ID before calling the provider means the 
 
 ## Go deeper
 
-- **Alex Xu Vol 1**: Chapter 10 (Notification system).
+- **Alex Xu, *System Design Interview Vol 1***: Chapter 10 (Design a notification system).
 - **ByteByteGo**: notification system video.
 - **Twilio + SendGrid docs** for production realities.
 - **AWS SNS / SES architectures**.

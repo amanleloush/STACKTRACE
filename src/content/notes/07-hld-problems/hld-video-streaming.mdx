@@ -9,6 +9,14 @@ estimatedMinutes: 5
 prerequisites: []
 ---
 
+## Definition (interview-ready)
+
+A **video streaming platform** lets creators upload videos and lets viewers anywhere watch them quickly, without stalls, at the lowest possible delivery cost. Uploads go straight to object storage through pre-signed multipart URLs. A distributed **transcoding pipeline** then splits each video, encodes it into a ladder of resolutions and bitrates (and codecs such as H.264 plus AV1 or HEVC), and cuts each rendition into short segments listed in an HLS or DASH **manifest**. Segments are immutable files served from a **CDN**, and the player uses **adaptive bitrate streaming** (ABR), choosing the rendition for each next segment from the throughput it measures.
+
+The key decisions: segment-based ABR, because identical segments cache perfectly and quality can adapt mid-playback; and pushing delivery to the edge, because bandwidth, not compute, is the dominant cost. The main trade-off is storage and transcoding cost (many renditions and codecs) in exchange for lower delivery cost and smoother playback.
+
+**One-liner:** Upload directly to object storage, transcode each video into a bitrate ladder of short HLS/DASH segments, and serve those immutable segments from a CDN while the player switches renditions adaptively based on measured bandwidth.
+
 ## Problem statement
 
 Design a video streaming platform: users upload videos, the system transcodes to multiple bitrates, stores them, and streams to viewers globally with low buffering and minimal cost.
@@ -61,7 +69,7 @@ flowchart LR
                        └──────┬──────┘
                               ▼
                        ┌─────────────┐
-                       │ Transcoding │ (Spark/distributed jobs)
+                       │ Transcoding │ (distributed workers)
                        │ Pipeline    │
                        └──────┬──────┘
                               ▼
@@ -95,9 +103,9 @@ flowchart LR
 
 - Single upload → many output renditions (240p, 360p, 480p, 720p, 1080p, 4K).
 - Two codecs (H.264 widely compatible, AV1/HEVC modern).
-- Per rendition, segmented into ~6–10s chunks for HLS/DASH.
-- Heavy CPU/GPU: distributed cluster (Spark, custom orchestrator).
-- Per video: 10–60 minutes processing time.
+- Per rendition, segmented into short chunks (Apple recommends 6 s for HLS; many services use 2–10 s).
+- Heavy CPU/GPU: a distributed worker cluster driven by a job orchestrator (usually custom-built; general data tools like Spark are not a natural fit).
+- Per video: minutes to hours of compute, depending on length, codecs and how many chunks are encoded in parallel.
 
 ### Storage
 
@@ -134,7 +142,7 @@ Each chunk is independently cacheable on CDN — huge cache hit rates because al
 
 - Encoder pushes RTMP/SRT to ingest.
 - Server transcodes in real time → segments → CDN.
-- Latency target: 5–30s (DVR-like) or sub-second (WebRTC-based) — different architectures.
+- Latency target: standard HLS/DASH lands around 10–30 s; low-latency HLS/DASH (partial segments) reaches roughly 2–5 s; sub-second needs a WebRTC-based architecture.
 
 ## Bottlenecks & optimizations
 
@@ -146,7 +154,7 @@ Each chunk is independently cacheable on CDN — huge cache hit rates because al
 ## Trade-offs
 
 - **VOD vs live**: VOD is simpler (transcode once, cache forever). Live is real-time, harder.
-- **HLS vs DASH**: HLS is the dominant standard (Apple's ecosystem); DASH is more flexible. Often serve both.
+- **HLS vs DASH**: HLS is required for Apple's native players and is the most widely supported; DASH is an open ISO standard. Many services serve both, often from one set of CMAF (fragmented MP4) segments with two manifests.
 - **Push (Netflix Open Connect) vs commercial CDN**: Open Connect has huge upfront cost but huge marginal savings; commercial CDN is pay-as-you-go.
 
 ## Practice questions
@@ -161,7 +169,7 @@ Network conditions vary. ABR lets the client pick the best rendition for current
 
 <QA q="Why segment video into chunks?" level="easy">
 
-Chunks (~6–10 s) are independently cacheable on the CDN → huge hit rates, since every viewer of a rendition fetches the same chunks. They enable ABR (switch rendition between chunks). Bad chunks can be re-fetched without restarting playback.
+Chunks (a few seconds each, commonly 2–10 s) are independently cacheable on the CDN → huge hit rates, since every viewer of a rendition fetches the same chunks. They enable ABR (switch rendition between chunks). Bad chunks can be re-fetched without restarting playback.
 
 </QA>
 
@@ -197,7 +205,7 @@ H.264 plays almost everywhere, so it's the compatibility baseline. AV1 and HEVC 
 
 <QA q="How does live streaming differ from video on demand?" level="hard">
 
-VOD is transcoded once and cached forever. Live must ingest (RTMP/SRT), transcode and segment in real time, then push segments to the CDN as they're produced. Segment-based live delivery typically lands at 5–30 s latency; sub-second latency needs a different, WebRTC-based architecture.
+VOD is transcoded once and cached forever. Live must ingest (RTMP/SRT), transcode and segment in real time, then push segments to the CDN as they're produced. Standard segment-based live delivery typically lands at 10–30 s latency, and low-latency HLS/DASH brings it to roughly 2–5 s; sub-second latency needs a different, WebRTC-based architecture.
 
 </QA>
 
@@ -286,7 +294,7 @@ Placing caches inside ISPs means most bytes never cross transit links. Codec cho
 
 <MCQ q="A product needs sub-second live latency for interactive streams. What does that imply?" options={["Use 10-second HLS segments", "Transcode once and cache forever", "Serve only from the cold tier", "A WebRTC-based architecture rather than standard segment-based delivery"]} answer={3}>
 
-Segment-based live delivery typically sits at 5–30 s; sub-second needs WebRTC-style delivery. Long segments add latency, transcode-once is VOD, and cold storage is for old content.
+Segment-based live delivery sits at seconds (about 2–5 s even with low-latency HLS/DASH); sub-second needs WebRTC-style delivery. Long segments add latency, transcode-once is VOD, and cold storage is for old content.
 
 </MCQ>
 
@@ -301,7 +309,7 @@ A small first chunk at a safe rendition starts playback fast, then ABR refines. 
 ## TL;DR cheat sheet
 
 - Upload via pre-signed S3 URLs (direct, multipart).
-- Transcode to multiple renditions + codecs (HLS/DASH chunks of 6-10s).
+- Transcode to multiple renditions + codecs (HLS/DASH chunks of ~2–10 s; Apple recommends 6 s for HLS).
 - Store chunks in S3; manifest lists them.
 - CDN at edge serves chunks to viewers (highest hit rate).
 - Adaptive bitrate: client picks rendition per chunk.
@@ -310,9 +318,9 @@ A small first chunk at a safe rendition starts playback fast, then ABR refines. 
 
 ## Go deeper
 
-- **Netflix Tech Blog**: [Open Connect](https://openconnect.netflix.com/) and many ABR/encoding posts.
+- **Netflix**: [Open Connect](https://openconnect.netflix.com/) overview, plus many ABR and encoding posts on the Netflix Tech Blog.
 - **YouTube engineering**: ABR + encoding history.
 - **Mux blog**: video streaming details.
-- **HLS spec**: [datatracker.ietf.org/doc/html/rfc8216](https://datatracker.ietf.org/doc/html/rfc8216).
+- **HLS spec**: [RFC 8216](https://datatracker.ietf.org/doc/html/rfc8216).
 - **DASH overview**.
 - **ByteByteGo**: video streaming videos.

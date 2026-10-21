@@ -13,6 +13,8 @@ prerequisites: []
 
 **HTTP/1.1** is text-based, one request per connection at a time (or pipelined poorly). **HTTP/2** is binary, multiplexes many streams over a single TCP connection, and adds header compression. **HTTP/3** keeps HTTP/2's semantics but runs on **QUIC** (UDP-based), eliminating TCP head-of-line blocking and combining the transport + TLS handshake into one round trip.
 
+**One-liner:** All three versions share the same HTTP semantics; HTTP/1.1 sends text with one request per connection at a time, HTTP/2 multiplexes binary streams over one TCP connection, and HTTP/3 moves those streams onto QUIC over UDP so a lost packet stalls only its own stream.
+
 ## Why it matters
 
 A backend dev needs to understand:
@@ -20,6 +22,7 @@ A backend dev needs to understand:
 - Why HTTP/2 didn't really fix the latency problem under loss
 - Why HTTP/3 / QUIC is showing up in load balancers, CDNs, and gRPC
 - Why gRPC requires HTTP/2 and what that means for proxies
+- How long-lived connections (SSE, long-polling, WebSockets) behave under HTTP/2 multiplexing
 
 ```mermaid
 flowchart TB
@@ -42,7 +45,6 @@ flowchart TB
         S3 -.->|stream c — packet loss only blocks this stream| C3
     end
 ```
-- When SSE / long-polling / WebSockets break under HTTP/2 multiplexing
 
 ## Core concepts
 
@@ -67,7 +69,7 @@ flowchart TB
 
 - **QUIC** = UDP-based reliable transport with built-in TLS 1.3.
 - Each QUIC stream has independent reliability — packet loss on stream A doesn't stall stream B.
-- **0-RTT** handshake on resumption: cached connection, no round trip before first byte.
+- **0-RTT** on resumption: using keys saved from an earlier session with the same server, the client can send its request in the very first packet, with no round trip before the first byte.
 - **Connection migration**: connection survives client IP change (Wi-Fi → LTE). Identified by connection ID, not 4-tuple.
 - Encryption is **mandatory** — there is no plaintext HTTP/3.
 
@@ -94,7 +96,7 @@ HTTP/3:    [UDP] [QUIC (includes TLS 1.3)] [HTTP]   — N independent streams (n
 
 - **Load balancer terminates HTTP/2 → upstream HTTP/1.1**: you lose stream multiplexing and may see degraded throughput. Check upstream protocol if performance regresses after enabling h2 at the edge.
 - **HTTP/2 with one connection breaks LB algorithms** that assume `connection = request`. A single client can monopolize a backend. Use stream-aware proxies.
-- **Long-lived h2 connection + flaky network** = catastrophic HOL stall. h3 fixes this.
+- **Long-lived h2 connection + flaky network** = repeated HOL stalls across every stream. h3 fixes this.
 - **Server push abuse**: pushing CSS/JS the client already cached just wastes bandwidth. Use 103 Early Hints instead.
 - **gRPC + HTTP/1.1 proxy**: silent failure. Always verify the entire path supports h2.
 
@@ -134,7 +136,7 @@ Per origin, they mostly don't: an h2 browser uses one connection per origin. Ext
 
 <QA q="What is ALPN and why does it matter?" level="medium">
 
-**Application-Layer Protocol Negotiation** is a TLS extension through which client and server agree on the application protocol (`h2`, `http/1.1`) *during* the TLS handshake. It saves the round trip an Upgrade-style negotiation would need, and it's how browsers pick h2 over h1. (HTTP/3 is usually discovered through the `Alt-Svc` header, since it runs over a different transport.)
+**Application-Layer Protocol Negotiation** is a TLS extension through which client and server agree on the application protocol (`h2`, `http/1.1`) *during* the TLS handshake. It saves the round trip an Upgrade-style negotiation would need, and it's how browsers pick h2 over h1. (HTTP/3 is usually discovered through the `Alt-Svc` header or a DNS `HTTPS` record, since it runs over a different transport.)
 
 </QA>
 
@@ -250,7 +252,7 @@ HPACK resists CRIME, but size-based guessing against the dynamic table remains. 
 | Multiplexing | No (6 conns) | Yes | Yes |
 | HOL blocking | App + TCP | TCP only | None |
 | Header compression | None (or gzip body) | HPACK | QPACK |
-| Handshake to first byte | TCP + TLS = 2 RTT | TCP + TLS = 2 RTT | 1 RTT (or 0-RTT) |
+| Handshake before first request | TCP + TLS 1.3 = 2 RTT (3 with TLS 1.2) | TCP + TLS 1.3 = 2 RTT (3 with TLS 1.2) | 1 RTT (or 0-RTT) |
 | Required encryption | No | De facto yes | Yes |
 
 ## Go deeper

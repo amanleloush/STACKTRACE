@@ -13,6 +13,8 @@ prerequisites: []
 
 A **cache** is a fast read store kept in front of a slow store of truth. **Cache patterns** describe *who* talks to the cache and DB, and *when*: **cache-aside** (app fills cache on miss), **read-through** (cache lib fetches on miss), **write-through** (write to cache and DB together), **write-back** (write to cache, async flush to DB), **write-around** (write skips cache).
 
+**One-liner:** Cache patterns decide who fills the cache and when writes reach the database: cache-aside and read-through fill on a miss, write-through updates cache and DB together, write-back writes the cache first and flushes later, and write-around skips the cache on writes.
+
 ## Why it matters
 
 Cache bugs cause more outages than people admit: stale data, inconsistent invalidation, thundering herds. Picking the right pattern up front (and knowing the failure modes of each) is the first lever for both performance and correctness in any system with a meaningful read load.
@@ -53,8 +55,8 @@ On write, update cache **and** DB synchronously.
 write: app → cache.set(k, val); db.write(k, val)
 ```
 
-Pros: cache and DB always in sync (no staleness).
-Cons: every write pays cache+DB latency; cache holds data that may never be read (waste).
+Pros: on the normal path the cache is updated on every write, so reads right after a write are fresh.
+Cons: the two writes are not atomic — if one fails, or two writers interleave, cache and DB can still diverge, so keep a TTL as a safety net. Every write pays cache+DB latency; cache holds data that may never be read (waste).
 
 ### Write-behind / write-back
 
@@ -90,7 +92,7 @@ Proactively refresh cache before TTL expires (predict next access). Reduces tail
 |---|---|---|---|
 | Cache-aside | ✓ | OK | OK (with invalidation) |
 | Read-through | ✓ | OK | OK |
-| Write-through | ✓ | poor (latency) | strong consistency |
+| Write-through | ✓ | poor (latency) | good (cache updated on write) |
 | Write-back | ✓ | ✓ (absorbs bursts) | strong if same cache |
 | Write-around | ✓ for stable data | ✓ for cold writes | stale on first read |
 
@@ -134,9 +136,9 @@ next read /user/42:
 
 ## Real-world examples
 
-- **Facebook TAO**: cache-aside with smart invalidation, geographically replicated. The blueprint paper for social-graph caching.
+- **Facebook memcache** (NSDI 2013): a look-aside (cache-aside) cache with delete-on-write, plus **leases** to stop stale fills and thundering herds.
+- **Facebook TAO**: the later, graph-aware cache for the social graph — read-through and write-through in front of MySQL, geographically replicated.
 - **Instagram**: Memcached (cache-aside) in front of Postgres for feed assembly.
-- **Stripe**: aggressive cache-aside on read paths; writes invalidate via Kafka + listeners.
 - **DAX (AWS)**: write-through + read-through on top of DynamoDB.
 - **Hibernate 2nd-level cache**: read-through; tons of subtle gotchas.
 
@@ -225,7 +227,7 @@ Fixes: store `(value, version)` and only fill on a miss if no newer version exis
 
 <QA q="A stale entry sometimes stays in the cache for hours despite TTL = 5 min. How?" level="scenario">
 
-- A race between a read-miss and a write — a slow read fills the cache with old data right after invalidation.
+- Misses are refilled from stale data — a lagging read replica, or a slow read racing a write — so each refill re-caches the old value and restarts the TTL.
 - Some write path doesn't invalidate (batch job, scheduled task, admin tool).
 - The cache is multi-region and the invalidation message is lost.
 - The TTL is set to a different value somewhere (defaults, another service).
@@ -330,7 +332,8 @@ This is a cache stampede. Single-flight (or a lock such as SET NX in Redis) lets
 
 - **AWS Whitepaper**: ["Caching Best Practices"](https://aws.amazon.com/caching/best-practices/).
 - **ByteByteGo**: ["A Guide to Top Caching Strategies"](https://blog.bytebytego.com/p/a-guide-to-top-caching-strategies).
+- **Facebook memcache paper**: ["Scaling Memcache at Facebook"](https://www.usenix.org/system/files/conference/nsdi13/nsdi13-final170_update.pdf) — leases, look-aside caching, invalidation.
 - **Facebook TAO paper**: ["TAO: Facebook's Distributed Data Store for the Social Graph"](https://www.usenix.org/system/files/conference/atc13/atc13-bronson.pdf).
 - **Memcached Wiki** and Brad Fitzpatrick's original posts.
 - **Caching at Netflix** engineering blog (EVCache).
-- **DDIA Chapter 5** — replication and caching overlap.
+- **DDIA Chapter 5** (Replication) — the same staleness and read-your-writes problems apply to caches.

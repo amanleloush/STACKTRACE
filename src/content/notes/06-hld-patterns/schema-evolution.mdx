@@ -13,6 +13,8 @@ prerequisites: []
 
 **Schema evolution** is the discipline of changing data formats (DB schemas, event/message schemas, API contracts) over time without breaking existing producers and consumers. **Backward compatibility** = newer consumers can read older data. **Forward compatibility** = older consumers can read newer data. **Full compatibility** = both.
 
+**One-liner:** Schema evolution is changing data formats and APIs without breaking whoever is still on the old version: make additive changes with defaults, never reuse or retype fields, enforce compatibility with a schema registry, and do destructive database changes as expand, migrate, contract across separate deploys.
+
 ## Why it matters
 
 In a system with N services, M deploys per day, and a Kafka topic carrying 6 months of history, every schema change is a potential outage if you don't manage compatibility. Schema evolution discipline is what separates teams that can deploy 100 times a day from those that can deploy weekly.
@@ -51,12 +53,15 @@ Most systems require **backward** compatibility (new consumers must read old dat
 #### Protobuf (Protocol Buffers)
 
 - Each field has a **field number** (the wire identity).
-- Rules: never reuse a field number; never change field's type; new fields must be **optional**; deletions: mark `reserved`.
+- Rules: never reuse a field number; don't change a field's type (only a few wire-compatible swaps, such as int32 to int64, are allowed); never add a `required` field (proto2 only; proto3 has no required fields); when deleting a field, mark its number and name `reserved`.
 - Result: additive evolution is easy. Breaking change = bump version (new message type).
 
 ```protobuf
+syntax = "proto3";
+
 message User {
-  reserved 4;  // do not reuse
+  reserved 4;        // do not reuse the number
+  reserved "phone";  // or the name
   int64 id = 1;
   string name = 2;
   string email = 3;
@@ -69,7 +74,7 @@ message User {
 
 - Schema travels with data (or referenced via schema ID).
 - **Schema Resolution**: at read time, reader uses its schema and the writer's schema to map fields. Default values in the reader schema let it handle missing fields from older writers.
-- Strong support for evolution if you follow rules: default values for added fields, no type changes for existing fields, no required fields removed.
+- Strong support for evolution if you follow rules: give added fields a default (so new readers can read old data), give any field you might later remove a default (so old readers can read new data), and don't change types except Avro's allowed promotions (such as int to long).
 
 #### JSON Schema
 
@@ -128,7 +133,7 @@ Each phase is a deploy. Never combine.
 
 For gRPC: new service or new package (`mypackage.v2`).
 
-For GraphQL: schema is additive — deprecate fields, never remove. Clients pick the fields they want.
+For GraphQL: evolve the schema additively — deprecate fields first and remove them only after usage has dropped to zero (or never). Clients pick the fields they want.
 
 ### Strategies for breaking changes
 
@@ -177,7 +182,7 @@ For analytics: Avro / Parquet with **schema-on-read** is common — old files ke
 - **Reusing a removed field number** in Protobuf → silent corruption.
 - **Changing a field's type** (string → int) → silent corruption.
 - **Adding a required field** to an Avro schema without default → breaks old data.
-- **Combining expand + contract** in one deploy → break-glass.
+- **Combining expand + contract** in one deploy → breaks whichever version of the code is still running during the rollout.
 - **Dropping a database column with `ALTER TABLE DROP`** while old code still writes to it → 500 errors.
 - **Migrating data in a giant single `UPDATE`** → long locks, blocking, replica lag.
 - **Schema "drift" without registry** → producers and consumers disagree silently.
@@ -221,7 +226,7 @@ A central service (Confluent Schema Registry, Apicurio, AWS Glue Schema Registry
 - **Expand**: `ALTER TABLE t ADD COLUMN c ... DEFAULT ...`. Postgres 11+ does this without rewriting the table when the default is non-volatile (a constant, not e.g. `random()`).
 - **Backfill** in chunks (`UPDATE ... WHERE id BETWEEN X AND Y`), committing between small batches.
 - **Migrate**: deploy code that writes the column.
-- **Contract** (optional): enforce NOT NULL once the backfill is done; drop the default if it shouldn't be permanent.
+- **Contract** (optional): enforce NOT NULL once the backfill is done; drop the default if it shouldn't be permanent. In Postgres, `SET NOT NULL` scans the whole table under an exclusive lock; to avoid that, first add `CHECK (c IS NOT NULL) NOT VALID`, then `VALIDATE CONSTRAINT` (no long lock), and Postgres 12+ can then set NOT NULL without the scan.
 - For MySQL, use an online schema-change tool (gh-ost, pt-online-schema-change) if blocking is a concern.
 
 </QA>

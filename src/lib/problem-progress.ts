@@ -6,6 +6,13 @@
 // lives in problem-progress-kv.ts so this module stays safe to ship to the
 // client.
 
+import {
+  applyLwwBatch,
+  mergeLww,
+  type BatchApplyResult as LwwBatchApplyResult,
+  type MergeResult as LwwMergeResult,
+} from './lww';
+
 export interface ProgressEntry {
   solved: boolean;
   notes: string;
@@ -89,40 +96,17 @@ export function parseBatchBody(body: unknown, now: number = Date.now()): ParseRe
   return { ok: true, value: out };
 }
 
-export interface BatchApplyResult {
-  /** The stored map after applying every newer incoming entry. */
-  next: ProgressMap;
-  /** Slugs whose incoming entry was strictly newer and is now stored. */
-  applied: string[];
-  /** Server copies that were at least as new as the incoming entry. */
-  stale: ProgressMap;
-  /** Incoming slugs that are new to the doc (count against the cap). */
-  added: number;
-}
+export type BatchApplyResult = LwwBatchApplyResult<ProgressEntry>;
 
 /**
  * Server-side last-write-wins over a batch: an incoming entry replaces the
  * stored one only when its `updatedAt` is strictly newer; otherwise the
  * stored entry is reported back in `stale` so the client can adopt it.
  * Ties are stale (no flip-flopping between devices). Pure — never mutates
- * `stored`.
+ * `stored`. See lww.ts.
  */
 export function applyBatch(stored: ProgressMap, incoming: ProgressMap): BatchApplyResult {
-  const next: ProgressMap = { ...stored };
-  const applied: string[] = [];
-  const stale: ProgressMap = {};
-  let added = 0;
-  for (const [slug, entry] of Object.entries(incoming)) {
-    const cur = Object.prototype.hasOwnProperty.call(stored, slug) ? stored[slug] : undefined;
-    if (cur && cur.updatedAt >= entry.updatedAt) {
-      stale[slug] = cur;
-      continue;
-    }
-    if (!cur) added++;
-    next[slug] = entry;
-    applied.push(slug);
-  }
-  return { next, applied: applied.sort(), stale, added };
+  return applyLwwBatch(stored, incoming);
 }
 
 /** Lenient read of a stored entry (localStorage or server JSON). */
@@ -142,34 +126,12 @@ export function isMeaningful(e: ProgressEntry | null | undefined): boolean {
   return !!e && (e.solved || e.notes.trim().length > 0);
 }
 
-export interface MergeResult {
-  /** Union of both sides, newest `updatedAt` per slug. */
-  merged: ProgressMap;
-  /** Slugs where the server copy won and must be written locally. */
-  pull: string[];
-  /** Slugs where the local copy is strictly newer and must be PUT. */
-  push: string[];
-}
+export type MergeResult = LwwMergeResult<ProgressEntry>;
 
 /**
  * Last-write-wins merge by `updatedAt`. Ties go to the server (nothing to
  * push, nothing to pull) so two devices that already agree stay quiet.
  */
 export function mergeProgress(local: ProgressMap, server: ProgressMap): MergeResult {
-  const merged: ProgressMap = {};
-  const pull: string[] = [];
-  const push: string[] = [];
-  const slugs = new Set([...Object.keys(local), ...Object.keys(server)]);
-  for (const slug of slugs) {
-    const l = local[slug];
-    const s = server[slug];
-    if (l && (!s || l.updatedAt > s.updatedAt)) {
-      merged[slug] = l;
-      push.push(slug);
-    } else if (s) {
-      merged[slug] = s;
-      if (!l || s.updatedAt > l.updatedAt) pull.push(slug);
-    }
-  }
-  return { merged, pull: pull.sort(), push: push.sort() };
+  return mergeLww(local, server);
 }
