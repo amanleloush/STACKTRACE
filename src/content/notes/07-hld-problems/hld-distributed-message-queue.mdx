@@ -1,0 +1,578 @@
+---
+title: "HLD: Design a Distributed Message Queue"
+phase: "07-hld-problems"
+order: 82
+tags: ["hld", "kafka", "messaging", "distributed-systems", "replication"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 30
+prerequisites: ["kafka-deep", "kafka-internals", "delivery-semantics", "consensus-raft-paxos"]
+summary: "Design a Kafka-like distributed message queue from scratch: a partitioned append-only log with segments and sparse indexes, leader/follower replication with an in-sync replica set, producer acks and batching, consumer groups and offsets, retention and compaction, a Raft-based controller and back-pressure, plus when to build a per-message-ack queue instead."
+---
+
+## Definition (interview-ready)
+
+A **distributed message queue** lets producers write messages and many consumers read them later, so services are decoupled in time and load. At high scale the winning design is a **partitioned, replicated, append-only log** (the Kafka model).
+
+A topic is split into **partitions**. Each partition is an ordered file that only grows at the end, stored as **segment files** with a small **sparse index** that maps an offset (a message's position number) to a byte position. Each partition has one **leader** broker that takes writes and some **followers** that copy it. A write is **committed** once every member of the **in-sync replica set (ISR)** has it. Consumers **pull** from an offset and save that offset themselves, so the broker keeps almost no per-consumer state. A small **Raft quorum of controllers** decides who leads what.
+
+The key trade-off: a log gives ordering per partition, replay and huge throughput, but it gives up per-message acknowledgement. When you need that, you design a **queue** instead.
+
+**One-liner:** Hash each key to a partition, append to the partition leader's segmented log, replicate to an ISR before acknowledging, let consumer groups pull by offset, delete old segments by time or compact by key, and keep cluster metadata in a Raft controller quorum.
+
+## Problem statement
+
+"Design a distributed message queue, something like Kafka. Producers publish messages to named topics. Many independent consumer applications read those messages, and each application can run many instances that share the work. Messages must not be lost if a machine dies, and messages with the same key should be read in the order they were written. Consumers should be able to re-read old messages.
+
+Scale: 1 million messages per second at peak, about 1 KB each. Several consumer applications read every topic. Data is kept for 7 days. The cluster must survive the loss of any single machine without losing acknowledged messages."
+
+## Requirements
+
+### Functional (in scope)
+
+- **Create topics** with a partition count, replication factor and retention policy.
+- **Produce**: publish a message (optional key, value, headers) to a topic and get back its position.
+- **Consume**: read messages from a position, in order within a partition.
+- **Consumer groups**: instances of one application share a topic's partitions; different applications each get every message.
+- **Commit offsets** so a restarted consumer resumes where it stopped.
+- **Replay**: reset a group to an earlier offset or timestamp.
+- **Retention**: delete by age or size, or keep the latest value per key (compaction).
+
+### Non-functional
+
+- **Durability**: an acknowledged message survives one broker failure (and more if the replication factor allows).
+- **Ordering**: per partition (per key), not global.
+- **Throughput first**: about 1 GB/s in, several GB/s out.
+- **Latency**: low tens of milliseconds end to end is fine; we trade a few ms for batching.
+- **Availability**: brokers fail and restart without the cluster stopping.
+- **Horizontal scale**: add brokers and partitions as load grows.
+
+### Out of scope
+
+- Exactly-once transactions across topics (mention, link to [Kafka Transactions & EOS](/learn/notes/kafka-transactions-eos/)).
+- Stream processing, connectors, schema registry.
+- Multi-region replication (mention at the end).
+- Delayed or scheduled delivery, priority queues.
+
+### Clarifying questions to ask
+
+| Question | Why it matters |
+|---|---|
+| Do consumers need replay, or is each message processed once and forgotten? | Replay → log. Process-and-delete with per-message ack → queue. |
+| Is ordering needed, and at what scope (global, per key, none)? | Global order means one partition, which caps throughput. |
+| What durability: can we lose the last few ms of data on a crash? | Drives `acks` and replication factor. |
+| How many consumer applications read each topic? | Sets egress bandwidth (fan-out). |
+| Message size range? | Large messages break batching; usually store them elsewhere and send a pointer. |
+| Retention: time, size, or forever-by-key? | Delete policy vs compaction; drives disk. |
+
+## Scale estimation
+
+**Ingress**
+
+```
+1,000,000 msg/s × 1 KB          = 1 GB/s produced (peak)
+```
+
+**Replication and disk writes** (replication factor 3)
+
+```
+leader writes                    = 1 GB/s
+follower copies (2 more)         = 2 GB/s across the network between brokers
+total disk writes in the cluster = 3 GB/s
+```
+
+**Egress** (say 3 consumer applications read everything)
+
+```
+3 groups × 1 GB/s                = 3 GB/s out to consumers
+plus 2 GB/s of follower fetches  = 5 GB/s total leaving brokers
+```
+
+Reads of recent data come from the OS page cache, not disk, as long as consumers keep up.
+
+**Storage** (7 days)
+
+```
+per day  = 1 GB/s × 86,400 s     = 86.4 TB
+7 days   = 86.4 TB × 7           = 604.8 TB
+× RF 3                           = 1,814.4 TB ≈ 1.8 PB (before compression)
+```
+
+**Broker count** (assume 12 TB usable disk per broker, about 50 MB/s of produce led per broker)
+
+```
+by disk:        1,814.4 TB / 12 TB   ≈ 152 brokers
+by throughput:  1,000 MB/s / 50 MB/s = 20 brokers
+```
+
+Disk, not CPU or network, sizes this cluster. That is the cue for **tiered storage**: keep only the last day on local disks and move older segments to object storage.
+
+```
+local, 1 day × RF 3 = 86.4 TB × 3 = 259.2 TB → 259.2 / 12 ≈ 22 brokers
+```
+
+**Partitions** (assume one consumer instance can process about 5 MB/s)
+
+```
+1,000 MB/s / 5 MB/s = 200 partitions minimum for the big topic
+```
+
+Round up (say 256 to 400) to leave room for growth, because adding partitions later moves keys to new partitions.
+
+**Batching effect**: at 1M msg/s, sending one request per message would be 1M requests/s. With 16 KB batches of 1 KB messages, that becomes about 62,500 batches/s (1,000,000 / 16), and compression of whole batches cuts bytes further.
+
+## Core API
+
+```
+# Admin
+CreateTopic(name, partitions, replicationFactor, config) → ok
+DescribeCluster() → brokers, controller
+Metadata(topics) → for each partition: leader broker, replicas, ISR
+
+# Producer (talks to the partition leader)
+Produce(topic, partition, batch[], acks, producerId, epoch, baseSequence)
+  → baseOffset, logAppendTime | error (NOT_LEADER, NOT_ENOUGH_REPLICAS, ...)
+
+# Consumer (long-poll pull)
+Fetch(topic, partition, fromOffset, maxBytes, maxWaitMs)
+  → records[], highWatermark
+ListOffsets(topic, partition, timestamp | EARLIEST | LATEST) → offset
+
+# Consumer groups
+JoinGroup / Heartbeat(group, memberId) → assigned partitions
+CommitOffset(group, topic, partition, offset, metadata) → ok
+FetchCommittedOffset(group, topic, partition) → offset
+```
+
+The client asks any broker for **metadata**, caches which broker leads each partition, and sends produce and fetch calls straight to that leader. A `NOT_LEADER` error tells it to refresh metadata.
+
+## High-level architecture
+
+```
+   Producers                                        Consumer group A      Consumer group B
+   (client lib:                                     (3 instances)         (1 instance)
+    partitioner,                                         ▲                      ▲
+    batching, retries)                                   │ Fetch(offset)        │
+        │ Produce(batch)                                 │ long-poll            │
+        ▼                                                │                      │
+ ┌──────────────────────────────── Broker fleet ─────────┴──────────────────────┴──────┐
+ │  Broker 1                 Broker 2                 Broker 3                          │
+ │  orders-p0  LEADER ──────► orders-p0 follower      orders-p0 follower               │
+ │  orders-p1  follower ◄──── orders-p1 LEADER ─────► orders-p1 follower               │
+ │  orders-p2  follower       orders-p2 follower ◄─── orders-p2 LEADER                 │
+ │   (followers pull from leaders; ISR tracked per partition)                          │
+ │  each partition = segments on disk + sparse offset index + time index               │
+ │  group coordinator: offsets in an internal compacted topic                         │
+ └──────────────────────────────────▲──────────────────────────────────────────────────┘
+                                    │ heartbeats, metadata updates, leader/ISR changes
+                       ┌────────────┴─────────────┐
+                       │ Controller quorum (3/5)  │  Raft-replicated metadata log:
+                       │ 1 active + hot standbys  │  topics, partitions, leaders,
+                       └──────────────────────────┘  ISR, leader epochs, configs
+                                    │
+                       (optional) tiered storage: old segments → object store
+```
+
+### Write path
+
+1. The producer library picks a partition: `hash(key) % partitionCount`, or spreads keyless messages across partitions.
+2. It adds the message to an in-memory **batch** for that partition and sends the batch when it is full or a short linger time passes.
+3. The partition **leader** checks the batch, assigns offsets, and appends it to the **active segment** (written to the page cache, not forced to disk).
+4. **Followers** fetch from the leader and append the same bytes to their own logs.
+5. Once every ISR member has the batch, the leader moves the **high watermark** forward and, if `acks=all`, replies to the producer with the base offset.
+
+### Read path
+
+1. A consumer joins its group and gets some partitions through the **group coordinator** (the broker that manages that group).
+2. It reads its last **committed offset** for each partition (or starts at earliest/latest).
+3. It sends `Fetch(offset)`. The broker finds the right segment and byte position using the sparse index, then streams bytes from the page cache to the socket. Only records below the high watermark are returned.
+4. The consumer processes the records and **commits** the next offset to read.
+
+## Data model
+
+### On-disk layout of one partition
+
+```
+/data/orders-3/
+  00000000000000000000.log        record batches, append-only
+  00000000000000000000.index      sparse: relative offset → byte position
+  00000000000000000000.timeindex  sparse: timestamp → offset
+  00000000000005242880.log        next segment (file name = its first offset)
+  00000000000005242880.index
+  00000000000005242880.timeindex
+  leader-epoch-checkpoint         epoch → first offset of that epoch
+```
+
+- Only the newest (**active**) segment is written. It **rolls** to a new file at a size or age limit (Kafka defaults: `segment.bytes` 1 GiB, `segment.ms` 7 days).
+- The index is **sparse**: one entry about every 4 KB of log (Kafka's `index.interval.bytes` default is 4096), so it stays tiny and can be memory-mapped.
+- **Finding offset N**: binary search the segment file names to find the segment whose base offset is the largest one not above N, binary search that segment's index for the nearest earlier entry, then scan forward a few KB.
+
+### Record batch (simplified)
+
+```
+RecordBatch {
+  baseOffset, batchLength, leaderEpoch, crc,
+  attributes (compression codec, timestamp type, is-transactional),
+  producerId, producerEpoch, baseSequence,   // for idempotent retries
+  firstTimestamp, maxTimestamp,
+  records[]: { offsetDelta, timestampDelta, key, value, headers }
+}
+```
+
+The broker stores the batch **as the producer sent it** (still compressed). It does not unpack every message on the hot path.
+
+### Metadata (in the controller's replicated log)
+
+| Entity | Fields | Key |
+|---|---|---|
+| Topic | id, name, partition count, config | topic id |
+| Partition | replicas list, leader, **leader epoch**, ISR | (topic id, partition) |
+| Broker | id, host, rack, registration epoch, fenced flag | broker id |
+
+### Committed offsets
+
+Stored as messages in an internal **compacted** topic, key = `(group, topic, partition)`, value = offset. Compaction keeps only the latest commit per key. The topic is partitioned by `hash(group)`, and the leader of that partition acts as the **group coordinator**, so each group's offsets and membership live on one broker.
+
+**Partition key choice:** the message key (order ID, user ID) is the partition key, because ordering is only promised within a partition. Pick a key with many distinct values, or one hot key will overload one partition. See [Sharding Strategies](/learn/notes/sharding-strategies/).
+
+## Detailed design
+
+### 1. Why an append-only log, and how it stays fast
+
+**Intuition:** a log is a notebook you only write at the end of. Nobody edits page 40. Readers keep a bookmark.
+
+- **Sequential I/O.** Appends and in-order reads are sequential, which disks and SSDs do far faster than random writes. No B-tree, no in-place updates.
+- **Page cache, not an app cache.** The broker writes into the OS page cache and lets the OS flush. Consumers that keep up read data that is still in memory. This avoids a second copy of data inside the JVM heap and survives broker process restarts (the cache belongs to the OS).
+- **Zero-copy.** For plaintext connections the broker can use `sendfile` to move bytes from the page cache to the socket without copying through user space. With TLS this doesn't apply, because encryption happens in user space.
+- **Batch everything.** Produce, replicate, store and fetch all work on batches, so per-message costs are paid once per batch.
+- **Durability by replication, not fsync.** Kafka doesn't force an fsync per write by default. It counts on copies in several machines' memory being safer than one disk. That is a deliberate choice you should be able to defend: losing all ISR members at once (say, a full-rack power cut) can lose the newest unflushed data.
+
+Full mechanics: [Kafka Internals](/learn/notes/kafka-internals/) and [Storage Fundamentals](/learn/notes/storage-fundamentals/).
+
+### 2. Replication: leader, followers and the ISR
+
+Each partition has a **replication factor** (RF), usually 3. One replica is the **leader**; all produce and (by default) fetch traffic goes to it. **Followers** send fetch requests to the leader like consumers do, which keeps the protocol simple and batches replication too.
+
+```
+offsets:        0 ... 97 98 99 100 101
+leader  LEO=102 ████████████████████████
+follower A      ███████████████████        (has up to 99)
+follower B      ██████████████████████     (has up to 100)
+high watermark  = 100  (lowest log end offset among the ISR)
+consumers may read offsets 0..99 only
+```
+
+- **LEO (log end offset)**: the next offset a replica will write.
+- **ISR (in-sync replicas)**: the leader plus followers that are caught up. In Kafka a follower drops out of the ISR if it hasn't caught up within `replica.lag.time.max.ms` (default 30 s) or loses its session with the controller.
+- **Committed** = written by every ISR member. The **high watermark** is the end of committed data. Consumers only see data below it, so they never read something that a failover could erase.
+- **`min.insync.replicas`** (topic setting, default 1) is the floor: with `acks=all`, if the ISR is smaller than this, the leader refuses the write with `NOT_ENOUGH_REPLICAS`. The standard durable setup is **RF=3, min.insync.replicas=2, acks=all**: it tolerates one broker down and still accepts writes, and every acknowledged write is on at least two machines.
+
+**Why ISR instead of a majority quorum?** A majority quorum needs 2f+1 replicas to survive f failures. An ISR waits for *all currently healthy* replicas, so f+1 replicas can survive f failures of committed data. That means less disk and less replication traffic for the same safety. The cost: a slow follower adds latency until it is dropped from the ISR, and the ISR can shrink. The Kafka design docs make exactly this argument.
+
+**Leader failure.** The controller notices the broker is gone, picks a new leader **from the ISR**, bumps the **leader epoch**, and publishes the change. Clients get `NOT_LEADER`, refresh metadata and retry. When the old leader comes back, it uses leader-epoch history to find where its log diverges from the new leader and **truncates** the extra, uncommitted tail before following again.
+
+**Unclean leader election** (`unclean.leader.election.enable`, default false): if every ISR member is dead, should an out-of-sync replica become leader? Yes = available again but **committed data is lost**. No = the partition stays offline until an ISR member returns. This is a CAP choice; see [CAP and PACELC](/learn/notes/cap-pacelc-consistency/).
+
+### 3. The producer: acks, batching and idempotence
+
+| `acks` | Leader replies when | Risk |
+|---|---|---|
+| `0` | never waits | Lost silently on any error |
+| `1` | leader wrote it locally | Lost if the leader dies before followers copy it |
+| `all` | every ISR member has it | Safe as long as ISR size ≥ `min.insync.replicas` |
+
+Kafka 3.0+ producers default to `acks=all` with idempotence on.
+
+**Batching.** The client keeps one buffer per partition. It sends a batch when it reaches `batch.size` (default 16 KB) or after `linger.ms` (default 5 ms since Kafka 4.0, 0 before). Bigger batches mean fewer requests and better compression, for a few ms of latency.
+
+**Idempotent retries.** A network timeout after a successful write makes the producer retry, which would duplicate the message. Fix: each producer gets a **producer ID**, and each batch carries a **sequence number** per partition. The leader remembers the last sequences it accepted and drops a batch it has already seen. This also keeps order with up to 5 in-flight requests per connection. Details: [Kafka Producer](/learn/notes/kafka-producer/).
+
+**How to say it:** "Durability is `acks=all` plus `min.insync.replicas=2` with RF 3. Throughput comes from batching and compression. Retries are safe because the broker dedupes by producer ID and sequence number."
+
+### 4. Consumers: groups, offsets and delivery semantics
+
+- A **consumer group** is one logical application. Each partition is given to **exactly one member** of the group at a time, so order inside a partition holds and the group needs no locks. Max useful parallelism = partition count.
+- The broker does **not** track which messages each consumer has acknowledged. Each consumer has one number per partition: its **offset**. That is why a log can serve thousands of consumers cheaply and why replay is just "set the offset back".
+- **Pull, not push.** Consumers fetch at their own pace (with long polling so an empty partition doesn't cause busy-looping). A slow consumer simply falls behind (lag) instead of being flooded.
+- **Rebalancing**: when members join or leave, partitions are reassigned. Kafka 4.0 made the new incremental protocol (KIP-848) generally available, which reduces stop-the-world pauses. See [Consumer Rebalancing](/learn/notes/kafka-consumer-rebalancing/).
+
+**Delivery semantics** come from *when you commit*:
+
+| Order of steps | Semantics | Failure case |
+|---|---|---|
+| commit offset, then process | at-most-once | crash after commit → message skipped |
+| process, then commit | at-least-once | crash before commit → message reprocessed |
+| process + commit atomically (transactions, or offset stored with the result in your DB) | effectively exactly-once | needs transactions or idempotent sinks |
+
+The practical default is **at-least-once plus an idempotent consumer** (dedupe by message ID or use upserts). Full treatment: [Delivery Semantics](/learn/notes/delivery-semantics/) and [Kafka Transactions & EOS](/learn/notes/kafka-transactions-eos/).
+
+### 5. Retention and compaction
+
+- **Delete policy** (default): drop whole **closed segments** once their newest record is older than `retention.ms` (default 7 days), or when the partition is over a size cap. Deleting a file is cheap, unlike deleting rows.
+- **Compact policy**: for keyed topics (like "latest profile per user" or the offsets topic), a background cleaner rewrites old segments keeping **at least the latest record per key**. Offsets never change and order is kept; gaps just appear. A record with a null value is a **tombstone** that deletes the key; tombstones are kept for `delete.retention.ms` (default 1 day) so slow readers still see the delete.
+- **Tiered storage** (Kafka KIP-405, production-ready since Kafka 3.9): closed segments are copied to object storage and local copies are dropped sooner. Brokers become smaller and recover faster, and long retention becomes cheap. Our scale math shows why: about 152 brokers for 7 days on local disk versus about 22 with 1 day local.
+
+### 6. Metadata and the controller: a Raft-style quorum
+
+Data replication uses the ISR, but **metadata** (who leads partition 7, what's in its ISR, which brokers are alive) must be **agreed** by everyone. Two brokers both believing they lead the same partition is the worst failure in this system.
+
+- Run **3 or 5 controller nodes** that replicate a **metadata log** with Raft: one active controller (the Raft leader) appends changes; a change is committed once a majority has it. 3 controllers survive 1 failure, 5 survive 2 (2N+1).
+- Brokers **follow the metadata log** and keep a local copy, so they don't query the controller on each request. They send heartbeats; a broker that misses them is **fenced**, and the controller moves its leaderships to ISR members.
+- **Epochs fence zombies.** Every leader change bumps the partition's leader epoch. Requests carrying an old epoch are rejected: followers have moved to the new leader, and the controller refuses ISR changes from the old one. So a paused-then-resumed old leader can't commit any write.
+- This is Kafka's **KRaft** design (KIP-500). It replaced ZooKeeper; Kafka 4.0 is the first release that runs entirely without ZooKeeper. Why put metadata in a log? Brokers can catch up by reading from their last position instead of reloading everything, and failover to a standby controller is fast because standbys already have the log.
+
+Why not Raft for the data too? Raft needs a majority (2f+1). For high-volume data the ISR's f+1 is cheaper. For small, critical metadata, majority agreement is worth it. Background: [Consensus: Raft and Paxos](/learn/notes/consensus-raft-paxos/).
+
+### 7. Back-pressure: what happens when someone is too fast
+
+Back-pressure means a slow part of the system makes the fast part slow down instead of falling over.
+
+- **Consumers are slower than producers**: the pull model is natural back-pressure. Data simply waits in the log (lag grows). The danger is lag passing the retention window, after which unread data is deleted. Alert on lag in time, not just messages.
+- **Producer outruns the network or broker**: the client's buffer (`buffer.memory`, 32 MiB default) fills, and `send()` blocks for up to `max.block.ms` (60 s default), then fails. The application must handle that error (slow down, shed, or spill).
+- **Brokers protect themselves with quotas**: per user or client-id byte-rate and request-rate limits. A client over its quota isn't rejected; the broker computes a delay, returns a throttle time and mutes that connection for that long. One noisy tenant can't starve others. See [Rate Limiting](/learn/notes/rate-limiting/).
+- **ISR too small**: with `min.insync.replicas` not met, `acks=all` writes fail fast. That is back-pressure for safety: better to refuse than to accept writes on a single copy.
+- **Consumer is slow per message**: if processing one batch takes longer than the poll interval, the member is kicked from the group and a rebalance follows. Fix with smaller batches, more partitions, or a separate worker pool with bounded queues.
+
+### 8. Log or queue? When to design SQS-style instead
+
+A **log** is the right shape when you want ordering per key, high throughput, many independent readers and replay. A **queue** (SQS, RabbitMQ) is the right shape when each message is a **task** that one worker must finish.
+
+| Need | Log (Kafka-like) | Queue (SQS-like) |
+|---|---|---|
+| Unit of tracking | one offset per partition per group | state per message (visible, in-flight, deleted) |
+| Ack | commit offset (covers all earlier messages) | ack/delete each message |
+| One slow or poison message | blocks its partition (head-of-line) | others continue; it retries then goes to a DLQ |
+| Parallelism | capped by partition count | add workers freely |
+| Replay | yes, reset offset | no, deleted after ack |
+| Ordering | per partition | none (standard) or per group (FIFO) |
+| Many readers of same data | cheap, each group has its own offset | need fan-out (one queue per subscriber) |
+
+**Designing the queue variant:** store messages in a partitioned store, and on `receive` mark a message **in-flight** with a **visibility timeout**. If the worker deletes it before the timeout, it is done. If not, it becomes visible again and another worker gets it (at-least-once). Track a receive count, and after N attempts move the message to a **dead-letter queue**. SQS works this way: default visibility timeout 30 s, extendable up to 12 hours from first receipt. The cost is per-message bookkeeping on the broker, which is exactly what the log avoids.
+
+Kafka itself added queue-style **share groups** (KIP-932, production-ready in Kafka 4.2): consumers in a share group can read the same partition and ack records one by one. More: [SQS and SNS](/learn/notes/aws-sqs-sns/), [Pulsar vs RabbitMQ vs SQS](/learn/notes/pulsar-rabbitmq-sqs/), [RabbitMQ](/learn/notes/rabbitmq-deep/).
+
+## Bottlenecks & optimizations
+
+- **Disk capacity** dominates (about 1.8 PB for 7 days at RF 3): compress batches (lz4/zstd), use tiered storage, shorten local retention.
+- **Hot partition** from a skewed key: pick a higher-cardinality key, add a suffix to known hot keys (losing strict order for them), or give that traffic its own topic.
+- **Too few partitions** caps consumer parallelism; **too many** means more open files, more metadata and slower leader failover. Size from throughput (we got about 200 to 400 for the big topic).
+- **Cross-AZ replication cost**: rack-aware replica placement spreads replicas across zones for safety; let consumers fetch from a same-zone follower (Kafka supports follower fetching since 2.4, KIP-392) to cut cross-zone traffic.
+- **Lagging consumers reading old data** fall out of the page cache and hit disk, which can slow everyone. Isolate catch-up readers or serve old data from tiered storage.
+- **Large messages** wreck batching and memory: keep messages small; put big payloads in object storage and send a pointer (claim-check pattern).
+- **Controller load** grows with partition count; keeping metadata as a log with snapshots lets brokers catch up incrementally.
+
+## Failure handling
+
+| Failure | What happens | Data loss? |
+|---|---|---|
+| Follower broker dies | Dropped from ISR after the lag timeout; leader keeps going if ISR ≥ min.insync. Returns, catches up, rejoins ISR. | No |
+| Leader broker dies | Controller fences it, elects a new leader from ISR, bumps epoch. Producers retry (idempotence prevents duplicates). | No for committed data. Uncommitted tail may be lost; with `acks=all` those writes were never acked, so producers retry them. |
+| Old leader returns after a pause | Its epoch is stale, so it can't commit writes (followers don't fetch from it and the controller rejects its ISR changes). It learns of the new leader, truncates its divergent tail and follows. | No |
+| All ISR members die | Partition offline (clean election) or out-of-sync replica leads (unclean). | Unclean → yes |
+| Active controller dies | Raft elects a new controller from standbys within seconds; data paths keep working meanwhile with cached metadata. | No |
+| Controller majority lost | No metadata changes (no failover, no topic creation) until majority is back. Existing leaders keep serving. | No, but no failover |
+| Consumer crashes | Group rebalances; its partitions go to other members starting from the last committed offset. | No, but reprocessing (at-least-once) |
+| Consumer lags past retention | Unread segments deleted; the group's offset is out of range and it resets to earliest or latest. | Yes, for that consumer |
+| Disk full on a broker | Writes fail for partitions on it; move partitions, expand, or cut retention. Alert well before. | Possible if unmanaged |
+| Network partition isolates the leader | It can't reach followers or the controller; it is fenced and a new leader is elected on the majority side. Its writes can't commit under `acks=all` with min.insync=2. | No for acked writes |
+
+See also [HLD Failure Scenarios](/learn/notes/hld-failure-scenarios/) and [Kafka Scenarios](/learn/notes/kafka-scenarios/).
+
+## Trade-offs
+
+| Decision | Chosen | Alternative | Why |
+|---|---|---|---|
+| Storage shape | Append-only partitioned log | Per-message queue with ack state | Throughput, replay, many readers; queue only if per-message ack is the requirement |
+| Ordering | Per partition | Global | Global order means one partition, which can't scale |
+| Data replication | Leader + ISR (f+1) | Majority quorum (2f+1), leaderless | Less disk and bandwidth for the same tolerance; ordering needs a single writer |
+| Metadata | Raft controller quorum | External ZooKeeper; gossip | One fewer system to run; strong agreement on leaders; gossip is too weak for leadership |
+| Durability | Replicate to page cache of ISR | fsync every write | Much higher throughput; risk only if all replicas lose power at once |
+| Delivery | Pull with consumer-held offsets | Broker push with per-message acks | Natural back-pressure, tiny broker state, replay |
+| Retention | Delete old segments / compact by key | Delete on consume | Allows replay and multiple readers; costs disk |
+| Storage tier | Local disk + tiered object store | Local only; separate storage layer (Pulsar + BookKeeper) | Cheap long retention while keeping one system |
+| Partition count | Generous, fixed up front | Grow often | Adding partitions remaps keys and breaks per-key order across the change |
+
+## Practice questions
+
+<Practice>
+
+<QA q="Why is a partitioned append-only log faster than a traditional queue?" level="easy">
+
+It only does sequential writes and reads, which disks do far faster than random I/O. It keeps almost no per-message state: each consumer group has one offset per partition, so there is no per-message ack bookkeeping. It batches everything (produce, replicate, fetch), serves hot data from the OS page cache, and can use zero-copy `sendfile` to send bytes to sockets on plaintext connections.
+
+</QA>
+
+<QA q="What is the ISR and what does committed mean?" level="easy">
+
+The in-sync replica set is the leader plus followers that are caught up (in Kafka, within `replica.lag.time.max.ms`, 30 s by default, and still registered with the controller). A message is committed once every ISR member has it. The high watermark marks the end of committed data, and consumers only read below it, so they never see data a failover could remove.
+
+</QA>
+
+<QA q="How does a broker find offset 5,000,123 quickly?" level="easy">
+
+Segment files are named by their first offset, so it binary searches those names to pick the segment. Inside that segment it binary searches the sparse offset index (one entry about every 4 KB of log) for the closest earlier entry, which gives a byte position. Then it scans forward a few KB to the exact record.
+
+</QA>
+
+<QA q="Compare acks=0, 1 and all." level="medium">
+
+`acks=0`: the producer doesn't wait; anything can be lost. `acks=1`: the leader wrote it locally; lost if the leader dies before followers copy it. `acks=all`: every ISR member has it; safe as long as the ISR is at least `min.insync.replicas`. For durability use RF 3, `min.insync.replicas=2`, `acks=all`, which tolerates one broker down while still accepting writes.
+
+</QA>
+
+<QA q="Why use an ISR for data but a Raft majority quorum for metadata?" level="medium">
+
+An ISR survives f failures with f+1 replicas because it waits for all healthy replicas, so it is cheaper for huge data volumes. A majority quorum needs 2f+1 but doesn't depend on slow members and gives strong agreement. Metadata (who leads which partition) is small and must never have two answers, so majority agreement is worth the cost. Data needs throughput, so the ISR wins.
+
+</QA>
+
+<QA q="How many partitions would you give a topic and what goes wrong with too many?" level="medium">
+
+Start from throughput: target rate divided by what one consumer instance can handle (e.g., 1,000 MB/s over 5 MB/s gives 200), then add headroom since adding partitions later remaps keys. Too many partitions means more open files and memory, more metadata for the controller, longer failover when a broker with many leaders dies, and smaller batches per partition.
+
+</QA>
+
+<QA q="How do you get exactly-once processing from an at-least-once log?" level="medium">
+
+Make retries harmless. On the produce side, the idempotent producer (producer ID plus per-partition sequence numbers) stops duplicate writes. On the consume side, either make the handler idempotent (dedupe by message ID, upserts) or commit the offset atomically with the result, using Kafka transactions for read-process-write within Kafka or storing the offset in the same database transaction as the output.
+
+</QA>
+
+<QA q="What is log compaction and when would you use it?" level="medium">
+
+For a keyed topic, a background cleaner rewrites old segments keeping at least the latest record per key; offsets and order stay the same. A null-value record is a tombstone that deletes the key, and tombstones live for `delete.retention.ms` (1 day default). Use it for changelogs and state, like latest user profile, CDC tables, or the internal consumer-offsets topic, where a new reader needs the current value of every key, not full history.
+
+</QA>
+
+<QA q="How does the system stop an old leader that was paused from accepting writes?" level="hard">
+
+Every leader change bumps the partition's leader epoch in the controller's metadata log. Followers now fetch from the new leader, the controller rejects any ISR change carrying the stale epoch, and the paused broker has also been fenced for missing heartbeats. With `acks=all` and `min.insync.replicas=2` it can't commit anything alone. When it recovers, it compares leader-epoch history with the new leader and truncates its log to where they diverge before following.
+
+</QA>
+
+<QA q="Design back-pressure end to end for this system." level="hard">
+
+Consumers pull, so slow consumers just build lag; alert on lag in time and keep it well under retention. Producers have a bounded buffer: when it fills, `send()` blocks up to `max.block.ms` then errors, and the app must slow down or shed. Brokers enforce per-client byte-rate and request-rate quotas by delaying responses and muting the connection, so one tenant can't starve others. If the ISR drops below `min.insync.replicas`, `acks=all` writes fail fast rather than accepting under-replicated data.
+
+</QA>
+
+<QA q="When would you design an SQS-style queue instead of a log?" level="hard">
+
+When each message is an independent task and you need per-message ack, retries and a dead-letter queue, or when one slow or poison message must not block others, or when you want to add workers beyond a partition count. The queue tracks state per message: receive marks it in-flight with a visibility timeout, delete acks it, and timeout makes it visible again. You lose replay and cheap fan-out to many readers, and the broker carries more state.
+
+</QA>
+
+<QA q="Why do brokers rely on replication instead of fsync on every write?" level="hard">
+
+An fsync per write would make throughput depend on disk flush latency. Instead the leader writes to the page cache and counts a write as committed when all ISR members have it, so the data is in several machines' memory and soon on their disks. A single broker crash loses nothing committed. The remaining risk is all ISR members losing power at the same moment, which you reduce by placing replicas in different racks or zones.
+
+</QA>
+
+<QA q="A consumer group's lag keeps growing during a sale. What do you do?" level="scenario">
+
+First check if it's processing time or partitions. If the group has fewer members than partitions, add instances. If every partition already has a member, the limit is partition count or per-message work: speed up processing (batch DB writes, async I/O), hand records to a bounded worker pool while keeping per-key order, or add partitions for the future knowing keys will remap. Check for one hot partition from a skewed key. Watch lag in time against retention so data isn't deleted before it's read.
+
+</QA>
+
+<QA q="One malformed message makes a consumer crash and restart forever. Fix it." level="scenario">
+
+In a log the bad message blocks its partition because the offset never moves. Catch the error, retry a few times, then publish the message to a dead-letter topic with error details and commit past it. Alert on the DLQ and build a tool to replay fixed messages. If poison messages are common and order doesn't matter, a queue with per-message retries and a built-in DLQ (or Kafka share groups) fits better.
+
+</QA>
+
+<QA q="A broker in a 3-broker cluster dies and producers with acks=all start failing. Why, and what are your options?" level="scenario">
+
+Some partitions likely had an ISR that shrank below `min.insync.replicas`, for example a follower was already lagging, so only the leader remained and `acks=all` writes are refused with NOT_ENOUGH_REPLICAS. That is the system protecting durability. Options: bring the broker back or reassign replicas to healthy brokers so the ISR recovers. Lowering `min.insync.replicas` to 1 or switching to `acks=1` restores writes but risks losing acknowledged data, so do it only as a conscious, temporary choice.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="With RF=3, min.insync.replicas=2 and acks=all, what happens if two of the three replicas are down?" options={["Writes succeed on the leader alone", "Writes are refused because the ISR is smaller than 2", "An out-of-sync replica is elected automatically", "Writes are buffered on the controller"]} answer={1}>
+
+With only one replica in the ISR, `acks=all` writes fail with NOT_ENOUGH_REPLICAS. Accepting them on one copy is exactly what the setting prevents. Unclean election is off by default, and controllers don't store data.
+
+</MCQ>
+
+<MCQ q="Why can consumers only read up to the high watermark?" options={["To give producers priority", "Because data beyond it is not compressed yet", "So they never see records that a leader failover could erase", "Because the index only covers that range"]} answer={2}>
+
+Records above the high watermark are not yet on every ISR member, so a new leader might not have them. Hiding them means consumers never see data that later disappears.
+
+</MCQ>
+
+<MCQ q="An ISR-based design and a majority quorum each want to survive 2 replica failures. How many replicas does each need?" options={["3 and 5", "5 and 5", "3 and 3", "2 and 3"]} answer={0}>
+
+ISR waits for all healthy replicas, so f+1 = 3 tolerates 2 failures of committed data. A majority quorum needs 2f+1 = 5.
+
+</MCQ>
+
+<MCQ q="Which policy best fits a topic holding the latest address of each customer?" options={["Delete after 7 days", "Delete when consumed", "Unlimited retention without compaction", "Log compaction keyed by customer ID"]} answer={3}>
+
+Compaction keeps the latest record per key forever, so a new reader rebuilds current state. Time deletion would lose customers who haven't changed recently, and keeping everything wastes disk on old versions.
+
+</MCQ>
+
+<MCQ q="A consumer processes a record, then crashes before committing its offset. What semantics is this?" options={["At-most-once", "At-least-once", "Exactly-once", "No guarantee at all"]} answer={1}>
+
+On restart it resumes from the last committed offset and processes the record again, so you get duplicates but no loss: at-least-once. Committing before processing would be at-most-once.
+
+</MCQ>
+
+<MCQ q="What is the main purpose of the producer ID and sequence number on each batch?" options={["Let the leader drop duplicate batches caused by retries", "Encrypt batches", "Choose the partition", "Track consumer position"]} answer={0}>
+
+The leader remembers recent sequence numbers per producer and partition, so a retried batch it already wrote is dropped. Partitioning uses the key, and consumer position is the offset.
+
+</MCQ>
+
+<MCQ q="Why does the design keep cluster metadata in a Raft-replicated log?" options={["Raft is faster than ISR for message data", "It removes the need for leaders", "Leadership must be agreed by a majority and brokers can catch up by reading the log", "It lets producers write to any broker"]} answer={2}>
+
+Metadata must have one agreed answer, which majority consensus gives, and a log lets brokers and standby controllers catch up incrementally. Raft isn't used for message data because it needs 2f+1 replicas.
+
+</MCQ>
+
+<MCQ q="Which requirement most strongly points to an SQS-style queue rather than a log?" options={["Replay last week's events", "Many independent applications read every message", "Strict order per customer", "Each task needs its own ack, retry and DLQ, and a slow task must not block others"]} answer={3}>
+
+Per-message ack and independent retries are what a queue tracks and a log avoids. Replay, many readers and per-key order are strengths of the log.
+
+</MCQ>
+
+<MCQ q="A broker is overloaded by one client sending too fast. How do quotas push back?" options={["The broker closes the connection permanently", "The broker delays its response and mutes that client's connection for the throttle time", "The controller deletes the client's topic", "The broker drops random messages"]} answer={1}>
+
+Quotas compute a delay, reply with a throttle time and mute the channel, so the client slows down without losing data or harming others.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **Shape**: topic → partitions → append-only log of segments + sparse offset and time indexes. Order is per partition.
+- **Partitioning**: `hash(key) % partitions`; choose count from throughput with headroom; adding partitions remaps keys.
+- **Fast because**: sequential I/O, page cache, batching and batch compression, zero-copy (plaintext only), tiny per-consumer state.
+- **Replication**: leader + followers pulling; ISR; committed = on all ISR; consumers read below the high watermark; leader epochs truncate divergent logs.
+- **Durable recipe**: RF 3, `min.insync.replicas=2`, `acks=all`, idempotent producer, unclean election off.
+- **Consumers**: groups split partitions; offsets committed to a compacted internal topic; pull with long-poll.
+- **Semantics**: commit-then-process = at-most-once; process-then-commit = at-least-once; add idempotency or transactions for effectively exactly-once.
+- **Retention**: delete closed segments by time/size, or compact by key with tombstones; tiered storage for long retention.
+- **Metadata**: 3 or 5 controllers in a Raft quorum (KRaft); epochs fence zombies; Kafka 4.0 has no ZooKeeper.
+- **Back-pressure**: pull + lag, bounded producer buffer that blocks, broker quotas that throttle, min-ISR refusal.
+- **Queue instead** when you need per-message ack, visibility timeout, retries and DLQ, and no head-of-line blocking.
+- **Numbers here**: 1 GB/s in → 86.4 TB/day → about 1.8 PB for 7 days at RF 3; about 152 brokers on local disk vs about 22 with 1 day local + tiered storage.
+
+## Go deeper
+
+- [Apache Kafka design documentation](https://kafka.apache.org/43/design/design/): the official reasoning on persistence, pull consumers, ISR vs majority voting, compaction and quotas.
+- [Apache Kafka KRaft operations](https://kafka.apache.org/43/operations/kraft/): controller quorum sizing and deployment.
+- [KIP-500: Replace ZooKeeper with a self-managed metadata quorum](https://cwiki.apache.org/confluence/display/KAFKA/KIP-500%3A+Replace+ZooKeeper+with+a+Self-Managed+Metadata+Quorum)
+- [KIP-405: Kafka Tiered Storage](https://cwiki.apache.org/confluence/display/KAFKA/KIP-405%3A+Kafka+Tiered+Storage)
+- [KIP-932: Queues for Kafka (share groups)](https://cwiki.apache.org/confluence/display/KAFKA/KIP-932%3A+Queues+for+Kafka)
+- [Apache Kafka 4.0 release announcement](https://kafka.apache.org/blog/2025/03/18/apache-kafka-4.0.0-release-announcement/): first release without ZooKeeper; KIP-848 GA.
+- [Kafka: a Distributed Messaging System for Log Processing](https://notes.stephenholiday.com/Kafka.pdf) (Kreps, Narkhede, Rao, NetDB 2011): the original LinkedIn paper.
+- [In Search of an Understandable Consensus Algorithm (Raft)](https://raft.github.io/raft.pdf)
+- [Confluent: Hands-free Kafka replication](https://www.confluent.io/blog/hands-free-kafka-replication-a-lesson-in-operational-simplicity/): why lag time, not message count, defines the ISR.
+- [Amazon SQS visibility timeout](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html): the per-message-ack queue model.
+- On this site: [Kafka Deep Dive](/learn/notes/kafka-deep/), [Kafka Internals](/learn/notes/kafka-internals/), [Kafka Producer](/learn/notes/kafka-producer/), [Consumer Rebalancing](/learn/notes/kafka-consumer-rebalancing/), [Delivery Semantics](/learn/notes/delivery-semantics/), [Distributed KV Store and Commit Log](/learn/notes/hld-distributed-kv-store/).

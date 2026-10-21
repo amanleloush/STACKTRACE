@@ -1,0 +1,1191 @@
+---
+title: "LLD: ATM Machine"
+phase: "14-lld"
+order: 161
+tags: ["lld", "machine-coding", "java", "design-patterns", "state-pattern", "chain-of-responsibility", "atm"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 50
+prerequisites: ["machine-coding-strategy", "behavioral-patterns", "java-concurrency-locks", "lld-vending-machine-logger"]
+summary: "A complete, tested Java 21 ATM machine-coding solution: a State machine from idle to out of service, a PIN retry limit, a Chain of Responsibility cash dispenser that falls back when greedy fails, the bank behind an interface, debit-then-dispense with a compensating reversal, and a per-day withdrawal limit that holds across many ATMs."
+---
+
+## Definition (interview-ready)
+
+An ATM lets a customer insert a card, enter a PIN, and withdraw cash or check a balance. The machine itself never owns money rules: it asks the bank. The core entities are an `Atm` (the context), five `AtmState` classes (`Idle`, `CardInserted`, `Authenticated`, `Transaction`, `OutOfService`), a `BankService` interface for the backend, and a `CashDispenser` built as a chain of `NoteHandler`s for 2000, 500, 200 and 100 notes. **State** fits because the same button means different things at each step. **Chain of Responsibility** fits because each denomination decides how many of its notes to give and passes the rest on, with a fallback when plain greedy gets stuck. A withdrawal is ordered as plan, then debit, then dispense, with a **compensating reversal** if the notes never come out. The bank enforces the PIN retry limit and the per-day limit, so they hold across every ATM.
+
+**One-liner:** A State machine drives the session, a bank interface owns balances, PIN tries and daily limits, and a denomination chain plans the notes before the debit so a failed dispense can always be reversed.
+
+## Problem statement
+
+> Design and implement the software for an ATM.
+>
+> - A customer inserts a **card** and enters a **PIN**. After **3 wrong PINs** the card is blocked and kept by the machine.
+> - Once logged in, the customer can **check balance** and **withdraw cash**, more than once per session, then take the card back.
+> - The machine holds notes of **2000, 500, 200 and 100**, in limited numbers. It must pay the exact amount asked for, or refuse.
+> - Account balances live in the **bank's backend**, not in the ATM.
+> - Each card has a **daily withdrawal limit**.
+> - The machine can **break** while paying out. The customer must never lose money because of that.
+> - An operator can take the machine **offline**, load cash and bring it back.
+> - Write a demo `main` that shows the important flows.
+
+Interviewers like this problem because one round tests three things: clean modelling, a small algorithm with tricky edge cases, and careful failure handling. The [Machine Coding Rounds strategy note](/learn/notes/machine-coding-strategy/) covers how to budget your time; this note shows a full answer.
+
+## Clarifying questions to ask
+
+| Question | Assumed answer |
+|---|---|
+| Who counts wrong PINs: the ATM or the bank? | The **bank**. Otherwise a thief just walks to the next ATM for three more tries. |
+| What happens on the third wrong PIN? | Card is blocked at the bank and retained by the machine; the ATM goes back to idle. |
+| Who enforces the daily limit? | The **bank**, for the same reason: it must hold across all ATMs. |
+| Which amounts are valid? | Positive multiples of 100, at most 20,000 per withdrawal (a machine-side cap). |
+| What if the machine has the money but not the right notes? | Refuse before debiting. Never debit for an amount you can't pay. |
+| Fewest notes, or any valid mix? | Prefer large notes (greedy) but fall back to any valid mix rather than refusing. |
+| What if the dispenser jams after the debit? | Reverse the debit, return the card, go out of service. |
+| What if the bank does not answer the debit in time? | Treat it as "maybe debited": pay nothing and send a reversal. |
+| Deposits, transfers, PIN change, receipts printer, screens? | Out of scope; mention as extensions. |
+| Concurrency? | One customer per ATM at a time, but many ATMs hit the same bank and the same account at once. |
+| Money type? | Whole rupees as `long`. |
+
+## Requirements
+
+**Functional (in scope)**
+
+1. Card insert, PIN check with 3 attempts, eject.
+2. Balance check and withdrawal, repeatable within one session.
+3. Note planning across 2000/500/200/100 with limited stock; exact amount or refusal.
+4. Bank behind an interface: card status, PIN check, balance, debit, reversal.
+5. Per-card daily withdrawal limit, reset each day.
+6. Dispense failure after debit leads to an automatic reversal and out-of-service.
+7. Operator: take offline, load cash, bring online.
+
+**Non-functional**
+
+- **No lost money:** the customer is never debited without getting cash (or a reversal), and never gets cash without a debit.
+- **Correct under concurrency:** two ATMs debiting the same account can't overspend the balance or the daily limit.
+- **Testable:** bank, dispenser hardware and clock are injected.
+- **Extensible:** a new transaction type or denomination should not require rewriting the state machine.
+
+**Out of scope:** deposits, transfers, PIN change, mini statements, real card networks and encryption. See [Extensions](#extensions-interviewers-ask-for).
+
+## Entities and relationships
+
+```text
+                           ┌──────────────────────── Atm (context) ────────────────────────┐
+ customer ── insertCard ──►│ state: AtmState          card: current session's card         │
+            enterPin       │ pendingReversals: txnIds the bank hasn't confirmed yet         │
+            selectWithdrawal│                                                               │
+            enterAmount    │  ◆── BankService «interface» ◁── InMemoryBank                  │
+            checkBalance   │  ◆── CashDispenser ◆── NoteHandler(2000) → (500) → (200) → (100)│
+            ejectCard      │                     ◆── DispenserHardware «interface»          │
+ operator ── takeOffline,  └────────────────────────────────────────────────────────────────┘
+             loadCash, bringOnline
+                                  AtmState «interface»
+            ┌──────────┬──────────────┼──────────────┬─────────────┬───────────────┐
+        IdleState  CardInsertedState  AuthenticatedState  TransactionState  OutOfServiceState
+
+ PinCheck(status, attemptsLeft)   DebitResult {APPROVED, INSUFFICIENT_FUNDS, DAILY_LIMIT_EXCEEDED, CARD_BLOCKED}
+ Receipt(txnId, maskedCard, amount, notes)
+```
+
+The state machine:
+
+```text
+                 bringOnline                 insertCard (card active)
+   OUT_OF_SERVICE ──────────► IDLE ───────────────────────────► CARD_INSERTED
+        ▲   ▲  loadCash         ▲  ▲                                │   │ wrong PIN (tries left): stay
+        │   │                   │  │ eject / cancel                  │   │
+        │   └── takeOffline ────┘  └────────────────────────────────┘   │ 3rd wrong PIN: block, retain card ──► IDLE
+        │                          ▲                                    │ correct PIN
+        │ jam after debit          │ eject / cancel                     ▼
+        │ (reverse, return card)   └──────────────────────────── AUTHENTICATED ◄──┐
+        │                                                    selectWithdrawal │    │ amount done / failed / cancel
+        └──────────────────────────────────────────────────────── TRANSACTION ─┘
+   (eject when the cassettes are empty also lands in OUT_OF_SERVICE)
+```
+
+- `Atm` **has** one current state, one dispenser and a reference to the bank. States hold no data; the session's card lives on the `Atm`.
+- `CashDispenser` **owns** a chain of `NoteHandler`s, largest note first, plus the hardware it drives.
+- The bank is **not** part of the ATM. It is a separate system the ATM talks to through `BankService`, which is why balances, PIN counters and daily usage live there.
+
+## Design patterns used and why
+
+| Pattern | Where | Why it earns its place |
+|---|---|---|
+| **State** | `AtmState` and its five classes | Each action (insert card, enter PIN, enter amount) is legal in some steps and illegal in others. Without State, every method starts with a `switch` on a status enum and the rules are scattered. With it, each class lists only what is legal there and decides the next state. See [State](/learn/notes/behavioral-patterns/). |
+| **Chain of Responsibility** | `NoteHandler` links 2000 → 500 → 200 → 100 | Each denomination handles its share and passes the remainder on. Adding a 50 note is one more link, not a code change in the others. See [Chain of Responsibility](/learn/notes/behavioral-patterns/). |
+| **Strategy / Adapter boundary** | `BankService`, `DispenserHardware` | Interfaces at the edges of the system. Tests plug in a flaky bank or a jamming dispenser with a few lines. In production, an adapter would translate `BankService` calls into the card network's messages. See [Adapter](/learn/notes/structural-patterns/). |
+| **Compensating transaction** | `Atm.withdraw` reverses the debit on failure | The bank debit and the physical dispense can't share one database transaction, so we make the first step undoable and undo it when the second fails. |
+
+The [vending machine note](/learn/notes/lld-vending-machine-logger/) uses State too, with the same "reject by default" trick, and covers change-making theory (canonical coin systems, bounded DP) in more depth. This note focuses on what is new for an ATM: a remote bank and a payout that can fail after the money moved.
+
+## Solution walkthrough
+
+### Step 1: draw the bank boundary first
+
+```java
+enum PinStatus { OK, WRONG, BLOCKED }
+record PinCheck(PinStatus status, int attemptsLeft) {}
+
+enum DebitResult { APPROVED, INSUFFICIENT_FUNDS, DAILY_LIMIT_EXCEEDED, CARD_BLOCKED }
+
+/** Everything the ATM needs from the bank's backend. The ATM never touches balances itself. */
+interface BankService {
+    boolean isCardActive(String card);
+    PinCheck verifyPin(String card, String pin);
+    long balance(String card);
+    /** Idempotent per txnId: retrying the same txnId never debits twice. */
+    DebitResult debit(String card, long amount, String txnId);
+    /** Idempotent compensation: reversing twice, or reversing an unknown txnId, is a no-op. */
+    void reverse(String txnId);
+}
+```
+
+Start here because it decides where every rule lives. An ATM is a **terminal**: the bank is the source of truth for balances, PIN attempts and the daily limit. If the ATM counted wrong PINs, pulling the card out and trying another ATM would reset the counter.
+
+Two words in the comments matter a lot:
+
+- **Idempotent** — doing it twice has the same effect as doing it once. The ATM sends a `txnId` with every debit, so if the network drops the reply and the ATM retries, the bank recognises the id and doesn't charge again.
+- **Compensation** — instead of rolling back (impossible across two systems), we run an opposite action. `reverse(txnId)` puts the money back.
+
+### Step 2: the in-memory bank, one lock per account
+
+```java
+public DebitResult debit(String card, long amount, String txnId) {
+    Account a = account(card);
+    synchronized (a) {                         // limit check + balance check + debit = one atomic step
+        if (debits.containsKey(txnId)) return DebitResult.APPROVED;          // retry of the same txn
+        if (a.blocked) return DebitResult.CARD_BLOCKED;
+        LocalDate today = LocalDate.now(clock);
+        if (!today.equals(a.day)) { a.day = today; a.withdrawnToday = 0; }    // new day, fresh limit
+        if (a.withdrawnToday + amount > a.dailyLimit) return DebitResult.DAILY_LIMIT_EXCEEDED;
+        if (a.balance < amount) return DebitResult.INSUFFICIENT_FUNDS;
+        a.balance -= amount;
+        a.withdrawnToday += amount;
+        debits.put(txnId, new Debit(card, amount, today));
+        return DebitResult.APPROVED;
+    }
+}
+
+public void reverse(String txnId) {
+    Debit d = debits.get(txnId);
+    if (d == null || !reversed.add(txnId)) return;     // never debited, or already reversed
+    Account a = account(d.card());
+    synchronized (a) {
+        a.balance += d.amount();
+        if (d.day().equals(a.day)) a.withdrawnToday -= d.amount();   // give the limit back too
+    }
+}
+```
+
+The **daily limit** is a pair of fields: which day `withdrawnToday` refers to, and the running total. When the first debit of a new day arrives, the total resets. This "lazy reset" needs no midnight job. The day comes from an injected `Clock`, so a test can jump forward one day.
+
+Checking the limit, checking the balance and subtracting all happen under the account's lock. Two ATMs debiting the same account then can't both pass the check with the same old numbers (a check-then-act race). The lock is **per account**, so different customers never wait for each other. `reversed` is a concurrent set: `add` returns `true` for exactly one caller, so even 16 threads reversing the same transaction refund it once. Note that a reversal also **gives back the daily limit**; otherwise a jammed machine would eat the customer's allowance.
+
+`verifyPin` follows the same shape: under the lock, compare, increment `failedPins`, block at 3, and reset the counter on success.
+
+### Step 3: the dispenser chain, and why plain greedy is wrong
+
+The textbook chain is greedy: each handler takes as many of its notes as fit and passes the rest on.
+
+```java
+/** Naive greedy: take as many as possible, pass the rest on. Can fail when stock is limited. */
+boolean greedy(long remaining, Map<Integer, Integer> out) {
+    int take = (int) Math.min(remaining / denomination, count);
+    if (take > 0) out.put(denomination, take);
+    long rest = remaining - (long) take * denomination;
+    if (rest == 0) return true;
+    return next != null && next.greedy(rest, out);
+}
+```
+
+With unlimited notes this works for 2000/500/200/100: our test compared greedy with an exact minimum-notes DP for every amount up to 40,000 and they always matched (by the Kozen–Zaks result quoted in the vending machine note, any counterexample would have to be below 2000 + 500, so this range is a proof). **But an ATM's notes are limited.** Say the machine has one 500, three 200s and no 100s, and the customer asks for 600:
+
+```text
+greedy:   500 handler takes 1 → remaining 100 → 200 handler takes 0 → 100 handler has none → FAIL
+correct:  500 handler takes 0 → 200 handler takes 3 → done (600 = 3 × 200)
+```
+
+Refusing a customer when the cash is sitting right there is a bug. The fix keeps the chain and greedy's preference, but lets each link **back off by one note** when the rest of the chain can't finish:
+
+```java
+/** Greedy first, but if the rest of the chain can't finish, retry with one fewer note here. */
+boolean plan(long remaining, Map<Integer, Integer> out) {
+    int max = (int) Math.min(remaining / denomination, count);
+    for (int take = max; take >= 0; take--) {
+        long rest = remaining - (long) take * denomination;
+        if (rest == 0 || (next != null && next.plan(rest, out))) {
+            if (take > 0) out.put(denomination, take);
+            return true;
+        }
+    }
+    return false;
+}
+```
+
+This is **backtracking**: the first answer it finds is the greedy one whenever greedy works, and it only tries smaller counts when needed. A link writes to `out` only after the rest of the chain has succeeded, so a failed branch leaves no garbage behind. Our test checked it against brute force on 3,000 random stocks and amounts: it finds a plan exactly when one exists.
+
+Cost: usually the first (greedy) try succeeds and the work is one pass down the chain. In the worst case backtracking explores combinations, bounded by the product of the note counts it loops over; with four denominations and a 20,000 cap per withdrawal that stays small. For many denominations or large amounts, say you'd switch to a bounded knapsack DP over amount / 100, whose cost grows with the amount instead of exponentially. Planning **does not touch stock**; that happens only after the hardware succeeds.
+
+### Step 4: the dispenser, with hardware behind an interface
+
+```java
+@FunctionalInterface
+interface DispenserHardware {
+    void present(Map<Integer, Integer> notes);   // throws DispenseFailedException on a jam
+}
+
+/** Hardware first; stock is reduced only if the notes really came out. */
+void dispense(Map<Integer, Integer> plan) {
+    hardware.present(plan);
+    plan.forEach((d, n) -> handlers.get(d).add(-n));
+}
+```
+
+The constructor sorts denominations from largest to smallest and links the handlers, so callers can pass them in any order. The hardware is a one-method interface: the demo passes a lambda that throws when a `jam` flag is set.
+
+### Step 5: the states, rejecting by default
+
+```java
+interface AtmState {
+    String name();
+    default void insertCard(Atm atm, String card)           { throw reject("insert a card"); }
+    default PinCheck enterPin(Atm atm, String pin)          { throw reject("enter a PIN"); }
+    default void selectWithdrawal(Atm atm)                  { throw reject("start a withdrawal"); }
+    default Receipt enterAmount(Atm atm, long amount)       { throw reject("enter an amount"); }
+    // ... checkBalance, cancel, ejectCard, takeOffline, loadCash, bringOnline
+    private AtmException reject(String action) { return new AtmException("Cannot " + action + " in state " + name()); }
+}
+
+final class CardInsertedState implements AtmState {
+    public String name() { return "CARD_INSERTED"; }
+    public PinCheck enterPin(Atm atm, String pin) {
+        PinCheck r = atm.bank().verifyPin(atm.card(), pin);
+        switch (r.status()) {
+            case OK      -> atm.setState(new AuthenticatedState());
+            case WRONG   -> { }                                    // stay; customer may retry
+            case BLOCKED -> atm.endSession(true);                  // card retained
+        }
+        return r;
+    }
+    public void cancel(Atm atm)    { atm.endSession(false); }
+    public void ejectCard(Atm atm) { atm.endSession(false); }
+}
+```
+
+Every action has a **default that throws**, so each state overrides only what is legal in it. "Withdraw before PIN" can't slip through because `CardInsertedState` never overrides `selectWithdrawal`. Private interface methods (Java 9+) keep the error message in one place.
+
+The **PIN retry limit** is three lines: on `WRONG` stay put (the result tells the screen how many tries are left), on `BLOCKED` end the session without returning the card. The bank decides which one it is.
+
+`TransactionState` is the step after "Withdraw" is pressed and before the amount is entered. It allows only `enterAmount` and `cancel`, so a balance check or a second card can't interleave with a payout:
+
+```java
+public Receipt enterAmount(Atm atm, long amount) {
+    try {
+        return atm.withdraw(amount);
+    } finally {
+        if (atm.state() == this) atm.setState(new AuthenticatedState());   // unless withdraw moved us
+    }
+}
+```
+
+Whether the withdrawal succeeds or is refused, the customer goes back to the menu. The one exception is a jam, where `withdraw` already moved the machine to `OUT_OF_SERVICE`; the `atm.state() == this` check keeps that.
+
+### Step 6: the withdrawal, where atomicity lives
+
+```java
+/** Order matters: plan -> debit -> dispense, with a compensating reversal if dispense fails. */
+Receipt withdraw(long amount) {
+    if (amount <= 0 || amount % 100 != 0) throw new AtmException("Amount must be a positive multiple of 100");
+    if (amount > maxPerWithdrawal) throw new AtmException("At most " + maxPerWithdrawal + " per withdrawal");
+    // 1. Can this machine pay this exact amount? Check BEFORE taking the customer's money.
+    Map<Integer, Integer> notes = dispenser.plan(amount)
+            .orElseThrow(() -> new AtmException("Cannot dispense " + amount + " with the notes available"));
+    // 2. Debit at the bank. A timeout means "unknown", so we reverse to be safe (reverse is idempotent).
+    String txnId = id + "-" + txnSeq.incrementAndGet();
+    DebitResult result;
+    try {
+        result = bank.debit(card, amount, txnId);
+    } catch (RuntimeException bankDown) {
+        reverseOrQueue(txnId);
+        throw new AtmException("Bank unavailable; no cash dispensed");
+    }
+    if (result != DebitResult.APPROVED) throw new AtmException("Declined: " + result);
+    // 3. Dispense. If the hardware fails after the debit, give the money back.
+    try {
+        dispenser.dispense(notes);
+    } catch (DispenseFailedException jam) {
+        boolean reversed = reverseOrQueue(txnId);
+        card = null;                                  // return the card
+        state = new OutOfServiceState();              // a jammed machine must stop taking customers
+        throw new AtmException("Dispense failed; " + amount + (reversed ? " reversed" : " reversal queued")
+                + " for " + txnId);
+    }
+    return new Receipt(txnId, mask(card), amount, notes);
+}
+```
+
+This is the part interviewers push on. The bank and the cash cassettes are **two systems with no shared transaction**, so "debit and dispense atomically" can't literally happen. Instead, pick an order where every failure has a safe recovery:
+
+| Step fails | State of the world | Recovery |
+|---|---|---|
+| Plan (wrong notes) | Nothing happened | Refuse. No debit was made. |
+| Debit declined | Nothing happened | Show the reason. |
+| Debit times out | **Unknown**: the bank may have debited | Pay nothing; send `reverse(txnId)`. If there was no debit, it's a no-op. |
+| Dispense jams | Money debited, no cash given | `reverse(txnId)`, return the card, go out of service. |
+| Reversal call itself fails | Money debited, no cash, refund not confirmed | Put the `txnId` in `pendingReversals` and retry later. |
+
+Why **debit before dispense** and not the other way round? Cash handed out cannot be taken back from the customer; a debit can be reversed. Always do the irreversible step last.
+
+Why **plan before debit**? So the common failure ("this machine has no 100s") never touches the customer's account at all.
+
+A real ATM writes the pending reversal to a **durable journal** (disk), so a power cut doesn't forget it; in the card industry's ISO 8583 message standard, reversals are their own message class (04xx), and a reversal advice that gets no response is resent as a "repeat" message (0421) until it is acknowledged. Regulators also care: in India, the RBI's 2019 turnaround-time circular requires a failed ATM withdrawal (account debited, cash not dispensed) to be reversed within T + 5 days, with ₹100 per day compensation to the customer after that. Your design's automatic reversal is exactly what makes that achievable.
+
+### Step 7: the context, one customer at a time
+
+```java
+synchronized void insertCard(String card)      { state.insertCard(this, card); }
+synchronized PinCheck enterPin(String pin)     { return state.enterPin(this, pin); }
+synchronized Receipt enterAmount(long amount)  { return state.enterAmount(this, amount); }
+// ...
+
+void endSession(boolean retainCard) {
+    card = null;               // physically: eject, or keep it in the retain bin
+    state = dispenser.isEmpty() ? new OutOfServiceState() : new IdleState();
+}
+```
+
+The `Atm` delegates every call to its current state. Its public methods are `synchronized`: a physical ATM has one keypad, but an operator console or a timeout thread could call in at the same time, and the lock makes every transition atomic. The machine **starts** in `OUT_OF_SERVICE` (no cash yet) and moves to `IDLE` only when the operator brings it online. When a session ends with empty cassettes, it goes straight to out of service instead of accepting the next card.
+
+## Full solution code
+
+One file, `Main.java`, Java 21. Compile and run with `javac Main.java && java Main`.
+
+```java
+import java.time.*;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+
+// ============================== Bank boundary ==============================
+
+enum PinStatus { OK, WRONG, BLOCKED }
+record PinCheck(PinStatus status, int attemptsLeft) {}
+
+enum DebitResult { APPROVED, INSUFFICIENT_FUNDS, DAILY_LIMIT_EXCEEDED, CARD_BLOCKED }
+
+/** Everything the ATM needs from the bank's backend. The ATM never touches balances itself. */
+interface BankService {
+    boolean isCardActive(String card);
+    PinCheck verifyPin(String card, String pin);
+    long balance(String card);
+    /** Idempotent per txnId: retrying the same txnId never debits twice. */
+    DebitResult debit(String card, long amount, String txnId);
+    /** Idempotent compensation: reversing twice, or reversing an unknown txnId, is a no-op. */
+    void reverse(String txnId);
+}
+
+/** In-memory stand-in for the bank. Each account is guarded by its own lock. */
+final class InMemoryBank implements BankService {
+    static final int MAX_PIN_ATTEMPTS = 3;
+
+    private static final class Account {
+        final String pin;              // a real bank stores a hash and receives an encrypted PIN block
+        final long dailyLimit;
+        long balance;
+        int failedPins;
+        boolean blocked;
+        LocalDate day;                 // the day withdrawnToday refers to
+        long withdrawnToday;
+        Account(String pin, long balance, long dailyLimit) {
+            this.pin = pin; this.balance = balance; this.dailyLimit = dailyLimit;
+        }
+    }
+    private record Debit(String card, long amount, LocalDate day) {}
+
+    private final Map<String, Account> accounts = new ConcurrentHashMap<>();
+    private final Map<String, Debit> debits = new ConcurrentHashMap<>();   // txnId -> debit
+    private final Set<String> reversed = ConcurrentHashMap.newKeySet();
+    private final Clock clock;
+
+    InMemoryBank(Clock clock) { this.clock = clock; }
+
+    void open(String card, String pin, long balance, long dailyLimit) {
+        accounts.put(card, new Account(pin, balance, dailyLimit));
+    }
+
+    private Account account(String card) {
+        Account a = accounts.get(card);
+        if (a == null) throw new AtmException("Unknown card");
+        return a;
+    }
+
+    public boolean isCardActive(String card) {
+        Account a = accounts.get(card);
+        if (a == null) return false;
+        synchronized (a) { return !a.blocked; }
+    }
+
+    public PinCheck verifyPin(String card, String pin) {
+        Account a = account(card);
+        synchronized (a) {
+            if (a.blocked) return new PinCheck(PinStatus.BLOCKED, 0);
+            if (a.pin.equals(pin)) { a.failedPins = 0; return new PinCheck(PinStatus.OK, MAX_PIN_ATTEMPTS); }
+            a.failedPins++;
+            if (a.failedPins >= MAX_PIN_ATTEMPTS) { a.blocked = true; return new PinCheck(PinStatus.BLOCKED, 0); }
+            return new PinCheck(PinStatus.WRONG, MAX_PIN_ATTEMPTS - a.failedPins);
+        }
+    }
+
+    public long balance(String card) {
+        Account a = account(card);
+        synchronized (a) { return a.balance; }
+    }
+
+    public DebitResult debit(String card, long amount, String txnId) {
+        Account a = account(card);
+        synchronized (a) {                         // limit check + balance check + debit = one atomic step
+            if (debits.containsKey(txnId)) return DebitResult.APPROVED;          // retry of the same txn
+            if (a.blocked) return DebitResult.CARD_BLOCKED;
+            LocalDate today = LocalDate.now(clock);
+            if (!today.equals(a.day)) { a.day = today; a.withdrawnToday = 0; }    // new day, fresh limit
+            if (a.withdrawnToday + amount > a.dailyLimit) return DebitResult.DAILY_LIMIT_EXCEEDED;
+            if (a.balance < amount) return DebitResult.INSUFFICIENT_FUNDS;
+            a.balance -= amount;
+            a.withdrawnToday += amount;
+            debits.put(txnId, new Debit(card, amount, today));
+            return DebitResult.APPROVED;
+        }
+    }
+
+    public void reverse(String txnId) {
+        Debit d = debits.get(txnId);
+        if (d == null || !reversed.add(txnId)) return;     // never debited, or already reversed
+        Account a = account(d.card());
+        synchronized (a) {
+            a.balance += d.amount();
+            if (d.day().equals(a.day)) a.withdrawnToday -= d.amount();   // give the limit back too
+        }
+    }
+}
+
+// ============================== Cash dispenser (Chain of Responsibility) ==============================
+
+class AtmException extends RuntimeException { AtmException(String m) { super(m); } }
+class DispenseFailedException extends AtmException { DispenseFailedException(String m) { super(m); } }
+
+/** The physical note mechanism. It may jam; then no notes reach the customer. */
+@FunctionalInterface
+interface DispenserHardware {
+    void present(Map<Integer, Integer> notes);   // throws DispenseFailedException on a jam
+}
+
+/** One link per denomination, largest first. Each link decides how many of its notes to use. */
+final class NoteHandler {
+    private final int denomination;
+    private int count;
+    private NoteHandler next;
+
+    NoteHandler(int denomination) { this.denomination = denomination; }
+    NoteHandler setNext(NoteHandler next) { this.next = next; return next; }
+    int denomination() { return denomination; }
+    int count() { return count; }
+    void add(int n) { count += n; }
+
+    /** Naive greedy: take as many as possible, pass the rest on. Can fail when stock is limited. */
+    boolean greedy(long remaining, Map<Integer, Integer> out) {
+        int take = (int) Math.min(remaining / denomination, count);
+        if (take > 0) out.put(denomination, take);
+        long rest = remaining - (long) take * denomination;
+        if (rest == 0) return true;
+        return next != null && next.greedy(rest, out);
+    }
+
+    /** Greedy first, but if the rest of the chain can't finish, retry with one fewer note here. */
+    boolean plan(long remaining, Map<Integer, Integer> out) {
+        int max = (int) Math.min(remaining / denomination, count);
+        for (int take = max; take >= 0; take--) {
+            long rest = remaining - (long) take * denomination;
+            if (rest == 0 || (next != null && next.plan(rest, out))) {
+                if (take > 0) out.put(denomination, take);
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+final class CashDispenser {
+    private final Map<Integer, NoteHandler> handlers = new LinkedHashMap<>();   // largest first
+    private final NoteHandler head;
+    private final DispenserHardware hardware;
+
+    CashDispenser(List<Integer> denominations, DispenserHardware hardware) {
+        List<Integer> desc = new ArrayList<>(denominations);
+        desc.sort(Comparator.reverseOrder());
+        NoteHandler prev = null;
+        for (int d : desc) {
+            NoteHandler h = new NoteHandler(d);
+            handlers.put(d, h);
+            if (prev != null) prev.setNext(h);
+            prev = h;
+        }
+        this.head = handlers.get(desc.get(0));
+        this.hardware = hardware;
+    }
+
+    void load(int denomination, int count) {
+        NoteHandler h = handlers.get(denomination);
+        if (h == null || count <= 0) throw new AtmException("Bad cassette load: " + denomination + " x " + count);
+        h.add(count);
+    }
+
+    /** Plans without touching stock. Empty if this exact amount can't be made from what's loaded. */
+    Optional<Map<Integer, Integer>> plan(long amount) {
+        Map<Integer, Integer> out = new TreeMap<>(Comparator.reverseOrder());
+        return head.plan(amount, out) ? Optional.of(out) : Optional.empty();
+    }
+
+    Optional<Map<Integer, Integer>> greedyPlan(long amount) {
+        Map<Integer, Integer> out = new TreeMap<>(Comparator.reverseOrder());
+        return head.greedy(amount, out) ? Optional.of(out) : Optional.empty();
+    }
+
+    /** Hardware first; stock is reduced only if the notes really came out. */
+    void dispense(Map<Integer, Integer> plan) {
+        hardware.present(plan);
+        plan.forEach((d, n) -> handlers.get(d).add(-n));
+    }
+
+    long totalCash() {
+        long sum = 0;
+        for (NoteHandler h : handlers.values()) sum += (long) h.denomination() * h.count();
+        return sum;
+    }
+    boolean isEmpty() { return totalCash() == 0; }
+    Map<Integer, Integer> stock() {
+        Map<Integer, Integer> m = new LinkedHashMap<>();
+        handlers.values().forEach(h -> m.put(h.denomination(), h.count()));
+        return m;
+    }
+}
+
+// ============================== States ==============================
+
+record Receipt(String txnId, String maskedCard, long amount, Map<Integer, Integer> notes) {}
+
+/** Every action is rejected by default; each state overrides only what is legal in it. */
+interface AtmState {
+    String name();
+    default void insertCard(Atm atm, String card)           { throw reject("insert a card"); }
+    default PinCheck enterPin(Atm atm, String pin)          { throw reject("enter a PIN"); }
+    default void selectWithdrawal(Atm atm)                  { throw reject("start a withdrawal"); }
+    default Receipt enterAmount(Atm atm, long amount)       { throw reject("enter an amount"); }
+    default long checkBalance(Atm atm)                      { throw reject("check balance"); }
+    default void cancel(Atm atm)                            { throw reject("cancel"); }
+    default void ejectCard(Atm atm)                         { throw reject("eject a card"); }
+    default void takeOffline(Atm atm)                       { throw reject("go offline"); }
+    default void loadCash(Atm atm, int denomination, int n) { throw reject("load cash"); }
+    default void bringOnline(Atm atm)                       { throw reject("come online"); }
+    private AtmException reject(String action) { return new AtmException("Cannot " + action + " in state " + name()); }
+}
+
+final class IdleState implements AtmState {
+    public String name() { return "IDLE"; }
+    public void insertCard(Atm atm, String card) {
+        if (!atm.bank().isCardActive(card)) throw new AtmException("Card not accepted; returned");
+        atm.startSession(card);
+        atm.setState(new CardInsertedState());
+    }
+    public void takeOffline(Atm atm) { atm.setState(new OutOfServiceState()); }
+}
+
+final class CardInsertedState implements AtmState {
+    public String name() { return "CARD_INSERTED"; }
+    public PinCheck enterPin(Atm atm, String pin) {
+        PinCheck r = atm.bank().verifyPin(atm.card(), pin);
+        switch (r.status()) {
+            case OK      -> atm.setState(new AuthenticatedState());
+            case WRONG   -> { }                                    // stay; customer may retry
+            case BLOCKED -> atm.endSession(true);                  // card retained
+        }
+        return r;
+    }
+    public void cancel(Atm atm)    { atm.endSession(false); }
+    public void ejectCard(Atm atm) { atm.endSession(false); }
+}
+
+final class AuthenticatedState implements AtmState {
+    public String name() { return "AUTHENTICATED"; }
+    public void selectWithdrawal(Atm atm) { atm.setState(new TransactionState()); }
+    public long checkBalance(Atm atm)     { return atm.bank().balance(atm.card()); }
+    public void cancel(Atm atm)           { atm.endSession(false); }
+    public void ejectCard(Atm atm)        { atm.endSession(false); }
+}
+
+final class TransactionState implements AtmState {
+    public String name() { return "TRANSACTION"; }
+    public Receipt enterAmount(Atm atm, long amount) {
+        try {
+            return atm.withdraw(amount);
+        } finally {
+            if (atm.state() == this) atm.setState(new AuthenticatedState());   // unless withdraw moved us
+        }
+    }
+    public void cancel(Atm atm) { atm.setState(new AuthenticatedState()); }
+}
+
+final class OutOfServiceState implements AtmState {
+    public String name() { return "OUT_OF_SERVICE"; }
+    public void loadCash(Atm atm, int denomination, int n) { atm.dispenser().load(denomination, n); }
+    public void bringOnline(Atm atm) {
+        if (atm.dispenser().isEmpty()) throw new AtmException("No cash loaded");
+        atm.setState(new IdleState());
+    }
+}
+
+// ============================== The ATM (context) ==============================
+
+final class Atm {
+    private final String id;
+    private final BankService bank;
+    private final CashDispenser dispenser;
+    private final long maxPerWithdrawal;
+    private final AtomicLong txnSeq = new AtomicLong();
+    private final List<String> pendingReversals = new ArrayList<>();
+    private AtmState state = new OutOfServiceState();     // load cash, then bringOnline()
+    private String card;                                  // current session's card, null when none
+
+    Atm(String id, BankService bank, CashDispenser dispenser, long maxPerWithdrawal) {
+        this.id = id; this.bank = bank; this.dispenser = dispenser; this.maxPerWithdrawal = maxPerWithdrawal;
+    }
+
+    // ---- public API: one customer at a time, so every entry point takes the ATM's lock ----
+    synchronized void insertCard(String card)      { state.insertCard(this, card); }
+    synchronized PinCheck enterPin(String pin)     { return state.enterPin(this, pin); }
+    synchronized void selectWithdrawal()           { state.selectWithdrawal(this); }
+    synchronized Receipt enterAmount(long amount)  { return state.enterAmount(this, amount); }
+    synchronized long checkBalance()               { return state.checkBalance(this); }
+    synchronized void cancel()                     { state.cancel(this); }
+    synchronized void ejectCard()                  { state.ejectCard(this); }
+    synchronized void takeOffline()                { state.takeOffline(this); }
+    synchronized void loadCash(int d, int n)       { state.loadCash(this, d, n); }
+    synchronized void bringOnline()                { state.bringOnline(this); }
+    synchronized String stateName()                { return state.name(); }
+    synchronized List<String> pendingReversals()   { return List.copyOf(pendingReversals); }
+
+    /** Retries reversals that failed earlier (e.g. the bank link was down). */
+    synchronized void retryPendingReversals() {
+        pendingReversals.removeIf(this::tryReverse);
+    }
+
+    // ---- used by the states ----
+    BankService bank()          { return bank; }
+    CashDispenser dispenser()   { return dispenser; }
+    AtmState state()            { return state; }
+    String card()               { return card; }
+    void setState(AtmState s)   { state = s; }
+    void startSession(String c) { card = c; }
+
+    void endSession(boolean retainCard) {
+        card = null;               // physically: eject, or keep it in the retain bin
+        state = dispenser.isEmpty() ? new OutOfServiceState() : new IdleState();
+    }
+
+    /** Order matters: plan -> debit -> dispense, with a compensating reversal if dispense fails. */
+    Receipt withdraw(long amount) {
+        if (amount <= 0 || amount % 100 != 0) throw new AtmException("Amount must be a positive multiple of 100");
+        if (amount > maxPerWithdrawal) throw new AtmException("At most " + maxPerWithdrawal + " per withdrawal");
+        // 1. Can this machine pay this exact amount? Check BEFORE taking the customer's money.
+        Map<Integer, Integer> notes = dispenser.plan(amount)
+                .orElseThrow(() -> new AtmException("Cannot dispense " + amount + " with the notes available"));
+        // 2. Debit at the bank. A timeout means "unknown", so we reverse to be safe (reverse is idempotent).
+        String txnId = id + "-" + txnSeq.incrementAndGet();
+        DebitResult result;
+        try {
+            result = bank.debit(card, amount, txnId);
+        } catch (RuntimeException bankDown) {
+            reverseOrQueue(txnId);
+            throw new AtmException("Bank unavailable; no cash dispensed");
+        }
+        if (result != DebitResult.APPROVED) throw new AtmException("Declined: " + result);
+        // 3. Dispense. If the hardware fails after the debit, give the money back.
+        try {
+            dispenser.dispense(notes);
+        } catch (DispenseFailedException jam) {
+            boolean reversed = reverseOrQueue(txnId);
+            card = null;                                  // return the card
+            state = new OutOfServiceState();              // a jammed machine must stop taking customers
+            throw new AtmException("Dispense failed; " + amount + (reversed ? " reversed" : " reversal queued")
+                    + " for " + txnId);
+        }
+        return new Receipt(txnId, mask(card), amount, notes);
+    }
+
+    private boolean reverseOrQueue(String txnId) {
+        if (tryReverse(txnId)) return true;
+        pendingReversals.add(txnId);                      // a real ATM writes this to a durable journal
+        return false;
+    }
+
+    private boolean tryReverse(String txnId) {
+        try { bank.reverse(txnId); return true; }
+        catch (RuntimeException e) { return false; }
+    }
+
+    private static String mask(String card) { return "XXXX" + card.substring(Math.max(0, card.length() - 4)); }
+}
+
+/** Test/demo clock we can move forward by hand. */
+final class MutableClock extends Clock {
+    private volatile Instant now;
+    MutableClock(Instant start) { this.now = start; }
+    void advance(Duration d) { now = now.plus(d); }
+    @Override public Instant instant() { return now; }
+    @Override public ZoneId getZone() { return ZoneOffset.UTC; }
+    @Override public Clock withZone(ZoneId zone) { return this; }
+}
+
+// ============================== Demo ==============================
+
+public class Main {
+    static void attempt(String label, Runnable r) {
+        try { r.run(); } catch (AtmException e) { System.out.println(label + " -> " + e.getMessage()); }
+    }
+
+    public static void main(String[] args) {
+        MutableClock clock = new MutableClock(Instant.parse("2026-01-01T09:00:00Z"));
+        InMemoryBank bank = new InMemoryBank(clock);
+        bank.open("4111000011112222", "1234", 50_000, 10_000);
+        bank.open("4111000033334444", "9999", 20_000, 10_000);
+        bank.open("4111000055556666", "4321", 30_000, 10_000);
+
+        boolean[] jam = {false};
+        DispenserHardware hardware = notes -> { if (jam[0]) throw new DispenseFailedException("note jam"); };
+        CashDispenser dispenser = new CashDispenser(List.of(2000, 500, 200, 100), hardware);
+        Atm atm = new Atm("ATM7", bank, dispenser, 20_000);
+        atm.loadCash(2000, 3); atm.loadCash(500, 2); atm.loadCash(200, 3);   // no 100s loaded
+        atm.bringOnline();
+        System.out.println("State: " + atm.stateName() + ", stock " + dispenser.stock());
+
+        attempt("Withdraw before card", () -> atm.selectWithdrawal());
+        atm.insertCard("4111000011112222");
+        System.out.println("Wrong PIN: " + atm.enterPin("0000"));
+        System.out.println("Right PIN: " + atm.enterPin("1234") + ", state " + atm.stateName());
+
+        atm.selectWithdrawal();
+        System.out.println("Withdrew: " + atm.enterAmount(2500));
+        System.out.println("600 greedy plan: " + dispenser.greedyPlan(600) + ", full plan: " + dispenser.plan(600));
+        atm.selectWithdrawal();
+        System.out.println("Withdrew: " + atm.enterAmount(600));
+        atm.selectWithdrawal();
+        attempt("Withdraw 150", () -> atm.enterAmount(150));
+        atm.selectWithdrawal();
+        attempt("Withdraw 300", () -> atm.enterAmount(300));
+        System.out.println("Balance: " + atm.checkBalance() + ", stock " + dispenser.stock());
+        atm.ejectCard();
+
+        atm.insertCard("4111000033334444");
+        for (int i = 0; i < 3; i++) System.out.println("Wrong PIN: " + atm.enterPin("1111"));
+        System.out.println("State after block: " + atm.stateName());
+        attempt("Re-insert blocked card", () -> atm.insertCard("4111000033334444"));
+
+        atm.insertCard("4111000055556666");
+        atm.enterPin("4321");
+        atm.selectWithdrawal();
+        jam[0] = true;
+        attempt("Withdraw 2000 with jam", () -> atm.enterAmount(2000));
+        System.out.println("Balance after reversal: " + bank.balance("4111000055556666")
+                + ", state " + atm.stateName() + ", stock " + dispenser.stock());
+        attempt("Insert while out of service", () -> atm.insertCard("4111000011112222"));
+
+        jam[0] = false;
+        atm.loadCash(2000, 5); atm.loadCash(100, 10);
+        atm.bringOnline();
+        atm.insertCard("4111000011112222");
+        atm.enterPin("1234");
+        atm.selectWithdrawal();
+        attempt("Withdraw 7000 (limit 10000, 3100 used)", () -> atm.enterAmount(7000));
+        clock.advance(Duration.ofDays(1));
+        atm.selectWithdrawal();
+        System.out.println("Next day: " + atm.enterAmount(7000));
+        atm.ejectCard();
+        System.out.println("Final state: " + atm.stateName() + ", stock " + dispenser.stock());
+    }
+}
+```
+
+**Demo output** (real output from running the program above):
+
+```text
+State: IDLE, stock {2000=3, 500=2, 200=3, 100=0}
+Withdraw before card -> Cannot start a withdrawal in state IDLE
+Wrong PIN: PinCheck[status=WRONG, attemptsLeft=2]
+Right PIN: PinCheck[status=OK, attemptsLeft=3], state AUTHENTICATED
+Withdrew: Receipt[txnId=ATM7-1, maskedCard=XXXX2222, amount=2500, notes={2000=1, 500=1}]
+600 greedy plan: Optional.empty, full plan: Optional[{200=3}]
+Withdrew: Receipt[txnId=ATM7-2, maskedCard=XXXX2222, amount=600, notes={200=3}]
+Withdraw 150 -> Amount must be a positive multiple of 100
+Withdraw 300 -> Cannot dispense 300 with the notes available
+Balance: 46900, stock {2000=2, 500=1, 200=0, 100=0}
+Wrong PIN: PinCheck[status=WRONG, attemptsLeft=2]
+Wrong PIN: PinCheck[status=WRONG, attemptsLeft=1]
+Wrong PIN: PinCheck[status=BLOCKED, attemptsLeft=0]
+State after block: IDLE
+Re-insert blocked card -> Card not accepted; returned
+Withdraw 2000 with jam -> Dispense failed; 2000 reversed for ATM7-3
+Balance after reversal: 30000, state OUT_OF_SERVICE, stock {2000=2, 500=1, 200=0, 100=0}
+Insert while out of service -> Cannot insert a card in state OUT_OF_SERVICE
+Withdraw 7000 (limit 10000, 3100 used) -> Declined: DAILY_LIMIT_EXCEEDED
+Next day: Receipt[txnId=ATM7-5, maskedCard=XXXX2222, amount=7000, notes={2000=3, 500=1, 100=5}]
+Final state: IDLE, stock {2000=4, 500=0, 200=0, 100=5}
+```
+
+Reading the output:
+
+- The machine starts with three 2000s, two 500s, three 200s and **no 100s**. Withdrawing before a card is rejected by `IdleState`.
+- One wrong PIN leaves 2 tries; the correct PIN logs in and resets the counter.
+- 2500 is paid greedily as 2000 + 500. For 600, plain greedy fails (it takes the 500 and is stuck with 100), but the chain backs off and pays 3 × 200.
+- 150 is not a multiple of 100. 300 is refused **before** any debit, because the machine has no 100s or 200s left.
+- Three wrong PINs on the second card block it at the bank and retain it; re-inserting it is refused.
+- The third card's 2000 jams: the debit is reversed (balance back to 30,000), cash stock is unchanged, and the machine is out of service.
+- After the operator loads cash and brings it online, the first customer asks for 7000 but has used 3100 of a 10,000 daily limit, so the bank declines. The next day the same 7000 succeeds.
+
+## Concurrency and edge cases
+
+| Race or edge case | What could go wrong | How the design handles it |
+|---|---|---|
+| Two ATMs debit one account at once (joint account, cloned card) | Balance or daily limit overspent | Limit check, balance check and debit run under the account's lock. Test: 8 ATMs × 10 withdrawals of 1000 against a 20,000 limit approve exactly 20, every run. |
+| Wrong PINs from several ATMs at once | More than 3 tries, or a counter that never blocks | PIN check and counter update share the account lock. Test: 8 concurrent wrong PINs give exactly 2 `WRONG`; the other 6 get `BLOCKED`. |
+| The same reversal sent twice (retry, or two recovery paths) | Customer refunded twice | `reversed.add(txnId)` succeeds once; test fires 16 concurrent reversals and checks a single refund. |
+| Network retry of a debit | Double debit | Debit is idempotent on `txnId`. The id must be globally unique, which is why it is `atmId + sequence`. Two ATMs sharing an id would make the bank treat a new withdrawal as a retry and approve it without charging — our test harness hit exactly this bug before the ids were made unique. |
+| Debit times out | Customer debited, no cash, nobody notices | Treat "unknown" as "maybe": no cash, send a reversal (a no-op if nothing was debited). |
+| Jam after debit | Money gone, no cash | Compensating reversal, card returned, machine out of service. |
+| Reversal call fails | Refund lost | Queued in `pendingReversals`, retried by `retryPendingReversals()`; idempotent, so retrying is always safe. |
+| Operator and customer at once | Cash loaded mid-payout | `loadCash` is legal only in `OUT_OF_SERVICE`, and all `Atm` methods share one lock. |
+| Day rolls over | Limit never resets, or resets mid-day | Lazy reset keyed on `LocalDate.now(clock)`; reversal returns limit only if it is still the same day. |
+| Amount 0, negative, 250, or 30,000 | Odd payouts | Validated before planning: positive, multiple of 100, at most the per-withdrawal cap. |
+| Machine runs out of cash | Next customer inserts a card for nothing | `endSession` checks `isEmpty()` and goes out of service. |
+
+One honest caveat for the interview: with a real network, a reversal could arrive **before** a slow debit is processed. The bank would then see a reversal for an unknown `txnId`, ignore it, and apply the debit later. The fix is to remember reversals for unknown ids for a while (a "tombstone"), so a late debit with that id is matched and cancelled instead of charged. Mention it; don't build it.
+
+Why a lock per account and not `ConcurrentHashMap.compute`? Either works. `compute` would make each update atomic too, but debit touches several fields and returns a reason code, which reads more clearly as a small `synchronized` block. The map lookups themselves use `ConcurrentHashMap` so accounts can be opened while others are being debited. See [Java Concurrency and Locks](/learn/notes/java-concurrency-locks/) and [ConcurrentHashMap internals](/learn/notes/java-collections-hashmap/).
+
+## Testing it
+
+JUnit 5 style tests for the key behaviours (the same checks ran in a plain-Java harness against the solution):
+
+```java
+import static org.junit.jupiter.api.Assertions.*;
+
+import java.time.*;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import org.junit.jupiter.api.Test;
+
+class AtmTest {
+    private final MutableClock clock = new MutableClock(Instant.parse("2026-01-01T09:00:00Z"));
+    private static final AtomicInteger ids = new AtomicInteger();
+
+    private Atm atm(BankService bank, DispenserHardware hw, int denom, int count) {
+        CashDispenser d = new CashDispenser(List.of(2000, 500, 200, 100), hw);
+        Atm a = new Atm("ATM" + ids.incrementAndGet(), bank, d, 20_000);   // unique ids -> unique txnIds
+        a.loadCash(denom, count);
+        a.bringOnline();
+        return a;
+    }
+
+    @Test
+    void actionsOutOfOrderAreRejected() {
+        InMemoryBank bank = new InMemoryBank(clock);
+        bank.open("C1", "1111", 10_000, 10_000);
+        Atm a = atm(bank, n -> {}, 500, 10);
+        assertThrows(AtmException.class, () -> a.enterPin("1111"));      // no card yet
+        a.insertCard("C1");
+        assertThrows(AtmException.class, () -> a.selectWithdrawal());     // no PIN yet
+        a.enterPin("1111");
+        a.selectWithdrawal();
+        assertThrows(AtmException.class, () -> a.checkBalance());         // mid-transaction
+    }
+
+    @Test
+    void thirdWrongPinBlocksAndRetainsCard() {
+        InMemoryBank bank = new InMemoryBank(clock);
+        bank.open("C1", "1111", 10_000, 10_000);
+        Atm a = atm(bank, n -> {}, 500, 10);
+        a.insertCard("C1");
+        assertEquals(2, a.enterPin("0").attemptsLeft());
+        assertEquals(1, a.enterPin("0").attemptsLeft());
+        assertEquals(PinStatus.BLOCKED, a.enterPin("0").status());
+        assertEquals("IDLE", a.stateName());
+        assertThrows(AtmException.class, () -> a.insertCard("C1"));
+    }
+
+    @Test
+    void fallsBackWhenGreedyGetsStuck() {
+        CashDispenser d = new CashDispenser(List.of(2000, 500, 200, 100), n -> {});
+        d.load(500, 1); d.load(200, 3);
+        assertTrue(d.greedyPlan(600).isEmpty());
+        assertEquals(Map.of(200, 3), d.plan(600).orElseThrow());
+        assertTrue(d.plan(300).isEmpty());
+    }
+
+    @Test
+    void undispensableAmountIsNeverDebited() {
+        InMemoryBank bank = new InMemoryBank(clock);
+        bank.open("C1", "1111", 10_000, 10_000);
+        Atm a = atm(bank, n -> {}, 2000, 1);
+        a.insertCard("C1"); a.enterPin("1111"); a.selectWithdrawal();
+        assertThrows(AtmException.class, () -> a.enterAmount(500));
+        assertEquals(10_000, bank.balance("C1"));
+    }
+
+    @Test
+    void jamAfterDebitIsReversedIncludingDailyLimit() {
+        InMemoryBank bank = new InMemoryBank(clock);
+        bank.open("C1", "1111", 10_000, 5_000);
+        AtomicBoolean jam = new AtomicBoolean(true);
+        Atm a = atm(bank, n -> { if (jam.get()) throw new DispenseFailedException("jam"); }, 500, 20);
+        a.insertCard("C1"); a.enterPin("1111"); a.selectWithdrawal();
+        assertThrows(AtmException.class, () -> a.enterAmount(5000));
+        assertEquals(10_000, bank.balance("C1"));
+        assertEquals("OUT_OF_SERVICE", a.stateName());
+        jam.set(false);
+        a.bringOnline();
+        a.insertCard("C1"); a.enterPin("1111"); a.selectWithdrawal();
+        assertEquals(5000, a.enterAmount(5000).amount());                 // limit was given back
+    }
+
+    @Test
+    void dailyLimitResetsNextDay() {
+        InMemoryBank bank = new InMemoryBank(clock);
+        bank.open("C1", "1111", 50_000, 10_000);
+        Atm a = atm(bank, n -> {}, 2000, 20);
+        a.insertCard("C1"); a.enterPin("1111");
+        a.selectWithdrawal(); a.enterAmount(10_000);
+        a.selectWithdrawal();
+        assertThrows(AtmException.class, () -> a.enterAmount(2000));
+        clock.advance(Duration.ofDays(1));
+        a.selectWithdrawal();
+        assertEquals(2000, a.enterAmount(2000).amount());
+    }
+
+    @Test
+    void manyAtmsNeverOverspendTheDailyLimit() throws Exception {
+        InMemoryBank bank = new InMemoryBank(clock);
+        bank.open("C1", "1111", 1_000_000, 20_000);
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicInteger approved = new AtomicInteger();
+        List<Future<?>> fs = new ArrayList<>();
+        for (int t = 0; t < 8; t++) fs.add(pool.submit(() -> {
+            Atm a = atm(bank, n -> {}, 500, 200);
+            start.await();
+            a.insertCard("C1"); a.enterPin("1111");
+            for (int i = 0; i < 10; i++) {
+                a.selectWithdrawal();
+                try { a.enterAmount(1000); approved.incrementAndGet(); } catch (AtmException e) { }
+            }
+            return null;
+        }));
+        start.countDown();
+        for (Future<?> f : fs) f.get();
+        pool.shutdown();
+        assertEquals(20, approved.get());
+        assertEquals(1_000_000 - 20_000, bank.balance("C1"));
+    }
+}
+```
+
+The plain-Java harness ran 72 distinct checks (110 assertions in total, because the 8-ATM concurrency scenario repeats 20 times), and passed on five consecutive runs. Beyond the tests above it covers: the reversal failing and being retried from `pendingReversals` without a double refund; a bank timeout after a successful debit (no cash given, debit reversed); idempotent debit and reversal; 16 concurrent reversals of one transaction; 8 concurrent wrong PINs; the machine going out of service when the cassettes empty; `plan()` against brute force on 3,000 random stocks; and greedy against an exact DP for every amount up to 40,000 with unlimited notes.
+
+## Extensions interviewers ask for
+
+| Ask | Change | What stays untouched |
+|---|---|---|
+| Deposits | `selectDeposit()` in `AuthenticatedState` leading to a `DepositState`; a `CashAcceptor` hardware interface; `bank.credit(card, amount, txnId)` | Withdrawal flow, dispenser |
+| Transfers, PIN change, mini statement | Each is a new option in `AuthenticatedState` and a new bank call. If the menu grows, model each as a **Command** (`AtmTransaction.execute(atm)`) | State classes stay small |
+| Session timeout | A scheduled task calls `atm.cancel()` / `ejectCard()` after N seconds of no input; the lock makes it safe. A card not taken in time is retracted | Bank, dispenser |
+| A 50 note, or a different country's notes | Pass the new list to `CashDispenser`; the chain links itself. Also change the "multiple of 100" check in `withdraw` to the smallest note | States, bank, existing handlers |
+| Fewest notes, or "give some small notes" | Swap the planning algorithm behind a `DispensePlanner` strategy (DP for fewest notes, or a mix rule) | States, bank |
+| Low cash alerts | **Observer**: the dispenser notifies listeners when a cassette falls under a threshold | Withdrawal flow |
+| Partial dispense (5 of 10 notes came out) | Hardware returns what was actually presented; reverse only the difference (`partialReverse(txnId, amount)`) | States |
+| Receipts printer | A `ReceiptPrinter` interface called after a successful withdrawal; a failure to print must never undo the payout | Bank, dispenser |
+| Real bank | An adapter implementing `BankService` that speaks the network's protocol; persistent reversal journal | ATM logic |
+
+## Common mistakes
+
+1. **A god class with a `status` field and `if` chains in every method.** Use State: each class lists what is legal in that step.
+2. **Counting PIN attempts or the daily limit inside the ATM.** Move the card to another ATM and the counters reset. These belong to the bank.
+3. **Greedy note selection with no fallback.** It refuses payable amounts once a cassette runs low (600 with one 500 and three 200s).
+4. **Debiting before checking the machine can pay.** The customer sees "insufficient notes" and a debit on their statement.
+5. **Dispensing before debiting.** If the debit then fails, the cash is already gone and can't be clawed back.
+6. **No reversal on a jam,** or a reversal that isn't idempotent, so a retry refunds twice.
+7. **Treating a timeout as "declined".** It is "unknown". Pay nothing and reverse.
+8. **Forgetting the daily limit on reversal.** The refund comes back but the allowance doesn't.
+9. **Non-unique transaction ids.** Idempotency then turns a new withdrawal into a "retry" that is approved without a debit.
+10. **Logging the PIN or full card number.** Mask the card (`XXXX2222`) and never log the PIN; real ATMs encrypt it in the PIN pad before it leaves the device.
+11. **Using `double` for money.** Use `long` rupees (or paise) or `BigDecimal`.
+
+## Practice questions
+
+<Practice>
+
+<QA q="Why is the State pattern a good fit for an ATM?" level="easy">
+
+An ATM is a sequence of steps, and the same input means different things at each step: a keypad entry is a PIN in one state and an amount in another, and "withdraw" is illegal before login. With State, each step is a class that implements only its legal actions and picks the next state. The alternative, a `status` enum with a `switch` in every method, spreads the rules across the code and makes it easy to forget a case. Defaults that throw make "illegal in this state" automatic.
+
+</QA>
+
+<QA q="Where should the PIN retry counter live, and why?" level="easy">
+
+At the bank, keyed by card. If the ATM counted, a thief could try 2 PINs, pull the card, and try 2 more at the next ATM forever. The bank's counter is shared by every terminal, so the third wrong PIN anywhere blocks the card. The ATM only reacts to the result: stay, log in, or retain the card.
+
+</QA>
+
+<QA q="Walk through the Chain of Responsibility in the dispenser. Can you add a 50 note?" level="easy">
+
+The dispenser builds one `NoteHandler` per denomination, largest first, each pointing to the next. A request for an amount enters the 2000 handler, which picks how many 2000s to use and passes the remainder to the 500 handler, and so on. A handler only knows its own note and its stock. Adding a 50 note is just passing `50` in the list; the constructor sorts and links it at the end. No existing handler changes. The only other edit is the amount check in `withdraw`, which must accept multiples of 50 instead of 100.
+
+</QA>
+
+<QA q="Give an example where greedy note selection fails, and explain your fix." level="medium">
+
+Stock: one 500, three 200s, no 100s. Request 600. Greedy takes the 500, leaves 100, finds no 200 that fits and no 100s, and refuses, even though 3 × 200 works. The fix is backtracking inside the chain: each handler first tries the greedy count, and if the rest of the chain can't finish, retries with one fewer note. It returns greedy's answer whenever greedy works and still finds any valid mix when it doesn't. For many denominations you'd use a bounded knapsack DP instead.
+
+</QA>
+
+<QA q="In what order do you plan, debit and dispense, and why that order?" level="medium">
+
+Plan, then debit, then dispense. Planning first means the most common failure (the machine lacks the right notes) never touches the customer's account. Debit before dispense because a debit can be undone (reversal) but cash in someone's hand can't. The irreversible step always goes last, and every earlier step has a compensating action.
+
+</QA>
+
+<QA q="The dispenser jams after the bank approved the debit. What exactly does your code do?" level="medium">
+
+It catches `DispenseFailedException`, calls `bank.reverse(txnId)`, returns the card, moves the ATM to `OUT_OF_SERVICE` and tells the customer the amount was reversed. Stock is untouched because `dispense` reduces counts only after the hardware succeeds. The reversal also gives back the daily limit. If the reversal call itself fails, the `txnId` goes into a pending list that is retried later.
+
+</QA>
+
+<QA q="Why must debit and reverse be idempotent?" level="medium">
+
+Networks lose replies. If the ATM sends a debit and the reply is lost, it must be able to retry with the same `txnId` without charging twice. Reversals are retried from a journal until acknowledged, and several recovery paths might send the same one, so applying it twice must still refund once. The bank stores debits by `txnId` and keeps a set of reversed ids to make both operations safe to repeat.
+
+</QA>
+
+<QA q="How does the per-day limit reset, and how does it stay correct across ATMs?" level="medium">
+
+Each account stores the day its running total refers to and the total. On each debit, if today (from an injected `Clock`) differs from the stored day, the total resets to zero. No midnight job is needed. Because the bank holds the counter and updates it under the account lock along with the balance, two ATMs can't both pass the limit check with stale numbers. The test with 8 ATMs approves exactly 20 × 1000 against a 20,000 limit.
+
+</QA>
+
+<QA q="The bank does not answer your debit request within the timeout. What should the ATM do?" level="hard">
+
+Treat the outcome as unknown, not declined. The bank may have debited and the reply was lost. The ATM gives no cash and sends a reversal for that `txnId`. If the debit did happen, the reversal refunds it; if it never happened, the reversal is a no-op. Giving cash would risk paying without a debit; doing nothing would risk a debit without cash. This is why reversals are keyed by the ATM's transaction id, not by a bank-side id the ATM never received.
+
+</QA>
+
+<QA q="Two people with cards for the same joint account withdraw at two ATMs at the same moment. What protects the balance?" level="hard">
+
+The bank's debit does the limit check, balance check and subtraction as one atomic step under the account's lock. One debit runs fully, then the other sees the updated balance and daily total. Without the lock, both could read balance 5000, both approve 5000, and the account would go to -5000. The lock is per account, so unrelated customers never wait for each other.
+
+</QA>
+
+<QA q="Interviewer: the reversal call fails too, and then the ATM loses power. How do you make sure the customer gets the money back?" level="scenario">
+
+The pending reversal has to survive the restart, so it goes to a durable journal (local disk or an outbox table) before the ATM shows the error, and the ATM replays the journal on startup and on a timer until the bank acknowledges each one. Because reversal is idempotent, replaying one that already succeeded is harmless. In card networks reversals are their own message type that the acquirer keeps resending until acknowledged, and in India the RBI requires failed ATM debits to be reversed within T + 5 days or the bank pays ₹100 per day of delay.
+
+</QA>
+
+<QA q="Interviewer: only 7 of 10 notes came out before the jam. What changes?" level="scenario">
+
+The hardware interface must report what was actually presented, not just succeed or fail. `present` would return the notes delivered; the ATM reduces stock by that amount and asks the bank for a partial reversal of the difference (here 3 notes' worth), keyed by the same `txnId`. The receipt shows the amount actually paid. A real machine also counts notes rejected into a purge bin so the cassette totals stay right for reconciliation.
+
+</QA>
+
+<QA q="Interviewer: add deposits. How much of the design changes?" level="scenario">
+
+Very little. `AuthenticatedState` gets a `selectDeposit()` that moves to a new `DepositState`, which accepts `insertNotes` and `confirm`. A `CashAcceptor` hardware interface counts the notes, and `BankService` gets `credit(card, amount, txnId)`. The order flips compared to withdrawal: take the notes into escrow first, then credit, and return the notes if the credit fails. Existing states and the dispenser are untouched.
+
+</QA>
+
+<QA q="Why is the Atm public API synchronized if only one customer uses it at a time?" level="hard">
+
+One customer, but not one thread: an operator console, a session timeout task or a hardware callback can call in concurrently. Without the lock, a timeout could eject the card in the middle of `withdraw`, leaving the state and the session card inconsistent. Locking every entry point makes each transition atomic. It is cheap because there is essentially no contention, and the bank call inside it does not block other ATMs, since each ATM has its own lock.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="The machine has one 500, three 200s and no 100s. A customer asks for 600. What does a plain greedy denomination chain do?" options={["Pays 500 + 100", "Pays 3 x 200", "Refuses the withdrawal", "Pays 2 x 200 + 2 x 100"]} answer={2}>
+
+Greedy takes the 500, leaves 100, can't use a 200, and has no 100s, so it refuses. 3 × 200 would have worked, which is why the chain needs a fallback. There are no 100s, so options A and D are impossible.
+
+</MCQ>
+
+<MCQ q="Which order of steps keeps a withdrawal recoverable at every point?" options={["Plan notes, then debit, then dispense", "Debit, then plan notes, then dispense", "Dispense, then debit", "Plan, dispense, then debit"]} answer={0}>
+
+Plan first so an unpayable amount never touches the account; debit next because it can be reversed; dispense last because cash can't be taken back. Any order that dispenses before debiting risks free cash.
+
+</MCQ>
+
+<MCQ q="The debit request times out. What should the ATM do?" options={["Retry the debit with a new transaction id", "Dispense, since it was probably approved", "Show declined and do nothing else", "Dispense nothing and send a reversal for that transaction id"]} answer={3}>
+
+A timeout means the outcome is unknown. Reversing the same id is safe either way because reversal is idempotent. A new id on retry could debit twice; dispensing risks paying without a debit; doing nothing risks a debit without cash.
+
+</MCQ>
+
+<MCQ q="Why does the bank, not the ATM, keep the wrong-PIN counter?" options={["The ATM has no memory", "So the limit holds across every ATM the card is used at", "Because the State pattern forbids counters", "To make PIN checks faster"]} answer={1}>
+
+A per-ATM counter resets when the card moves to another machine, giving unlimited guesses. The bank's counter is shared by all terminals.
+
+</MCQ>
+
+<MCQ q="A jam is detected after the debit. Which of these is NOT part of a correct response?" options={["Reverse the debit", "Give back the used daily limit", "Reduce cassette stock by the planned notes", "Move the ATM out of service"]} answer={2}>
+
+No notes came out, so stock must stay as it was. The solution reduces stock only after the hardware succeeds. Reversing the debit and the daily limit, and stopping the machine, are all correct.
+
+</MCQ>
+
+<MCQ q="Two ATMs used the same terminal id, so they generated the same transaction ids. What can go wrong with an idempotent bank?" options={["A new withdrawal is treated as a retry and approved without a debit", "Nothing, idempotency handles it", "The bank throws ConcurrentModificationException", "Both withdrawals are debited twice"]} answer={0}>
+
+The bank sees a txnId it already processed and returns the earlier result without charging again. Idempotency keys must be unique per real operation, which is why the id is terminal id plus a sequence.
+
+</MCQ>
+
+<MCQ q="In this design, what happens when a customer calls selectWithdrawal while in CARD_INSERTED?" options={["It succeeds but the amount is ignored", "The default method in AtmState throws, because CardInsertedState does not override it", "The ATM asks for the PIN again", "The ATM moves to OUT_OF_SERVICE"]} answer={1}>
+
+Every action in the interface defaults to throwing. `CardInsertedState` overrides only `enterPin`, `cancel` and `ejectCard`, so withdrawal before login is rejected automatically.
+
+</MCQ>
+
+<MCQ q="How does the daily limit reset in the bank?" options={["A scheduled job zeroes all counters at midnight", "The ATM resets it when a card is inserted", "It never resets; the limit is per account lifetime", "Each debit compares today with the stored day and resets the running total if they differ"]} answer={3}>
+
+A lazy reset needs no background job: the first debit of a new day resets the total. The day comes from an injected Clock, so tests can move forward a day.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **States:** `IDLE` → `CARD_INSERTED` → `AUTHENTICATED` ⇄ `TRANSACTION`; `OUT_OF_SERVICE` on start, offline, jam or empty cassettes. Every action throws by default; each state overrides only what is legal.
+- **PIN:** bank counts; 3 wrong = block and retain card; success resets the counter.
+- **Dispenser:** Chain of Responsibility 2000 → 500 → 200 → 100. Greedy first, back off one note when the rest can't finish (600 = 3 × 200 when there are no 100s). Plan never touches stock.
+- **Withdrawal order:** validate → plan → debit (idempotent `txnId`) → dispense → on jam reverse, return card, go out of service. Timeout = unknown = no cash + reverse. Failed reversal = journal and retry.
+- **Bank:** `BankService` interface; per-account lock makes limit + balance + debit one atomic step; daily limit lazily reset by date; reversal gives the limit back.
+- **Concurrency:** ATM methods `synchronized` (one session, several threads); unique `txnId = atmId + seq`.
+- **Extensions:** deposits as a new state, Command for many transaction types, Observer for low cash, partial dispense via partial reversal.
+
+## Go deeper
+
+- [RBI circular: harmonisation of turnaround time for failed transactions (2019)](https://rbi.org.in/Scripts/NotificationUser.aspx?Id=11693)
+- [ISO 8583 overview (message types including reversals)](https://en.wikipedia.org/wiki/ISO_8583)
+- [Java SE 21 API: java.time.Clock](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/time/Clock.html)
+- [Java SE 21 API: ConcurrentHashMap](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ConcurrentHashMap.html)
+- Related notes: [Machine Coding Strategy](/learn/notes/machine-coding-strategy/), [Behavioral Patterns](/learn/notes/behavioral-patterns/), [Structural Patterns](/learn/notes/structural-patterns/), [SOLID Principles](/learn/notes/solid-principles/), [Vending Machine and Logger](/learn/notes/lld-vending-machine-logger/), [Parking Lot](/learn/notes/lld-parking-lot/), [Java Concurrency and Locks](/learn/notes/java-concurrency-locks/), [Executors and Virtual Threads](/learn/notes/java-executors-virtual-threads/)

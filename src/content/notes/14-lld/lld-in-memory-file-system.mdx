@@ -1,0 +1,1131 @@
+---
+title: "LLD: In-Memory File System"
+phase: "14-lld"
+order: 162
+tags: ["lld", "machine-coding", "java", "design-patterns", "composite", "concurrency", "file-system"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 45
+prerequisites: ["machine-coding-strategy", "structural-patterns", "behavioral-patterns", "java-concurrency-locks"]
+summary: "A complete, tested Java 21 in-memory file system — Composite tree of files and directories, path normalisation, mkdir -p, sorted ls, read/write/append, rm -r, move with the own-subtree check, find with pluggable filters, recursive size, and a read-write lock with its trade-offs — mapped to LeetCode 588."
+---
+
+## Definition (interview-ready)
+
+An in-memory file system keeps a tree of directories and files in RAM and supports the shell-style operations people know: `mkdir -p`, `ls`, create, read, write, append, `rm -r`, `mv` and `find`. The core entities are an abstract `Node` with two subclasses, `FileNode` (holds bytes) and `DirectoryNode` (holds named children in a sorted map), plus a `PathParser` that turns messy paths like `/a/./b//../c` into clean parts, and a `FileSystem` facade that resolves paths and runs each operation. The **Composite** pattern lets the code treat a file and a whole directory the same way, so `size()` on a directory is just the sum of its children. Search uses a **Strategy** (`SearchFilter`) so new "find by" rules are new lambdas, not new methods. One `ReentrantReadWriteLock` lets many readers run together while each change, including a `mv` that touches two directories, happens atomically.
+
+**One-liner:** A Composite tree of files and sorted directories, a lexical path normaliser, a facade that resolves paths, filter strategies for `find`, and one read-write lock so reads run in parallel and every change is atomic.
+
+## Problem statement
+
+> Design and implement an in-memory file system.
+>
+> - Paths are absolute and Unix-style, for example `/home/aman/notes.txt`. Paths may contain `.`, `..` and repeated slashes, and must be handled like a shell does.
+> - Support making a directory, **creating any missing parent directories** along the way.
+> - Support **listing** a path: for a directory, its entries in sorted order; for a file, just the file's name.
+> - Support creating a file, **reading** it, **overwriting** it and **appending** to it.
+> - Support **deleting** a file or directory, with a recursive option for non-empty directories.
+> - Support **moving or renaming** a file or directory. Invalid moves must be rejected.
+> - Support **finding** entries under a path by name, extension or size.
+> - Report the **size** of any path (a directory's size is the total of everything inside it).
+> - Many threads may use the file system at the same time.
+> - Write a demo `main`.
+
+This is LeetCode 588, "Design In-Memory File System" (rated Hard), stretched into a full machine-coding round. LeetCode asks for four methods: `ls`, `mkdir`, `addContentToFile` and `readContentFromFile`. The machine-coding version adds the operations where most bugs hide: delete, move, search, size and concurrency. The [Machine Coding Rounds strategy note](/learn/notes/machine-coding-strategy/) covers how to pace the 90 minutes; this note is the worked solution.
+
+## Clarifying questions to ask
+
+Ask these early and write the answers as a comment at the top of your file.
+
+| Question | Assumed answer |
+|---|---|
+| Absolute paths only, or a current directory too? | Absolute only. A `cd` and relative paths are an extension. |
+| What does `..` at the root mean? | It stays at the root, as in Unix (`/..` is `/`). |
+| Sort order for `ls`? | Plain string order (so `Alpha` sorts before `b`), like LeetCode's lexicographic order. |
+| Does `mkdir` fail if the directory already exists? | No. It behaves like `mkdir -p`: missing parts are created, existing ones reused. It fails if any part is a file. |
+| Does writing to a missing file create it? | Yes for `write` and `append` (like `echo x >> f`), but the parent directory must exist. `createFile` fails if the name is taken. |
+| What is a file's size? | Its content in bytes (UTF-8). A directory's size is the sum of all files below it; directories themselves cost 0. |
+| `mv` semantics? | If the target is an existing directory, move inside it keeping the name; otherwise treat the target as the new full path (a rename). Never overwrite an existing entry. |
+| Can a directory be moved into itself or its own subtree? | No. Reject it; it would detach the subtree into a cycle. |
+| Delete the root? | No. |
+| Symlinks, permissions, timestamps, persistence? | Out of scope; mention as extensions. |
+| Concurrency? | Yes, many threads. Each operation must be atomic and readers must never see a half-done change. |
+
+## Requirements
+
+**Functional (in scope)**
+
+1. Parse and normalise absolute paths (`.`, `..`, repeated and trailing slashes).
+2. `mkdir(path)` with `-p` behaviour.
+3. `ls(path)`: sorted entries of a directory, or the name of a file.
+4. `createFile`, `readFile`, `writeFile` (overwrite), `appendFile`.
+5. `rm(path, recursive)`.
+6. `move(src, dst)`: move into a directory or rename; reject moving a directory into its own subtree.
+7. `find(start, filter)`: by name, extension, size, type, and combinations.
+8. `size(path)` for files and directories.
+
+**Non-functional**
+
+- Thread-safe: every operation is atomic; reads run in parallel.
+- Clear errors: named exceptions such as `NotFoundException` and `IsADirectoryException`, never `null` returns.
+- Extensible: a new search rule needs no change to `FileSystem`.
+
+**Out of scope:** symlinks, permissions, timestamps, a current working directory, persistence, quotas. Each appears in [Extensions](#extensions-interviewers-ask-for).
+
+## Entities and relationships
+
+```text
+                        ┌──────────────────── FileSystem (facade) ────────────────────┐
+  caller ── path ──────►│ root: DirectoryNode                                         │
+  (strings in,          │ lock: ReentrantReadWriteLock  (read: ls/read/find/size,     │
+   strings out)         │                                write: mkdir/write/rm/mv)    │
+                        │ uses ──► PathParser.parse(path) -> List of names            │
+                        │ uses ──► SearchFilter (Strategy) for find()                 │
+                        └──────────────────────────────┬──────────────────────────────┘
+                                                       │ owns
+                                                       ▼
+                               «sealed abstract» Node  (name, parent, size(), path())
+                                    ▲                         ▲
+                                    │                         │
+                               FileNode                 DirectoryNode
+                         (bytes: ByteArrayOutputStream)  (children: TreeMap name -> Node)
+                                                              │ 0..*
+                                                              └────────► Node   (Composite: a directory
+                                                                                 contains files AND directories)
+
+  SearchFilter  ◁── nameEquals, extension, largerThan, isDirectory   (+ and / or / negate)
+  FsException   ◁── NotFound, NotADirectory, IsADirectory, AlreadyExists, DirectoryNotEmpty,
+                    InvalidPath, InvalidMove
+```
+
+- A `DirectoryNode` **has** children; each child is any `Node`. That recursive "has-a" is the Composite.
+- Each `Node` keeps a **parent** pointer. It is needed to build a node's full path, to unlink it on `rm` and `mv`, and to check "is the target inside the thing I'm moving?" by walking upwards.
+- The `FileSystem` never hands a `Node` to callers; its API takes and returns strings. That keeps every change behind the lock.
+
+## Design patterns used and why
+
+| Pattern | Where | Why it earns its place |
+|---|---|---|
+| **Composite** | `Node`, `FileNode`, `DirectoryNode` | A directory contains files and directories. Both are `Node`s, so `size()`, `path()` and `find` treat one file and a whole subtree the same way. See [Composite](/learn/notes/structural-patterns/). |
+| **Strategy** | `SearchFilter` | "Find by name", "by size", "by extension", "big `.log` files" are all rules plugged into one traversal. New rule = new lambda, combined with `and`, `or`, `negate`. See [Strategy](/learn/notes/behavioral-patterns/). |
+| **Facade** | `FileSystem` | One small API over the tree, the parser and the lock. Callers never touch nodes or locks. See [Facade](/learn/notes/structural-patterns/). |
+| **Visitor (discussed)** | Alternative for `find`, `size`, printing | Useful when many operations walk the same stable set of node types. In Java 21, a sealed hierarchy plus a pattern-matching `switch` gives the same type-safe dispatch with less code. Details below. |
+
+### Strategy filter or Visitor?
+
+Both are fair answers when the interviewer says "find by name or size".
+
+- A **search filter Strategy** answers one question per node: "does this node match?" The traversal stays in `FileSystem`. This is the simplest fit for `find`, and filters compose: `extension("log").and(largerThan(1_000_000))`.
+- A **Visitor** moves a whole operation (sum sizes, print a tree, collect matches, export to JSON) out of the node classes. Each node has `accept(visitor)` and the visitor has `visitFile` and `visitDirectory`. It pays off when you keep adding operations over node types that rarely change.
+
+The classic Visitor in Java looks like this:
+
+```java
+interface NodeVisitor<R> {
+    R visitFile(FileNode f);
+    R visitDirectory(DirectoryNode d);
+}
+// in Node:          abstract <R> R accept(NodeVisitor<R> v);
+// in FileNode:      <R> R accept(NodeVisitor<R> v) { return v.visitFile(this); }
+// in DirectoryNode: <R> R accept(NodeVisitor<R> v) { return v.visitDirectory(this); }
+```
+
+Because `Node` is a **sealed** class (Java 17+), Java 21's pattern-matching `switch` over it is checked for exhaustiveness at compile time, so you get the same "handle every node type" guarantee without `accept` methods. The solution's `ls` uses this:
+
+```java
+return switch (resolve(path)) {
+    case FileNode f      -> List.of(f.name());
+    case DirectoryNode d -> d.children().stream().map(Node::name).toList();
+};
+```
+
+**How to say it in an interview:** "`find` takes a `SearchFilter` strategy so new search rules are lambdas. If we keep adding whole operations over the tree, like export or checksum, I'd use a Visitor, or in Java 21 a pattern-matching switch over the sealed `Node`."
+
+## Solution walkthrough
+
+Build it in this order; each step compiles and can be tried on its own.
+
+### Step 1: path parsing and normalisation
+
+```java
+final class PathParser {
+    private PathParser() {}
+
+    static List<String> parse(String path) {
+        if (path == null || !path.startsWith("/")) throw new InvalidPathException("must be absolute: " + path);
+        Deque<String> parts = new ArrayDeque<>();
+        for (String part : path.split("/")) {
+            if (part.isEmpty() || part.equals(".")) continue;   // "//" and "." add nothing
+            if (part.equals("..")) { parts.pollLast(); continue; } // ".." at root stays at root
+            parts.addLast(part);
+        }
+        return List.copyOf(parts);
+    }
+
+    static String join(List<String> parts) { return "/" + String.join("/", parts); }
+}
+```
+
+Split on `/` and use a **stack**:
+
+- An empty piece comes from `//`, a leading `/` or a trailing `/`. Skip it. POSIX also treats repeated slashes as one (it leaves exactly two leading slashes implementation-defined, which we ignore).
+- `.` means "this directory". Skip it.
+- `..` means "parent". Pop the last name. Popping an empty stack does nothing, so `/..` stays at `/`; POSIX allows exactly this for `..` in the root.
+- Anything else is a name. Push it.
+
+`/a/./b//c/../d/` becomes `[a, b, d]`. The root is the empty list.
+
+This is **lexical** normalisation: it works on the string only, without looking at the tree. That is correct here because there are no symlinks. With symlinks, `a/link/..` might not be `a`, which is why Java's `Path.normalize()` warns that removing `..` can change which file a path points to. Parsing before taking any lock also keeps the locked section short.
+
+### Step 2: the Composite nodes
+
+```java
+sealed abstract class Node permits FileNode, DirectoryNode {
+    private String name;
+    private DirectoryNode parent;            // null only for the root
+
+    Node(String name, DirectoryNode parent) { this.name = name; this.parent = parent; }
+
+    String name() { return name; }
+    DirectoryNode parent() { return parent; }
+    void relink(DirectoryNode newParent, String newName) { this.parent = newParent; this.name = newName; }
+
+    abstract long size();
+
+    boolean isSelfOrAncestorOf(Node other) {
+        for (Node n = other; n != null; n = n.parent) if (n == this) return true;
+        return false;
+    }
+
+    String path() { /* walk parents up to the root, then join the names */ }
+}
+```
+
+`Node` is the **component**. It is `sealed`, so only `FileNode` and `DirectoryNode` can extend it, and the compiler knows that list. `name` and `parent` are not final because `mv` changes both. `isSelfOrAncestorOf` walks up the parent chain from `other`. It is how we will reject moving a directory into its own subtree, in O(depth) and without scanning the subtree.
+
+```java
+final class FileNode extends Node {
+    private final ByteArrayOutputStream data = new ByteArrayOutputStream();
+
+    String read() { return data.toString(StandardCharsets.UTF_8); }
+    void write(String content) { data.reset(); append(content); }
+    void append(String content) { data.writeBytes(content.getBytes(StandardCharsets.UTF_8)); }
+    @Override long size() { return data.size(); }
+}
+```
+
+`FileNode` is the **leaf**. It stores bytes, not a `String`, so `size()` is the byte count a real file system would report (`"héllo"` is 6 bytes, because `é` takes 2 bytes in UTF-8). `ByteArrayOutputStream` grows its buffer as needed, so appends are cheap on average. `writeBytes(byte[])` exists since Java 11 and `toString(Charset)` since Java 10.
+
+```java
+final class DirectoryNode extends Node {
+    private final NavigableMap<String, Node> children = new TreeMap<>();
+
+    Node child(String name) { return children.get(name); }
+    void add(Node node) { children.put(node.name(), node); }
+    void remove(String name) { children.remove(name); }
+    boolean isEmpty() { return children.isEmpty(); }
+    Collection<Node> children() { return Collections.unmodifiableCollection(children.values()); }
+
+    @Override long size() {
+        long total = 0;
+        for (Node child : children.values()) total += child.size();
+        return total;
+    }
+}
+```
+
+`DirectoryNode` is the **composite**. Its children live in a `TreeMap`, a red-black tree that keeps keys sorted, so `ls` is already in order and lookup by name is O(log k) for k children. A `HashMap` would give O(1) lookup but you would sort on every `ls` (O(k log k)); say which one you picked and why. `size()` is the Composite payoff: a directory asks each child for its size, and the child may be a file or another directory.
+
+### Step 3: the filter Strategy
+
+```java
+@FunctionalInterface
+interface SearchFilter {
+    boolean matches(Node node);
+
+    default SearchFilter and(SearchFilter other) { return n -> matches(n) && other.matches(n); }
+    default SearchFilter or(SearchFilter other)  { return n -> matches(n) || other.matches(n); }
+    default SearchFilter negate()                { return n -> !matches(n); }
+
+    static SearchFilter nameEquals(String name)  { return n -> n.name().equals(name); }
+    static SearchFilter extension(String ext)    { return n -> n instanceof FileNode && n.name().endsWith("." + ext); }
+    static SearchFilter largerThan(long bytes)   { return n -> n instanceof FileNode && n.size() > bytes; }
+    static SearchFilter isDirectory()            { return n -> n instanceof DirectoryNode; }
+}
+```
+
+One method means lambdas can implement it. The `default` methods make filters composable, the same idea as `java.util.function.Predicate`. Static factory methods give the common rules readable names. A new rule ("modified in the last hour", "name matches a glob") is a new lambda; `FileSystem.find` never changes.
+
+### Step 4: locking helpers and path resolution in the facade
+
+```java
+private final DirectoryNode root = new DirectoryNode("", null);
+private final ReadWriteLock lock = new ReentrantReadWriteLock();
+
+private <T> T underRead(Supplier<T> op) {
+    lock.readLock().lock();
+    try { return op.get(); } finally { lock.readLock().unlock(); }
+}
+
+private <T> T underWrite(Supplier<T> op) {
+    lock.writeLock().lock();
+    try { return op.get(); } finally { lock.writeLock().unlock(); }
+}
+
+private Node walk(List<String> parts, String original, boolean missingOk) {
+    Node cur = root;
+    for (int i = 0; i < parts.size(); i++) {
+        if (!(cur instanceof DirectoryNode dir)) throw new NotADirectoryException(original);
+        cur = dir.child(parts.get(i));
+        if (cur == null) {
+            if (missingOk && i == parts.size() - 1) return null;
+            throw new NotFoundException(original);
+        }
+    }
+    return cur;
+}
+```
+
+Every public method runs inside exactly one of `underRead` or `underWrite`, so you can't forget to unlock (the `finally` does it even on exceptions) and you can see at a glance which operations mutate. `walk` goes from the root, one name at a time:
+
+- If the current node is a file but there are more names left, the path goes **through** a file: `NotADirectoryException` (the shell says "Not a directory" for `/a/file.txt/x`).
+- If a name is missing, it's `NotFoundException`, unless the caller allows only the **last** part to be missing (used by `mv` to tell "target exists" from "target is a new name").
+
+Resolution costs O(depth × log k). Helpers `parentDirOf` and `fileAt` are built on `walk`.
+
+### Step 5: mkdir -p, ls, and the file operations
+
+```java
+void mkdir(String path) {
+    underWrite(() -> {
+        DirectoryNode cur = root;
+        for (String part : PathParser.parse(path)) {
+            Node next = cur.child(part);
+            if (next == null) { next = new DirectoryNode(part, cur); cur.add(next); }
+            if (!(next instanceof DirectoryNode dir)) throw new NotADirectoryException(path);
+            cur = dir;
+        }
+        return null;
+    });
+}
+```
+
+`mkdir -p` walks down and creates what's missing. It is idempotent: running it twice is fine. If any part is a file, it fails. One honest caveat: if it fails halfway (`/a/b/file.txt/x`), the directories created before the file stay. Real `mkdir -p` behaves the same way. If the interviewer wants all-or-nothing, check the whole path first, then create.
+
+It takes the **write** lock from the start. You cannot check under the read lock and then "upgrade": `ReentrantReadWriteLock` does not support read-to-write upgrades, and a thread that tries blocks forever.
+
+```java
+List<String> ls(String path) {
+    return underRead(() -> switch (resolve(path)) {
+        case FileNode f -> List.of(f.name());
+        case DirectoryNode d -> d.children().stream().map(Node::name).toList();
+    });
+}
+```
+
+`ls` on a file returns its name, as in LeetCode 588 and the shell. On a directory it returns a **copy** of the sorted names, never a live view, so the caller can use the list after the lock is released.
+
+`createFile` is strict (parent must exist, name must be free). `writeFile` and `appendFile` create the file if it's missing (like `>` and `>>` in the shell) but never create parent directories, and both fail with `IsADirectoryException` on a directory. `readFile` returns a new `String`, so no internal buffer escapes.
+
+### Step 6: rm and rm -r
+
+```java
+void rm(String path, boolean recursive) {
+    underWrite(() -> {
+        Node node = resolve(path);
+        if (node == root) throw new FsException("Refusing to remove /");
+        if (node instanceof DirectoryNode dir && !dir.isEmpty() && !recursive)
+            throw new DirectoryNotEmptyException(path);
+        node.parent().remove(node.name());
+        return null;
+    });
+}
+```
+
+Removing one map entry detaches the whole subtree; nothing else points into it, so the garbage collector frees it. That makes `rm -r` O(depth × log k), not O(subtree size). Without `recursive`, a non-empty directory is refused, like `rmdir`.
+
+### Step 7: move and rename, with the own-subtree check
+
+```java
+void move(String src, String dst) {
+    underWrite(() -> {
+        Node node = resolve(src);
+        if (node == root) throw new InvalidMoveException("cannot move /");
+        List<String> dstParts = PathParser.parse(dst);
+        Node existing = walk(dstParts, dst, true);
+
+        DirectoryNode targetDir;
+        String targetName;
+        if (existing instanceof DirectoryNode dir) { targetDir = dir; targetName = node.name(); }
+        else if (existing != null) throw new AlreadyExistsException(dst);
+        else { targetDir = parentDirOf(dstParts, dst); targetName = dstParts.getLast(); }
+
+        if (node.isSelfOrAncestorOf(targetDir))
+            throw new InvalidMoveException(src + " into its own subtree " + dst);
+        Node clash = targetDir.child(targetName);
+        if (clash == node) return null;                         // already there: no-op
+        if (clash != null) throw new AlreadyExistsException(clash.path());
+
+        node.parent().remove(node.name());
+        node.relink(targetDir, targetName);
+        targetDir.add(node);
+        return null;
+    });
+}
+```
+
+This is the method interviewers probe. In order:
+
+1. **Work out the target.** If `dst` is an existing directory, the node goes inside it with its own name (`mv notes.txt projects/`). If `dst` is an existing file, refuse; we never overwrite. If `dst` doesn't exist, its parent must be a directory and the last part is the new name (a rename).
+2. **Reject moving into its own subtree.** `mv /home/aman /home/aman/projects` would unlink `aman` from `/home` and attach it under its own grandchild: the subtree becomes a loop that nothing reachable points to, and the data silently disappears. The check walks **up** from the target directory; if it meets the node being moved, refuse. This also catches `mv /a /a` and `mv /a /a/newname`.
+3. **Check for a name clash** at the target. If the clashing entry is the node itself (`mv /a/f /a`, moving a file into the folder it is already in), do nothing.
+4. **Unlink, relink, link.** Remove from the old parent's map, update the node's parent and name, add to the new parent. Because the node object is moved, not copied, the whole subtree moves in O(depth × log k) and every descendant's `path()` is automatically correct.
+
+Steps 1 to 4 all run under the one write lock, so no other thread can move a parent in between the check and the change.
+
+`List.getLast()` comes from Java 21's `SequencedCollection`; on older Java use `parts.get(parts.size() - 1)`.
+
+### Step 8: size and find
+
+```java
+long size(String path) { return underRead(() -> resolve(path).size()); }
+
+List<String> find(String start, SearchFilter filter) {
+    return underRead(() -> {
+        List<String> out = new ArrayList<>();
+        Deque<Node> stack = new ArrayDeque<>();
+        stack.push(resolve(start));
+        while (!stack.isEmpty()) {
+            Node n = stack.pop();
+            if (filter.matches(n)) out.add(n.path());
+            if (n instanceof DirectoryNode d) {
+                List<Node> kids = new ArrayList<>(d.children());
+                for (int i = kids.size() - 1; i >= 0; i--) stack.push(kids.get(i));
+            }
+        }
+        return out;
+    });
+}
+```
+
+`size` on a directory is computed on demand by recursion: O(nodes in the subtree). That's simple and always correct. If `size` is called far more often than files change, cache each directory's total and update the parent chain on every write, `rm` and `mv` (O(depth) per change); see [Extensions](#extensions-interviewers-ask-for).
+
+`find` is a depth-first walk with an explicit stack, so a very deep tree can't overflow the thread's call stack. Children are pushed in reverse so they are popped in sorted order, which makes the result deterministic and easy to test. Like Unix `find`, the start node itself is included if it matches.
+
+## Full solution code
+
+One file, `Main.java`, Java 21. Compile and run with `javac Main.java && java Main`.
+
+```java
+import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Supplier;
+
+// ============================== Errors ==============================
+
+class FsException extends RuntimeException { FsException(String m) { super(m); } }
+class NotFoundException extends FsException { NotFoundException(String p) { super("No such file or directory: " + p); } }
+class NotADirectoryException extends FsException { NotADirectoryException(String p) { super("Not a directory: " + p); } }
+class IsADirectoryException extends FsException { IsADirectoryException(String p) { super("Is a directory: " + p); } }
+class AlreadyExistsException extends FsException { AlreadyExistsException(String p) { super("Already exists: " + p); } }
+class DirectoryNotEmptyException extends FsException { DirectoryNotEmptyException(String p) { super("Directory not empty: " + p); } }
+class InvalidPathException extends FsException { InvalidPathException(String m) { super("Invalid path: " + m); } }
+class InvalidMoveException extends FsException { InvalidMoveException(String m) { super("Invalid move: " + m); } }
+
+// ============================== Paths ==============================
+
+/** Turns "/a/./b//c/../d/" into [a, b, d]. Purely lexical: no I/O, no locks. */
+final class PathParser {
+    private PathParser() {}
+
+    static List<String> parse(String path) {
+        if (path == null || !path.startsWith("/")) throw new InvalidPathException("must be absolute: " + path);
+        Deque<String> parts = new ArrayDeque<>();
+        for (String part : path.split("/")) {
+            if (part.isEmpty() || part.equals(".")) continue;   // "//" and "." add nothing
+            if (part.equals("..")) { parts.pollLast(); continue; } // ".." at root stays at root
+            parts.addLast(part);
+        }
+        return List.copyOf(parts);
+    }
+
+    static String join(List<String> parts) { return "/" + String.join("/", parts); }
+}
+
+// ============================== Composite: Node, FileNode, DirectoryNode ==============================
+
+sealed abstract class Node permits FileNode, DirectoryNode {
+    private String name;
+    private DirectoryNode parent;            // null only for the root
+
+    Node(String name, DirectoryNode parent) { this.name = name; this.parent = parent; }
+
+    String name() { return name; }
+    DirectoryNode parent() { return parent; }
+    void relink(DirectoryNode newParent, String newName) { this.parent = newParent; this.name = newName; }
+
+    /** The one operation every node answers uniformly: a file its bytes, a directory the sum of its children. */
+    abstract long size();
+
+    /** True if this node is `other` or one of its ancestors. Used to block moving a directory into itself. */
+    boolean isSelfOrAncestorOf(Node other) {
+        for (Node n = other; n != null; n = n.parent) if (n == this) return true;
+        return false;
+    }
+
+    String path() {
+        if (parent == null) return "/";
+        Deque<String> parts = new ArrayDeque<>();
+        for (Node n = this; n.parent != null; n = n.parent) parts.addFirst(n.name);
+        return PathParser.join(List.copyOf(parts));
+    }
+}
+
+final class FileNode extends Node {
+    private final ByteArrayOutputStream data = new ByteArrayOutputStream();   // files hold bytes, like a real FS
+
+    FileNode(String name, DirectoryNode parent) { super(name, parent); }
+
+    String read() { return data.toString(StandardCharsets.UTF_8); }
+    void write(String content) { data.reset(); append(content); }
+    void append(String content) { data.writeBytes(content.getBytes(StandardCharsets.UTF_8)); }
+    @Override long size() { return data.size(); }
+}
+
+final class DirectoryNode extends Node {
+    private final NavigableMap<String, Node> children = new TreeMap<>();     // sorted: ls is free
+
+    DirectoryNode(String name, DirectoryNode parent) { super(name, parent); }
+
+    Node child(String name) { return children.get(name); }
+    void add(Node node) { children.put(node.name(), node); }
+    void remove(String name) { children.remove(name); }
+    boolean isEmpty() { return children.isEmpty(); }
+    Collection<Node> children() { return Collections.unmodifiableCollection(children.values()); }
+
+    @Override long size() {
+        long total = 0;
+        for (Node child : children.values()) total += child.size();   // recursion = Composite at work
+        return total;
+    }
+}
+
+// ============================== Strategy: search filters ==============================
+
+@FunctionalInterface
+interface SearchFilter {
+    boolean matches(Node node);
+
+    default SearchFilter and(SearchFilter other) { return n -> matches(n) && other.matches(n); }
+    default SearchFilter or(SearchFilter other)  { return n -> matches(n) || other.matches(n); }
+    default SearchFilter negate()                { return n -> !matches(n); }
+
+    static SearchFilter nameEquals(String name)  { return n -> n.name().equals(name); }
+    static SearchFilter extension(String ext)    { return n -> n instanceof FileNode && n.name().endsWith("." + ext); }
+    static SearchFilter largerThan(long bytes)   { return n -> n instanceof FileNode && n.size() > bytes; }
+    static SearchFilter isDirectory()            { return n -> n instanceof DirectoryNode; }
+}
+
+// ============================== The file system ==============================
+
+final class FileSystem {
+    private final DirectoryNode root = new DirectoryNode("", null);
+    private final ReadWriteLock lock = new ReentrantReadWriteLock();   // many readers OR one writer
+
+    // ---------- locking helpers: every public method goes through exactly one of these ----------
+
+    private <T> T underRead(Supplier<T> op) {
+        lock.readLock().lock();
+        try { return op.get(); } finally { lock.readLock().unlock(); }
+    }
+
+    private <T> T underWrite(Supplier<T> op) {
+        lock.writeLock().lock();
+        try { return op.get(); } finally { lock.writeLock().unlock(); }
+    }
+
+    // ---------- resolution (caller already holds a lock) ----------
+
+    /** Walks the parts from the root. Returns null if the last part is missing (when allowed). */
+    private Node walk(List<String> parts, String original, boolean missingOk) {
+        Node cur = root;
+        for (int i = 0; i < parts.size(); i++) {
+            if (!(cur instanceof DirectoryNode dir)) throw new NotADirectoryException(original);
+            cur = dir.child(parts.get(i));
+            if (cur == null) {
+                if (missingOk && i == parts.size() - 1) return null;
+                throw new NotFoundException(original);
+            }
+        }
+        return cur;
+    }
+
+    private Node resolve(String path) { return walk(PathParser.parse(path), path, false); }
+
+    private DirectoryNode parentDirOf(List<String> parts, String original) {
+        Node parent = walk(parts.subList(0, parts.size() - 1), original, false);
+        if (parent instanceof DirectoryNode dir) return dir;
+        throw new NotADirectoryException(original);
+    }
+
+    private FileNode fileAt(String path, boolean create) {
+        List<String> parts = PathParser.parse(path);
+        if (parts.isEmpty()) throw new IsADirectoryException(path);
+        DirectoryNode parent = parentDirOf(parts, path);
+        Node node = parent.child(parts.getLast());
+        if (node == null) {
+            if (!create) throw new NotFoundException(path);
+            FileNode file = new FileNode(parts.getLast(), parent);
+            parent.add(file);
+            return file;
+        }
+        if (node instanceof FileNode file) return file;
+        throw new IsADirectoryException(path);
+    }
+
+    // ---------- public API ----------
+
+    /** mkdir -p: creates every missing directory; fine if it already exists; fails if a part is a file. */
+    void mkdir(String path) {
+        underWrite(() -> {
+            DirectoryNode cur = root;
+            for (String part : PathParser.parse(path)) {
+                Node next = cur.child(part);
+                if (next == null) { next = new DirectoryNode(part, cur); cur.add(next); }
+                if (!(next instanceof DirectoryNode dir)) throw new NotADirectoryException(path);
+                cur = dir;
+            }
+            return null;
+        });
+    }
+
+    /** A file lists as its own name; a directory lists its children in sorted order. */
+    List<String> ls(String path) {
+        return underRead(() -> switch (resolve(path)) {
+            case FileNode f -> List.of(f.name());
+            case DirectoryNode d -> d.children().stream().map(Node::name).toList();
+        });
+    }
+
+    /** touch-like, but strict: parent must exist and the name must be free. */
+    void createFile(String path) {
+        underWrite(() -> {
+            List<String> parts = PathParser.parse(path);
+            if (parts.isEmpty()) throw new AlreadyExistsException(path);
+            DirectoryNode parent = parentDirOf(parts, path);
+            if (parent.child(parts.getLast()) != null) throw new AlreadyExistsException(path);
+            parent.add(new FileNode(parts.getLast(), parent));
+            return null;
+        });
+    }
+
+    void writeFile(String path, String content)  { underWrite(() -> { fileAt(path, true).write(content); return null; }); }
+    void appendFile(String path, String content) { underWrite(() -> { fileAt(path, true).append(content); return null; }); }
+    String readFile(String path)                 { return underRead(() -> fileAt(path, false).read()); }
+
+    /** rm (recursive=false) refuses a non-empty directory; rm -r removes the whole subtree. */
+    void rm(String path, boolean recursive) {
+        underWrite(() -> {
+            Node node = resolve(path);
+            if (node == root) throw new FsException("Refusing to remove /");
+            if (node instanceof DirectoryNode dir && !dir.isEmpty() && !recursive)
+                throw new DirectoryNotEmptyException(path);
+            node.parent().remove(node.name());      // unlinking the subtree root drops the whole subtree
+            return null;
+        });
+    }
+
+    /**
+     * mv. If dst is an existing directory, src goes inside it under its own name;
+     * otherwise dst is the new full path (a rename). A directory may never move into its own subtree.
+     */
+    void move(String src, String dst) {
+        underWrite(() -> {
+            Node node = resolve(src);
+            if (node == root) throw new InvalidMoveException("cannot move /");
+            List<String> dstParts = PathParser.parse(dst);
+            Node existing = walk(dstParts, dst, true);
+
+            DirectoryNode targetDir;
+            String targetName;
+            if (existing instanceof DirectoryNode dir) { targetDir = dir; targetName = node.name(); }
+            else if (existing != null) throw new AlreadyExistsException(dst);
+            else { targetDir = parentDirOf(dstParts, dst); targetName = dstParts.getLast(); }
+
+            if (node.isSelfOrAncestorOf(targetDir))
+                throw new InvalidMoveException(src + " into its own subtree " + dst);
+            Node clash = targetDir.child(targetName);
+            if (clash == node) return null;                         // already there: no-op
+            if (clash != null) throw new AlreadyExistsException(clash.path());
+
+            node.parent().remove(node.name());
+            node.relink(targetDir, targetName);
+            targetDir.add(node);
+            return null;
+        });
+    }
+
+    long size(String path) { return underRead(() -> resolve(path).size()); }
+
+    /** Depth-first, children in sorted order, so results are deterministic. */
+    List<String> find(String start, SearchFilter filter) {
+        return underRead(() -> {
+            List<String> out = new ArrayList<>();
+            Deque<Node> stack = new ArrayDeque<>();
+            stack.push(resolve(start));
+            while (!stack.isEmpty()) {                               // iterative: deep trees can't overflow the stack
+                Node n = stack.pop();
+                if (filter.matches(n)) out.add(n.path());
+                if (n instanceof DirectoryNode d) {
+                    List<Node> kids = new ArrayList<>(d.children());
+                    for (int i = kids.size() - 1; i >= 0; i--) stack.push(kids.get(i));
+                }
+            }
+            return out;
+        });
+    }
+
+    /** Pretty printer for the demo. */
+    String tree(String path) {
+        return underRead(() -> {
+            StringBuilder sb = new StringBuilder();
+            print(resolve(path), "", sb);
+            return sb.toString();
+        });
+    }
+
+    private void print(Node n, String indent, StringBuilder sb) {
+        String label = n.parent() == null ? "/" : n.name() + (n instanceof DirectoryNode ? "/" : "");
+        sb.append(indent).append(label).append(" (").append(n.size()).append(" B)\n");
+        if (n instanceof DirectoryNode d) for (Node c : d.children()) print(c, indent + "  ", sb);
+    }
+}
+
+// ============================== Demo ==============================
+
+public class Main {
+    public static void main(String[] args) {
+        FileSystem fs = new FileSystem();
+
+        fs.mkdir("/home/aman/projects/stacktrace");
+        fs.mkdir("/home/aman/projects/stacktrace");                  // mkdir -p is idempotent
+        fs.mkdir("/var/log");
+        fs.writeFile("/home/aman/notes.txt", "buy milk");
+        fs.appendFile("/home/aman/notes.txt", ", call mom");
+        fs.writeFile("/home/aman/projects/stacktrace/README.md", "# StackTrace");
+        fs.appendFile("/var/log/app.log", "boot ok\n");               // append creates the file
+        fs.writeFile("/home/aman/projects/todo.txt", "ship fs note");
+
+        System.out.println("ls /home/aman        -> " + fs.ls("/home/aman"));
+        System.out.println("ls via messy path   -> " + fs.ls("//home/./aman/projects/../projects/"));
+        System.out.println("ls on a file         -> " + fs.ls("/home/aman/notes.txt"));
+        System.out.println("read notes.txt       -> " + fs.readFile("/home/aman/notes.txt"));
+        System.out.println("size /home           -> " + fs.size("/home") + " bytes");
+        System.out.println("find *.txt           -> " + fs.find("/", SearchFilter.extension("txt")));
+        System.out.println("find files > 10 B    -> " + fs.find("/", SearchFilter.largerThan(10)));
+        System.out.println("find name=projects   -> " + fs.find("/", SearchFilter.nameEquals("projects")));
+
+        fs.move("/home/aman/notes.txt", "/home/aman/projects");      // into an existing directory
+        fs.move("/home/aman/projects/todo.txt", "/home/aman/projects/done.txt");   // rename
+        System.out.println("after moves, ls projects -> " + fs.ls("/home/aman/projects"));
+
+        tryIt(() -> fs.move("/home/aman", "/home/aman/projects/stacktrace"));
+        tryIt(() -> fs.rm("/home/aman/projects", false));
+        tryIt(() -> fs.mkdir("/home/aman/projects/done.txt/x"));
+        tryIt(() -> fs.readFile("/home/aman/projects"));
+        tryIt(() -> fs.ls("/nope"));
+        tryIt(() -> fs.ls("relative/path"));
+
+        fs.rm("/var", true);                                          // rm -r
+        System.out.print(fs.tree("/"));
+    }
+
+    private static void tryIt(Runnable r) {
+        try { r.run(); System.out.println("unexpected success"); }
+        catch (FsException e) { System.out.println("Rejected: " + e.getMessage()); }
+    }
+}
+```
+
+**Demo output** (real output from running the program above):
+
+```text
+ls /home/aman        -> [notes.txt, projects]
+ls via messy path   -> [stacktrace, todo.txt]
+ls on a file         -> [notes.txt]
+read notes.txt       -> buy milk, call mom
+size /home           -> 42 bytes
+find *.txt           -> [/home/aman/notes.txt, /home/aman/projects/todo.txt]
+find files > 10 B    -> [/home/aman/notes.txt, /home/aman/projects/stacktrace/README.md, /home/aman/projects/todo.txt]
+find name=projects   -> [/home/aman/projects]
+after moves, ls projects -> [done.txt, notes.txt, stacktrace]
+Rejected: Invalid move: /home/aman into its own subtree /home/aman/projects/stacktrace
+Rejected: Directory not empty: /home/aman/projects
+Rejected: Not a directory: /home/aman/projects/done.txt/x
+Rejected: Is a directory: /home/aman/projects
+Rejected: No such file or directory: /nope
+Rejected: Invalid path: must be absolute: relative/path
+/ (42 B)
+  home/ (42 B)
+    aman/ (42 B)
+      projects/ (42 B)
+        done.txt (12 B)
+        notes.txt (18 B)
+        stacktrace/ (12 B)
+          README.md (12 B)
+```
+
+Reading the output: the messy path `//home/./aman/projects/../projects/` normalises to `/home/aman/projects`. `ls` on a file returns just its name. `/home` is 42 bytes: `notes.txt` (18) + `README.md` (12) + `todo.txt` (12). `find` returns full paths in sorted depth-first order. The first move puts `notes.txt` inside `projects` because the target is an existing directory; the second is a rename. Moving `/home/aman` into its own grandchild is rejected, as are a non-recursive `rm` of a non-empty directory, a path through a file, reading a directory, a missing path and a relative path. Finally `rm -r /var` removes the whole log tree.
+
+## Concurrency and edge cases
+
+### The locking design
+
+The whole tree is guarded by **one** `ReentrantReadWriteLock`: many threads can hold the read lock together, but the write lock is exclusive (no readers, no other writer). See [ReadWriteLock and StampedLock](/learn/notes/java-concurrency-locks/).
+
+- **Read lock:** `ls`, `readFile`, `size`, `find`, `tree`. These never change the tree, so they run in parallel.
+- **Write lock:** `mkdir`, `createFile`, `writeFile`, `appendFile`, `rm`, `move`.
+
+Why does even a read need a lock? `TreeMap` is not thread-safe. A reader iterating a directory while a writer adds a child can get a `ConcurrentModificationException` (TreeMap iterators are fail-fast, on a best-effort basis), or worse, see a half-rebalanced red-black tree. A reader walking `/a/b/c` while `mv` relinks `b` could also see `b` in neither place or in both. The read lock rules all of this out.
+
+### Why one lock and not one per node?
+
+| Option | Pros | Cons |
+|---|---|---|
+| **One read-write lock (chosen)** | Simple; every operation is atomic, including `mv` which touches two directories and checks ancestors; no deadlock possible | All writers queue behind each other even in unrelated folders; a long `find` over a huge tree delays every writer |
+| One `synchronized` / `ReentrantLock` for everything | Simplest of all | Readers also block each other, so no read parallelism |
+| A lock per directory, taken hand-over-hand down the path (lock coupling) | Writers in different folders run in parallel | `mv` must lock two parents in a fixed global order to avoid deadlock, and the subtree check must hold the ancestors steady; much harder to get right in 90 minutes |
+| Immutable tree, new root swapped in with `AtomicReference` (copy-on-write) | Readers never lock and always see a consistent snapshot | Each write copies every directory on the path from root to the changed node (O(depth) copies, each also copying its child map unless you use a persistent map); writers still need a lock or a CAS retry loop |
+
+**How to say it in an interview:** "I'll start with one `ReentrantReadWriteLock`: reads share, writes are exclusive, and `mv` is trivially atomic. If writes in different folders contend, I'd move to per-directory locks with a global lock order for `mv`, or a copy-on-write tree with an atomic root for lock-free reads."
+
+### Read-write lock trade-offs to mention
+
+- **No upgrade.** The Javadoc states that upgrading from a read lock to the write lock is not possible; a thread holding the read lock that asks for the write lock waits forever. So `mkdir` takes the write lock from the start instead of "check under read, then upgrade". (Downgrading, write then read then release write, is allowed.)
+- **Fairness.** The default is non-fair. The Javadoc says a continuously contended non-fair lock may postpone some readers or writers indefinitely, but usually has higher throughput. `new ReentrantReadWriteLock(true)` gives roughly arrival order at some throughput cost.
+- **It only helps if reads dominate.** If most calls are appends, a read-write lock costs more bookkeeping than a plain `ReentrantLock` for no gain. Measure before choosing.
+- **Keep locked work small.** Parsing happens before the lock. Results are copied (names, paths, strings) so callers never touch nodes after the lock is released.
+
+### Edge cases
+
+| Case | What could go wrong | How the design handles it |
+|---|---|---|
+| `mv /a /a/b/c` | Subtree detached into a cycle; data lost | `isSelfOrAncestorOf` walks up from the target and refuses |
+| Two threads: `mv /p /q/y` and `mv /q /p/x` | Without atomicity both pass the subtree check and form a cycle | Both run under the write lock; the second sees the new tree and fails with `NotFoundException` |
+| `/..`, `//a///b/`, `/a/./b` | Crash, or escaping above root | Stack-based normaliser; `..` at root is a no-op |
+| Relative path or `null` | Silent wrong lookup | `InvalidPathException` |
+| Path goes through a file (`/f.txt/x`) | Class cast or `null` pointer | `NotADirectoryException` |
+| `readFile` or `writeFile` on a directory | Overwrites a directory | `IsADirectoryException` |
+| `mkdir` where a file exists | File silently replaced | `NotADirectoryException` |
+| `rm /` or `mv /` | Whole tree gone | Refused |
+| Move onto an existing name | Silent overwrite | `AlreadyExistsException` |
+| Moving into the directory it is already in (`mv /a/f /a`) | Removing then re-adding loses it if done in the wrong order | Detected as a no-op. (`mv /a/f /a/f` names an existing file as the target, so it is refused, much like GNU `mv` reports "are the same file") |
+| Very deep tree | `find` overflows the call stack | Iterative DFS (`size()` is still recursive; make it iterative too if depth is unbounded) |
+| Non-ASCII content | Size counted in chars, not bytes | Content stored as UTF-8 bytes |
+
+## Testing it
+
+JUnit 5 tests for the key behaviours (compiled and run with JUnit 5.10.2 against the full solution above; all 8 pass):
+
+```java
+import static org.junit.jupiter.api.Assertions.*;
+
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import org.junit.jupiter.api.Test;
+
+class FileSystemTest {
+
+    @Test
+    void normalisesDotDotDotAndSlashes() {
+        assertEquals(List.of("a", "b", "d"), PathParser.parse("/a/./b//c/../d/"));
+        assertTrue(PathParser.parse("/../..").isEmpty());          // .. at root stays at root
+        assertThrows(InvalidPathException.class, () -> PathParser.parse("a/b"));
+    }
+
+    @Test
+    void mkdirIsMinusPAndLsIsSorted() {
+        FileSystem fs = new FileSystem();
+        fs.mkdir("/a/zeta"); fs.mkdir("/a/Alpha"); fs.mkdir("/a/b/c"); fs.mkdir("/a/b/c");
+        assertEquals(List.of("Alpha", "b", "zeta"), fs.ls("/a"));
+        fs.writeFile("/a/f.txt", "x");
+        assertEquals(List.of("f.txt"), fs.ls("/a/f.txt"));
+        assertThrows(NotADirectoryException.class, () -> fs.mkdir("/a/f.txt/x"));
+    }
+
+    @Test
+    void appendAppendsWriteOverwritesSizeIsBytes() {
+        FileSystem fs = new FileSystem();
+        fs.appendFile("/n.txt", "abc");
+        fs.appendFile("/n.txt", "def");
+        assertEquals("abcdef", fs.readFile("/n.txt"));
+        fs.writeFile("/n.txt", "héllo");
+        assertEquals(6, fs.size("/n.txt"));                        // é is 2 bytes in UTF-8
+        assertThrows(IsADirectoryException.class, () -> fs.readFile("/"));
+    }
+
+    @Test
+    void rmNeedsRecursiveForNonEmptyDirectories() {
+        FileSystem fs = new FileSystem();
+        fs.mkdir("/d/e");
+        assertThrows(DirectoryNotEmptyException.class, () -> fs.rm("/d", false));
+        fs.rm("/d", true);
+        assertTrue(fs.ls("/").isEmpty());
+        assertThrows(FsException.class, () -> fs.rm("/", true));
+    }
+
+    @Test
+    void moveRejectsOwnSubtreeAndKeepsDescendants() {
+        FileSystem fs = new FileSystem();
+        fs.mkdir("/a/b/c");
+        fs.writeFile("/a/b/c/f.txt", "hi");
+        assertThrows(InvalidMoveException.class, () -> fs.move("/a", "/a/b/c"));
+        assertThrows(InvalidMoveException.class, () -> fs.move("/a", "/a/renamed"));
+        fs.mkdir("/z");
+        fs.move("/a/b", "/z");
+        assertEquals("hi", fs.readFile("/z/b/c/f.txt"));
+        assertEquals(List.of("/z/b/c/f.txt"), fs.find("/", SearchFilter.extension("txt")));
+    }
+
+    @Test
+    void findComposesFilters() {
+        FileSystem fs = new FileSystem();
+        fs.writeFile("/big.log", "x".repeat(100));
+        fs.writeFile("/small.log", "x");
+        fs.writeFile("/big.txt", "x".repeat(100));
+        assertEquals(List.of("/big.log"),
+                fs.find("/", SearchFilter.extension("log").and(SearchFilter.largerThan(10))));
+    }
+
+    @Test
+    void concurrentAppendsAreNotLost() throws Exception {
+        FileSystem fs = new FileSystem();
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        CountDownLatch go = new CountDownLatch(1);
+        List<Future<?>> futures = new ArrayList<>();
+        for (int t = 0; t < 8; t++)
+            futures.add(pool.submit(() -> { go.await(); for (int i = 0; i < 1000; i++) fs.appendFile("/log", "x"); return null; }));
+        go.countDown();
+        for (Future<?> f : futures) f.get();
+        pool.shutdown();
+        assertEquals(8000, fs.size("/log"));
+    }
+
+    @Test
+    void crossMovesNeverCreateACycle() throws Exception {
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        for (int round = 0; round < 2000; round++) {
+            FileSystem fs = new FileSystem();
+            fs.mkdir("/p/x"); fs.mkdir("/q/y");
+            CyclicBarrier barrier = new CyclicBarrier(2);
+            AtomicInteger ok = new AtomicInteger();
+            Future<?> f1 = pool.submit(() -> { barrier.await(); try { fs.move("/p", "/q/y"); ok.incrementAndGet(); } catch (FsException e) {} return null; });
+            Future<?> f2 = pool.submit(() -> { barrier.await(); try { fs.move("/q", "/p/x"); ok.incrementAndGet(); } catch (FsException e) {} return null; });
+            f1.get(); f2.get();
+            assertEquals(1, ok.get());                              // exactly one move wins
+            assertEquals(1, fs.ls("/").size());                     // the other dir is nested, not lost
+            assertEquals(5, fs.find("/", SearchFilter.isDirectory()).size());
+        }
+        pool.shutdown();
+    }
+}
+```
+
+The same scenarios, and more, were run as a plain-Java harness (no JUnit dependency) against the exact code above: **60 checks**, all passing on five repeated runs. Besides path parsing, every operation's happy path and every error in the edge-case table, it has four multi-threaded tests: 8 threads appending 1,000 times each to one file (no lost bytes), 8 threads racing `mkdir -p` over overlapping paths (each directory created once), 2,000 rounds of the crossed-moves race above (exactly one wins, tree stays acyclic), and 4 readers running `find` and `size` while 2 writers create and delete files (no `ConcurrentModificationException`, no torn reads, correct final count).
+
+## Extensions interviewers ask for
+
+| Ask | Change | What stays untouched |
+|---|---|---|
+| `cd` and relative paths | A `Session` object holding a current directory path; `PathParser` resolves relative paths against it before normalising | Nodes, lock, all operations |
+| Fast `size()` on huge trees | Cache `totalSize` in each `DirectoryNode`; on write/append add the byte delta to every ancestor; on `rm` subtract, on `mv` subtract from old ancestors and add to new (all O(depth), under the write lock) | API, filters |
+| Glob search (`*.log`, `a?c`) | A new `SearchFilter` that compiles the glob once, for example via `FileSystems.getDefault().getPathMatcher("glob:" + pattern)` or a hand-written regex | `FileSystem.find` |
+| Metadata: created/modified time, owner | Fields on `Node`, set from an injected `Clock`; new filters like `modifiedAfter(instant)` | Traversal, lock |
+| Permissions | A `Permission` set on each node, checked in `walk` and in each operation; a `User` passed into calls | Composite structure |
+| Symlinks | A third `Node` subtype `LinkNode(targetPath)`; resolution follows links with a hop limit to break loops; `..` handling must become physical, not lexical | Files, directories, filters |
+| Watch for changes | **Observer**: listeners notified with `Created`, `Deleted`, `Moved` events after the write lock is released | Everything else |
+| Undo | **Command**: each mutation becomes an object with `execute` and `undo` (a `mv` undo is the reverse `mv`; an `rm` undo keeps the detached subtree) | Nodes |
+| Higher write throughput | Per-directory locks with a global lock order for `mv`, or a copy-on-write tree with an `AtomicReference` root | Public API |
+| Quotas | Check the cached `totalSize` of the quota directory before each write | Filters, nodes |
+| Persistence | Snapshot the tree to JSON, or log every mutation and replay it on start (write-ahead log) | In-memory model |
+
+## Common mistakes
+
+1. **No path normaliser.** Splitting on `/` and using the pieces directly breaks on `//`, `.`, `..` and trailing slashes, and an empty name ends up as a child.
+2. **`instanceof` chains everywhere.** Without Composite, every operation re-implements "if file do X, else loop over children". Put `size()` on the node.
+3. **Forgetting the own-subtree check in `mv`.** The tree silently loses a branch. Interviewers almost always test `mv /a /a/b`.
+4. **Copying on move.** Deep-copying a subtree and deleting the original is O(subtree) and breaks identity; relink the node instead.
+5. **Overwriting on `mv` or `createFile`.** Silent data loss. Refuse unless an explicit overwrite flag is passed.
+6. **Locking per method with `synchronized` on nodes** without a lock order. `mv` locks two parents and can deadlock against a reverse `mv`.
+7. **Trying to upgrade a read lock to a write lock.** With `ReentrantReadWriteLock` the thread blocks forever.
+8. **Returning live collections or nodes.** A caller iterating `children()` after the lock is released races with writers. Return copies.
+9. **Size in characters.** `String.length()` counts UTF-16 units, not bytes.
+10. **Recursion on unbounded depth.** A deep chain of directories can throw `StackOverflowError`; prefer an explicit stack for traversals.
+
+## Practice questions
+
+<Practice>
+
+<QA q="Why is Composite the natural pattern for a file system?" level="easy">
+
+A directory contains files and other directories, which is a part-whole tree. Composite gives both kinds one type, `Node`, with shared operations like `size()` and `path()`. A file answers directly; a directory asks its children and combines the answers. Callers and traversals then treat one file and a whole subtree the same way, with no `if (isFile)` branches scattered around.
+
+</QA>
+
+<QA q="How does your path parser handle /a/./b//c/../d/ and /.. ?" level="easy">
+
+It splits on `/` and pushes names onto a stack. Empty pieces (from `//`, leading or trailing slashes) and `.` are skipped. `..` pops the last name. So `/a/./b//c/../d/` becomes `[a, b, d]`. For `/..`, popping an empty stack does nothing, so it stays at the root, which matches POSIX (`..` in the root may refer to the root itself).
+
+</QA>
+
+<QA q="Why TreeMap for a directory's children instead of HashMap?" level="easy">
+
+`ls` must be sorted. A `TreeMap` keeps keys sorted all the time, so `ls` is a simple walk in O(k), and get, put and remove are O(log k). A `HashMap` gives O(1) lookup but you'd sort on every `ls`, O(k log k). Both are fine for interview-sized trees; the point is to state the trade-off. If `ls` is rare and lookups dominate, `HashMap` plus sort-on-demand is reasonable.
+
+</QA>
+
+<QA q="What does ls return for a file, and why return a copy rather than the children collection?" level="easy">
+
+For a file it returns a one-element list with the file's name, matching LeetCode 588 and the shell. For a directory it returns a new list of names. A copy matters because the lock is released when `ls` returns; a live view of the `TreeMap` would let the caller iterate while another thread modifies it, causing `ConcurrentModificationException` or inconsistent results.
+
+</QA>
+
+<QA q="Walk through what move does when the target is an existing directory versus a new name." level="medium">
+
+If `dst` resolves to an existing directory, the node goes inside it and keeps its name, like `mv notes.txt projects/`. If `dst` resolves to an existing file, the move is refused to avoid overwriting. If `dst` doesn't exist, its parent must be an existing directory and the last path part becomes the node's new name, which is a rename. In all cases the code then runs the own-subtree check, checks for a name clash, and finally unlinks the node from its old parent, updates its parent and name, and adds it to the new parent.
+
+</QA>
+
+<QA q="How do you detect that a directory is being moved into its own subtree, and what is the cost?" level="medium">
+
+Find the target directory first, then walk **up** its parent pointers to the root. If you meet the node being moved, the target is inside it (or is it), so refuse. That costs O(depth). The alternative of comparing normalised paths (is `dst` equal to `src` or does it start with `src` plus `/`) also works, but walking real parent pointers can't be fooled by string tricks and stays correct if you later add symlinks. Without the check, the subtree is detached into a cycle that nothing reachable points to.
+
+</QA>
+
+<QA q="Why does rm -r cost almost nothing, and what happens to the removed files?" level="medium">
+
+Removing the subtree's root from its parent's map makes the whole subtree unreachable from the file system. Nothing else references it, so the garbage collector reclaims it later. The cost is the path lookup plus one `TreeMap.remove`, not a walk over every file. If you cache directory sizes, you must also subtract the removed subtree's size from every ancestor, which is still O(depth).
+
+</QA>
+
+<QA q="When would you choose a Visitor over the SearchFilter strategy?" level="medium">
+
+A filter answers one yes/no question per node and fits `find` well. A Visitor fits when you keep adding whole operations over the tree, like total size, pretty printing, JSON export or checksums, and the node types rarely change. Each operation becomes one visitor class instead of a new method on every node. In Java 21 a pattern-matching `switch` over the sealed `Node` gives the same exhaustive dispatch with less ceremony.
+
+</QA>
+
+<QA q="Why a ReentrantReadWriteLock, and what are its downsides here?" level="hard">
+
+Most traffic on a file system is reads (`ls`, `read`, `find`), and a read-write lock lets those run in parallel while keeping writes exclusive, so every mutation including a two-directory `mv` is atomic. Downsides: all writers queue on one lock even in unrelated folders; a long `find` over a huge tree blocks writers until it finishes; the default non-fair mode can postpone some threads indefinitely under constant contention; read-to-write upgrade is impossible, so mutating methods must take the write lock up front; and if writes dominate, the extra bookkeeping is pure overhead compared to a plain lock.
+
+</QA>
+
+<QA q="How would you let writes in different directories proceed in parallel?" level="hard">
+
+Give each directory its own lock. For single-directory changes, lock the parent (and hold ancestors steady, for example with read locks taken top-down, hand over hand). For `mv`, which touches two parents, acquire their locks in a fixed global order (for example by node id, or by path) so two opposite moves can't deadlock, and keep the ancestor chain of the target stable while running the subtree check. Another route is a copy-on-write tree: writers build a new path from root to the changed node and swap the root with an `AtomicReference` compare-and-set; readers just read the current root with no locks. Say clearly that this is more complex and only worth it when the single lock is measured to be the bottleneck.
+
+</QA>
+
+<QA q="Directory size is O(subtree) now. How would you make it O(1) and keep it correct?" level="hard">
+
+Store a `totalSize` field in each directory. On write or append, compute the byte delta for the file and add it to every ancestor up to the root (O(depth)). On `rm`, subtract the removed node's total from its ancestors. On `mv`, subtract from the old ancestors and add to the new ones. All of this happens inside the same write lock as the change itself, so readers never see a total that disagrees with the files. The trade-off is slower writes and more code paths that must remember to update the cache.
+
+</QA>
+
+<QA q="Interviewer: two threads run mv /p /q/y and mv /q /p/x at the same time. What can go wrong and how does your design prevent it?" level="scenario">
+
+Each move on its own is legal. Without atomicity, both could run their own-subtree check against the old tree, both pass, and both relink: `p` ends up under `q` and `q` under `p`, a cycle detached from the root, so both directories vanish. In this design both moves take the single write lock, so they run one after the other. The second sees the tree after the first move: its source or target path no longer exists where it expected, so it fails with `NotFoundException`. The test harness runs this race 2,000 times and checks that exactly one move wins and both directories are still reachable.
+
+</QA>
+
+<QA q="Interviewer: map your design to LeetCode 588. What's different?" level="scenario">
+
+LeetCode 588 has a `FileSystem` class with `ls`, `mkdir`, `addContentToFile` and `readContentFromFile`. `ls` returns a file's name for a file path or a directory's entries in lexicographic order; `mkdir` creates missing middle directories; `addContentToFile` creates the file or appends to it. Those map to `ls`, `mkdir`, `appendFile` and `readFile` here, and the common LeetCode solution is the same trie of nodes with sorted children. The machine-coding version adds what LeetCode leaves out: path normalisation, delete, move with the subtree check, search strategies, size, error types and thread safety.
+
+</QA>
+
+<QA q="Interviewer: add symlinks. What breaks in your current design?" level="scenario">
+
+Lexical `..` handling breaks: with a link `a/link` pointing elsewhere, `a/link/..` is the target's parent, not `a`, so `..` must be resolved while walking the real tree (physical resolution). Resolution must follow links and limit hops to stop loops (Unix gives up with "too many levels of symbolic links"). `find` and `size` must decide whether to follow links, and `rm -r` must remove the link itself, not its target. The own-subtree check still works because it uses real parent pointers. Add a `LinkNode` as a third subtype of the sealed `Node`, and the compiler will flag every `switch` that must now handle it.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="What does the normaliser return for /a/b/../../../c/./ ?" options={["An error, because it goes above the root", "[a, c]", "[c]", "[.., c]"]} answer={2}>
+
+`a`, `b` are pushed; two `..` pop them; the third `..` pops an empty stack, which is a no-op at the root; `c` is pushed; `.` and the trailing empty piece are skipped. Result `[c]`, the path `/c`.
+
+</MCQ>
+
+<MCQ q="Which pattern lets size() treat a single file and an entire directory tree uniformly?" options={["Composite", "Decorator", "Observer", "Adapter"]} answer={0}>
+
+Composite: files (leaves) and directories (composites) share the `Node` type, and a directory's `size()` sums its children, each of which may itself be a directory.
+
+</MCQ>
+
+<MCQ q="mv /home/aman /home/aman/projects is called. What should happen?" options={["aman is moved under projects and paths update", "projects is moved up to /home", "It succeeds but the subtree is copied first", "It is rejected because the target is inside the source subtree"]} answer={3}>
+
+The target is a descendant of the source. Relinking would attach `aman` under its own child, detaching the subtree into a cycle. The code walks up from the target, meets the source and throws `InvalidMoveException`.
+
+</MCQ>
+
+<MCQ q="A thread holds the read lock of a ReentrantReadWriteLock and calls writeLock().lock() in mkdir. What happens?" options={["The lock is upgraded atomically", "It blocks forever", "It throws IllegalMonitorStateException", "The read lock is dropped and the write lock acquired"]} answer={1}>
+
+Upgrading from read to write is not supported. The write lock waits for all readers to leave, including this thread, so it never proceeds. That is why every mutating method takes the write lock from the start.
+
+</MCQ>
+
+<MCQ q="Why does ls need the read lock at all, when it doesn't change anything?" options={["Java requires a lock to read a TreeMap", "To make ls faster", "Because ls creates directories that are missing", "So that a concurrent writer can't modify the TreeMap or relink nodes while ls iterates"]} answer={3}>
+
+`TreeMap` is not thread-safe. Iterating while another thread changes it can throw `ConcurrentModificationException` or see a half-updated tree. The read lock blocks writers, while still allowing other readers.
+
+</MCQ>
+
+<MCQ q="The file holds the text héllo. What does size() return in this design?" options={["6", "5", "10", "It depends on the platform default charset"]} answer={0}>
+
+Content is stored as UTF-8 bytes. `h`, `l`, `l`, `o` are 1 byte each and `é` is 2 bytes, so 6. `String.length()` would say 5. The charset is fixed to UTF-8, so the platform default doesn't matter.
+
+</MCQ>
+
+<MCQ q="How expensive is rm -r on a directory with a million files in this design?" options={["O(million), every file must be deleted one by one", "Path lookup plus one map removal; the GC reclaims the subtree later", "O(million log million) because of the TreeMap", "It is not supported"]} answer={1}>
+
+Removing the subtree root from its parent's map makes everything below it unreachable. No per-file work is needed unless you maintain cached sizes, which adds an O(depth) update.
+
+</MCQ>
+
+<MCQ q="The interviewer wants find to support big .log files modified today. What is the smallest correct change?" options={["Add three new find methods to FileSystem", "Subclass DirectoryNode", "Add a modifiedAfter filter and combine it: extension and largerThan and modifiedAfter", "Replace the read-write lock with synchronized"]} answer={2}>
+
+`find` already takes a `SearchFilter` strategy with `and`, `or` and `negate`. Add one new filter (plus a modified-time field on `Node`) and compose it with the existing ones. `FileSystem.find` does not change.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **Entities:** sealed `Node` (name, parent, `size()`, `path()`) with `FileNode` (UTF-8 bytes) and `DirectoryNode` (`TreeMap` of children); `PathParser`; `FileSystem` facade; `SearchFilter`; named `FsException` subclasses.
+- **Patterns:** Composite (files and directories as nodes), Strategy (`SearchFilter` with `and`/`or`/`negate`), Facade (`FileSystem`); Visitor or a sealed `switch` as the alternative for many tree-wide operations.
+- **Paths:** split on `/`, stack: skip empty and `.`, pop on `..` (no-op at root), push names. Lexical is fine without symlinks.
+- **Operations:** `mkdir -p` creates missing parts and fails on a file; `ls` returns a sorted copy (a file lists as its own name); `write` overwrites, `append` appends, both create the file but not parents; `rm` refuses non-empty without `-r`; `rm -r` unlinks one entry.
+- **Move:** existing directory target means move inside; missing target means rename; refuse if the target is the source or below it (walk up parent pointers); refuse name clashes; relink, don't copy.
+- **Size:** file = bytes; directory = sum of children, O(subtree). Cache totals and update ancestors for O(1) reads.
+- **Concurrency:** one `ReentrantReadWriteLock`; reads share, writes exclusive; no read-to-write upgrade; non-fair by default; return copies, never nodes. Scale-out options: per-directory locks with a global order, or copy-on-write with an atomic root.
+- **LeetCode 588:** `ls`, `mkdir`, `addContentToFile`, `readContentFromFile` on a trie of nodes; this design is that plus delete, move, search, size and threads.
+
+## Go deeper
+
+- [LeetCode 588: Design In-Memory File System](https://leetcode.com/problems/design-in-memory-file-system/)
+- [Java SE 21 API: ReentrantReadWriteLock](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/locks/ReentrantReadWriteLock.html)
+- [Java SE 21 API: TreeMap](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/TreeMap.html)
+- [Java SE 21 API: Path (normalize)](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/nio/file/Path.html)
+- [POSIX: Pathname Resolution](https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/V1_chap04.html)
+- Related notes: [Machine Coding Strategy](/learn/notes/machine-coding-strategy/), [Structural Patterns](/learn/notes/structural-patterns/), [Behavioral Patterns](/learn/notes/behavioral-patterns/), [Java Concurrency and Locks](/learn/notes/java-concurrency-locks/), [Java Collections and HashMap](/learn/notes/java-collections-hashmap/)

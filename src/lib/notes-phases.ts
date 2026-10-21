@@ -58,7 +58,7 @@ export const NOTES_PHASES: NotesPhase[] = [
     num: '07',
     title: 'HLD Problems',
     blurb:
-      'The interview framework, failure drills, and marquee designs — URL shortener, news feed, chat, notifications, payments, flash sale / ticket booking, video, ride-sharing, metrics pipeline, distributed KV store.',
+      'The interview framework, failure drills, and 27 marquee designs — URL shortener, news feed, chat, notifications, payments, flash sale, hotel booking, video, ride-sharing, food delivery, Google Docs, nearby places, leaderboards, search, photo sharing, live comments, a stock exchange, a message queue, a distributed KV store and more.',
   },
   {
     slug: '08-data-engineering',
@@ -107,7 +107,7 @@ export const NOTES_PHASES: NotesPhase[] = [
     num: '14',
     title: 'Low-Level Design',
     blurb:
-      'SOLID, design patterns, a machine-coding strategy, a Python-to-Java ramp-up, 10 solved machine-coding problems (parking lot, LRU + rate limiter, Splitwise, elevator, BookMyShow, vending machine + logger, pub-sub, KV cache, meeting rooms) and two timed mocks.',
+      'SOLID, design patterns, a machine-coding strategy, a Python-to-Java ramp-up, 17 solved machine-coding problems (parking lot, LRU + rate limiter, Splitwise, elevator, BookMyShow, vending machine + logger, pub-sub, KV cache, meeting rooms, tic-tac-toe, chess, library, ATM, file system, task scheduler, car rental, food ordering) and two timed mocks.',
   },
   {
     slug: '15-interview-readiness',

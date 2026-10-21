@@ -1,0 +1,1207 @@
+---
+title: "LLD: Library Management System"
+phase: "14-lld"
+order: 160
+tags: ["lld", "machine-coding", "java", "design-patterns", "concurrency", "library-management"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 45
+prerequisites: ["machine-coding-strategy", "solid-principles", "behavioral-patterns", "java-concurrency-locks"]
+summary: "A complete, tested Java 21 machine-coding solution for a library system — books versus physical copies, member borrowing limits, checkout, return and renew, a FIFO hold queue, pluggable fines (Strategy), indexed search, hold-ready notifications (Observer), an injected Clock, and a per-title lock so the last copy is never lent twice."
+---
+
+## Definition (interview-ready)
+
+A library management system lends physical copies of books to members and takes them back. It enforces borrowing limits, lets members renew loans and queue holds on books that are all out, charges fines for late returns, and searches the catalogue. The core entities are a `Book` (the catalogue entry, one per ISBN), many `BookItem`s (the physical copies, one per barcode), a `Member` with a `MemberType` that sets the loan limit and loan length, `Loan` and `Hold` records, and a `Library` service. Fines are a **Strategy** (`FinePolicy`) so the rule can change without touching checkout or return. "Your hold is ready" is published to **Observers** (`LibraryListener`). Time comes from an injected `java.time.Clock`, so due dates and fines are testable. For concurrency, each title's copies and hold queue share one lock, so two members can never both get the last copy.
+
+**One-liner:** Book versus BookItem, a per-title lock guarding copies plus a FIFO hold queue, fines as a Strategy, hold-ready events through Observer, and an injected Clock for every date.
+
+## Problem statement
+
+> Design and implement a library management system.
+>
+> - The library has many books. It can own **several copies** of the same book.
+> - **Members** borrow copies. A standard member can have at most **3** books out for **14 days**; a premium member **5** books for **28 days**.
+> - Members can **return** a book and **renew** a loan (at most twice). A loan can't be renewed if other members are waiting for that book.
+> - If every copy of a book is out, a member can **reserve** it. Reservations are served **first come, first served**. When a copy comes back, the next member in line has **3 days** to collect it, and should be **notified**.
+> - Late returns are **fined** per day, with a maximum. Members with too many unpaid fines can't borrow. The fine rule will change, so make it easy to swap.
+> - Members can **search** by title, author or ISBN.
+> - Several librarians and self-service kiosks use the system at the same time.
+> - Write a demo `main`.
+
+This is a favourite because it looks easy and isn't. The trap is the word "book": a book on a search page and a book in your hand are different things. The second trap is the reservation queue: the moment a copy comes back, it belongs to the head of the queue, not to whoever is standing at the desk. This note builds on the method in [Machine Coding Rounds](/learn/notes/machine-coding-strategy/) and the patterns in [Behavioral Patterns](/learn/notes/behavioral-patterns/).
+
+## Clarifying questions to ask
+
+Write the answers as a comment at the top of your file.
+
+| Question | Assumed answer |
+|---|---|
+| Is a "book" the title or the physical copy? | Both exist. `Book` is the title (ISBN, title, authors). `BookItem` is a copy with a barcode. Loans are for copies. |
+| Can a member borrow two copies of the same book? | No. One copy per title per member. |
+| Can a member reserve a book when a copy is on the shelf? | No, they should just borrow it. Reservations ("holds") are only for books with no free copy. |
+| Renewal extends from when? | From the current due date, by the member's loan length. Not allowed if overdue, if anyone is waiting, or after 2 renewals. |
+| How long is a ready hold kept? | Until the end of the 3rd day after it became ready. Then it passes to the next member in line. |
+| Fine rule? | 10 rupees per late day, capped at 300. Members owing 100 or more are blocked from borrowing. |
+| How do notifications go out? | Out of scope to actually send email or SMS. Publish an event to listeners; a listener can send the message. |
+| Search semantics? | Case-insensitive whole-word match; a multi-word query must match every word. ISBN accepts hyphens. |
+| Lost or damaged books, payments, persistence, UI? | Out of scope; mention as extensions. Everything in memory. |
+| Concurrency? | Yes. Two kiosks may try to lend the last copy at the same moment; it must go to exactly one member. |
+
+## Requirements
+
+**Functional (in scope)**
+
+1. Add books (by ISBN) and physical copies (by barcode); register members.
+2. Search by title words, author words, or exact ISBN.
+3. Checkout: give a member a copy, respecting the loan limit, fines block and hold queue.
+4. Return: close the loan, compute any fine, and hand the copy to the next waiting member if there is one.
+5. Renew: extend the due date, subject to the rules above.
+6. Place and cancel holds; holds are served FIFO; expire uncollected holds.
+7. Notify when a hold is ready and when it expires.
+
+**Non-functional**
+
+- Thread-safe: no copy lent twice, no member over the limit, no double return.
+- Testable: the clock and the fine rule are injected.
+- Extensible: a new fine rule, a new notification channel or a new member type without editing the service.
+
+**Out of scope:** lost and damaged copies, payment gateways, multiple branches, persistence. All appear in [Extensions](#extensions-interviewers-ask-for).
+
+## Entities and relationships
+
+```text
+                       ┌───────────────────────────── Library (service) ─────────────────────────────┐
+ Librarian / kiosk ───►│ stock:       isbn    -> BookStock    (ConcurrentHashMap)                    │
+   checkout()          │ items:       barcode -> BookItem                                            │
+   returnItem()        │ members:     id      -> Member                                              │
+   renew()             │ activeLoans: barcode -> Loan                                                │
+   placeHold()         │  ◆── CatalogIndex  (byIsbn, title word -> isbns, author word -> isbns)      │
+   expireHolds()       │  ◆── FinePolicy    ◁── PerDayFine, FinePolicy.NONE          (Strategy)      │
+                       │  ◆── Clock                                                  (injected)      │
+                       │  ◆── LibraryListener 0..*  ◁── email, SMS, test spy         (Observer)      │
+                       └─────────────────────────────────────────────────────────────────────────────┘
+ BookStock (one per ISBN) ── lock: ReentrantLock
+   ├── Book (isbn, title, authors)             catalogue entry, immutable record
+   ├── BookItem 1..*  (barcode, status, heldFor, pickupBy)   status: AVAILABLE | ON_LOAN | ON_HOLD
+   └── holds: Deque of Hold (memberId, isbn, placedOn)       FIFO
+ Member (id, MemberType{maxLoans, loanDays}, borrowed isbns, finesDue)
+ Loan (id, barcode, isbn, memberId, issuedOn, dueOn, renewals)    ReturnReceipt (loan, returnedOn, fine)
+ LibraryEvent «sealed» ◁── HoldReady (memberId, isbn, barcode, pickupBy), HoldExpired (memberId, isbn, barcode)
+```
+
+- A `Book` **has** many `BookItem`s. They are grouped, with that book's hold queue and one lock, in a `BookStock`.
+- A `Loan` **refers to** a copy by barcode and a member by id. Loans are immutable records; renewing creates a new one.
+- A `Hold` is on a **title**, not a copy: any copy that comes back can serve it.
+- `Library` **depends on** `FinePolicy`, `Clock` and a list of `LibraryListener`s, all supplied from outside.
+
+## Design patterns used and why
+
+| Pattern | Where | Why it earns its place |
+|---|---|---|
+| **Strategy** | `FinePolicy` (`PerDayFine`, `FinePolicy.NONE`) | The problem says the fine rule will change. A new rule (grace days, premium discount, holiday waiver) is a new class wired in `main`; checkout and return never change. See [Strategy](/learn/notes/behavioral-patterns/). |
+| **Observer** | `LibraryListener` receiving `HoldReady` and `HoldExpired` | The library shouldn't know about email, SMS or push. It publishes events; any number of listeners react. Tests subscribe a spy list. See [Observer](/learn/notes/behavioral-patterns/). |
+| **Dependency injection** | `Clock`, `FinePolicy`, `Rules` passed to the constructor | Every date comes from `LocalDate.now(clock)`. Tests move a fake clock 17 days forward instead of waiting 17 days. |
+| **Value objects (records)** | `Book`, `Loan`, `Hold`, `ReturnReceipt`, events | Immutable data is safe to share between threads and to compare with `equals`, which the renew race check relies on. |
+| **State (considered, kept simple)** | `CopyStatus` enum | A copy has three states with simple transitions. A full State pattern (one class per state) would be overkill; an enum plus guarded methods is enough. Say you'd upgrade if states gain behaviour (lost, in repair, in transit). |
+
+This split follows [SOLID](/learn/notes/solid-principles/): search lives in `CatalogIndex`, fine rules in `FinePolicy`, notification delivery in listeners, and the `Library` only coordinates.
+
+## Solution walkthrough
+
+Build it in this order. Each step compiles, so you always have something to run.
+
+### Step 1: Book versus BookItem
+
+```java
+record Book(String isbn, String title, List<String> authors) {
+    Book {
+        isbn = Isbn.normalize(isbn);
+        if (title == null || title.isBlank()) throw new IllegalArgumentException("title required");
+        authors = List.copyOf(authors);
+    }
+}
+
+enum CopyStatus { AVAILABLE, ON_LOAN, ON_HOLD }
+
+/** One physical copy. Its mutable fields are changed only while holding its BookStock's lock. */
+final class BookItem {
+    private final String barcode;
+    private final String isbn;
+    private CopyStatus status = CopyStatus.AVAILABLE;
+    private String heldFor;                 // member id while ON_HOLD
+    private LocalDate pickupBy;             // last day the held copy can be collected
+    // getters, markOnLoan(), markAvailable(), markOnHold(memberId, until)
+}
+```
+
+`Book` is what the catalogue shows: one per ISBN, immutable, so it's a record. Its **compact constructor** (the `Book { ... }` block that runs before fields are set) normalises the ISBN so `978-0-13-468599-1` and `9780134685991` are the same book, and copies the author list so nobody can change it later. `BookItem` is the thing on the shelf, with a barcode and a status. If you merge these two into one class, you can't model "the library has 3 copies of Clean Code", and you can't tell which copy a member has.
+
+`BookItem` is deliberately **not** thread-safe on its own. Its fields only change while the caller holds the lock of the `BookStock` that owns it. That's a rule you state out loud in the interview, and write as a comment.
+
+### Step 2: the stock for one title, with its hold queue
+
+```java
+record Hold(String memberId, String isbn, LocalDate placedOn) {}
+
+/** Everything that changes together for one ISBN: its copies and its FIFO hold queue, under one lock. */
+final class BookStock {
+    final Book book;
+    final List<BookItem> copies = new ArrayList<>();
+    final Deque<Hold> holds = new ArrayDeque<>();
+    final ReentrantLock lock = new ReentrantLock();
+
+    /** A copy held for this member wins; otherwise a shelf copy, but only if nobody is queued. */
+    Optional<BookItem> pickCopyFor(String memberId) {
+        for (BookItem c : copies)
+            if (c.status() == CopyStatus.ON_HOLD && memberId.equals(c.heldFor())) return Optional.of(c);
+        if (!holds.isEmpty()) return Optional.empty();
+        return copies.stream().filter(c -> c.status() == CopyStatus.AVAILABLE).findFirst();
+    }
+}
+```
+
+This class is the key design decision. The copies of a title and the queue of people waiting for it **must change together**: "a copy came back, so the first person in the queue gets it" touches both. Putting them behind one lock makes every such change atomic. An `ArrayDeque` is the FIFO queue: `addLast` to join, `pollFirst` to serve. It isn't thread-safe, and doesn't need to be, because only the lock holder touches it.
+
+`pickCopyFor` encodes the fairness rule: a copy held for you is yours; a shelf copy is only lendable if nobody is waiting. Without the second check, someone walking in could take a copy that the queue was owed.
+
+### Step 3: members and their limits
+
+```java
+enum MemberType {
+    STANDARD(3, 14), PREMIUM(5, 28);
+    // maxLoans(), loanDays()
+}
+
+final class Member {
+    private final Set<String> borrowedIsbns = new HashSet<>();
+    private long finesDue;
+
+    /** Atomically checks fines, the loan limit and duplicates, then reserves a slot for this ISBN. */
+    synchronized void startLoan(String isbn, long fineBlockLimit) {
+        if (finesDue >= fineBlockLimit) throw new MemberBlockedException(id, finesDue);
+        if (borrowedIsbns.size() >= type.maxLoans()) throw new LoanLimitException(id, type.maxLoans());
+        if (!borrowedIsbns.add(isbn)) throw new LibraryException(id + " already has a copy of " + isbn);
+    }
+    synchronized void endLoan(String isbn) { borrowedIsbns.remove(isbn); }
+    // addFine, payFine, finesDue, isBorrowing, loanCount — all synchronized
+}
+```
+
+The rule "at most 3 loans" lives on the `MemberType` enum, so there's no `if (premium)` anywhere. `startLoan` is a **check-then-act** made safe: checking the count and adding the ISBN happen inside one `synchronized` method, so two kiosks lending to the same member at the same time can't both see "2 loans" and both add a third and fourth. The member's monitor is a **leaf lock**: its methods only touch the member's own fields and never call out, so it can't take part in a deadlock.
+
+### Step 4: loans and fines (Strategy)
+
+```java
+record Loan(String id, String barcode, String isbn, String memberId, LocalDate issuedOn, LocalDate dueOn, int renewals) {
+    Loan renewed(int days) { return new Loan(id, barcode, isbn, memberId, issuedOn, dueOn.plusDays(days), renewals + 1); }
+}
+
+@FunctionalInterface
+interface FinePolicy {
+    long fineFor(Loan loan, LocalDate returnedOn);      // whole rupees
+    FinePolicy NONE = (loan, returnedOn) -> 0;
+}
+
+/** A flat amount per late day, capped. */
+final class PerDayFine implements FinePolicy {
+    private final long perDay, cap;
+    PerDayFine(long perDay, long cap) { this.perDay = perDay; this.cap = cap; }
+    public long fineFor(Loan loan, LocalDate returnedOn) {
+        long daysLate = ChronoUnit.DAYS.between(loan.dueOn(), returnedOn);
+        return daysLate <= 0 ? 0 : Math.min(daysLate * perDay, cap);
+    }
+}
+```
+
+Dates are `LocalDate` because library rules are in whole days. `ChronoUnit.DAYS.between(due, returned)` counts calendar days; it is negative or zero when the book is on time. Money is a `long` of whole rupees; say you'd switch to paise or `BigDecimal` if fractions appear. `FinePolicy` has one method, so tests can pass a lambda, and `FinePolicy.NONE` is a ready-made "no fines" rule.
+
+### Step 5: search with indexes
+
+```java
+final class CatalogIndex {
+    private final Map<String, Book> byIsbn = new ConcurrentHashMap<>();
+    private final Map<String, Set<String>> titleIndex = new ConcurrentHashMap<>();
+    private final Map<String, Set<String>> authorIndex = new ConcurrentHashMap<>();
+
+    void add(Book b) {
+        if (byIsbn.putIfAbsent(b.isbn(), b) != null) throw new IllegalArgumentException("duplicate isbn " + b.isbn());
+        for (String w : tokens(b.title())) titleIndex.computeIfAbsent(w, k -> ConcurrentHashMap.newKeySet()).add(b.isbn());
+        // same for each author's words
+    }
+
+    private List<Book> search(Map<String, Set<String>> index, String query) {
+        List<String> words = tokens(query);
+        if (words.isEmpty()) return List.of();
+        Set<String> hits = null;
+        for (String w : words) {                       // intersect the posting sets (AND)
+            Set<String> ids = index.getOrDefault(w, Set.of());
+            if (hits == null) hits = new HashSet<>(ids); else hits.retainAll(ids);
+            if (hits.isEmpty()) return List.of();
+        }
+        return hits.stream().map(byIsbn::get).sorted(Comparator.comparing(Book::title)).toList();
+    }
+}
+```
+
+An **inverted index** maps each word to the ISBNs that contain it, like the index at the back of a book. Searching "clean code" looks up `clean` and `code` and keeps the ISBNs in both sets, so the cost depends on how many books match those words, not on the size of the catalogue. ISBN lookup is a plain hash-map get. `tokens` lowercases with `Locale.ROOT` (no locale surprises) and splits on anything that isn't a letter or digit. `computeIfAbsent` on a `ConcurrentHashMap` creates each word's set atomically, and `ConcurrentHashMap.newKeySet()` gives a thread-safe set, so books can be added while others search. More on hash maps in [Java Collections and HashMap](/learn/notes/java-collections-hashmap/).
+
+### Step 6: checkout, the two-phase claim
+
+```java
+Loan checkout(String memberId, String isbn) {
+    Member m = member(memberId);
+    BookStock s = stockFor(isbn);
+    m.startLoan(s.book.isbn(), rules.fineBlockLimit());     // 1. reserve a loan slot (member lock, released)
+    s.lock.lock();                                          // 2. claim a copy under the title lock
+    try {
+        BookItem copy = s.pickCopyFor(memberId).orElseThrow(() -> new NoCopyAvailableException(s.book.isbn()));
+        copy.markOnLoan();
+        LocalDate today = today();
+        Loan loan = new Loan("L" + loanSeq.incrementAndGet(), copy.barcode(), copy.isbn(), memberId,
+                             today, today.plusDays(m.type().loanDays()), 0);
+        activeLoans.put(copy.barcode(), loan);
+        return loan;
+    } catch (RuntimeException e) {
+        m.endLoan(s.book.isbn());                           // undo the slot reservation
+        throw e;
+    } finally {
+        s.lock.unlock();
+    }
+}
+```
+
+Two steps, two locks, never held in a conflicting order:
+
+1. **Reserve a member slot.** `startLoan` checks fines, the limit and duplicates atomically, and releases the member's lock when it returns.
+2. **Claim a copy** under the title's lock. Choosing the copy and marking it `ON_LOAN` happen inside the same critical section, so two kiosks can't both pick the last copy. If there's no copy, the slot reservation is undone and the error is rethrown.
+
+`lock()` comes right before `try`, and `unlock()` sits in `finally`. That's the standard `ReentrantLock` idiom: the lock is released however the block exits. See [Java Concurrency and Locks](/learn/notes/java-concurrency-locks/).
+
+### Step 7: return, and handing the copy to the queue
+
+```java
+ReturnReceipt returnItem(String barcode) {
+    Loan loan = activeLoans.remove(barcode);                // atomic claim: one return per loan
+    if (loan == null) throw new LibraryException("No active loan for " + barcode);
+    LocalDate today = today();
+    long fine = finePolicy.fineFor(loan, today);
+    Member m = member(loan.memberId());
+    m.endLoan(loan.isbn());
+    if (fine > 0) m.addFine(fine);
+
+    BookStock s = stock.get(loan.isbn());
+    List<LibraryEvent> events = new ArrayList<>();
+    s.lock.lock();
+    try {
+        BookItem item = items.get(barcode);
+        item.markAvailable();
+        handToNextHold(s, item, today, events);
+    } finally { s.lock.unlock(); }
+    publish(events);                                        // notify outside the lock
+    return new ReturnReceipt(loan, today, fine);
+}
+
+/** Caller holds s.lock and item is AVAILABLE: give it to the head of the queue, if any. */
+private void handToNextHold(BookStock s, BookItem item, LocalDate today, List<LibraryEvent> events) {
+    Hold next = s.holds.pollFirst();
+    if (next == null) return;
+    LocalDate pickupBy = today.plusDays(rules.holdPickupDays());
+    item.markOnHold(next.memberId(), pickupBy);
+    events.add(new HoldReady(next.memberId(), item.isbn(), item.barcode(), pickupBy));
+}
+```
+
+`activeLoans.remove(barcode)` is an atomic "find and claim": if the same copy is scanned at two return desks, only one gets the loan back. Then the copy goes back on the shelf and, **in the same critical section**, straight to the head of the hold queue if anyone is waiting. There is never a moment when a returned copy is `AVAILABLE` while someone is queued, so nobody can jump the line.
+
+Events are collected while holding the lock and **published after** releasing it. A slow email listener therefore never blocks other kiosks working on that title.
+
+### Step 8: renew, holds and expiry
+
+```java
+Loan renew(String memberId, String barcode) {
+    Loan loan = activeLoans.get(barcode);
+    if (loan == null || !loan.memberId().equals(memberId))
+        throw new LibraryException("No active loan of " + barcode + " for " + memberId);
+    BookStock s = stock.get(loan.isbn());
+    s.lock.lock();                                          // same lock as placeHold: queue can't change mid-check
+    try {
+        if (!s.holds.isEmpty()) throw new RenewalDeniedException(barcode, "other members are waiting");
+        if (loan.renewals() >= rules.maxRenewals()) throw new RenewalDeniedException(barcode, "renewal limit reached");
+        if (today().isAfter(loan.dueOn())) throw new RenewalDeniedException(barcode, "overdue");
+        Loan renewed = loan.renewed(member(memberId).type().loanDays());
+        if (!activeLoans.replace(barcode, loan, renewed))   // lost a race with a return or another renew
+            throw new RenewalDeniedException(barcode, "loan changed, try again");
+        return renewed;
+    } finally { s.lock.unlock(); }
+}
+```
+
+Renew holds the title lock so that "is anyone waiting?" can't change between the check and the update: `placeHold` needs the same lock. The final write uses `ConcurrentHashMap.replace(key, expectedOld, newValue)`, which only succeeds if the map still holds exactly the loan we read. If a return removed it, or another renew already replaced it, the call returns `false` and we refuse. Because `Loan` is a record, "exactly the loan we read" is a value comparison.
+
+`placeHold` (under the title lock) refuses if a copy is on the shelf and nobody is queued, if the member already has a hold, or if they already have the book; otherwise it appends to the queue and returns the position. `cancelHold` removes a queued hold, or, if a copy was already waiting for that member, passes it to the next person. `expireHolds` is what a daily scheduler would call: any copy still `ON_HOLD` after its `pickupBy` date fires `HoldExpired` and moves to the next member in line.
+
+### Step 9: notifications (Observer)
+
+```java
+sealed interface LibraryEvent permits HoldReady, HoldExpired {}
+record HoldReady(String memberId, String isbn, String barcode, LocalDate pickupBy) implements LibraryEvent {}
+record HoldExpired(String memberId, String isbn, String barcode) implements LibraryEvent {}
+
+@FunctionalInterface
+interface LibraryListener { void onEvent(LibraryEvent event); }
+
+private void publish(List<LibraryEvent> events) {
+    for (LibraryEvent e : events)
+        for (LibraryListener l : listeners) {
+            try { l.onEvent(e); }
+            catch (RuntimeException ex) { /* a broken listener must not undo a return; log in real code */ }
+        }
+}
+```
+
+The `Library` keeps listeners in a `CopyOnWriteArrayList`: subscribing is rare and notifying is frequent, and iteration works on a snapshot, so a listener added mid-publish can't cause a `ConcurrentModificationException`. The event type is a **sealed interface** (Java 17+), so a listener can use a pattern-matching `switch` over it (Java 21) and the compiler checks that every event type is handled. A listener that throws is caught: the book was returned, and a failed email must not change that.
+
+## Full solution code
+
+One file, `Main.java`, Java 21. Compile and run with `javac Main.java && java Main`.
+
+```java
+import java.time.*;
+import java.time.temporal.ChronoUnit;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
+
+// ============================== Catalog: books and search ==============================
+
+final class Isbn {
+    private Isbn() {}
+    /** Strips hyphens and spaces; accepts the 10- or 13-character forms. */
+    static String normalize(String raw) {
+        if (raw == null) throw new IllegalArgumentException("isbn required");
+        String s = raw.replaceAll("[-\\s]", "").toUpperCase(Locale.ROOT);
+        if (!s.matches("\\d{9}[\\dX]|\\d{13}")) throw new IllegalArgumentException("bad isbn " + raw);
+        return s;
+    }
+}
+
+/** The catalogue entry (the "title"). Physical copies are BookItems. */
+record Book(String isbn, String title, List<String> authors) {
+    Book {
+        isbn = Isbn.normalize(isbn);
+        if (title == null || title.isBlank()) throw new IllegalArgumentException("title required");
+        authors = List.copyOf(authors);
+    }
+}
+
+/** Inverted indexes: word -> ISBNs. A query matches books that contain every query word. */
+final class CatalogIndex {
+    private final Map<String, Book> byIsbn = new ConcurrentHashMap<>();
+    private final Map<String, Set<String>> titleIndex = new ConcurrentHashMap<>();
+    private final Map<String, Set<String>> authorIndex = new ConcurrentHashMap<>();
+
+    void add(Book b) {
+        if (byIsbn.putIfAbsent(b.isbn(), b) != null) throw new IllegalArgumentException("duplicate isbn " + b.isbn());
+        for (String w : tokens(b.title())) titleIndex.computeIfAbsent(w, k -> ConcurrentHashMap.newKeySet()).add(b.isbn());
+        for (String author : b.authors())
+            for (String w : tokens(author)) authorIndex.computeIfAbsent(w, k -> ConcurrentHashMap.newKeySet()).add(b.isbn());
+    }
+
+    Optional<Book> byIsbn(String isbn) { return Optional.ofNullable(byIsbn.get(Isbn.normalize(isbn))); }
+    List<Book> searchTitle(String query) { return search(titleIndex, query); }
+    List<Book> searchAuthor(String query) { return search(authorIndex, query); }
+
+    private List<Book> search(Map<String, Set<String>> index, String query) {
+        List<String> words = tokens(query);
+        if (words.isEmpty()) return List.of();
+        Set<String> hits = null;
+        for (String w : words) {                       // intersect the posting sets (AND)
+            Set<String> ids = index.getOrDefault(w, Set.of());
+            if (hits == null) hits = new HashSet<>(ids); else hits.retainAll(ids);
+            if (hits.isEmpty()) return List.of();
+        }
+        return hits.stream().map(byIsbn::get).sorted(Comparator.comparing(Book::title)).toList();
+    }
+
+    static List<String> tokens(String text) {
+        if (text == null) return List.of();
+        return Arrays.stream(text.toLowerCase(Locale.ROOT).split("[^\\p{L}\\p{Nd}]+"))
+                .filter(w -> !w.isEmpty()).distinct().toList();
+    }
+}
+
+// ============================== Copies, holds, stock ==============================
+
+enum CopyStatus { AVAILABLE, ON_LOAN, ON_HOLD }
+
+/** One physical copy. Its mutable fields are changed only while holding its BookStock's lock. */
+final class BookItem {
+    private final String barcode;
+    private final String isbn;
+    private CopyStatus status = CopyStatus.AVAILABLE;
+    private String heldFor;                 // member id while ON_HOLD
+    private LocalDate pickupBy;             // last day the held copy can be collected
+
+    BookItem(String barcode, String isbn) { this.barcode = barcode; this.isbn = isbn; }
+
+    String barcode() { return barcode; }
+    String isbn() { return isbn; }
+    CopyStatus status() { return status; }
+    String heldFor() { return heldFor; }
+    LocalDate pickupBy() { return pickupBy; }
+
+    void markOnLoan() { status = CopyStatus.ON_LOAN; heldFor = null; pickupBy = null; }
+    void markAvailable() { status = CopyStatus.AVAILABLE; heldFor = null; pickupBy = null; }
+    void markOnHold(String memberId, LocalDate until) { status = CopyStatus.ON_HOLD; heldFor = memberId; pickupBy = until; }
+}
+
+record Hold(String memberId, String isbn, LocalDate placedOn) {}
+
+/** Everything that changes together for one ISBN: its copies and its FIFO hold queue, under one lock. */
+final class BookStock {
+    final Book book;
+    final List<BookItem> copies = new ArrayList<>();
+    final Deque<Hold> holds = new ArrayDeque<>();
+    final ReentrantLock lock = new ReentrantLock();
+
+    BookStock(Book book) { this.book = book; }
+
+    /** A copy held for this member wins; otherwise a shelf copy, but only if nobody is queued. */
+    Optional<BookItem> pickCopyFor(String memberId) {
+        for (BookItem c : copies)
+            if (c.status() == CopyStatus.ON_HOLD && memberId.equals(c.heldFor())) return Optional.of(c);
+        if (!holds.isEmpty()) return Optional.empty();
+        return copies.stream().filter(c -> c.status() == CopyStatus.AVAILABLE).findFirst();
+    }
+
+    long count(CopyStatus s) { return copies.stream().filter(c -> c.status() == s).count(); }
+
+    boolean hasHoldBy(String memberId) {
+        return holds.stream().anyMatch(h -> h.memberId().equals(memberId))
+            || copies.stream().anyMatch(c -> memberId.equals(c.heldFor()));
+    }
+}
+
+// ============================== Members and loans ==============================
+
+enum MemberType {
+    STANDARD(3, 14), PREMIUM(5, 28);
+    private final int maxLoans, loanDays;
+    MemberType(int maxLoans, int loanDays) { this.maxLoans = maxLoans; this.loanDays = loanDays; }
+    int maxLoans() { return maxLoans; }
+    int loanDays() { return loanDays; }
+}
+
+/** Synchronized methods only touch this member's own fields: it is a "leaf" lock that never calls out. */
+final class Member {
+    private final String id;
+    private final MemberType type;
+    private final Set<String> borrowedIsbns = new HashSet<>();
+    private long finesDue;
+
+    Member(String id, MemberType type) { this.id = id; this.type = type; }
+    String id() { return id; }
+    MemberType type() { return type; }
+
+    /** Atomically checks fines, the loan limit and duplicates, then reserves a slot for this ISBN. */
+    synchronized void startLoan(String isbn, long fineBlockLimit) {
+        if (finesDue >= fineBlockLimit) throw new MemberBlockedException(id, finesDue);
+        if (borrowedIsbns.size() >= type.maxLoans()) throw new LoanLimitException(id, type.maxLoans());
+        if (!borrowedIsbns.add(isbn)) throw new LibraryException(id + " already has a copy of " + isbn);
+    }
+    synchronized void endLoan(String isbn) { borrowedIsbns.remove(isbn); }
+    synchronized boolean isBorrowing(String isbn) { return borrowedIsbns.contains(isbn); }
+    synchronized int loanCount() { return borrowedIsbns.size(); }
+    synchronized void addFine(long amount) { finesDue += amount; }
+    synchronized long finesDue() { return finesDue; }
+    synchronized void payFine(long amount) {
+        if (amount <= 0 || amount > finesDue) throw new IllegalArgumentException("bad payment " + amount);
+        finesDue -= amount;
+    }
+}
+
+record Loan(String id, String barcode, String isbn, String memberId, LocalDate issuedOn, LocalDate dueOn, int renewals) {
+    Loan renewed(int days) { return new Loan(id, barcode, isbn, memberId, issuedOn, dueOn.plusDays(days), renewals + 1); }
+}
+
+record ReturnReceipt(Loan loan, LocalDate returnedOn, long fine) {}
+
+record Rules(int maxRenewals, int holdPickupDays, long fineBlockLimit) {}
+
+// ============================== Fines (Strategy) ==============================
+
+@FunctionalInterface
+interface FinePolicy {
+    long fineFor(Loan loan, LocalDate returnedOn);      // whole rupees
+    FinePolicy NONE = (loan, returnedOn) -> 0;
+}
+
+/** A flat amount per late day, capped. */
+final class PerDayFine implements FinePolicy {
+    private final long perDay, cap;
+    PerDayFine(long perDay, long cap) { this.perDay = perDay; this.cap = cap; }
+    public long fineFor(Loan loan, LocalDate returnedOn) {
+        long daysLate = ChronoUnit.DAYS.between(loan.dueOn(), returnedOn);
+        return daysLate <= 0 ? 0 : Math.min(daysLate * perDay, cap);
+    }
+}
+
+// ============================== Notifications (Observer) ==============================
+
+sealed interface LibraryEvent permits HoldReady, HoldExpired {}
+record HoldReady(String memberId, String isbn, String barcode, LocalDate pickupBy) implements LibraryEvent {}
+record HoldExpired(String memberId, String isbn, String barcode) implements LibraryEvent {}
+
+@FunctionalInterface
+interface LibraryListener { void onEvent(LibraryEvent event); }
+
+// ============================== Errors ==============================
+
+class LibraryException extends RuntimeException { LibraryException(String m) { super(m); } }
+class NoCopyAvailableException extends LibraryException {
+    NoCopyAvailableException(String isbn) { super("No copy of " + isbn + " is free for you"); }
+}
+class LoanLimitException extends LibraryException {
+    LoanLimitException(String member, int max) { super(member + " already has " + max + " loans"); }
+}
+class MemberBlockedException extends LibraryException {
+    MemberBlockedException(String member, long due) { super(member + " is blocked: unpaid fines " + due); }
+}
+class RenewalDeniedException extends LibraryException {
+    RenewalDeniedException(String barcode, String why) { super("Cannot renew " + barcode + ": " + why); }
+}
+
+// ============================== Service ==============================
+
+final class Library {
+    private final CatalogIndex catalog = new CatalogIndex();
+    private final Map<String, BookStock> stock = new ConcurrentHashMap<>();        // isbn -> stock
+    private final Map<String, BookItem> items = new ConcurrentHashMap<>();         // barcode -> copy
+    private final Map<String, Member> members = new ConcurrentHashMap<>();
+    private final Map<String, Loan> activeLoans = new ConcurrentHashMap<>();       // barcode -> loan
+    private final List<LibraryListener> listeners = new CopyOnWriteArrayList<>();
+    private final AtomicLong loanSeq = new AtomicLong();
+    private final FinePolicy finePolicy;
+    private final Clock clock;
+    private final Rules rules;
+
+    Library(FinePolicy finePolicy, Clock clock, Rules rules) {
+        this.finePolicy = finePolicy; this.clock = clock; this.rules = rules;
+    }
+
+    CatalogIndex catalog() { return catalog; }
+    void subscribe(LibraryListener l) { listeners.add(l); }
+    private LocalDate today() { return LocalDate.now(clock); }
+
+    void addBook(Book b) {
+        if (stock.putIfAbsent(b.isbn(), new BookStock(b)) != null) throw new IllegalArgumentException("duplicate isbn " + b.isbn());
+        catalog.add(b);                                  // searchable only once its stock exists
+    }
+
+    BookItem addCopy(String isbn, String barcode) {
+        BookStock s = stockFor(isbn);
+        BookItem item = new BookItem(barcode, s.book.isbn());
+        if (items.putIfAbsent(barcode, item) != null) throw new IllegalArgumentException("duplicate barcode " + barcode);
+        List<LibraryEvent> events = new ArrayList<>();
+        s.lock.lock();
+        try { s.copies.add(item); handToNextHold(s, item, today(), events); }
+        finally { s.lock.unlock(); }
+        publish(events);
+        return item;
+    }
+
+    Member register(String id, MemberType type) {
+        Member m = new Member(id, type);
+        if (members.putIfAbsent(id, m) != null) throw new IllegalArgumentException("duplicate member " + id);
+        return m;
+    }
+
+    Loan checkout(String memberId, String isbn) {
+        Member m = member(memberId);
+        BookStock s = stockFor(isbn);
+        m.startLoan(s.book.isbn(), rules.fineBlockLimit());     // 1. reserve a loan slot (member lock, released)
+        s.lock.lock();                                          // 2. claim a copy under the title lock
+        try {
+            BookItem copy = s.pickCopyFor(memberId).orElseThrow(() -> new NoCopyAvailableException(s.book.isbn()));
+            copy.markOnLoan();
+            LocalDate today = today();
+            Loan loan = new Loan("L" + loanSeq.incrementAndGet(), copy.barcode(), copy.isbn(), memberId,
+                                 today, today.plusDays(m.type().loanDays()), 0);
+            activeLoans.put(copy.barcode(), loan);
+            return loan;
+        } catch (RuntimeException e) {
+            m.endLoan(s.book.isbn());                           // undo the slot reservation
+            throw e;
+        } finally {
+            s.lock.unlock();
+        }
+    }
+
+    ReturnReceipt returnItem(String barcode) {
+        Loan loan = activeLoans.remove(barcode);                // atomic claim: one return per loan
+        if (loan == null) throw new LibraryException("No active loan for " + barcode);
+        LocalDate today = today();
+        long fine = finePolicy.fineFor(loan, today);
+        Member m = member(loan.memberId());
+        m.endLoan(loan.isbn());
+        if (fine > 0) m.addFine(fine);
+
+        BookStock s = stock.get(loan.isbn());
+        List<LibraryEvent> events = new ArrayList<>();
+        s.lock.lock();
+        try {
+            BookItem item = items.get(barcode);
+            item.markAvailable();
+            handToNextHold(s, item, today, events);
+        } finally { s.lock.unlock(); }
+        publish(events);                                        // notify outside the lock
+        return new ReturnReceipt(loan, today, fine);
+    }
+
+    Loan renew(String memberId, String barcode) {
+        Loan loan = activeLoans.get(barcode);
+        if (loan == null || !loan.memberId().equals(memberId))
+            throw new LibraryException("No active loan of " + barcode + " for " + memberId);
+        BookStock s = stock.get(loan.isbn());
+        s.lock.lock();                                          // same lock as placeHold: queue can't change mid-check
+        try {
+            if (!s.holds.isEmpty()) throw new RenewalDeniedException(barcode, "other members are waiting");
+            if (loan.renewals() >= rules.maxRenewals()) throw new RenewalDeniedException(barcode, "renewal limit reached");
+            if (today().isAfter(loan.dueOn())) throw new RenewalDeniedException(barcode, "overdue");
+            Loan renewed = loan.renewed(member(memberId).type().loanDays());
+            if (!activeLoans.replace(barcode, loan, renewed))   // lost a race with a return or another renew
+                throw new RenewalDeniedException(barcode, "loan changed, try again");
+            return renewed;
+        } finally { s.lock.unlock(); }
+    }
+
+    /** Returns the member's position in the FIFO queue (1 = next). */
+    int placeHold(String memberId, String isbn) {
+        Member m = member(memberId);
+        BookStock s = stockFor(isbn);
+        s.lock.lock();
+        try {
+            if (m.isBorrowing(s.book.isbn())) throw new LibraryException(memberId + " already has this book");
+            if (s.holds.isEmpty() && s.count(CopyStatus.AVAILABLE) > 0)
+                throw new LibraryException("A copy is on the shelf: borrow it instead");
+            if (s.hasHoldBy(memberId)) throw new LibraryException(memberId + " already has a hold");
+            s.holds.addLast(new Hold(memberId, s.book.isbn(), today()));
+            return s.holds.size();
+        } finally { s.lock.unlock(); }
+    }
+
+    void cancelHold(String memberId, String isbn) {
+        BookStock s = stockFor(isbn);
+        List<LibraryEvent> events = new ArrayList<>();
+        s.lock.lock();
+        try {
+            boolean removed = s.holds.removeIf(h -> h.memberId().equals(memberId));
+            for (BookItem c : s.copies)
+                if (c.status() == CopyStatus.ON_HOLD && memberId.equals(c.heldFor())) {
+                    c.markAvailable(); handToNextHold(s, c, today(), events); removed = true;
+                }
+            if (!removed) throw new LibraryException(memberId + " has no hold on " + s.book.isbn());
+        } finally { s.lock.unlock(); }
+        publish(events);
+    }
+
+    /** Run daily by a scheduler: uncollected holds expire and pass to the next member in line. */
+    int expireHolds() {
+        LocalDate today = today();
+        List<LibraryEvent> events = new ArrayList<>();
+        int expired = 0;
+        for (BookStock s : stock.values()) {
+            s.lock.lock();
+            try {
+                for (BookItem c : s.copies)
+                    if (c.status() == CopyStatus.ON_HOLD && today.isAfter(c.pickupBy())) {
+                        events.add(new HoldExpired(c.heldFor(), c.isbn(), c.barcode()));
+                        c.markAvailable();
+                        handToNextHold(s, c, today, events);
+                        expired++;
+                    }
+            } finally { s.lock.unlock(); }
+        }
+        publish(events);
+        return expired;
+    }
+
+    /** Caller holds s.lock and item is AVAILABLE: give it to the head of the queue, if any. */
+    private void handToNextHold(BookStock s, BookItem item, LocalDate today, List<LibraryEvent> events) {
+        Hold next = s.holds.pollFirst();
+        if (next == null) return;
+        LocalDate pickupBy = today.plusDays(rules.holdPickupDays());
+        item.markOnHold(next.memberId(), pickupBy);
+        events.add(new HoldReady(next.memberId(), item.isbn(), item.barcode(), pickupBy));
+    }
+
+    private void publish(List<LibraryEvent> events) {
+        for (LibraryEvent e : events)
+            for (LibraryListener l : listeners) {
+                try { l.onEvent(e); }
+                catch (RuntimeException ex) { /* a broken listener must not undo a return; log in real code */ }
+            }
+    }
+
+    long available(String isbn) {
+        BookStock s = stockFor(isbn);
+        s.lock.lock();
+        try { return s.count(CopyStatus.AVAILABLE); } finally { s.lock.unlock(); }
+    }
+
+    List<String> holdQueue(String isbn) {
+        BookStock s = stockFor(isbn);
+        s.lock.lock();
+        try { return s.holds.stream().map(Hold::memberId).toList(); } finally { s.lock.unlock(); }
+    }
+
+    Optional<Loan> loanOf(String barcode) { return Optional.ofNullable(activeLoans.get(barcode)); }
+
+    Member member(String id) {
+        Member m = members.get(id);
+        if (m == null) throw new LibraryException("Unknown member " + id);
+        return m;
+    }
+
+    private BookStock stockFor(String isbn) {
+        BookStock s = stock.get(Isbn.normalize(isbn));
+        if (s == null) throw new LibraryException("Unknown isbn " + isbn);
+        return s;
+    }
+}
+
+/** Test/demo clock we can move forward by hand. */
+final class MutableClock extends Clock {
+    private volatile Instant now;
+    MutableClock(Instant start) { this.now = start; }
+    void advance(Duration d) { now = now.plus(d); }
+    @Override public Instant instant() { return now; }
+    @Override public ZoneId getZone() { return ZoneOffset.UTC; }
+    @Override public Clock withZone(ZoneId zone) { return this; }
+}
+
+// ============================== Demo ==============================
+
+public class Main {
+    public static void main(String[] args) {
+        MutableClock clock = new MutableClock(Instant.parse("2026-03-02T10:00:00Z"));
+        Library lib = new Library(new PerDayFine(10, 300), clock, new Rules(2, 3, 100));
+        lib.subscribe(e -> System.out.println("  [notify] " + e));
+
+        String ej = "978-0134685991", cc = "978-0132350884", ca = "978-0134494166", rf = "978-0134757599";
+        lib.addBook(new Book(ej, "Effective Java", List.of("Joshua Bloch")));
+        lib.addBook(new Book(cc, "Clean Code", List.of("Robert C. Martin")));
+        lib.addBook(new Book(ca, "Clean Architecture", List.of("Robert C. Martin")));
+        lib.addBook(new Book(rf, "Refactoring", List.of("Martin Fowler")));
+        lib.addCopy(ej, "EJ-1");
+        lib.addCopy(cc, "CC-1"); lib.addCopy(cc, "CC-2");
+        lib.addCopy(ca, "CA-1"); lib.addCopy(rf, "RF-1");
+        lib.register("asha", MemberType.STANDARD);
+        lib.register("ravi", MemberType.STANDARD);
+        lib.register("meera", MemberType.PREMIUM);
+
+        System.out.println("Title 'clean': " + lib.catalog().searchTitle("clean").stream().map(Book::title).toList());
+        System.out.println("Author 'martin': " + lib.catalog().searchAuthor("MARTIN").stream().map(Book::title).toList());
+        System.out.println("ISBN 9780134685991: " + lib.catalog().byIsbn("9780134685991").map(Book::title).orElse("-"));
+
+        Loan l1 = lib.checkout("asha", ej);
+        System.out.println("asha borrowed " + l1.barcode() + ", due " + l1.dueOn());
+        try { lib.checkout("ravi", ej); } catch (LibraryException e) { System.out.println("ravi: " + e.getMessage()); }
+        System.out.println("ravi hold position " + lib.placeHold("ravi", ej));
+        System.out.println("meera hold position " + lib.placeHold("meera", ej));
+        try { lib.renew("asha", "EJ-1"); } catch (LibraryException e) { System.out.println("asha: " + e.getMessage()); }
+
+        clock.advance(Duration.ofDays(17));
+        ReturnReceipt r = lib.returnItem("EJ-1");
+        System.out.println("asha returned EJ-1 on " + r.returnedOn() + ", fine " + r.fine());
+        try { lib.checkout("meera", ej); } catch (LibraryException e) { System.out.println("meera: " + e.getMessage()); }
+        Loan l2 = lib.checkout("ravi", ej);
+        System.out.println("ravi collected " + l2.barcode() + ", due " + l2.dueOn());
+
+        lib.checkout("asha", cc); lib.checkout("asha", ca); lib.checkout("asha", rf);
+        try { lib.checkout("asha", ej); } catch (LibraryException e) { System.out.println("asha: " + e.getMessage()); }
+        Loan cc1 = lib.renew("asha", "CC-1");
+        System.out.println("asha renewed CC-1, due " + cc1.dueOn() + " (renewal " + cc1.renewals() + ")");
+        lib.renew("asha", "CC-1");
+        try { lib.renew("asha", "CC-1"); } catch (LibraryException e) { System.out.println("asha: " + e.getMessage()); }
+        lib.returnItem("RF-1");
+        try { lib.checkout("asha", cc); } catch (LibraryException e) { System.out.println("asha: " + e.getMessage()); }
+
+        lib.returnItem("EJ-1");                     // ravi returns on time: meera is next in line
+        clock.advance(Duration.ofDays(4));
+        System.out.println("expired holds: " + lib.expireHolds());
+        System.out.println("Effective Java on shelf: " + lib.available(ej) + ", queue " + lib.holdQueue(ej));
+        System.out.println("asha fines due: " + lib.member("asha").finesDue());
+    }
+}
+```
+
+**Demo output** (real output from running the program above):
+
+```text
+Title 'clean': [Clean Architecture, Clean Code]
+Author 'martin': [Clean Architecture, Clean Code, Refactoring]
+ISBN 9780134685991: Effective Java
+asha borrowed EJ-1, due 2026-03-16
+ravi: No copy of 9780134685991 is free for you
+ravi hold position 1
+meera hold position 2
+asha: Cannot renew EJ-1: other members are waiting
+  [notify] HoldReady[memberId=ravi, isbn=9780134685991, barcode=EJ-1, pickupBy=2026-03-22]
+asha returned EJ-1 on 2026-03-19, fine 30
+meera: No copy of 9780134685991 is free for you
+ravi collected EJ-1, due 2026-04-02
+asha: asha already has 3 loans
+asha renewed CC-1, due 2026-04-16 (renewal 1)
+asha: Cannot renew CC-1: renewal limit reached
+asha: asha already has a copy of 9780132350884
+  [notify] HoldReady[memberId=meera, isbn=9780134685991, barcode=EJ-1, pickupBy=2026-03-22]
+  [notify] HoldExpired[memberId=meera, isbn=9780134685991, barcode=EJ-1]
+expired holds: 1
+Effective Java on shelf: 1, queue []
+asha fines due: 30
+```
+
+Reading the output:
+
+- Search: "clean" matches two titles; "MARTIN" (any case) matches Robert C. Martin's two books and Martin Fowler's, because the author index is word-based.
+- Asha takes the only copy of Effective Java. Ravi can't borrow it, so he joins the queue at position 1; Meera at 2. Asha can't renew because people are waiting.
+- Asha returns 3 days late (due 16 March, returned 19 March): 3 × 10 = 30 fine. In the same step the copy goes on hold for Ravi and he's notified, with a pickup deadline 3 days later.
+- Meera can't take the held copy; Ravi collects it.
+- Asha borrows three more books, so a fourth checkout hits the standard limit of 3. She renews Clean Code twice (each adds 14 days to the due date), and the third renewal is refused. She can't borrow a second copy of a book she already has.
+- Ravi returns the book; it goes on hold for Meera. Four days pass without pickup, so the hold expires and the copy goes back on the shelf with an empty queue.
+
+## Concurrency and edge cases
+
+| Race or edge case | What could go wrong | How the design handles it |
+|---|---|---|
+| Two kiosks lend the last copy | Two loans, one book | Choosing and marking the copy happen under the title's `ReentrantLock`. |
+| Same member borrows at 10 kiosks at once | Member ends up with 10 loans | `Member.startLoan` checks and reserves inside one `synchronized` method. |
+| Checkout fails after the slot was reserved | Member's count stuck one too high | The `catch` calls `endLoan` and rethrows. |
+| Same copy returned at two desks | Fine charged twice, copy handed out twice | `activeLoans.remove(barcode)` gives the loan to exactly one caller. |
+| A copy is returned while people are queued | A walk-in takes it before the queue | Return marks it available and hands it to the queue head in one critical section; `pickCopyFor` refuses shelf copies while anyone is queued. |
+| Renew while someone places a hold | Renewal granted although someone is now waiting | Both run under the same title lock. |
+| Renew races a return | A renewed loan for a book already back on the shelf | `activeLoans.replace(barcode, old, new)` fails if the loan was removed. |
+| Hold-ready email is slow or throws | Every kiosk waits; or a return is half-done | Events are published after unlocking, and listener exceptions are caught. |
+| Hold not collected | Copy stuck forever | `expireHolds` (daily) passes it to the next member or back to the shelf. |
+| Dates and time zones | Fines change depending on when the test runs | `LocalDate.now(clock)` with an injected `Clock`; tests move a fake clock. |
+
+**Lock design in one breath.** There are two kinds of lock: one `ReentrantLock` per title, and each member's monitor. The service never holds two title locks at once (`expireHolds` takes them one at a time). The member lock is a leaf: it can be taken while holding a title lock, but member methods never take a title lock. With no cycle in the lock order, there's no deadlock.
+
+**Why not one global lock?** It would be correct, and it's a fine first answer. But a busy library has many titles, and a global lock makes a kiosk lending *Clean Code* wait for one returning *Effective Java*. Per-title locks let unrelated titles proceed in parallel and only serialise work on the same title, which is where conflicts actually happen.
+
+**Why not a lock-free compare-and-set per copy, like the parking lot?** In the [Parking Lot](/learn/notes/lld-parking-lot/) each spot is independent, so a CAS on one spot is enough. Here, a returning copy and the hold queue must change **together**, and a CAS on one copy can't also update the queue atomically. A small lock around both is simpler and easy to defend.
+
+Honest caveats to mention:
+
+- `expireHolds` is a sweep. Between the `pickupBy` date and the next sweep, the member can still collect the copy. That's lenient, and usually what libraries want.
+- `checkout` reserves the member's slot before taking the title lock. During that tiny window, a concurrent `placeHold` by the **same** member for the **same** title sees "already borrowing" and refuses, even if the checkout then fails. That's a harmless false refusal; the member can just retry.
+- `available` and `holdQueue` return snapshots, which may be stale a moment later. That's fine for display.
+
+## Testing it
+
+JUnit 5 tests. They compile against the full solution above and pass under JUnit Jupiter 5.10:
+
+```java
+import static org.junit.jupiter.api.Assertions.*;
+
+import java.time.*;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import org.junit.jupiter.api.Test;
+
+class LibraryTest {
+    static final String EJ = "978-0134685991", CC = "978-0132350884";
+    private final MutableClock clock = new MutableClock(Instant.parse("2026-03-02T10:00:00Z"));
+
+    private Library library(FinePolicy fines) {
+        Library l = new Library(fines, clock, new Rules(2, 3, 100));
+        l.addBook(new Book(EJ, "Effective Java", List.of("Joshua Bloch")));
+        l.addBook(new Book(CC, "Clean Code", List.of("Robert C. Martin")));
+        l.addCopy(EJ, "EJ-1"); l.addCopy(CC, "CC-1"); l.addCopy(CC, "CC-2");
+        for (String m : List.of("asha", "ravi", "meera")) l.register(m, MemberType.STANDARD);
+        return l;
+    }
+
+    @Test
+    void searchIsCaseInsensitiveAndMatchesAllWords() {
+        Library l = library(FinePolicy.NONE);
+        assertEquals(1, l.catalog().searchTitle("CLEAN code").size());
+        assertTrue(l.catalog().searchTitle("clean java").isEmpty());
+        assertTrue(l.catalog().byIsbn("978-0-13-468599-1").isPresent());
+    }
+
+    @Test
+    void lastCopyCannotBeLentTwiceAndFailedCheckoutFreesTheSlot() {
+        Library l = library(FinePolicy.NONE);
+        l.checkout("asha", EJ);
+        assertThrows(NoCopyAvailableException.class, () -> l.checkout("ravi", EJ));
+        assertEquals(0, l.member("ravi").loanCount());
+    }
+
+    @Test
+    void holdsAreServedFirstComeFirstServed() {
+        Library l = library(FinePolicy.NONE);
+        List<LibraryEvent> events = new ArrayList<>();
+        l.subscribe(events::add);
+        l.checkout("asha", EJ);
+        assertEquals(1, l.placeHold("ravi", EJ));
+        assertEquals(2, l.placeHold("meera", EJ));
+        l.returnItem("EJ-1");
+        assertEquals("ravi", ((HoldReady) events.get(0)).memberId());
+        assertThrows(NoCopyAvailableException.class, () -> l.checkout("meera", EJ));   // can't jump the queue
+        l.checkout("ravi", EJ);
+        l.returnItem("EJ-1");
+        assertEquals("meera", ((HoldReady) events.get(1)).memberId());
+    }
+
+    @Test
+    void renewIsRefusedWhenSomeoneIsWaitingOrAfterTheLimit() {
+        Library l = library(FinePolicy.NONE);
+        Loan cc = l.checkout("asha", CC);
+        assertEquals(cc.dueOn().plusDays(14), l.renew("asha", "CC-1").dueOn());
+        l.renew("asha", "CC-1");
+        assertThrows(RenewalDeniedException.class, () -> l.renew("asha", "CC-1"));
+        l.checkout("asha", EJ);
+        l.placeHold("ravi", EJ);
+        assertThrows(RenewalDeniedException.class, () -> l.renew("asha", "EJ-1"));
+    }
+
+    @Test
+    void finesArePerDayCappedAndBlockBorrowing() {
+        Library l = library(new PerDayFine(10, 300));
+        l.checkout("asha", EJ);
+        clock.advance(Duration.ofDays(15));                       // due after 14 days
+        assertEquals(10, l.returnItem("EJ-1").fine());
+        l.checkout("asha", EJ);
+        clock.advance(Duration.ofDays(200));
+        assertEquals(300, l.returnItem("EJ-1").fine());           // capped
+        assertThrows(MemberBlockedException.class, () -> l.checkout("asha", EJ));
+    }
+
+    @Test
+    void uncollectedHoldExpiresTheDayAfterPickupBy() {
+        Library l = library(FinePolicy.NONE);
+        l.checkout("asha", EJ);
+        l.placeHold("ravi", EJ);
+        l.returnItem("EJ-1");
+        clock.advance(Duration.ofDays(3));
+        assertEquals(0, l.expireHolds());                         // pickupBy day itself is still fine
+        clock.advance(Duration.ofDays(1));
+        assertEquals(1, l.expireHolds());
+        assertEquals(1, l.available(EJ));
+    }
+
+    @Test
+    void thirtyTwoMembersRaceForTheLastCopy() throws Exception {
+        Library l = library(FinePolicy.NONE);
+        for (int i = 0; i < 32; i++) l.register("m" + i, MemberType.STANDARD);
+        ExecutorService pool = Executors.newFixedThreadPool(32);
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicInteger won = new AtomicInteger(), lost = new AtomicInteger();
+        List<Future<?>> futures = new ArrayList<>();
+        for (int i = 0; i < 32; i++) {
+            String member = "m" + i;
+            futures.add(pool.submit(() -> {
+                start.await();
+                try { l.checkout(member, EJ); won.incrementAndGet(); }
+                catch (NoCopyAvailableException e) { lost.incrementAndGet(); }
+                return null;
+            }));
+        }
+        start.countDown();
+        for (Future<?> f : futures) f.get();
+        pool.shutdown();
+        assertEquals(1, won.get());
+        assertEquals(31, lost.get());
+    }
+}
+```
+
+The plain-Java harness ran **49 checks** and passed on repeated runs. Besides the cases above, it covered six multi-threaded scenarios: 32 members racing for the last copy (repeated 50 times, exactly one winner each time); one member borrowing 10 titles from 10 threads with a limit of 3 (exactly 3 succeed); the same copy returned at 8 desks (exactly one return); 20 members placing holds at once, then being served in exactly the queue's order; a renew racing a return 300 times (never a renewed loan for a returned copy); and a stress run of 16 members each doing 2,000 random checkouts, holds and returns, after which every copy was back on the shelf and every queue empty. As a sanity check, removing the title lock from `checkout` made the last-copy test fail on the second round.
+
+## Extensions interviewers ask for
+
+| Ask | Change | What stays untouched |
+|---|---|---|
+| Premium members pay half fines | A `MemberAwareFine` that wraps a `FinePolicy` (Decorator) and looks up the member type; or add the member type to `Loan` | Checkout, return, holds |
+| Grace period of 2 days | `GraceDaysFine(inner, 2)` decorator that subtracts 2 days before delegating | Everything else |
+| Email and SMS when a hold is ready | Two `LibraryListener` classes; in production, publish to a queue so delivery retries don't block | The `Library` |
+| Overdue reminders | A daily `sendOverdueReminders()` that scans `activeLoans` and publishes a new `LoanOverdue` event; add it to the sealed interface | Fines, holds |
+| Lost or damaged copies | Add `LOST` and `IN_REPAIR` to `CopyStatus` and a `reportLost(barcode)` that closes the loan and charges the replacement cost | Search, holds |
+| Prefix search ("refact") | Keep the word index in a `ConcurrentSkipListMap` and use `subMap(prefix, prefix + Character.MAX_VALUE)` | Everything except `CatalogIndex` |
+| Multiple branches | One `BookStock` per (branch, ISBN); holds can be filled by any branch, with a transfer step | Members, fines |
+| Max 5 holds per member | A counter on `Member`, checked in `placeHold` like `startLoan` | Lock design |
+| Persistence | Put loans, holds and copies behind repository interfaces; the per-title lock becomes a row lock or an optimistic version column | Strategies, listeners |
+
+## Common mistakes
+
+1. **One `Book` class for title and copy.** You can't model several copies, and loans can't say which copy is out. Split `Book` and `BookItem`.
+2. **Holds on a copy instead of a title.** A member waiting for *Clean Code* wants any copy. Queue on the title.
+3. **Letting a returned copy go back on the shelf before serving the queue.** A walk-in grabs it and the queue is skipped. Hand it over in the same critical section.
+4. **Check-then-act on availability.** `if (available > 0) lend()` from two threads lends the last copy twice. Pick and mark under one lock.
+5. **A loan limit counted outside a lock.** Two kiosks both see "2 loans" and both lend a third. Make check and increment one atomic step.
+6. **Calling `LocalDate.now()` directly.** Due dates and fines become untestable. Inject a `Clock`.
+7. **Fine rules written as `if` chains inside `returnItem`.** Make the rule a `FinePolicy` strategy.
+8. **Sending email inside the lock.** Every kiosk waits on the mail server. Collect events, unlock, then publish.
+9. **Scanning every book for search.** Fine for 10 books, not for a catalogue. Build word indexes when books are added.
+10. **Using `double` for fines.** Use whole units as `long`, or `BigDecimal`.
+
+## Practice questions
+
+<Practice>
+
+<QA q="Why do you need both Book and BookItem?" level="easy">
+
+`Book` is the catalogue entry: ISBN, title, authors — one per ISBN (each edition and format of a book has its own ISBN). `BookItem` is a physical copy with a barcode and a status. The library can own several copies of one book, a loan is for a specific copy (you need to know which barcode came back), but a hold is for the book (any copy will do). One class can't do both jobs cleanly.
+
+</QA>
+
+<QA q="Where does the rule a standard member can borrow 3 books for 14 days live, and why there?" level="easy">
+
+On the `MemberType` enum: `STANDARD(3, 14), PREMIUM(5, 28)`. The service asks `member.type().maxLoans()` and `loanDays()`. Adding a `STUDENT` type is one enum constant, and no `if (premium)` checks are scattered through the code.
+
+</QA>
+
+<QA q="How does the design make sure the last copy is never lent to two members?" level="easy">
+
+Each title has a `BookStock` with one `ReentrantLock`. Checkout takes that lock, picks a copy and marks it `ON_LOAN` before releasing it. Two kiosks targeting the same title run that section one after the other, so the second sees no free copy and gets `NoCopyAvailableException`. The multi-threaded test (32 members, 1 copy, 50 rounds) always produced exactly one winner.
+
+</QA>
+
+<QA q="Why is the fine rule a Strategy, and what would a new rule look like?" level="medium">
+
+The problem says fine rules will change, and they are independent of the lending flow. `FinePolicy` has one method, `fineFor(loan, returnedOn)`. A new rule is a new class — for example, a grace-period decorator that subtracts 2 days and then calls a wrapped policy — wired in `main`. `returnItem` never changes, which is the Open/Closed principle in practice.
+
+</QA>
+
+<QA q="Walk through what happens when a copy is returned and two members are waiting." level="medium">
+
+`activeLoans.remove(barcode)` claims the loan. The fine is computed and added to the borrower, and their slot is freed. Under the title lock the copy is marked available and immediately handed to the head of the queue: `pollFirst()` removes the first hold, the copy becomes `ON_HOLD` for that member with a pickup deadline, and a `HoldReady` event is recorded. After unlocking, listeners are notified. The second member stays in the queue at position 1.
+
+</QA>
+
+<QA q="Why are listeners notified after releasing the lock?" level="medium">
+
+Listeners do unknown work, like sending email, that may be slow or fail. Calling them while holding the title lock would make every other kiosk wait on the mail server, and a listener that tried to call back into the library for the same title could deadlock or see half-updated state. So events are collected in a list inside the lock and published after it. Exceptions from listeners are caught so a failed message never undoes a return.
+
+</QA>
+
+<QA q="How does search work and what is its cost?" level="medium">
+
+When a book is added, its title and author are split into lowercase words, and each word maps to a set of ISBNs (an inverted index). A query is split the same way, and the sets for each word are intersected. The cost depends on the size of those sets, not on the whole catalogue. ISBN lookup is a hash-map get after removing hyphens. For prefix search, keep the word map sorted and scan the range of words that start with the prefix.
+
+</QA>
+
+<QA q="Renew checks that nobody is waiting. What race could break that, and how is it prevented?" level="hard">
+
+Without a lock: renew checks the queue (empty), a member places a hold, then renew extends the loan — the new member now waits an extra 14 days. Both `renew` and `placeHold` take the same title lock, so the check and the update can't interleave with a new hold. Separately, renew could race a return; the final `activeLoans.replace(barcode, oldLoan, newLoan)` succeeds only if the map still holds the exact loan read earlier, so a renew can't bring back a returned loan.
+
+</QA>
+
+<QA q="Why use a lock per title instead of compare-and-set on each copy like the parking lot design?" level="hard">
+
+In a parking lot, each spot is independent, so a single CAS on the spot is enough. Here, returning a copy must also update the hold queue — mark the copy, remove the queue head, assign the copy to them — as one step. A CAS on one copy can't atomically change a separate queue. A small lock around a title's copies and queue keeps the code simple and correct, and since different titles have different locks, unrelated work still runs in parallel.
+
+</QA>
+
+<QA q="Could this design deadlock?" level="hard">
+
+Deadlock needs a cycle of threads each waiting for a lock another holds. Here the service never holds two title locks at once, and the member's monitor is a leaf: member methods only touch the member's own fields and never take a title lock. So the possible order is always title lock, then member lock, never the reverse. No cycle can form.
+
+</QA>
+
+<QA q="Interviewer: a test for fines passes on your laptop and fails in CI. What is your first guess?" level="scenario">
+
+The code probably calls `LocalDate.now()` without a clock, so the result depends on when and in which time zone the test runs (a CI server in UTC can be on a different date than a laptop in India near midnight). This design injects a `Clock` and always uses `LocalDate.now(clock)`; tests use a fake clock that starts at a fixed instant and is moved forward explicitly.
+
+</QA>
+
+<QA q="Interviewer: notify members by email and SMS, and email must retry on failure. How do you add this?" level="scenario">
+
+Write `EmailNotifier` and `SmsNotifier` implementing `LibraryListener` and subscribe both; the `Library` doesn't change. For retries, the email listener shouldn't retry inline — that would block the thread that returned the book. It should put the message on a queue (in production, a message broker; in an interview, an `ExecutorService` or a `BlockingQueue` with a worker) and let a worker retry with backoff.
+
+</QA>
+
+<QA q="Interviewer: a member says the book was on the shelf but the kiosk refused to lend it. Is that a bug?" level="scenario">
+
+Probably not. If the copy is `ON_HOLD`, it's physically on the hold shelf but reserved for someone else until the pickup deadline. And a copy can't be lent from the shelf while anyone is queued. The kiosk should show the reason: "reserved for another member" or "you are number 2 in the queue". Then check the other reasons the design gives: the member is at the loan limit, or blocked by unpaid fines.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="A library owns 3 copies of Clean Code. How many Book and BookItem objects represent them?" options={["1 Book, 3 BookItem", "3 Book, 3 BookItem", "3 Book, 1 BookItem", "1 Book, 1 BookItem with a count of 3"]} answer={0}>
+
+One catalogue entry per ISBN (`Book`) and one object per physical copy (`BookItem`), each with its own barcode and status. A count alone can't say which copy a member has or which one came back.
+
+</MCQ>
+
+<MCQ q="Ravi and Meera are queued for a book. The copy comes back. What should happen?" options={["The copy goes on the shelf and whoever asks first gets it", "The copy is put on hold for Ravi, and he is notified", "The copy is put on hold for Meera because she asked last", "Both are notified and the first to arrive gets it"]} answer={1}>
+
+Holds are FIFO. The returned copy goes straight to the head of the queue, inside the same critical section as the return, and a `HoldReady` event is published.
+
+</MCQ>
+
+<MCQ q="Which pattern lets you change the fine rule without editing returnItem?" options={["Observer", "Singleton", "Builder", "Strategy"]} answer={3}>
+
+`FinePolicy` is a Strategy: the service calls an interface, and the concrete rule is chosen when the library is built. Observer is used for notifications, not for rules.
+
+</MCQ>
+
+<MCQ q="Why does the service publish HoldReady events after releasing the title lock?" options={["Events cannot be created inside a lock", "So a slow or failing listener never blocks other work on that title", "Because CopyOnWriteArrayList requires it", "To make the events arrive in random order"]} answer={1}>
+
+Listeners can be slow (email) or throw. Calling them outside the lock keeps the critical section short and protects the library's state from listener failures.
+
+</MCQ>
+
+<MCQ q="A loan was due on 16 March and is returned on 19 March. PerDayFine is 10 per day, capped at 300. What is the fine?" options={["0", "20", "30", "40"]} answer={2}>
+
+`ChronoUnit.DAYS.between(16 March, 19 March)` is 3 days late, so 3 × 10 = 30, which is under the cap.
+
+</MCQ>
+
+<MCQ q="What does ConcurrentHashMap.replace(key, oldValue, newValue) give the renew method?" options={["It blocks until no one else uses the key", "It replaces only if the current value still equals oldValue, so a renew cannot resurrect a returned loan", "It always overwrites the value", "It inserts the key if it is missing"]} answer={1}>
+
+This is an atomic conditional replace. If a return removed the loan, or another renew changed it, the call returns false and the renewal is refused.
+
+</MCQ>
+
+<MCQ q="Two kiosks lend books to the same member at the same instant. The member has 2 of 3 allowed loans. What prevents both from succeeding?" options={["Member.startLoan checks and reserves the slot in one synchronized method", "The title lock of each book", "The CatalogIndex", "Nothing; this is an accepted race"]} answer={0}>
+
+The two books have different title locks, so those don't help. The member's synchronized `startLoan` makes count-check plus add one atomic step: one kiosk gets the third slot, the other gets `LoanLimitException`.
+
+</MCQ>
+
+<MCQ q="Why inject a Clock instead of calling LocalDate.now() directly?" options={["Clock is faster", "LocalDate.now() is deprecated", "Clock stores dates in the database", "Tests can fix and move time, so due dates, fines and hold expiry are deterministic"]} answer={3}>
+
+`LocalDate.now(clock)` reads the date from whatever clock is passed in. A fake clock lets a test jump 17 days in one line, and results don't depend on when or where the test runs.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **Entities:** `Book` (title, per ISBN) vs `BookItem` (copy, per barcode); `BookStock` groups a title's copies, FIFO hold queue and lock; `Member` with `MemberType(maxLoans, loanDays)`; `Loan`, `Hold`, `ReturnReceipt` records.
+- **Flows:** checkout = reserve member slot, then pick and mark a copy under the title lock. Return = `remove` the loan, fine, then shelf or next hold in one critical section. Renew = refuse if queued, at limit or overdue; conditional `replace`.
+- **Patterns:** Strategy for fines, Observer for hold-ready and hold-expired events, injected `Clock`, records for values, enum for copy state.
+- **Concurrency:** per-title `ReentrantLock` (copies and queue change together); member lock is a leaf; never two title locks at once; publish events after unlocking.
+- **Search:** inverted word indexes for title and author, intersect for multi-word queries; normalised ISBN hash lookup.
+- **Demo:** last copy taken, FIFO holds, renew refused, late fine, loan limit, renewal limit, hold expiry.
+
+## Go deeper
+
+- [Java SE 21 API: ReentrantLock](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/locks/ReentrantLock.html)
+- [Java SE 21 API: ConcurrentHashMap](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ConcurrentHashMap.html)
+- [Java SE 21 API: CopyOnWriteArrayList](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CopyOnWriteArrayList.html)
+- [Java SE 21 API: java.time.Clock](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/time/Clock.html)
+- Related notes: [Machine Coding Strategy](/learn/notes/machine-coding-strategy/), [Parking Lot](/learn/notes/lld-parking-lot/), [Behavioral Patterns](/learn/notes/behavioral-patterns/), [SOLID Principles](/learn/notes/solid-principles/), [Creational Patterns](/learn/notes/creational-patterns/), [Java Concurrency and Locks](/learn/notes/java-concurrency-locks/), [Java Collections and HashMap](/learn/notes/java-collections-hashmap/), [Executors and Virtual Threads](/learn/notes/java-executors-virtual-threads/)
