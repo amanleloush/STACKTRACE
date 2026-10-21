@@ -1,7 +1,6 @@
 import { defineConfig } from 'astro/config';
 import mdx from '@astrojs/mdx';
 import sitemap from '@astrojs/sitemap';
-import pagefind from 'astro-pagefind';
 import cloudflare from '@astrojs/cloudflare';
 import rehypeSlug from 'rehype-slug';
 import rehypeAutolinkHeadings from 'rehype-autolink-headings';
@@ -46,7 +45,10 @@ export default defineConfig({
       ],
     }),
     sitemap(),
-    pagefind(),
+    // Search: no astro-pagefind integration. scripts/build-search-index.ts
+    // builds dist/pagefind after `astro build` (see package.json), because
+    // the Worker-rendered /learn/* pages need records the integration
+    // can't add, and running both indexed every page twice.
   ],
   build: {
     format: 'directory',
