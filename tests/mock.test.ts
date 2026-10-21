@@ -263,6 +263,8 @@ describe('mock problems from content', () => {
     for (const p of problems) {
       expect(p.briefHtml, p.slug).not.toBe('');
       expect(p.briefHeading, p.slug).not.toMatch(/Definition/);
+      // The brief must be the interviewer's prompt, never a fallback section.
+      expect(p.briefHeading, p.slug).toMatch(/^(Problem statement|The problem)$/);
       expect(p.briefHtml, p.slug).not.toContain('language-mermaid');
       expect(p.definitionHtml, p.slug).toContain('One-liner');
       expect(p.tldrHtml, p.slug).not.toBe('');

@@ -1,0 +1,1240 @@
+---
+title: "LLD: Task Scheduler (Delayed and Recurring Jobs)"
+phase: "14-lld"
+order: 163
+tags: ["lld", "machine-coding", "java", "concurrency", "scheduler", "design-patterns"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 50
+prerequisites: ["machine-coding-strategy", "java-concurrency-locks", "java-executors-virtual-threads", "behavioral-patterns"]
+summary: "A complete, tested Java 21 machine-coding solution for an in-process job scheduler: one-off delayed jobs, fixed-rate vs fixed-delay recurring jobs with exact java.util.concurrent semantics, a priority queue ordered by next run time, a dispatcher thread that sleeps on a Condition and wakes when an earlier job arrives, a worker pool, cancellation, retries with backoff, failing tasks, graceful shutdown, an injectable clock for deterministic tests, and a comparison with ScheduledThreadPoolExecutor."
+---
+
+## Definition (interview-ready)
+
+A task scheduler runs code later: once after a delay, or again and again on a timetable. Jobs wait in a `PriorityQueue` ordered by their next run time. One **dispatcher** thread sleeps on a `Condition` until the earliest job is due, or until a new, earlier job arrives and signals it. It then hands due jobs to a **worker pool**, so a slow job never delays the others. Recurring jobs come in two kinds. **Fixed rate** means the next start is the previous *planned* start plus the period. **Fixed delay** means the next start is the previous *finish* plus the delay. These are the same rules `ScheduledExecutorService` uses. Each job is a Command object with its own state machine. Cancellation uses compare-and-set. Retries with exponential backoff are a pluggable Strategy. An injected clock makes the tests exact, with no real waiting.
+
+**One-liner:** A min-heap of jobs by next run time, one dispatcher that waits on a Condition until the head is due, a worker pool that runs the jobs and puts recurring ones back in the heap, CAS state for cancellation, and an injected clock for deterministic tests.
+
+## Problem statement
+
+> Build an in-process job scheduler library.
+>
+> - A caller can submit a job to run **once after a delay** (for example "send this reminder in 30 minutes").
+> - A caller can submit a **recurring** job in two flavours: "start every N ms, on a fixed timetable" and "wait N ms after each run finishes, then run again".
+> - Several jobs may be due at the same moment; they should run **in parallel**, and one slow job must not hold up the others.
+> - A submitted job can be **cancelled**. A cancelled job must not run again.
+> - A job may **throw**. Optionally, a failed job is **retried**, waiting longer after each failure, up to a limit.
+> - The scheduler can be **shut down** cleanly: no new jobs, and running jobs are allowed to finish.
+> - Callers can see each job's status (waiting, running, done, failed, cancelled) and how many times it ran.
+> - The tests must not sleep for real minutes, and must give the same result on every run.
+> - Write a demo `main`.
+
+This problem comes up a lot because it tests real concurrency (locks, conditions, thread pools, races between cancel and run) on top of ordinary object modelling. Interviewers also like it because the JDK already has an answer, `ScheduledThreadPoolExecutor`. A strong candidate can build a small version and then explain where the real one differs. If thread pools or `Condition` are new to you, read [Java Executors and Virtual Threads](/learn/notes/java-executors-virtual-threads/) and [Java Concurrency and Locks](/learn/notes/java-concurrency-locks/) first. This note uses both without re-teaching them.
+
+## Clarifying questions to ask
+
+| Question | Assumed answer |
+|---|---|
+| In-process or distributed? Must jobs survive a restart? | In-process and in memory. Persistence and multi-node are [extensions](#extensions-interviewers-ask-for). |
+| Time unit and precision? | Milliseconds. "Runs no earlier than its due time" is the guarantee. There is no promise about how soon after. |
+| What does "every N ms" mean if one run takes longer than N? | Two modes. **Fixed rate** keeps the original timetable: late runs start right away to catch up, but two runs of the same job never overlap. **Fixed delay** waits N ms after each run ends. These match the JDK. |
+| Two jobs due at the same instant? | Run them in submission order (first in, first out). |
+| What happens when a job throws? | Record the error. If it has a retry policy, retry after a backoff. If not, or once retries run out, mark it FAILED. A recurring job stops, just as the JDK stops it. |
+| Cron expressions ("every Monday 9am")? | Out of scope. They are an extension: one more schedule type. |
+| Cancel a job that is already running? | Let the current run finish. Never run it again. Interrupting is only for `shutdownNow`. |
+| Shutdown semantics? | `shutdown()`: reject new jobs, drop pending jobs (return them to the caller), let running jobs finish. `shutdownNow()`: also interrupt running jobs. |
+| How many worker threads? | Configurable, fixed size. |
+
+## Requirements
+
+**Functional (in scope)**
+
+1. `schedule(name, task, delay)`: run once after `delay` ms. A negative delay means "now".
+2. `scheduleAtFixedRate(name, task, initialDelay, period)` and `scheduleWithFixedDelay(name, task, initialDelay, delay)`. Reject a period or delay of zero or less.
+3. A general `submit(...)` that takes a schedule and a retry policy.
+4. A handle per job with `state()`, `runs()`, `lastError()` and `cancel()`.
+5. `shutdown()`, `shutdownNow()`, `awaitTermination(timeout)`.
+
+**Non-functional**
+
+- Thread-safe. Any thread can submit or cancel at any time.
+- A slow or failing job does not delay or break other jobs.
+- No busy-waiting. The dispatcher sleeps until the next job is due, and wakes early when an earlier job arrives.
+- Testable without real time: the clock is injected, and there is a no-threads mode for unit tests.
+
+**Out of scope:** cron syntax, persistence, distribution across machines, job priorities other than time, and metrics. Each one appears under [Extensions](#extensions-interviewers-ask-for).
+
+## Entities and relationships
+
+```text
+  caller ──schedule()/submit()──►┌──────────────────────── TaskScheduler ─────────────────────────┐
+  caller ◄──── JobHandle ────────│ lock: ReentrantLock      wakeUp: Condition (on lock)           │
+                                 │ queue: PriorityQueue<Job>  ordered by (nextRunAt, seq)         │
+                                 │ dispatcher: Thread  ──pollDue()──► workers: Executor (pool)    │
+                                 │ clock: SchedulerClock ◁── SystemClock (nanoTime), FakeClock    │
+                                 └────────────────────────────────────────────────────────────────┘
+                                         ◆ 0..*
+                                   Job (inner class) implements JobHandle, Runnable
+                                     name, task: Runnable          ← the Command
+                                     repeat: Repeat (sealed)        ← Once | FixedRate(period) | FixedDelay(delay)
+                                     retry: RetryPolicy             ← none() | exponential(base, max, retries)
+                                     state: AtomicReference<JobState>
+                                     nextRunAt, anchor, failures, runs, lastError
+
+  JobState:  SCHEDULED ──dispatch──► RUNNING ──ok, recurring──► SCHEDULED
+                 │                      ├──ok, one-off──► COMPLETED
+                 │                      ├──threw, no retry left──► FAILED
+                 └──cancel()──► CANCELLED ◄──cancel() or shutdown──┘
+```
+
+- `TaskScheduler` **owns** the queue, the lock and the dispatcher thread. The worker `Executor` is created by a factory method, so tests can swap it.
+- `Job` is a private inner class. Callers only see the `JobHandle` interface, so they can't touch `nextRunAt` or put a job in the queue twice.
+- `Repeat` is a **sealed** interface with three records. `RetryPolicy` is a one-method interface. Both are plain values held by the job.
+
+## Design patterns used and why
+
+| Pattern | Where | Why it earns its place |
+|---|---|---|
+| **Command** | `Job` wraps a `Runnable` with its schedule, retry policy and state | A request turned into an object can be queued, run later, retried and cancelled. That is the whole job of a scheduler. See [Command](/learn/notes/behavioral-patterns/). |
+| **Strategy** | `RetryPolicy`, `SchedulerClock` | How long to back off, and where time comes from, are the things that change between production and tests. Each is one interface, injected. See [Strategy](/learn/notes/behavioral-patterns/). |
+| **Producer–consumer** with a condition queue | Callers produce jobs, the dispatcher consumes them; `wakeUp` is the condition | The textbook use of `ReentrantLock` and `Condition`, except the wait has a deadline. See [Conditions](/learn/notes/java-concurrency-locks/). |
+| **Static factory methods** | `TaskScheduler.start(clock, n)` and `TaskScheduler.manual(clock)` | They name the two modes, and they start the thread only *after* construction, so `this` never escapes a half-built object. See [Creational Patterns](/learn/notes/creational-patterns/). |
+| **Sealed type plus pattern-matching `switch`** (instead of a Strategy for `Repeat`) | `Once`, `FixedRate`, `FixedDelay` | There are exactly three schedule kinds, and computing the next time needs the job's internals (anchor, finish time). An exhaustive `switch` keeps that logic in one place. A fourth kind will not compile until it is handled. |
+
+**How to say it in an interview:** "Each job is a Command sitting in a min-heap keyed by next run time. One dispatcher thread waits on a Condition with a deadline and is signalled when a new job becomes the head. Workers run the jobs and put recurring ones back. The clock and retry policy are strategies, so tests are exact."
+
+## Solution walkthrough
+
+Build it in this order. Each step compiles on its own.
+
+### Step 1: an injectable clock
+
+```java
+/** All scheduling decisions read time from here, never from System directly. */
+interface SchedulerClock {
+    long millis();
+    /** A fake clock calls the listener whenever time jumps, so a sleeping dispatcher re-checks. */
+    default void onJump(Runnable listener) {}
+}
+
+/** Monotonic: nanoTime never jumps backwards when NTP or a person changes the wall clock. */
+final class SystemClock implements SchedulerClock {
+    public long millis() { return System.nanoTime() / 1_000_000; }
+}
+
+/** Test clock: time moves only when a test (or a task simulating work) moves it. */
+final class FakeClock implements SchedulerClock {
+    private final AtomicLong now = new AtomicLong();
+    private final List<Runnable> listeners = new CopyOnWriteArrayList<>();
+    public long millis() { return now.get(); }
+    public void onJump(Runnable listener) { listeners.add(listener); }
+    void advance(long ms) { now.addAndGet(ms); listeners.forEach(Runnable::run); }
+    void advanceTo(long t) { now.accumulateAndGet(t, Math::max); listeners.forEach(Runnable::run); }
+}
+```
+
+Two decisions here matter.
+
+- **Monotonic time.** `System.currentTimeMillis()` is wall-clock time, and it can jump when the OS syncs with NTP or someone changes the clock. A jump backwards would freeze every job. `System.nanoTime()` only measures elapsed time and never goes backwards, so it is the right source for delays. The JDK's own scheduled executor also uses `nanoTime`. We use our own small interface instead of `java.time.Clock`, because we need monotonic milliseconds and a "time jumped" hook. `java.time.Clock` gives wall-clock instants.
+- **The jump hook.** With a fake clock, the dispatcher may be asleep waiting for a job due at fake time 10,000. When a test calls `advance(10_000)`, nothing in real time has changed. The hook lets the fake clock poke the dispatcher ("time moved, look again"). The real clock never jumps, so its hook does nothing.
+
+### Step 2: schedules and retry policies as values
+
+```java
+sealed interface Repeat permits Once, FixedRate, FixedDelay {}
+record Once() implements Repeat {}
+/** Next start = previous *scheduled* start + period. Late runs catch up; runs never overlap. */
+record FixedRate(long periodMs) implements Repeat {
+    FixedRate { if (periodMs <= 0) throw new IllegalArgumentException("period must be > 0"); }
+}
+/** Next start = previous *finish* + delay. Slow runs push the whole timeline back. */
+record FixedDelay(long delayMs) implements Repeat {
+    FixedDelay { if (delayMs <= 0) throw new IllegalArgumentException("delay must be > 0"); }
+}
+
+@FunctionalInterface
+interface RetryPolicy {
+    /** Wait before retry number {@code failures}, or -1 to give up. */
+    long backoffMillis(int failures);
+
+    static RetryPolicy none() { return failures -> -1; }
+
+    static RetryPolicy exponential(long baseMs, long maxMs, int maxRetries) {
+        if (baseMs < 1 || baseMs > Integer.MAX_VALUE || maxMs < baseMs || maxRetries < 0) throw new IllegalArgumentException("bad retry policy");
+        return failures -> failures > maxRetries ? -1
+                : Math.min(maxMs, baseMs << Math.min(failures - 1, 30));   // base, 2*base, 4*base ... capped
+    }
+}
+```
+
+The records validate themselves in their compact constructors. A zero period is rejected, just as `scheduleAtFixedRate` throws `IllegalArgumentException` for a period of zero or less. With `exponential(100, 1000, 3)`, the waits after failures 1, 2 and 3 are 100, 200 and 400 ms, and after the 4th failure it gives up. The base must be between 1 ms and `Integer.MAX_VALUE` ms (about 24.8 days), and the shift is capped at 30. Together those keep `baseMs << n` below 2^61, so it can't overflow into a zero or negative wait. `maxMs` caps the wait itself. The base must be at least 1 ms, so a failing job can never retry in a tight loop.
+
+### Step 3: fixed rate vs fixed delay, precisely
+
+This is the part interviewers probe most, so be exact. The JDK's `ScheduledExecutorService` docs define the two modes like this:
+
+- **`scheduleAtFixedRate(task, initialDelay, period)`**: runs start at `initialDelay`, then `initialDelay + period`, then `initialDelay + 2 * period`, and so on. If a run takes longer than the period, later runs **may start late, but never at the same time** as each other.
+- **`scheduleWithFixedDelay(task, initialDelay, delay)`**: the `delay` is measured from the **end of one run to the start of the next**.
+
+In the OpenJDK source, a fixed-rate task computes its next time as `time += period`, where `time` is the previous *planned* time. A fixed-delay task uses "now + delay", computed after the run finishes. So a fixed-rate job that fell behind runs again right away, several times if needed, until it is back on its timetable. A fixed-delay job never bunches up. Instead it drifts later.
+
+Here is the demo's task. The first run takes 250 ms and later runs take 10 ms, with a period (or delay) of 100 ms:
+
+```text
+fixed rate, period 100      next planned start = previous PLANNED start + 100
+  planned:  0     100     200     300   400   500   600
+  started:  0     250     260     300   400   500   600
+                  late    late    back on the original timetable (runs never overlap)
+
+fixed delay, delay 100      next start = previous FINISH + 100
+  run 1: 0 -> 250    run 2: 350 -> 360    run 3: 460 -> 470    run 4: 570 -> 580
+```
+
+Rules of thumb: use **fixed rate** when the timetable matters, like a metrics tick every 10 s. Use **fixed delay** when you want a gap between runs, like polling an API, so that a slow run backs everything off instead of causing a burst. Note that the catch-up burst can hit a downstream system hard after a long GC pause or a slow run.
+
+### Step 4: the job (a Command with a state machine)
+
+```java
+enum JobState { SCHEDULED, RUNNING, COMPLETED, FAILED, CANCELLED }
+
+/** What callers get back: observe or cancel a job, never touch its internals. */
+interface JobHandle {
+    String name();
+    JobState state();
+    int runs();
+    Optional<Throwable> lastError();
+    /** Stops future runs. Returns false if the job had already finished, failed or been cancelled. */
+    boolean cancel();
+}
+
+// inside TaskScheduler:
+private final class Job implements JobHandle, Runnable {
+    final String name;
+    final Runnable task;
+    final Repeat repeat;
+    final RetryPolicy retry;
+    final long seq;
+    final AtomicReference<JobState> state = new AtomicReference<>(JobState.SCHEDULED);
+    final AtomicInteger runs = new AtomicInteger();
+    long nextRunAt;              // guarded by lock; changed only while the job is not in the queue
+    long anchor;                 // fixed-rate timeline; only the single running execution touches it
+    int failures;                // consecutive failures; same rule
+    volatile Throwable lastError;
+    // ... constructor, getters, cancel() delegates to TaskScheduler.this.cancel(this)
+    public void run() { runOnce(this); }   // what the worker pool executes
+}
+```
+
+- `state` is an `AtomicReference`, so every transition is a **compare-and-set**: "move from SCHEDULED to RUNNING only if nobody cancelled it first". This is how cancel and dispatch race safely. See [Atomics and CAS](/learn/notes/java-concurrency-locks/).
+- `nextRunAt` is the heap's sort key. It is only changed while the job is **outside** the heap, under the lock. Changing the key of an element inside a `PriorityQueue` breaks the heap order without any error.
+- `anchor` is the planned start of the current period, which fixed rate needs. A retry does not move it.
+- `seq` comes from a counter and breaks ties, so jobs due at the same time run first in, first out. `ScheduledThreadPoolExecutor` does the same with its `sequenceNumber`.
+- Callers get a `JobHandle`, never the `Job` itself.
+- `Job` is also the `Runnable` handed to the pool. That way, when `shutdownNow()` drains jobs that were handed off but never started, the scheduler can recognise them and mark them CANCELLED.
+
+### Step 5: the queue, the lock and the Condition
+
+```java
+private final ReentrantLock lock = new ReentrantLock();
+private final Condition wakeUp = lock.newCondition();
+// Earliest nextRunAt first; equal times run in submission order (seq), like the JDK.
+private final PriorityQueue<Job> queue = new PriorityQueue<>(
+        Comparator.comparingLong((Job j) -> j.nextRunAt).thenComparingLong(j -> j.seq));
+
+JobHandle submit(String name, Runnable task, long initialDelayMs, Repeat repeat, RetryPolicy retry) {
+    Job job = new Job(Objects.requireNonNull(name), Objects.requireNonNull(task),
+            Objects.requireNonNull(repeat), Objects.requireNonNull(retry), seqGen.incrementAndGet());
+    lock.lock();
+    try {
+        if (shutdown) throw new RejectedExecutionException("scheduler is shut down");
+        job.anchor = job.nextRunAt = clock.millis() + Math.max(0, initialDelayMs); // negative = run now
+        enqueue(job);
+    } finally {
+        lock.unlock();
+    }
+    return job;
+}
+
+/** Caller holds the lock. */
+private void enqueue(Job job) {
+    queue.add(job);
+    if (queue.peek() == job) wakeUp.signal();   // new earliest job: the dispatcher must shorten its sleep
+}
+```
+
+`PriorityQueue` is a binary min-heap. `add` and `poll` are O(log n), `peek` is O(1), and `remove(Object)` is O(n). It is **not thread-safe**, so every access goes through `lock`. Why not `PriorityBlockingQueue` or `DelayQueue`? We need "check the head, wait until its time, but wake up early if the head changes" as one atomic step. That requires owning the lock and the condition ourselves. (`DelayQueue` does this internally, but then cancellation and re-queueing are harder to control.)
+
+The key line is the signal in `enqueue`. The dispatcher may be asleep until 09:00 for the current head. When a job due at 08:30 arrives and becomes the new head, we must wake the dispatcher so it can recompute its sleep. If the new job is *not* the head, there's no need to wake anyone. The JDK's `DelayedWorkQueue.offer` uses the same "signal only if it became the head" rule.
+
+### Step 6: the dispatcher loop
+
+```java
+private void dispatchLoop() {
+    while (true) {
+        List<Job> due;
+        lock.lock();
+        try {
+            while (true) {
+                if (shutdown) return;
+                due = pollDue();
+                if (!due.isEmpty()) break;
+                Job head = queue.peek();
+                if (head == null) wakeUp.await();     // nothing scheduled: sleep until signalled
+                else wakeUp.await(head.nextRunAt - clock.millis(), TimeUnit.MILLISECONDS);
+            }                                         // loop again: spurious wakeups, earlier jobs, clock jumps
+        } catch (InterruptedException e) {
+            return;
+        } finally {
+            lock.unlock();
+        }
+        due.forEach(this::hand);                      // hand off OUTSIDE the lock
+    }
+}
+
+/** Caller holds the lock. Removes every due job and marks it RUNNING. */
+private List<Job> pollDue() {
+    List<Job> due = new ArrayList<>();
+    long now = clock.millis();
+    while (!queue.isEmpty() && queue.peek().nextRunAt <= now) {
+        Job job = queue.poll();
+        if (job.state.compareAndSet(JobState.SCHEDULED, JobState.RUNNING)) due.add(job);
+    }
+    return due;
+}
+```
+
+Read it as: "Under the lock, take everything that is due. If nothing is due, sleep until the head is due, or until someone signals. Then check again." Three details:
+
+- **Wait in a loop.** `Condition.await` can return early. That happens on a signal (a new head, a clock jump, shutdown), on a timeout, or with a **spurious wakeup**, which the `Condition` docs explicitly allow. We never trust the wakeup. We re-check the queue every time.
+- **No lost wakeups.** We read the clock and the head while holding the lock, and `await` releases the lock atomically as it starts waiting. A submitter that adds an earlier job must take the same lock to signal. So it either runs before we read the queue (and we see its job), or after we're waiting (and its signal reaches us).
+- **Hand off outside the lock.** `hand` calls `workers.execute`. If the pool's queue blocks, or (in manual mode) the task runs inline, holding the lock there would freeze every submitter and canceller.
+
+### Step 7: running a job, retries, and putting it back
+
+```java
+private void hand(Job job) {
+    try {
+        workers.execute(job);                         // Job.run() calls runOnce(this)
+    } catch (RejectedExecutionException e) {          // pool shut down between poll and hand-off
+        job.state.set(JobState.CANCELLED);
+    }
+}
+
+private void runOnce(Job job) {
+    Exception error = null;
+    try {
+        job.task.run();
+    } catch (Exception e) {                           // a throwing task must not kill the worker
+        error = e;
+    }
+    job.runs.incrementAndGet();
+    long now = clock.millis();
+    long next;
+    if (error == null) {
+        job.failures = 0;
+        next = switch (job.repeat) {
+            case Once o -> -1;
+            case FixedRate(long period) -> job.anchor += period;     // keep the original timeline
+            case FixedDelay(long delay) -> job.anchor = now + delay; // measured from this run's end
+        };
+    } else {
+        job.lastError = error;
+        long backoff = job.retry.backoffMillis(++job.failures);
+        next = backoff < 0 ? -1 : now + backoff;      // anchor unchanged: a retry is not a new period
+    }
+    finish(job, next, error == null ? JobState.COMPLETED : JobState.FAILED);
+}
+
+private void finish(Job job, long nextRunAt, JobState terminal) {
+    lock.lock();
+    try {
+        if (nextRunAt < 0) job.state.compareAndSet(JobState.RUNNING, terminal);
+        else if (shutdown) job.state.compareAndSet(JobState.RUNNING, JobState.CANCELLED);
+        else if (job.state.compareAndSet(JobState.RUNNING, JobState.SCHEDULED)) {
+            job.nextRunAt = nextRunAt;                // change the key only while OUT of the heap
+            enqueue(job);
+        }                                             // else: cancelled while running, so not re-queued
+    } finally {
+        lock.unlock();
+    }
+}
+```
+
+This is where all the rules come together.
+
+- **A throwing task is caught.** If the exception escaped, the pool would replace the dead worker thread, and the job would stay RUNNING forever. We record the error and decide what to do next.
+- **Pattern-matching `switch` (Java 21).** The record patterns `FixedRate(long period)` pull the field out directly. The `switch` is exhaustive over the sealed interface, so there is no `default` to forget.
+- **Fixed rate uses `anchor += period`.** That is the JDK's `time += period`, and it is what makes a late job catch up. **Fixed delay uses `now + delay`**, where `now` is read after the run ends.
+- **Retries don't move the anchor.** A fixed-rate job due at 1000 that fails and succeeds on retry at 1100 next runs at 2000, not 2100. The timetable survives failures.
+- **Out of retries means FAILED, even for recurring jobs.** This matches the JDK: when a periodic task throws, "subsequent executions are suppressed". If the interviewer wants "log it and carry on with the next period", that is a one-line change in the `else` branch: compute the next normal time instead of `-1`.
+- **No overlapping runs.** A job goes back in the heap only in `finish`, after its run has ended. So it can't be dispatched twice at once, even with many workers, just like the JDK.
+- **Cancel during a run.** `finish` does a CAS from RUNNING to SCHEDULED. If `cancel()` has already changed the state to CANCELLED, the CAS fails and the job is quietly dropped.
+
+### Step 8: cancel and shutdown
+
+```java
+private boolean cancel(Job job) {
+    while (true) {
+        JobState s = job.state.get();
+        if (s != JobState.SCHEDULED && s != JobState.RUNNING) return false;
+        if (job.state.compareAndSet(s, JobState.CANCELLED)) break;
+    }
+    lock.lock();
+    try { queue.remove(job); } finally { lock.unlock(); }   // no dead entries left in the heap
+    return true;
+}
+
+private List<JobHandle> shutdown(boolean interrupt) {
+    List<JobHandle> neverRun = new ArrayList<>();
+    lock.lock();
+    try {
+        shutdown = true;
+        for (Job j : queue) if (j.state.compareAndSet(JobState.SCHEDULED, JobState.CANCELLED)) neverRun.add(j);
+        queue.clear();
+        wakeUp.signalAll();
+    } finally {
+        lock.unlock();
+    }
+    if (workers instanceof ExecutorService pool) {
+        if (!interrupt) pool.shutdown();
+        else for (Runnable r : pool.shutdownNow())     // handed to the pool but never started
+            if (r instanceof Job j && j.state.compareAndSet(JobState.RUNNING, JobState.CANCELLED)) neverRun.add(j);
+    }
+    return neverRun;
+}
+```
+
+- **Cancel is a CAS loop**, so exactly one of several racing `cancel()` calls returns `true`. A cancel that wins against the dispatcher's SCHEDULED to RUNNING CAS means the job never runs. If the dispatcher wins, the job runs once and is not re-queued.
+- **Removing from the heap right away** stops cancelled jobs from piling up. The cost is O(n) per cancel. The JDK keeps each task's heap index so removal is O(log n), and by default it doesn't remove at all until the delay passes (more on this [below](#compared-with-scheduledthreadpoolexecutor)).
+- **Shutdown** sets the flag under the lock, cancels and returns the pending jobs, wakes the dispatcher so it can exit, and shuts down the pool. `shutdown()` lets running jobs finish, and `finish` sees the flag and won't re-queue them. `shutdownNow()` also interrupts the workers, and any job still waiting in the pool's queue (handed off, never started) is marked CANCELLED and returned with the others. A job that was polled just before shutdown gets `RejectedExecutionException` from the pool, and `hand` marks it CANCELLED.
+- **`awaitTermination`** joins the dispatcher thread and then waits for the pool, both within one overall deadline.
+
+### Step 9: two modes — threads for production, none for unit tests
+
+```java
+static TaskScheduler start(SchedulerClock clock, int workerThreads) {
+    TaskScheduler s = new TaskScheduler(clock, Executors.newFixedThreadPool(workerThreads));
+    clock.onJump(s::wakeDispatcher);      // registered after construction: no 'this' escape
+    s.dispatcher = Thread.ofPlatform().name("scheduler-dispatcher").start(s::dispatchLoop);
+    return s;
+}
+
+static TaskScheduler manual(SchedulerClock clock) {
+    return new TaskScheduler(clock, Runnable::run);
+}
+
+/** Manual mode: run everything due now, including catch-up runs. Returns how many runs happened. */
+int runDueTasks() { ... }   // same pollDue() + hand(), called by the test instead of a thread
+```
+
+All the scheduling logic (`pollDue`, `runOnce`, `finish`) is shared by both modes. Only the **driver** differs. In production a dispatcher thread calls it. In manual mode the test calls `runDueTasks()`, and `Runnable::run` makes the tasks run inline on the test's own thread. With a `FakeClock`, a unit test about fixed rate or retries has no threads and no sleeps, and gets the same result every time. Even the "slow task" is fake: the task calls `clock.advance(250)` to pretend it took 250 ms.
+
+The factories also start the thread **after** the constructor returns. Starting a thread inside a constructor lets it see a half-built object (the "`this` escape" problem from *Java Concurrency in Practice*).
+
+## Full solution code
+
+One file, `Main.java`, Java 21. Compile and run with `javac Main.java && java Main`.
+
+```java
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import java.util.concurrent.locks.*;
+
+// ============================== Time ==============================
+
+/** All scheduling decisions read time from here, never from System directly. */
+interface SchedulerClock {
+    long millis();
+    /** A fake clock calls the listener whenever time jumps, so a sleeping dispatcher re-checks. */
+    default void onJump(Runnable listener) {}
+}
+
+/** Monotonic: nanoTime never jumps backwards when NTP or a person changes the wall clock. */
+final class SystemClock implements SchedulerClock {
+    public long millis() { return System.nanoTime() / 1_000_000; }
+}
+
+/** Test clock: time moves only when a test (or a task simulating work) moves it. */
+final class FakeClock implements SchedulerClock {
+    private final AtomicLong now = new AtomicLong();
+    private final List<Runnable> listeners = new CopyOnWriteArrayList<>();
+    public long millis() { return now.get(); }
+    public void onJump(Runnable listener) { listeners.add(listener); }
+    void advance(long ms) { now.addAndGet(ms); listeners.forEach(Runnable::run); }
+    void advanceTo(long t) { now.accumulateAndGet(t, Math::max); listeners.forEach(Runnable::run); }
+}
+
+// ============================== Schedules and retries ==============================
+
+sealed interface Repeat permits Once, FixedRate, FixedDelay {}
+record Once() implements Repeat {}
+/** Next start = previous *scheduled* start + period. Late runs catch up; runs never overlap. */
+record FixedRate(long periodMs) implements Repeat {
+    FixedRate { if (periodMs <= 0) throw new IllegalArgumentException("period must be > 0"); }
+}
+/** Next start = previous *finish* + delay. Slow runs push the whole timeline back. */
+record FixedDelay(long delayMs) implements Repeat {
+    FixedDelay { if (delayMs <= 0) throw new IllegalArgumentException("delay must be > 0"); }
+}
+
+@FunctionalInterface
+interface RetryPolicy {
+    /** Wait before retry number {@code failures}, or -1 to give up. */
+    long backoffMillis(int failures);
+
+    static RetryPolicy none() { return failures -> -1; }
+
+    static RetryPolicy exponential(long baseMs, long maxMs, int maxRetries) {
+        if (baseMs < 1 || baseMs > Integer.MAX_VALUE || maxMs < baseMs || maxRetries < 0) throw new IllegalArgumentException("bad retry policy");
+        return failures -> failures > maxRetries ? -1
+                : Math.min(maxMs, baseMs << Math.min(failures - 1, 30));   // base, 2*base, 4*base ... capped
+    }
+}
+
+enum JobState { SCHEDULED, RUNNING, COMPLETED, FAILED, CANCELLED }
+
+/** What callers get back: observe or cancel a job, never touch its internals. */
+interface JobHandle {
+    String name();
+    JobState state();
+    int runs();
+    Optional<Throwable> lastError();
+    /** Stops future runs. Returns false if the job had already finished, failed or been cancelled. */
+    boolean cancel();
+}
+
+// ============================== Scheduler ==============================
+
+final class TaskScheduler {
+    private final SchedulerClock clock;
+    private final Executor workers;
+    private final ReentrantLock lock = new ReentrantLock();
+    private final Condition wakeUp = lock.newCondition();
+    // Earliest nextRunAt first; equal times run in submission order (seq), like the JDK.
+    private final PriorityQueue<Job> queue = new PriorityQueue<>(
+            Comparator.comparingLong((Job j) -> j.nextRunAt).thenComparingLong(j -> j.seq));
+    private final AtomicLong seqGen = new AtomicLong();
+    private boolean shutdown;                 // guarded by lock
+    private Thread dispatcher;                // null in manual mode
+
+    private TaskScheduler(SchedulerClock clock, Executor workers) {
+        this.clock = clock;
+        this.workers = workers;
+    }
+
+    /** Production mode: one dispatcher thread decides WHEN, a worker pool decides WHERE. */
+    static TaskScheduler start(SchedulerClock clock, int workerThreads) {
+        TaskScheduler s = new TaskScheduler(clock, Executors.newFixedThreadPool(workerThreads));
+        clock.onJump(s::wakeDispatcher);      // registered after construction: no 'this' escape
+        s.dispatcher = Thread.ofPlatform().name("scheduler-dispatcher").start(s::dispatchLoop);
+        return s;
+    }
+
+    /** Test mode: no threads at all. Tasks run inline when the test calls runDueTasks(). */
+    static TaskScheduler manual(SchedulerClock clock) {
+        return new TaskScheduler(clock, Runnable::run);
+    }
+
+    // ---------- submitting ----------
+
+    JobHandle schedule(String name, Runnable task, long delayMs) {
+        return submit(name, task, delayMs, new Once(), RetryPolicy.none());
+    }
+    JobHandle scheduleAtFixedRate(String name, Runnable task, long initialDelayMs, long periodMs) {
+        return submit(name, task, initialDelayMs, new FixedRate(periodMs), RetryPolicy.none());
+    }
+    JobHandle scheduleWithFixedDelay(String name, Runnable task, long initialDelayMs, long delayMs) {
+        return submit(name, task, initialDelayMs, new FixedDelay(delayMs), RetryPolicy.none());
+    }
+
+    JobHandle submit(String name, Runnable task, long initialDelayMs, Repeat repeat, RetryPolicy retry) {
+        Job job = new Job(Objects.requireNonNull(name), Objects.requireNonNull(task),
+                Objects.requireNonNull(repeat), Objects.requireNonNull(retry), seqGen.incrementAndGet());
+        lock.lock();
+        try {
+            if (shutdown) throw new RejectedExecutionException("scheduler is shut down");
+            job.anchor = job.nextRunAt = clock.millis() + Math.max(0, initialDelayMs); // negative = run now
+            enqueue(job);
+        } finally {
+            lock.unlock();
+        }
+        return job;
+    }
+
+    /** Caller holds the lock. */
+    private void enqueue(Job job) {
+        queue.add(job);
+        if (queue.peek() == job) wakeUp.signal();   // new earliest job: the dispatcher must shorten its sleep
+    }
+
+    // ---------- dispatching ----------
+
+    private void dispatchLoop() {
+        while (true) {
+            List<Job> due;
+            lock.lock();
+            try {
+                while (true) {
+                    if (shutdown) return;
+                    due = pollDue();
+                    if (!due.isEmpty()) break;
+                    Job head = queue.peek();
+                    if (head == null) wakeUp.await();     // nothing scheduled: sleep until signalled
+                    else wakeUp.await(head.nextRunAt - clock.millis(), TimeUnit.MILLISECONDS);
+                }                                         // loop again: spurious wakeups, earlier jobs, clock jumps
+            } catch (InterruptedException e) {
+                return;
+            } finally {
+                lock.unlock();
+            }
+            due.forEach(this::hand);                      // hand off OUTSIDE the lock
+        }
+    }
+
+    /** Manual mode: run everything due now, including catch-up runs. Returns how many runs happened. */
+    int runDueTasks() {
+        int ran = 0;
+        while (true) {
+            List<Job> due;
+            lock.lock();
+            try { due = shutdown ? List.of() : pollDue(); } finally { lock.unlock(); }
+            if (due.isEmpty()) return ran;
+            due.forEach(this::hand);
+            ran += due.size();
+        }
+    }
+
+    /** Caller holds the lock. Removes every due job and marks it RUNNING. */
+    private List<Job> pollDue() {
+        List<Job> due = new ArrayList<>();
+        long now = clock.millis();
+        while (!queue.isEmpty() && queue.peek().nextRunAt <= now) {
+            Job job = queue.poll();
+            if (job.state.compareAndSet(JobState.SCHEDULED, JobState.RUNNING)) due.add(job);
+        }
+        return due;
+    }
+
+    private void hand(Job job) {
+        try {
+            workers.execute(job);                         // Job.run() calls runOnce(this)
+        } catch (RejectedExecutionException e) {          // pool shut down between poll and hand-off
+            job.state.set(JobState.CANCELLED);
+        }
+    }
+
+    private void runOnce(Job job) {
+        Exception error = null;
+        try {
+            job.task.run();
+        } catch (Exception e) {                           // a throwing task must not kill the worker
+            error = e;
+        }
+        job.runs.incrementAndGet();
+        long now = clock.millis();
+        long next;
+        if (error == null) {
+            job.failures = 0;
+            next = switch (job.repeat) {
+                case Once o -> -1;
+                case FixedRate(long period) -> job.anchor += period;     // keep the original timeline
+                case FixedDelay(long delay) -> job.anchor = now + delay; // measured from this run's end
+            };
+        } else {
+            job.lastError = error;
+            long backoff = job.retry.backoffMillis(++job.failures);
+            next = backoff < 0 ? -1 : now + backoff;      // anchor unchanged: a retry is not a new period
+        }
+        finish(job, next, error == null ? JobState.COMPLETED : JobState.FAILED);
+    }
+
+    private void finish(Job job, long nextRunAt, JobState terminal) {
+        lock.lock();
+        try {
+            if (nextRunAt < 0) job.state.compareAndSet(JobState.RUNNING, terminal);
+            else if (shutdown) job.state.compareAndSet(JobState.RUNNING, JobState.CANCELLED);
+            else if (job.state.compareAndSet(JobState.RUNNING, JobState.SCHEDULED)) {
+                job.nextRunAt = nextRunAt;                // change the key only while OUT of the heap
+                enqueue(job);
+            }                                             // else: cancelled while running, so not re-queued
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private void wakeDispatcher() {
+        lock.lock();
+        try { wakeUp.signal(); } finally { lock.unlock(); }
+    }
+
+    // ---------- cancelling and shutting down ----------
+
+    private boolean cancel(Job job) {
+        while (true) {
+            JobState s = job.state.get();
+            if (s != JobState.SCHEDULED && s != JobState.RUNNING) return false;
+            if (job.state.compareAndSet(s, JobState.CANCELLED)) break;
+        }
+        lock.lock();
+        try { queue.remove(job); } finally { lock.unlock(); }   // no dead entries left in the heap
+        return true;
+    }
+
+    /** Stop accepting jobs, drop pending ones, let running ones finish. Returns jobs that will never run. */
+    List<JobHandle> shutdown() { return shutdown(false); }
+
+    /** Like shutdown, but also interrupts running tasks. */
+    List<JobHandle> shutdownNow() { return shutdown(true); }
+
+    private List<JobHandle> shutdown(boolean interrupt) {
+        List<JobHandle> neverRun = new ArrayList<>();
+        lock.lock();
+        try {
+            shutdown = true;
+            for (Job j : queue) if (j.state.compareAndSet(JobState.SCHEDULED, JobState.CANCELLED)) neverRun.add(j);
+            queue.clear();
+            wakeUp.signalAll();
+        } finally {
+            lock.unlock();
+        }
+        if (workers instanceof ExecutorService pool) {
+            if (!interrupt) pool.shutdown();
+            else for (Runnable r : pool.shutdownNow())     // handed to the pool but never started
+                if (r instanceof Job j && j.state.compareAndSet(JobState.RUNNING, JobState.CANCELLED)) neverRun.add(j);
+        }
+        return neverRun;
+    }
+
+    boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException {
+        long deadline = System.nanoTime() + unit.toNanos(timeout);
+        if (dispatcher != null) {
+            TimeUnit.NANOSECONDS.timedJoin(dispatcher, deadline - System.nanoTime());
+            if (dispatcher.isAlive()) return false;
+        }
+        return !(workers instanceof ExecutorService pool)
+                || pool.awaitTermination(deadline - System.nanoTime(), TimeUnit.NANOSECONDS);
+    }
+
+    int pendingCount() {
+        lock.lock();
+        try { return queue.size(); } finally { lock.unlock(); }
+    }
+
+    // ---------- the job ----------
+
+    private final class Job implements JobHandle, Runnable {
+        final String name;
+        final Runnable task;
+        final Repeat repeat;
+        final RetryPolicy retry;
+        final long seq;
+        final AtomicReference<JobState> state = new AtomicReference<>(JobState.SCHEDULED);
+        final AtomicInteger runs = new AtomicInteger();
+        long nextRunAt;              // guarded by lock; changed only while the job is not in the queue
+        long anchor;                 // fixed-rate timeline; only the single running execution touches it
+        int failures;                // consecutive failures; same rule
+        volatile Throwable lastError;
+
+        Job(String name, Runnable task, Repeat repeat, RetryPolicy retry, long seq) {
+            this.name = name; this.task = task; this.repeat = repeat; this.retry = retry; this.seq = seq;
+        }
+        public String name() { return name; }
+        public JobState state() { return state.get(); }
+        public int runs() { return runs.get(); }
+        public Optional<Throwable> lastError() { return Optional.ofNullable(lastError); }
+        public boolean cancel() { return TaskScheduler.this.cancel(this); }
+        public void run() { runOnce(this); }   // what the worker pool executes
+        @Override public String toString() { return name + "[" + state.get() + ", runs=" + runs.get() + "]"; }
+    }
+}
+
+// ============================== Demo ==============================
+
+public class Main {
+    /** Steps fake time in 10 ms ticks (never backwards) and runs whatever is due. */
+    static void runUntil(FakeClock clock, TaskScheduler s, long until) {
+        for (long t = 0; t <= until; t += 10) { clock.advanceTo(t); s.runDueTasks(); }
+    }
+
+    public static void main(String[] args) throws Exception {
+        // 1. Fixed rate vs fixed delay, same task: the first run is slow (250 ms), later runs take 10 ms.
+        for (String mode : List.of("fixed-rate ", "fixed-delay")) {
+            FakeClock clock = new FakeClock();
+            TaskScheduler s = TaskScheduler.manual(clock);
+            List<Long> starts = new ArrayList<>();
+            Runnable report = () -> {
+                starts.add(clock.millis());
+                clock.advance(starts.size() == 1 ? 250 : 10);   // simulate work by moving fake time
+            };
+            if (mode.startsWith("fixed-rate")) s.scheduleAtFixedRate("report", report, 0, 100);
+            else s.scheduleWithFixedDelay("report", report, 0, 100);
+            runUntil(clock, s, 600);
+            System.out.println(mode + " period/delay 100 -> starts at " + starts);
+        }
+
+        // 2. Retries with exponential backoff: fails twice, then succeeds.
+        FakeClock clock = new FakeClock();
+        TaskScheduler s = TaskScheduler.manual(clock);
+        AtomicInteger calls = new AtomicInteger();
+        List<Long> attempts = new ArrayList<>();
+        JobHandle flaky = s.submit("send-email", () -> {
+            attempts.add(clock.millis());
+            if (calls.incrementAndGet() <= 2) throw new IllegalStateException("SMTP timeout #" + calls.get());
+        }, 0, new Once(), RetryPolicy.exponential(100, 1_000, 3));
+        runUntil(clock, s, 1_000);
+        System.out.println("flaky job attempts at " + attempts + " -> " + flaky
+                + ", last error: " + flaky.lastError().map(Throwable::getMessage).orElse("none"));
+
+        // 3. A task that always throws, with no retries, and a cancelled heartbeat.
+        JobHandle broken = s.schedule("broken", () -> { throw new RuntimeException("boom"); }, 50);
+        JobHandle heartbeat = s.scheduleAtFixedRate("heartbeat", () -> {}, 0, 100);
+        runUntil(clock, s, 1_300);
+        System.out.println("after t=1300: " + broken + ", " + heartbeat);
+        System.out.println("cancel heartbeat: " + heartbeat.cancel() + ", cancel again: " + heartbeat.cancel()
+                + ", pending=" + s.pendingCount());
+        runUntil(clock, s, 2_000);
+        System.out.println("after t=2000: " + heartbeat);
+
+        // 4. Real threads, fake clock: an earlier job arriving wakes the sleeping dispatcher.
+        FakeClock fake = new FakeClock();
+        TaskScheduler threaded = TaskScheduler.start(fake, 2);
+        CountDownLatch earlyDone = new CountDownLatch(1);
+        JobHandle late = threaded.schedule("nightly-report", () -> {}, 10_000);
+        JobHandle early = threaded.schedule("cache-refresh", earlyDone::countDown, 5);
+        fake.advance(5);
+        System.out.println("early ran: " + earlyDone.await(2, TimeUnit.SECONDS) + ", late is " + late.state());
+        System.out.println("shutdown, never run: " + threaded.shutdown()
+                + ", terminated: " + threaded.awaitTermination(2, TimeUnit.SECONDS) + ", early is " + early.state());
+        try { threaded.schedule("too-late", () -> {}, 0); }
+        catch (RejectedExecutionException e) { System.out.println("rejected: " + e.getMessage()); }
+    }
+}
+```
+
+**Demo output** (real output from running the program above):
+
+```text
+fixed-rate  period/delay 100 -> starts at [0, 250, 260, 300, 400, 500, 600]
+fixed-delay period/delay 100 -> starts at [0, 350, 460, 570]
+flaky job attempts at [0, 100, 300] -> send-email[COMPLETED, runs=3], last error: SMTP timeout #2
+after t=1300: broken[FAILED, runs=1], heartbeat[SCHEDULED, runs=4]
+cancel heartbeat: true, cancel again: false, pending=0
+after t=2000: heartbeat[CANCELLED, runs=4]
+early ran: true, late is SCHEDULED
+shutdown, never run: [nightly-report[CANCELLED, runs=0]], terminated: true, early is COMPLETED
+rejected: scheduler is shut down
+```
+
+Reading the output:
+
+- **Lines 1–2:** the same task under both modes. Fixed rate starts late at 250 and 260 (planned 100 and 200), then is back on the timetable at 300. Fixed delay drifts to 350, 460 and 570, always 100 ms after the previous run ended.
+- **Line 3:** the email job failed at 0 and 100, then succeeded at 300. The waits were 100 ms and then 200 ms. The last error is kept for diagnosis even though the job finally completed.
+- **Line 4:** `broken` threw once with no retry policy, so it is FAILED. The fixed-rate heartbeat started at fake time 1000 and ran at 1000, 1100, 1200 and 1300.
+- **Lines 5–6:** the first cancel returns `true`, the second `false`. The job left the queue, and it never ran again.
+- **Lines 7–9:** real dispatcher and worker threads with a fake clock. The dispatcher waits for the job due at +10,000. The job due at +5 becomes the new head and signals it, and advancing the fake clock by 5 runs it. (Whether the dispatcher had already started waiting is a matter of thread timing, but the result is the same either way.) Shutdown returned the never-run nightly job and terminated, and a later submission was rejected.
+
+## Concurrency and edge cases
+
+| Race or edge case | What could go wrong | How the design handles it |
+|---|---|---|
+| A job earlier than the current head arrives while the dispatcher sleeps | It runs late, at the old head's time | `enqueue` signals `wakeUp` when the new job becomes the head; the dispatcher recomputes its wait. |
+| Signal sent between "read head" and "await" | Lost wakeup | Both happen under `lock`, and `await` releases it atomically; the signaller needs the same lock. |
+| Spurious wakeup or timeout | Running a job early | The loop re-checks `nextRunAt <= now` every time. A job never runs early (a test checks this). |
+| `cancel()` races the dispatcher | Job runs after a successful cancel | Both CAS on `state`: SCHEDULED to CANCELLED vs SCHEDULED to RUNNING. Only one wins. |
+| `cancel()` while the job is running | Recurring job re-queued after cancel | `finish` re-queues only through a CAS from RUNNING to SCHEDULED, which fails once the state is CANCELLED. |
+| Two threads cancel the same job | Both think they cancelled it | The CAS loop lets exactly one return `true` (tested with 2 threads per job). |
+| Fixed-rate job slower than its period | Two copies run at once on different workers | A job is re-queued only after its run ends, so it is never in the heap while running (tested with 4 workers). |
+| Task throws | Worker thread dies, or the job is stuck in RUNNING | `runOnce` catches `Exception`, records it, then retries or marks the job FAILED. |
+| Changing the sort key | Heap order corrupted silently | `nextRunAt` is only written while the job is out of the heap. |
+| Shutdown while a job is being handed off | Job stuck in RUNNING | `RejectedExecutionException` is caught in `hand`, and the job is marked CANCELLED. |
+| Wall-clock jumps (NTP, daylight saving) | Jobs fire early or freeze | `SystemClock` uses `nanoTime`, which is monotonic. |
+| Negative initial delay, zero period | Undefined timing, infinite loop | A negative delay means "now". A period of zero or less throws `IllegalArgumentException`. Both match the JDK. |
+| `Error` thrown by a task (for example `OutOfMemoryError`) | Swallowing an unrecoverable error | We catch `Exception` only. An `Error` goes up to the pool's thread, and that job stays RUNNING. Say this out loud: it's a deliberate choice. |
+
+**Honest limits to mention:** cancel removal is O(n). The dispatcher is one thread, but it only moves jobs, so it is rarely the bottleneck. A job counts as "due" at the clock's millisecond precision. Nothing guarantees *how soon* after its due time a job starts: if all workers are busy, due jobs wait in the pool's queue. The JDK makes the same promise, "no sooner than", with no real-time guarantee.
+
+## Compared with ScheduledThreadPoolExecutor
+
+In production you would almost always use `Executors.newScheduledThreadPool(n)` (a `ScheduledThreadPoolExecutor`). The interview question is whether you understand what it does. Facts below are from the Java 21 docs and the OpenJDK 21 source.
+
+| Aspect | This design | `ScheduledThreadPoolExecutor` |
+|---|---|---|
+| Queue | `PriorityQueue` + one `ReentrantLock` + one `Condition` | `DelayedWorkQueue`: its own binary heap with one `ReentrantLock` and a `Condition` called `available` |
+| Who waits for the head | One dedicated dispatcher thread, then hands off to a separate pool | The workers themselves. One worker is the **leader** and does a timed wait for the head; the others wait with no timeout (a Leader-Follower variant). There is no separate dispatcher. |
+| Earlier job arrives | Signal if it became the head | Same: `offer` resets the leader and signals if the new task is at the head |
+| Same due time | FIFO by `seq` | FIFO by `sequenceNumber` ("first-in-first-out order of submission") |
+| Fixed rate / fixed delay | `anchor += period` / finish + delay | `time += period` / now + delay, in `setNextRunTime()` |
+| Overlapping runs | Never | Never ("will not concurrently execute") |
+| Task throws | Retry with backoff if configured, else FAILED | Later runs are suppressed. `future.get()` throws `ExecutionException`. `afterExecute` gets `null` for the throwable. No retries are built in. |
+| Cancelled tasks | Removed from the heap right away, O(n) | By default they stay in the queue until their delay passes. `setRemoveOnCancelPolicy(true)` removes them right away, in O(log n), because each task stores its heap index. |
+| Shutdown | Pending jobs cancelled and returned. Running jobs finish. | By default, delayed one-shot tasks **still run** after `shutdown()` (`executeExistingDelayedTasksAfterShutdown` is true), and periodic tasks are cancelled (`continueExistingPeriodicTasksAfterShutdown` is false). |
+| Pool size | Fixed | Fixed `corePoolSize`; changing `maximumPoolSize` "has no useful effect" (the queue is unbounded) |
+| Clock | Injected, so tests use a fake clock | `System.nanoTime()` inside, not injectable. Tests either wait in real time or wrap it. |
+
+Two consequences to mention:
+
+1. **A periodic task that throws stops silently.** Nothing is logged unless someone calls `get()` on the returned future, and `afterExecute` sees `null`. The common fix is to wrap the body in `try/catch` and log, or to keep the future and check it. Our scheduler records `lastError` and moves the job to FAILED, which is easier to see.
+2. **`java.util.Timer` is worse.** It runs every task on **one** thread, so a slow task "hogs" it (in the docs' words), and late tasks then bunch up. Its run loop catches only `InterruptedException` around `task.run()`, so one task that throws a `RuntimeException` kills the timer thread. After that, scheduling anything throws `IllegalStateException`. The `Timer` docs themselves point to `ScheduledThreadPoolExecutor` as the more versatile replacement. *Java Concurrency in Practice* (section 6.2.5) gives the same advice.
+
+**How to say it in an interview:** "In production I'd use `ScheduledThreadPoolExecutor` and wrap each task in a try/catch, because a throwing periodic task is silently cancelled. I built my own here to show the mechanics. Mine adds retries, a fake clock and an explicit job state. The JDK adds leader-follower waiting and O(log n) cancellation."
+
+## Testing it
+
+JUnit 5 tests. These were compiled and run against the solution with JUnit Platform 1.10.2: 9 out of 9 passed, on 10 runs in a row.
+
+```java
+import static org.junit.jupiter.api.Assertions.*;
+
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import org.junit.jupiter.api.Test;
+
+class TaskSchedulerTest {
+    private final FakeClock clock = new FakeClock();
+
+    /** Step fake time in 10 ms ticks and run whatever is due (manual mode: no threads). */
+    private void runUntil(TaskScheduler s, long until) {
+        for (long t = 0; t <= until; t += 10) { clock.advanceTo(t); s.runDueTasks(); }
+    }
+
+    @Test
+    void oneOffRunsExactlyAtDueTime() {
+        TaskScheduler s = TaskScheduler.manual(clock);
+        AtomicInteger n = new AtomicInteger();
+        JobHandle h = s.schedule("x", n::incrementAndGet, 100);
+        clock.advanceTo(99);  s.runDueTasks();
+        assertEquals(0, n.get());
+        clock.advanceTo(100); s.runDueTasks();
+        assertEquals(1, n.get());
+        assertEquals(JobState.COMPLETED, h.state());
+    }
+
+    @Test
+    void fixedRateCatchesUpButFixedDelayDrifts() {
+        List<Long> rate = new ArrayList<>(), delay = new ArrayList<>();
+        TaskScheduler r = TaskScheduler.manual(clock);
+        r.scheduleAtFixedRate("r", () -> { rate.add(clock.millis()); clock.advance(rate.size() == 1 ? 250 : 10); }, 0, 100);
+        runUntil(r, 600);
+        assertEquals(List.of(0L, 250L, 260L, 300L, 400L, 500L, 600L), rate);
+
+        FakeClock c2 = new FakeClock();
+        TaskScheduler d = TaskScheduler.manual(c2);
+        d.scheduleWithFixedDelay("d", () -> { delay.add(c2.millis()); c2.advance(delay.size() == 1 ? 250 : 10); }, 0, 100);
+        for (long t = 0; t <= 600; t += 10) { c2.advanceTo(t); d.runDueTasks(); }
+        assertEquals(List.of(0L, 350L, 460L, 570L), delay);
+    }
+
+    @Test
+    void retriesWithExponentialBackoffThenSucceeds() {
+        TaskScheduler s = TaskScheduler.manual(clock);
+        AtomicInteger calls = new AtomicInteger();
+        List<Long> at = new ArrayList<>();
+        JobHandle h = s.submit("email", () -> {
+            at.add(clock.millis());
+            if (calls.incrementAndGet() <= 2) throw new IllegalStateException("timeout");
+        }, 0, new Once(), RetryPolicy.exponential(100, 1_000, 3));
+        runUntil(s, 2_000);
+        assertEquals(List.of(0L, 100L, 300L), at);
+        assertEquals(JobState.COMPLETED, h.state());
+    }
+
+    @Test
+    void retryKeepsTheFixedRateTimeline() {
+        TaskScheduler s = TaskScheduler.manual(clock);
+        List<Long> at = new ArrayList<>();
+        s.submit("r", () -> { at.add(clock.millis()); if (clock.millis() == 1000) throw new RuntimeException(); },
+                0, new FixedRate(1000), RetryPolicy.exponential(100, 1000, 2));
+        runUntil(s, 3_000);
+        assertEquals(List.of(0L, 1000L, 1100L, 2000L, 3000L), at);
+    }
+
+    @Test
+    void throwingRecurringTaskWithoutRetryStops() {
+        TaskScheduler s = TaskScheduler.manual(clock);
+        AtomicInteger n = new AtomicInteger();
+        JobHandle h = s.scheduleWithFixedDelay("d", () -> { if (n.incrementAndGet() == 2) throw new RuntimeException(); }, 0, 100);
+        runUntil(s, 1_000);
+        assertEquals(2, n.get());
+        assertEquals(JobState.FAILED, h.state());
+    }
+
+    @Test
+    void cancelledJobNeverRunsAndLeavesTheQueue() {
+        TaskScheduler s = TaskScheduler.manual(clock);
+        AtomicInteger n = new AtomicInteger();
+        JobHandle h = s.scheduleAtFixedRate("r", n::incrementAndGet, 100, 100);
+        assertTrue(h.cancel());
+        assertFalse(h.cancel());
+        assertEquals(0, s.pendingCount());
+        runUntil(s, 1_000);
+        assertEquals(0, n.get());
+    }
+
+    @Test
+    void concurrentCancelsWinAgainstAFrozenClock() throws Exception {
+        TaskScheduler s = TaskScheduler.start(clock, 4);
+        int n = 1000;
+        AtomicIntegerArray hits = new AtomicIntegerArray(n);
+        CountDownLatch odds = new CountDownLatch(n / 2);
+        List<JobHandle> jobs = new ArrayList<>();
+        for (int i = 0; i < n; i++) { int id = i; jobs.add(s.schedule("j" + i, () -> { hits.incrementAndGet(id); odds.countDown(); }, 100)); }
+
+        ExecutorService cancellers = Executors.newFixedThreadPool(8);
+        AtomicInteger wins = new AtomicInteger();
+        List<Future<?>> fs = new ArrayList<>();
+        for (int t = 0; t < 8; t++) {                       // two threads race to cancel each even job
+            int start = (t % 4) * 2;
+            fs.add(cancellers.submit(() -> { for (int i = start; i < n; i += 8) if (jobs.get(i).cancel()) wins.incrementAndGet(); }));
+        }
+        for (Future<?> f : fs) f.get();
+        cancellers.shutdown();
+        assertEquals(n / 2, wins.get());                    // each even job cancelled exactly once
+
+        clock.advanceTo(100);                               // only now can anything run
+        assertTrue(odds.await(5, TimeUnit.SECONDS));
+        s.shutdown();
+        assertTrue(s.awaitTermination(5, TimeUnit.SECONDS));
+        for (int i = 0; i < n; i++) assertEquals(i % 2 == 0 ? 0 : 1, hits.get(i));
+    }
+
+    @Test
+    void earlierJobWakesTheSleepingDispatcher() throws Exception {
+        TaskScheduler s = TaskScheduler.start(clock, 2);
+        CountDownLatch early = new CountDownLatch(1);
+        JobHandle late = s.schedule("late", () -> {}, 10_000);
+        Thread.sleep(20);                                   // dispatcher is now waiting on 'late'
+        s.schedule("early", early::countDown, 5);
+        clock.advance(5);
+        assertTrue(early.await(5, TimeUnit.SECONDS));
+        assertEquals(JobState.SCHEDULED, late.state());
+        assertEquals(List.of(late), s.shutdown());
+        assertTrue(s.awaitTermination(5, TimeUnit.SECONDS));
+    }
+
+    @Test
+    void gracefulShutdownLetsRunningJobFinish() throws Exception {
+        TaskScheduler s = TaskScheduler.start(clock, 2);
+        CountDownLatch started = new CountDownLatch(1), release = new CountDownLatch(1);
+        JobHandle running = s.schedule("running", () -> {
+            started.countDown();
+            try { release.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        }, 0);
+        JobHandle pending = s.schedule("pending", () -> {}, 1_000);
+        assertTrue(started.await(5, TimeUnit.SECONDS));
+        assertEquals(List.of(pending), s.shutdown());
+        assertFalse(s.awaitTermination(50, TimeUnit.MILLISECONDS));   // still running
+        release.countDown();
+        assertTrue(s.awaitTermination(5, TimeUnit.SECONDS));
+        assertEquals(JobState.COMPLETED, running.state());
+        assertThrows(RejectedExecutionException.class, () -> s.schedule("x", () -> {}, 0));
+    }
+}
+```
+
+**Why these multi-threaded tests are deterministic.** The usual flaky scheduler test sleeps for a real second and hopes the job ran. These tests never depend on real timing for their *result*:
+
+- **Fake time is frozen until the test moves it.** In `concurrentCancelsWinAgainstAFrozenClock`, all 1,000 jobs are due at fake time 100, and the clock stays at 0 while 8 threads cancel the even ones. No job *can* run during the race, so "evens never ran" is guaranteed, not just likely. Only after every cancel finishes does the test advance the clock.
+- **Latches, not sleeps, wait for work.** `odds.await(5, SECONDS)` returns the moment the 500th job finishes. The 5 seconds is only a safety net for a broken build.
+- **Exact counts.** Each test checks an exact number (500 runs, 500 cancel wins, a list of start times), not "at least one".
+- **Fixed-rate timing tests have no threads at all.** In manual mode the "slow" task calls `clock.advance(250)`, so the start times `[0, 250, 260, 300, ...]` are exact.
+
+The `Thread.sleep(20)` in `earlierJobWakesTheSleepingDispatcher` only makes it *likely* that the dispatcher is already asleep when the early job arrives, so the signal path is exercised. The assertion holds either way.
+
+An extra plain-Java harness (no JUnit) ran 10 scenarios with 1,019 checks, 5 runs in a row, all passing. It adds: 8 threads submitting 2,000 jobs with random delays on the **real** clock, none of which ran early; cancelling a recurring job while it runs (it ran once and was not re-queued); a fixed-rate job that is always behind, on 4 workers, never running two copies at once; `shutdownNow` interrupting a running task and cancelling the jobs still waiting in the pool's queue; a task that schedules another job from inside its run; FIFO for 50 equal due times; a retry policy running out (attempts at 0, 100, 300 and 700, then FAILED); backoff never overflowing; a negative delay; and a zero period being rejected.
+
+## Extensions interviewers ask for
+
+| Ask | Change | What stays untouched |
+|---|---|---|
+| Cron expressions ("9:00 every weekday") | Add `record Cron(String expr) implements Repeat`. The compiler then flags the `switch` in `runOnce`. Compute the next time from a cron parser and a wall-clock time zone. Cron is about calendar time, so this is the one place a `ZoneId` belongs. | Queue, dispatcher, cancel, retries |
+| Jitter in backoff (avoid a thundering herd) | A new `RetryPolicy` that returns a random wait between 0 and the exponential value ("full jitter"), with the `Random` injected so tests stay exact | Everything else |
+| "Keep running the periodic job after it fails" | A flag on the job: when retries run out, compute the next normal period instead of `-1` | Queue, dispatcher |
+| Run at most N jobs of one type at a time | One `Semaphore` per type, acquired in the worker before `task.run()`. Or a separate pool per type, chosen in `hand`. | Scheduling logic |
+| Millions of timers (for example request timeouts) | Replace the heap with a **hashed or hierarchical timing wheel**: O(1) insert and cancel, in exchange for coarser time. Netty's `HashedWheelTimer` and Kafka's request purgatory both use timing wheels. | `JobHandle` API, retry policy |
+| Jobs survive restarts | Store jobs in a table (`next_run_at` indexed). On startup, load the due jobs. Commit "ran at" after success. | Retry policy, `Repeat` |
+| Many nodes, each job runs once | Each node claims due rows with a lease (`UPDATE ... WHERE id = ? AND lease_until < now`), runs the job, then moves `next_run_at` forward. Mention Quartz's JDBC job store and its clustering as an off-the-shelf option. | Single-node logic inside each node |
+| Metrics and listeners | **Observer**: a `JobListener` with `onStart`, `onSuccess` and `onFailure`, called from `runOnce` outside the lock | Queue, states |
+| Faster cancel | Store each job's heap index in the job (like the JDK), or cancel lazily: leave the job in the heap and skip it when popped, then purge when more than half the heap is cancelled | Public API |
+
+## Common mistakes
+
+1. **`Thread.sleep` until the next job.** A sleeping thread can't be woken when an earlier job arrives. Use `Condition.await` with a timeout, and signal it.
+2. **Running the task on the dispatcher thread.** One slow task delays every other job. This is exactly `java.util.Timer`'s weakness. Hand off to a pool.
+3. **`if` instead of `while` around `await`.** Spurious wakeups and timeouts happen. Always re-check "is the head due?" in a loop.
+4. **Holding the lock while running a task**, or while calling `execute`. Submitters and cancellers freeze until the task ends, and so does any task that tries to schedule or cancel a job from a worker thread.
+5. **Changing a job's time while it is in the `PriorityQueue`.** The heap does not re-sort and gives no error. Remove the job, change it, and add it back.
+6. **Not catching task exceptions.** Depending on the executor, the worker dies, the job hangs in RUNNING, or a periodic job silently stops. Catch, record and decide.
+7. **Re-queueing a recurring job *before* it runs.** Then a slow run can overlap with the next one. Re-queue only after the run finishes.
+8. **Mixing up fixed rate and fixed delay.** Fixed rate is planned start to planned start. Fixed delay is end to start. Say what happens when a run is late: fixed rate catches up, fixed delay drifts.
+9. **Using `System.currentTimeMillis()` for delays.** Wall-clock jumps break scheduling. Use `nanoTime` for delays, and wall-clock time only for cron-style calendar rules.
+10. **Tests that sleep in real time.** Slow and flaky. Inject a clock, keep a no-threads mode, and wait with latches.
+11. **Starting the dispatcher in the constructor.** `this` escapes before the object is fully built. Start it from a factory method.
+
+## Practice questions
+
+<Practice>
+
+<QA q="What exactly is the difference between scheduleAtFixedRate and scheduleWithFixedDelay?" level="easy">
+
+**Fixed rate** keeps a timetable based on planned start times: `initialDelay`, `initialDelay + period`, `initialDelay + 2 * period`, and so on. **Fixed delay** waits `delay` after each run *finishes* before the next one starts. With a 100 ms setting and a task that takes 30 ms, fixed rate starts at 0, 100, 200. Fixed delay starts at 0, 130, 260. If a run is slow, fixed rate starts later runs late and catches up (they may run back to back), but never in parallel. Fixed delay just drifts later. In the JDK, a period or delay of zero or less throws `IllegalArgumentException`.
+
+</QA>
+
+<QA q="Why is the queue a priority queue keyed by next run time, and why is there a second key?" level="easy">
+
+The dispatcher only ever needs one thing: the job that is due first. A min-heap gives that with `peek()` in O(1), and `add` and `poll` in O(log n). The second key is a submission sequence number. Without it, jobs due at the same millisecond would come out in arbitrary heap order. With it, they run first in, first out. `ScheduledThreadPoolExecutor` makes the same promise and uses a `sequenceNumber` for it.
+
+</QA>
+
+<QA q="Why have both a dispatcher thread and a worker pool? Why not run tasks on the dispatcher?" level="easy">
+
+The dispatcher decides *when*. The pool decides *where*. If the dispatcher ran tasks itself, a task taking 10 s would delay every other job by 10 s. That is how `java.util.Timer` behaves, since it has a single thread. With a hand-off, the dispatcher only moves jobs from the heap to the pool, which takes microseconds, and several due jobs run in parallel. The JDK takes another route: its workers take turns acting as the waiter (leader-follower), so it doesn't need a separate dispatcher thread.
+
+</QA>
+
+<QA q="How does the dispatcher wait, and what can wake it up?" level="medium">
+
+Under the lock, it looks at the head of the heap. If the heap is empty, it calls `wakeUp.await()` with no timeout. Otherwise it calls `wakeUp.await(head.nextRunAt - now, MILLISECONDS)`. Four things wake it: the timeout (the head is now due); a signal from `enqueue` when a new job becomes the head; a signal from a fake clock's jump hook, or from `shutdown`; or a spurious wakeup. Since any of these is possible, it re-checks in a loop and never assumes the head is due just because it woke up.
+
+</QA>
+
+<QA q="A fixed-rate job has a 1 s period, but one run takes 3.5 s. What happens next, in your scheduler and in the JDK?" level="medium">
+
+The planned starts were 0, 1, 2, 3, 4 s. The run that began at 0 ends at 3.5 s. Its next planned start is 1 s, which is already past, so it starts right away at 3.5 s. If those runs are quick, the 2 s and 3 s runs follow back to back, and then the 4 s run is on time again. Runs never overlap, because the job is only put back in the queue after it finishes. The JDK does the same thing (`time += period`, "may start late, but will not concurrently execute"). If a catch-up burst would hurt a downstream system, use fixed delay instead.
+
+</QA>
+
+<QA q="What happens when a task throws, in your design, in ScheduledThreadPoolExecutor, and in java.util.Timer?" level="medium">
+
+**Here:** `runOnce` catches the exception and stores it as `lastError`. It then asks the retry policy for a backoff. If there is one, the job runs again at now + backoff, and the fixed-rate anchor is kept. If not, the job becomes FAILED. Other jobs are not affected. **`ScheduledThreadPoolExecutor`:** for a periodic task, later runs are suppressed and `future.get()` throws `ExecutionException`. Nothing is logged, and `afterExecute` gets `null`, so wrap the body in try/catch. **`Timer`:** its loop doesn't catch, so the exception kills the single timer thread, and any later `schedule` call throws `IllegalStateException`.
+
+</QA>
+
+<QA q="Walk through what happens when cancel() races with the dispatcher." level="medium">
+
+Both sides use compare-and-set on the job's `state`. Cancel does SCHEDULED to CANCELLED. The dispatcher's `pollDue` does SCHEDULED to RUNNING. Exactly one CAS succeeds. If cancel wins, the dispatcher's CAS fails, it skips the job, and the job never runs. If the dispatcher wins, the job runs once. Cancel then moves RUNNING to CANCELLED and returns `true`, and when the run ends, the RUNNING to SCHEDULED CAS in `finish` fails, so the job isn't re-queued. Cancel also removes the job from the heap under the lock, so no cancelled jobs pile up.
+
+</QA>
+
+<QA q="How do you make tests for a multi-threaded scheduler deterministic?" level="medium">
+
+Four things. (1) **Inject the clock.** A `FakeClock` moves only when the test says so, so "this job cannot run yet" is guaranteed. (2) **A no-threads mode.** `TaskScheduler.manual` runs tasks inline when the test calls `runDueTasks()`, so timing logic like fixed rate, fixed delay and backoff is tested on one thread, and a slow task is simulated with `clock.advance`. (3) **Latches, not sleeps.** Wait for "N jobs finished" with a `CountDownLatch` and a generous timeout that only matters when the code is broken. (4) **Freeze time during races.** Run the concurrent part (submits, cancels) while the clock is frozen, then advance it and assert exact counts.
+
+</QA>
+
+<QA q="Why must nextRunAt never change while the job is inside the PriorityQueue?" level="hard">
+
+A binary heap only places an element when it is added, by moving it up or down. If you later change its key in place, the heap doesn't know, so the job may sit below jobs that are now later than it, or above jobs that are earlier. `peek()` then returns the wrong job, and nothing throws. The fix is to remove the job, change the key, and add it again. Our design keeps the job out of the heap while it runs and sets `nextRunAt` under the lock just before `enqueue`. The JDK's task objects do the same: `setNextRunTime()` runs after the task has been taken out of the queue, before it is re-queued.
+
+</QA>
+
+<QA q="Your shutdown cancels pending one-off jobs. The JDK's does not by default. Explain both, and when each is right." level="hard">
+
+Ours: `shutdown()` rejects new jobs, cancels and returns everything still waiting, and lets running jobs finish. `shutdownNow()` also interrupts the running ones. JDK defaults: after `shutdown()`, delayed one-shot tasks **still run** when they become due (`executeExistingDelayedTasksAfterShutdown` is true), but future periodic runs are cancelled (`continueExistingPeriodicTasksAfterShutdown` is false). Both settings can be changed. Choose by meaning. If a delayed job is a promise ("send this email in 5 minutes"), dropping it on deploy loses work, so either run it or persist it. If delayed jobs are just best-effort refreshes, dropping them gives a fast, predictable shutdown. Returning the never-run list lets the caller save them.
+
+</QA>
+
+<QA q="The heap gives O(log n) insert and O(n) cancel. How would you handle a million timeouts per second?" level="hard">
+
+Use a **timing wheel**: a circular array of buckets, one per tick (say 10 ms). A timer due in t ms goes into bucket `(current + t / tick) % size`, along with a "rounds" count when the delay is longer than one full turn. Insert and cancel are O(1). Each tick, the worker processes one bucket. The cost is precision, since timers fire at tick granularity. Hierarchical wheels (seconds, minutes, hours) handle long delays without huge arrays. Netty's `HashedWheelTimer` and Kafka's request purgatory both use timing wheels. This suits huge numbers of short timeouts that are mostly cancelled. The heap stays better for a modest number of precise jobs.
+
+</QA>
+
+<QA q="Interviewer: retries from 1,000 failing jobs all hit the recovering database at the same moment. Fix it." level="scenario">
+
+That is a thundering herd: plain exponential backoff keeps the jobs in step, because they all failed at the same time and so retry at the same times. Add **jitter**. Write a new `RetryPolicy` that returns a random wait between 0 and the exponential value ("full jitter"), or the exponential value plus or minus some percentage. Inject the `Random` (or a seed) so tests stay exact. Nothing else changes, because the retry policy is a Strategy. Also cap the maximum wait and the number of retries, and consider a circuit breaker so jobs stop calling a dependency that is clearly down.
+
+</QA>
+
+<QA q="Interviewer: we now run three instances of the service. The nightly report must run exactly once. What changes?" level="scenario">
+
+The in-memory heap no longer works on its own, because each instance has its own copy. Move the schedule into a shared store: a `jobs` table with `next_run_at` (indexed), `lease_owner` and `lease_until`. Each instance polls for due rows and claims one with a conditional update, for example "set the lease to me where `lease_until` is in the past". Only one instance's update succeeds. The winner runs the job, then moves `next_run_at` forward and clears the lease. If it crashes, the lease expires and another instance takes over, so the job may run twice. That is at-least-once, so the job must be idempotent. Quartz's JDBC job store in clustered mode is the ready-made version of this.
+
+</QA>
+
+<QA q="Interviewer: why not just use ScheduledThreadPoolExecutor? Would you, in production?" level="scenario">
+
+Yes, in production I would, perhaps through Spring's `@Scheduled`. It is well tested, handles the leader-follower wait, and cancels in O(log n). Building one in an interview shows I understand the heap, the condition wait, the fixed-rate and fixed-delay rules, the races, and shutdown. Then I'd list the gaps I'd cover when using the JDK version: wrap periodic tasks in try/catch, since a throw silently cancels them; call `setRemoveOnCancelPolicy(true)` if many tasks get cancelled; think about the shutdown policies; and add retries myself, since none are built in. It also can't take a fake clock, so I'd test the job logic separately from the scheduling.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="A job uses scheduleWithFixedDelay with delay 100 ms. Each run takes 40 ms. When does the third run start, if the first starts at 0?" options={["280 ms", "200 ms", "240 ms", "300 ms"]} answer={0}>
+
+Fixed delay measures from the end of a run. Run 1 is 0 to 40, so run 2 starts at 140 and ends at 180, and run 3 starts at 280. With fixed rate and period 100, run 3 would start at 200.
+
+</MCQ>
+
+<MCQ q="A fixed-rate job (period 100) has one run that takes 250 ms, starting at 0. What happens in the JDK and in this design?" options={["The runs planned for 100 and 200 are skipped", "Two runs execute in parallel to catch up", "The runs start late, right after each other, and never overlap", "The period is permanently shifted by 150 ms"]} answer={2}>
+
+The next planned time is the previous planned time plus the period, so the 100 and 200 runs are already overdue and start one after another as soon as possible. The JDK docs say late runs 'may start late, but will not concurrently execute'. Shifting the timetable permanently is what fixed delay does.
+
+</MCQ>
+
+<MCQ q="Why does enqueue call wakeUp.signal() only when the new job becomes the head of the heap?" options={["Signalling is not allowed while holding the lock", "Only a new earliest job can change how long the dispatcher should sleep", "PriorityQueue requires a signal after every add", "To avoid a deadlock with the worker pool"]} answer={1}>
+
+The dispatcher is waiting until the current head is due. A job later than the head doesn't change that deadline. An earlier one does, so the dispatcher must wake and recompute its wait. ScheduledThreadPoolExecutor's queue uses the same rule.
+
+</MCQ>
+
+<MCQ q="Why is the await call inside a while loop that re-checks the head?" options={["Condition.await can return without the head being due: timeouts, other signals, or spurious wakeups", "Because await releases the lock permanently", "Java requires every await to be in a loop or it will not compile", "To make the dispatcher busy-wait for accuracy"]} answer={0}>
+
+The Condition docs explicitly allow spurious wakeups and recommend always waiting in a loop that tests the condition. A signal can also mean 'something changed', not 'a job is due'. It compiles without a loop, but it would be wrong.
+
+</MCQ>
+
+<MCQ q="A periodic task submitted to ScheduledThreadPoolExecutor throws a RuntimeException on its 5th run. What happens?" options={["The exception is logged and the 6th run happens on schedule", "The worker thread dies and the pool stops", "Subsequent runs are suppressed, and future.get() throws ExecutionException", "The task is retried with exponential backoff"]} answer={2}>
+
+The ScheduledExecutorService docs say an exception from one run suppresses later runs, and get() on the returned future throws ExecutionException with that cause. Nothing is logged automatically, and there are no built-in retries.
+
+</MCQ>
+
+<MCQ q="cancel() and the dispatcher race on the same SCHEDULED job. What guarantees it either never runs or runs exactly once and is not re-queued?" options={["The volatile keyword on nextRunAt", "Compare-and-set transitions on the job's AtomicReference state", "PriorityQueue being thread-safe", "Removing the job from the heap before calling cancel"]} answer={1}>
+
+Cancel does SCHEDULED to CANCELLED and dispatch does SCHEDULED to RUNNING, both with CAS, so only one wins. After a run, re-queueing needs a CAS from RUNNING to SCHEDULED, which fails if cancel got in first. PriorityQueue itself is not thread-safe.
+
+</MCQ>
+
+<MCQ q="Which test approach makes a multi-threaded cancellation test deterministic?" options={["Thread.sleep(1000) after cancelling, then assert", "Run the test 100 times and accept a 99 percent pass rate", "Use a fake clock frozen before the due time while threads cancel, then advance it and await a latch", "Use a real clock with very short delays"]} answer={2}>
+
+With fake time frozen, no job can become due during the race, so jobs that were cancelled can't have run. Advancing the clock afterwards and waiting on a latch for the expected count gives exact assertions without real-time guesses.
+
+</MCQ>
+
+<MCQ q="By default, what does ScheduledThreadPoolExecutor.shutdown() do to a one-shot task due in 5 minutes?" options={["Cancels it immediately", "Runs it immediately", "Throws RejectedExecutionException", "Still runs it when its delay elapses"]} answer={3}>
+
+executeExistingDelayedTasksAfterShutdown defaults to true, so delayed one-shot tasks still run after shutdown. Periodic tasks are cancelled by default, because continueExistingPeriodicTasksAfterShutdown defaults to false. RejectedExecutionException is for new submissions.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **Core:** `PriorityQueue` ordered by (next run time, sequence number), guarded by one `ReentrantLock`. One dispatcher waits on a `Condition` with `await(head - now)`, in a loop. A worker pool runs the jobs.
+- **Wakeup:** signal when a new job becomes the head. A fake clock's jump also signals. Read the head and await under the same lock, so no wakeup is lost.
+- **Fixed rate:** next = previous **planned** start + period. Late runs catch up and never overlap. **Fixed delay:** next = previous **finish** + delay. Matches the JDK, including `IllegalArgumentException` for a period of zero or less.
+- **Job:** a Command with CAS state SCHEDULED, RUNNING, COMPLETED, FAILED or CANCELLED. Re-queue only after the run ends. Change `nextRunAt` only outside the heap.
+- **Failures:** catch `Exception`, store `lastError`, back off with a `RetryPolicy` (exponential plus cap, add jitter for herds). When retries run out, the job is FAILED, as in the JDK.
+- **Cancel:** a CAS loop (exactly one winner) plus removal from the heap. Cancelling while running prevents the re-queue.
+- **Shutdown:** reject new jobs, cancel and return pending ones, let running ones finish. `shutdownNow` interrupts. `awaitTermination` joins the dispatcher, then the pool.
+- **Tests:** injected monotonic clock, a manual no-threads mode, latches instead of sleeps, freeze time during races, exact counts.
+- **JDK:** `ScheduledThreadPoolExecutor` uses leader-follower workers, FIFO ties, O(log n) cancel with `setRemoveOnCancelPolicy(true)`, delayed one-shots still run after `shutdown()` by default, and a throwing periodic task is silently suppressed. `Timer` has one thread and dies on an exception.
+
+## Go deeper
+
+- [Java SE 21 API: ScheduledExecutorService](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ScheduledExecutorService.html)
+- [Java SE 21 API: ScheduledThreadPoolExecutor](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ScheduledThreadPoolExecutor.html)
+- [Java SE 21 API: Condition](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/locks/Condition.html)
+- [Java SE 21 API: PriorityQueue](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/PriorityQueue.html)
+- [Java SE 21 API: Timer](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/Timer.html)
+- [Netty HashedWheelTimer](https://netty.io/4.1/api/io/netty/util/HashedWheelTimer.html) and [Apache Kafka, Purgatory, and Hierarchical Timing Wheels](https://www.confluent.io/blog/apache-kafka-purgatory-hierarchical-timing-wheels/)
+- Related notes: [Java Executors and Virtual Threads](/learn/notes/java-executors-virtual-threads/), [Java Concurrency and Locks](/learn/notes/java-concurrency-locks/), [Behavioral Patterns](/learn/notes/behavioral-patterns/), [Creational Patterns](/learn/notes/creational-patterns/), [Machine Coding Strategy](/learn/notes/machine-coding-strategy/), [LLD: In-Memory Pub-Sub Message Queue](/learn/notes/lld-pubsub-queue/)
