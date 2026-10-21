@@ -5,6 +5,7 @@ import cloudflare from '@astrojs/cloudflare';
 import rehypeSlug from 'rehype-slug';
 import rehypeAutolinkHeadings from 'rehype-autolink-headings';
 import remarkCodeTabs from './src/lib/remark-code-tabs.ts';
+import rehypeKeepMermaid from './src/lib/rehype-keep-mermaid.ts';
 
 const SITE_SLUG = process.env.SITE_SLUG ?? 'stacktrace';
 const SITE_URL = process.env.SITE_URL ?? 'https://example.com';
@@ -25,10 +26,19 @@ export default defineConfig({
       // <CodeTabs> on DSA pages: groups the fenced blocks inside it into
       // C++ / Java / Python tabs and precomputes each godbolt.org run link.
       remarkPlugins: [remarkCodeTabs],
+      // Highlight code at build time with both themes; global.css picks
+      // the one matching the site's data-theme. @astrojs/mdx 4.0 only
+      // turns Shiki on for the string form, so it is set explicitly here.
+      syntaxHighlight: 'shiki',
+      shikiConfig: {
+        themes: { light: 'github-light', dark: 'github-dark' },
+        defaultColor: false,
+      },
       // Brain-detox-style heading permalinks: every h2/h3/h4 gets an id
       // + a clickable ¶ anchor on hover, so readers can deep-link
       // straight to a section.
       rehypePlugins: [
+        rehypeKeepMermaid,
         rehypeSlug,
         [
           rehypeAutolinkHeadings,
