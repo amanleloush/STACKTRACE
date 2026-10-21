@@ -1,7 +1,7 @@
 ---
 title: "Distributed Transactions: 2PC, Sagas, Outbox"
 phase: "05-distributed-systems"
-order: 24
+order: 46
 tags: ["distsys"]
 premium: false
 previewParagraphs: 4
@@ -12,6 +12,8 @@ prerequisites: []
 ## Definition (interview-ready)
 
 A **distributed transaction** is a unit of work spanning multiple services or data stores that must commit or roll back as a whole. **Two-phase commit (2PC)** is the classic protocol: a coordinator asks all participants to prepare, then to commit. **Sagas** decompose the transaction into local steps with **compensating actions** for failure. The **outbox pattern** atomically writes a business change + an event to the same DB so downstream sees what actually committed.
+
+**One-liner:** A distributed transaction is work across several services or databases that must all succeed or all be undone; 2PC gives atomicity but blocks if the coordinator fails, so microservices usually use sagas (local commits plus compensations) and the outbox pattern to publish events reliably.
 
 ## Why it matters
 
@@ -67,7 +69,7 @@ Coordinator + N participants.
 **Pros**: atomic across participants when it works.
 
 **Cons**:
-- **Blocking**: if coordinator crashes between phases, participants hold locks indefinitely.
+- **Blocking**: if the coordinator crashes after participants voted YES, they can't decide on their own and hold their locks until the coordinator recovers.
 - **Slow**: at least 2 round-trips + fsyncs at each participant.
 - **Coupling**: every participant must support 2PC; coordinator is a single point of pain.
 - **Cross-system XA support is rare and rotted** in modern microservice stacks.
@@ -103,7 +105,7 @@ Tools: AWS Step Functions, Temporal, Cadence, Camunda — all built for this.
 
 ### Compensating actions
 
-Must be **idempotent** and **commutative-friendly**. "Undo" is not always possible (you can't unsend an email) — design carefully:
+Must be **idempotent** (safe to retry) and must not fail for business reasons, because nothing undoes a failed compensation; it should also cope with running after a retried or partially applied step. "Undo" is not always possible (you can't unsend an email) — design carefully:
 - **Soft compensations**: send a "sorry" follow-up email rather than retract.
 - **Reservation-based**: hold resources tentatively (3-step protocol — reserve, then commit or release).
 - **Avoid where possible**: order steps so the irreversible step is **last**.
@@ -165,11 +167,9 @@ Saga state is persisted (Postgres / Cassandra / state machine in Temporal) so it
 
 ## Real-world examples
 
-- **Uber**: saga-based booking flow with compensations; uses Cadence/Temporal-style orchestration.
-- **Netflix**: Conductor (their workflow engine) drives sagas.
-- **Square Cash**: saga-based payment flows with explicit compensations.
-- **Airbnb**: orchestrated saga for reservation + payment + notification.
-- **AWS Step Functions**: managed saga orchestration.
+- **Uber**: built Cadence for durable, long-running workflow orchestration; Temporal is its fork by Cadence's creators.
+- **Netflix**: built Conductor, an open-source workflow orchestrator (Netflix stopped maintaining it in Dec 2023; Orkes and the community carry it on).
+- **AWS Step Functions**: managed orchestration; AWS documents a saga pattern with compensating steps on it.
 
 ## Common pitfalls
 
@@ -182,46 +182,159 @@ Saga state is persisted (Postgres / Cassandra / state machine in Temporal) so it
 - **Forgetting timeouts**: a saga step that hangs forever blocks the saga. Have explicit timeouts + escalation.
 - **Eventual consistency surprises**: user sees state mid-saga (order placed but not shipped). Decide what the API surface is during the saga window.
 
-## Interview questions
+## Practice questions
 
-### Q1 — Easy: Why don't we use 2PC for microservice transactions?
-Because it's blocking (coordinator failure leaves participants holding locks), slow (round-trips + fsyncs), and requires every participant to support XA/2PC — rarely true for modern stacks (Redis, Kafka, external APIs). Sagas + compensation are the modern fit.
+<Practice>
 
-### Q2 — Easy: What's a saga?
-A long-running transaction decomposed into a sequence of local transactions, each with a compensating action. If any step fails, previous steps' compensations run in reverse to leave the system in a consistent state.
+<QA q="Why don't we use 2PC for microservice transactions?" level="easy">
 
-### Q3 — Medium: Choreography vs orchestration for sagas — when to pick which?
-Choreography (event-driven, no central) is simpler at first and loosely coupled, but it gets opaque past 3–4 steps. Orchestration (central coordinator like Temporal/Step Functions) is clearer, observable, easier to debug — preferred for complex flows. Many systems start with choreography and migrate to orchestration when scaling.
+It's **blocking** (a coordinator failure leaves participants holding locks), **slow** (round trips plus fsyncs at every participant), and requires every participant to support XA/2PC — rarely true for modern stacks (Redis, Kafka, external APIs). Sagas with compensation are the modern fit.
 
-### Q4 — Medium: Explain the outbox pattern.
-In the same DB transaction, write the business change and insert an event row into an `outbox` table. A relay (CDC or polling) reads the outbox and publishes to a message broker. Because the outbox write is in the same transaction, events are emitted exactly when the business change commits — no divergence possible. Solves the dual-write problem.
+</QA>
 
-### Q5 — Medium: Compensating actions for sending an email — how?
-You can't unsend. Either: (1) order the email last in the saga so it only fires on success; (2) send a "ignore previous message" follow-up email as compensation; (3) defer the actual send until the saga commits — buffer in your DB, send only on saga success.
+<QA q="What's a saga?" level="easy">
 
-### Q6 — Hard: Design a place-order saga across Inventory, Payment, Shipping services.
-- **Orchestrator** (Temporal or similar) manages state.
+A long-running transaction decomposed into a sequence of **local** transactions, each with a **compensating action**. If any step fails, the compensations for the completed steps run in reverse, leaving the system in a consistent state.
+
+</QA>
+
+<QA q="What is the dual-write problem?" level="easy">
+
+Code that updates the DB and then publishes to Kafka (or calls another service) as two separate operations. Either can fail independently — the DB commits but the publish fails, or the event goes out for a change that rolled back — so the systems diverge. The outbox pattern fixes it.
+
+</QA>
+
+<QA q="Walk through the two phases of 2PC and where it blocks." level="medium">
+
+**Prepare**: the coordinator asks every participant 'can you commit?'; each does its work, holds its locks, logs 'prepared', and votes yes or no. **Commit/abort**: if all voted yes, the coordinator logs 'commit' and tells everyone to commit; otherwise it tells everyone to abort; participants then release their locks. It blocks if the coordinator crashes after participants have prepared — they can't decide alone, so they hold locks until it recovers.
+
+</QA>
+
+<QA q="Choreography vs orchestration for sagas — when to pick which?" level="medium">
+
+**Choreography** (services react to each other's events, no central coordinator) is simple to start and loosely coupled, but becomes opaque past 3–4 steps — hard to trace, and ownership of compensation gets murky. **Orchestration** (a central coordinator like Temporal or Step Functions) gives clear control flow and is easier to observe and debug — preferred for complex flows. Many systems start with choreography and migrate.
+
+</QA>
+
+<QA q="Explain the outbox pattern." level="medium">
+
+In the **same DB transaction**, write the business change and insert an event row into an `outbox` table. A relay (polling or CDC) reads the outbox and publishes to the broker. Because both writes commit atomically, an event is emitted if and only if the business change committed — solving the dual-write problem. Delivery is at-least-once, so consumers should dedupe.
+
+</QA>
+
+<QA q="What is the inbox pattern?" level="medium">
+
+The consumer-side mirror of the outbox. In one local transaction, check whether the event ID is already in an `inbox` table; if so, skip it; otherwise insert the ID and apply the effect. Combined with at-least-once delivery, it gives effectively-exactly-once processing per consumer.
+
+</QA>
+
+<QA q="How do you compensate for sending an email in a saga?" level="medium">
+
+You can't unsend it. Options: (1) order the email **last** so it only fires on success; (2) send a follow-up 'please ignore the previous message' as a soft compensation; (3) defer the actual send until the saga completes — buffer it in your DB and send only on success.
+
+</QA>
+
+<QA q="Why must saga state be persisted, and why do steps need timeouts?" level="hard">
+
+If the orchestrator restarts without persisted state, it loses track of which steps ran — it may re-run them (double effects) or abandon the saga half-done. Persist every transition (Postgres, Cassandra, or a workflow engine like Temporal). Timeouts matter because a step that hangs forever blocks the saga; on timeout, compensate or escalate.
+
+</QA>
+
+<QA q="Compare TCC with sagas." level="hard">
+
+**TCC (Try-Confirm-Cancel)**: Try reserves resources tentatively without committing, Confirm finalizes, Cancel releases. Resources stay reserved between Try and Confirm/Cancel, so partial states aren't exposed, at the cost of holding reservations and more application state. **Sagas**: each step commits locally right away and compensations undo it later — simpler and non-blocking, but intermediate states are visible. TCC fits financial flows; sagas fit most user-facing flows.
+
+</QA>
+
+<QA q="During a saga, what should the API show the user, and why does it matter?" level="hard">
+
+A saga is eventually consistent, so there's a window where some steps have committed and others haven't (order placed, payment pending, not shipped). Decide the API surface explicitly — e.g., expose an 'order pending' status until the saga completes, then push the final state by webhook or polling. Otherwise users see confusing partial states or act on them.
+
+</QA>
+
+<QA q="Design a place-order saga across Inventory, Payment, and Shipping services." level="scenario">
+
+- An **orchestrator** (Temporal or similar) manages state.
 - Steps:
   1. `Inventory.reserve(orderId, items)` — compensation: `Inventory.release(orderId)`.
-  2. `Payment.charge(orderId, amount, idempotencyKey=orderId)` — compensation: `Payment.refund(orderId)`.
+  2. `Payment.charge(orderId, amount)` with `orderId` as the idempotency key — compensation: `Payment.refund(orderId)`.
   3. `Shipping.create(orderId)` — compensation: `Shipping.cancel(orderId)`.
-- Each step is idempotent (orderId is the idempotency key).
-- Persistent saga state (Postgres).
-- Timeouts per step; on timeout, run compensations.
-- Customer sees "order pending" until saga completes; final status updates UI via webhook or polling.
+- Every step is idempotent, keyed by `orderId`.
+- Saga state persisted (e.g., Postgres); timeouts per step, compensating on timeout.
+- The customer sees 'order pending' until the saga completes.
 
-### Q7 — Hard: Your saga occasionally double-charges customers. Investigate.
-- **Non-idempotent charge**: `Payment.charge` isn't using a stable idempotency key. Pass the `orderId` (or saga ID) to make charges idempotent — the provider dedupes.
-- **Retry on ambiguous error**: HTTP 504 might mean "succeeded but slow" — retry without idempotency = double charge.
-- **Saga state lost on orchestrator restart**: it re-runs steps. Persist state.
-- **Compensation runs and the original commits** (race condition): track step state atomically; never roll forward while compensation is in flight.
+</QA>
 
-### Q8 — Hard: Compare TCC with sagas.
-**TCC (Try-Confirm-Cancel)**: explicit reservation phase. The "Try" phase pre-allocates resources but doesn't commit; "Confirm" commits; "Cancel" releases. Resource is locked between Try and Confirm/Cancel. Strong consistency at the cost of holding reservations.
+<QA q="Your saga occasionally double-charges customers. Investigate." level="scenario">
 
-**Sagas**: each step commits its local transaction immediately; compensation undoes if a later step fails. No reservation; potentially observable intermediate state.
+- **Non-idempotent charge**: `Payment.charge` doesn't use a stable idempotency key. Pass the `orderId` (or saga ID) so the provider dedupes.
+- **Retry on an ambiguous error**: a 504 may mean 'succeeded but slow' — retrying without idempotency charges twice.
+- **Saga state lost on orchestrator restart**, so steps re-run. Persist state.
+- **Compensation racing the original step**: track step state atomically; never roll forward while a compensation is in flight.
 
-TCC = stronger guarantees, more state mgmt, blocking-ish. Saga = simpler, eventually consistent, no blocking but exposes intermediates. TCC fits financial flows where you can't reveal partial states; saga fits most user-facing flows.
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="In 2PC, what happens if the coordinator crashes after all participants vote yes but before sending the decision?" options={["Participants commit automatically after a timeout", "Participants abort automatically", "Participants stay blocked holding locks until the coordinator recovers", "The fastest participant becomes coordinator and commits"]} answer={2}>
+
+Prepared participants can't safely decide alone, so they hold locks and wait. That blocking is 2PC's core weakness.
+
+</MCQ>
+
+<MCQ q="A service updates its DB and then publishes to Kafka in separate steps. What is the risk?" options={["Kafka rejects duplicate messages", "The DB and the event stream can diverge if one step fails", "Transactions become serializable", "The DB update is rolled back automatically"]} answer={1}>
+
+This is the dual-write problem: either step can fail alone. The outbox pattern makes the event part of the DB transaction.
+
+</MCQ>
+
+<MCQ q="What makes the outbox pattern reliable?" options={["The event row is written in the same DB transaction as the business change", "Kafka supports XA transactions", "The relay deletes events before publishing", "Consumers never receive duplicates"]} answer={0}>
+
+Atomic commit of business data plus outbox row means events exist exactly when the change committed. Relays can still redeliver, so consumers should be idempotent.
+
+</MCQ>
+
+<MCQ q="A saga reserves inventory, charges payment, then shipment creation fails. What runs next?" options={["Shipment creation retries forever", "Only the inventory release", "Nothing; the order stays as is", "Refund payment, then release inventory, in reverse order"]} answer={3}>
+
+Compensations run in reverse for the completed steps. Retrying forever without a timeout blocks the saga.
+
+</MCQ>
+
+<MCQ q="A flow has 6 services and 10 event types, and nobody can tell who triggers compensation. What change helps most?" options={["Move from choreography to orchestration", "Switch to 2PC", "Remove compensations", "Add more event types"]} answer={0}>
+
+Orchestration centralizes control flow and state, making complex sagas observable. 2PC brings blocking and needs XA support everywhere.
+
+</MCQ>
+
+<MCQ q="A saga step sends a welcome email that can't be undone. Where should it go?" options={["First, so users are informed early", "In parallel with all other steps", "Last, after all steps that might fail", "Inside the compensation path"]} answer={2}>
+
+Putting irreversible steps last means they only run once everything that might fail has succeeded.
+
+</MCQ>
+
+<MCQ q="What does the inbox pattern give a consumer receiving at-least-once deliveries?" options={["Ordered delivery across partitions", "Atomic writes to the producer's DB", "Lower publish latency", "Effectively-exactly-once processing by deduping on event ID"]} answer={3}>
+
+Recording processed event IDs in the same transaction as the effect lets duplicates be skipped. It doesn't affect ordering or producer-side behavior.
+
+</MCQ>
+
+<MCQ q="How does TCC differ from a saga?" options={["TCC commits each step immediately and compensates later", "TCC reserves resources in Try and finalizes in Confirm, so partial states are not exposed", "TCC needs no application-level state", "TCC is choreography-only"]} answer={1}>
+
+TCC holds tentative reservations until Confirm or Cancel. Sagas commit immediately and expose intermediate states, which is what option A describes.
+
+</MCQ>
+
+<MCQ q="A payment call times out with a 504 and the saga retries without an idempotency key. What can happen?" options={["The customer may be charged twice", "The retry is guaranteed to fail", "The saga state is lost", "The payment provider rolls back the first charge"]} answer={0}>
+
+A timeout is ambiguous: the first charge may have succeeded. Without an idempotency key the provider can't dedupe the retry.
+
+</MCQ>
+
+</Quiz>
 
 ## TL;DR cheat sheet
 
@@ -235,10 +348,10 @@ TCC = stronger guarantees, more state mgmt, blocking-ish. Saga = simpler, eventu
 
 ## Go deeper
 
-- **microservices.io**: ["Saga pattern"](https://microservices.io/patterns/data/saga.html), [Outbox](https://microservices.io/patterns/data/transactional-outbox.html), [Inbox](https://microservices.io/patterns/data/messaging.html).
+- **microservices.io**: ["Saga pattern"](https://microservices.io/patterns/data/saga.html), [Outbox](https://microservices.io/patterns/data/transactional-outbox.html), [Idempotent consumer (inbox)](https://microservices.io/patterns/communication-style/idempotent-consumer.html).
 - **Chris Richardson** book: *Microservices Patterns* — best chapter on distributed transactions.
-- **DDIA Chapter 7** — distributed transactions and ACID across services.
+- **DDIA Chapters 7 and 9** — transactions/ACID (Ch 7); 2PC, XA and atomic commit (Ch 9).
 - **Temporal docs**: [docs.temporal.io](https://docs.temporal.io/) — production saga orchestrator.
 - **AWS Step Functions** — managed orchestration.
-- **Caitie McCaffrey**: ["Distributed Sagas: A Protocol for Coordinating Microservices"](https://www.youtube.com/watch?v=0UTOLRTwOX0) (YOW! talk).
+- **Caitie McCaffrey**: ["Distributed Sagas: A Protocol for Coordinating Microservices"](https://www.youtube.com/watch?v=0UTOLRTwOX0) (J On The Beach 2017 talk).
 - **Bernd Rücker (Camunda)** — blog posts on saga vs orchestration tradeoffs.

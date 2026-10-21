@@ -1,0 +1,1107 @@
+---
+title: "Redis Patterns & Use Cases: Sessions, Rate Limits, Queues, Leaderboards"
+phase: "03-caching-redis"
+order: 28
+tags: ["caching"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 30
+prerequisites: ["redis-deep", "cache-patterns"]
+summary: "How Redis is actually used in production (sessions, rate limiters, queues, locks, leaderboards, analytics, ML and recommendations), how to wire it into apps and microservices, how to test it, and where the project and its ecosystem came from and are heading."
+---
+
+## Definition (interview-ready)
+
+A **Redis pattern** is a recipe that maps an application problem onto one or two Redis data structures plus an expiry and, when needed, an atomic step (a single command, `MULTI`/`EXEC`, or a Lua script). Sessions are hashes with a TTL. Rate limiters are counters or sorted sets that expire. Queues are lists moved atomically with `BLMOVE`, or streams with consumer groups. Leaderboards are sorted sets. Locks are `SET key token NX PX ttl`. Unique counts are HyperLogLogs, and daily-active flags are bitmaps.
+
+The interview skill is not listing these. It is explaining **why** each structure fits, which guarantees you lose because Redis is in-memory and replicates asynchronously, and **when you should not use Redis at all**.
+
+**One-liner:** A Redis pattern maps a problem onto the right in-memory data structure plus a TTL and an atomic step, for example a sorted set for a leaderboard or `SET NX PX` for a lock, while accepting that Redis can lose recent writes on a crash or failover.
+
+## Why it matters
+
+Redis turns up in nearly every system-design answer, and interviewers check whether you understand the trade-offs behind it. "Put it in Redis" is a weak answer. A strong one sounds like this: "Sliding-window limiter on a sorted set, made atomic with a Lua script, keyed per user. If Redis is down, the limiter fails open, and we accept that because the gateway also has a coarse per-node limit."
+
+The same small set of primitives covers many problems, so learning the patterns once pays off across caching, messaging, coordination, analytics, and AI workloads.
+
+```
+            ┌──────────────────────── Redis primitives ────────────────────────┐
+ Problem    │ STRING/INCR  HASH   LIST   SET   ZSET   STREAM  BITMAP  HLL  GEO │
+ ───────────┼──────────────────────────────────────────────────────────────────┤
+ Session    │               ●                                                  │
+ Rate limit │   ●                               ●                              │
+ Queue      │                      ●                    ●                      │
+ Lock       │   ● (SET NX PX)                                                  │
+ Leaderboard│                                   ●                              │
+ DAU / uniq │                                                   ●       ●      │
+ Recs       │                             ●     ●                              │
+ Nearby     │                                                              ●   │
+            └──────────────────────────────────────────────────────────────────┘
+```
+
+## Core concepts
+
+### Session store
+
+HTTP is stateless. A session store keeps per-login state (user id, roles, CSRF token, cart) on the server, keyed by an opaque random session id stored in a cookie. Redis suits this well:
+
+- **Shared across app servers.** Any instance behind the load balancer can read the session, so you don't need sticky sessions.
+- **Native expiry.** Idle sessions disappear on their own, with no cleanup cron.
+- **Sub-millisecond reads** on every request.
+
+```
+redis-cli> HSET sess:9f2c71ab uid 42 role admin csrf k3J9x
+(integer) 3
+redis-cli> EXPIRE sess:9f2c71ab 1800          # 30-min idle timeout
+(integer) 1
+redis-cli> HGETALL sess:9f2c71ab               # every request
+redis-cli> EXPIRE sess:9f2c71ab 1800           # sliding expiration: refresh on activity
+redis-cli> DEL sess:9f2c71ab                   # logout
+```
+
+Design notes:
+
+- **Hash, not one JSON string.** You can update one field (`HSET sess:x cart_count 3`) without rewriting the whole blob or racing another request.
+- **Set an absolute lifetime as well as the idle one.** Sliding expiration alone lets a stolen session live forever if it keeps being used. Store `created_at` in the hash and reject sessions past the absolute limit.
+- **Revoke all sessions for a user.** Keep a set `user:42:sessions` of session ids. On a password change, delete them all.
+- **Losing sessions = mass logout.** Eviction (`allkeys-lru`) or an unpersisted restart logs everyone out. Use a dedicated instance or a `volatile-*` policy, size `maxmemory` with headroom, and enable persistence if a forced logout is unacceptable.
+- **Framework support exists:** Spring Session (Redis), `connect-redis` for Express, Django and Rails cache-backed sessions.
+
+### Redis as a primary database: when it's OK and when it isn't
+
+Redis can be the system of record. Whether it should be depends on the durability, query, and size requirements.
+
+| Concern | What Redis gives you | Implication |
+|---|---|---|
+| Durability | RDB snapshots and/or AOF. `appendfsync always` fsyncs every write. The default `everysec` can lose about 1 s of writes | Tunable, but `always` costs throughput |
+| Replication | Asynchronous. `WAIT` blocks until N replicas acknowledge, but that is still not a consensus protocol | Writes acknowledged by the primary can be lost on failover |
+| Dataset size | Bounded by RAM (with replicas, multiplied) | Cost per GB is far higher than disk-based stores |
+| Querying | Lookup by key, plus data-structure operations. Secondary indexes are manual or come from the Query Engine (`FT.*`) | No ad-hoc joins or SQL-style analytics |
+| Transactions | `MULTI`/`EXEC` and scripts run atomically, but there is no rollback on a runtime error | Not the multi-statement ACID model of an RDBMS |
+
+**Good fit:** data that is naturally key-shaped or structure-shaped, fits in memory, and can tolerate a small loss window. Examples: game state, leaderboards, feature-store values, counters, ephemeral collaboration state.
+
+**Poor fit:** money, orders, inventory of record, anything needing relational integrity or ad-hoc reporting, and datasets much larger than RAM.
+
+Interview line: *"Redis can be primary for data I can afford to lose a second of, or rebuild; for the ledger I want a database with synchronous durability and constraints, and Redis in front of it."*
+
+### Client libraries, connection pooling, and RESP2 vs RESP3
+
+A client library hides the wire protocol (**RESP**), manages connections, maps replies to native types, and adds cluster routing, Sentinel discovery, retries, pipelining, and TLS. The redis.io docs list these clients:
+
+| Language | Clients | Connection model |
+|---|---|---|
+| Python | `redis-py` (sync, plus `redis.asyncio`), RedisVL for vector workloads | Connection pool |
+| Java | **Jedis** (synchronous, simple API) and **Lettuce** (sync, async, and reactive on Netty) | Jedis uses a pool. Lettuce can multiplex one connection or use a pool |
+| Node.js | **node-redis** (recommended for new code) and **ioredis** (still supported, older) | Promise-based |
+| Go | **go-redis** | Built-in pool, goroutine-safe client |
+| .NET | StackExchange.Redis, plus NRedisStack for Stack features | Multiplexer |
+
+```python
+import redis
+pool = redis.ConnectionPool.from_url("redis://localhost:6379/0", max_connections=50)
+r = redis.Redis(connection_pool=pool, decode_responses=True)
+r.set("greeting", "hello", ex=60)
+```
+
+```go
+rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", PoolSize: 50})
+err := rdb.Set(ctx, "greeting", "hello", time.Minute).Err()
+```
+
+**Pooling vs multiplexing.** A pool lends out whole connections, so each caller has exclusive use while a command is in flight. A multiplexer pushes every caller's commands through one connection and routes the replies back. Multiplexing is efficient and often pipelines automatically. The catch: a blocking command such as `BLPOP` would stall every caller sharing that connection, so blocking pops need a dedicated connection.
+
+**RESP2 vs RESP3.**
+
+- RESP2 has been the standard protocol since Redis 2.0.
+- RESP3 arrived as opt-in in Redis 6.0. A client switches to it with `HELLO 3`. Connections start in RESP2 by default.
+- RESP3 adds real types: maps, sets, doubles, booleans, a single null type, and **push** messages, which carry out-of-band data on the same connection.
+- Push messages are why **client-side caching** (server-assisted `CLIENT TRACKING`, also Redis 6) can deliver invalidations on the data connection. With RESP2 you need a second connection that subscribes to `__redis__:invalidate`.
+
+### Web-app integration and Redis next to a database
+
+The default integration is **cache-aside**: read from Redis, fall back to the DB on a miss, then populate Redis with a TTL. The variants (read-through, write-through, write-behind) and their consistency trade-offs are covered in [Cache Patterns](/learn/notes/cache-patterns/). Stampede control is in [Cache Stampede & TTL](/learn/notes/cache-stampede-ttl/). This section only covers how invalidation reaches Redis:
+
+```
+ (1) App-driven                    (2) CDC-driven (recommended at scale)
+ ┌─────┐ write ┌────┐              ┌─────┐ write ┌────┐ binlog ┌──────────┐ ┌───────┐
+ │ App │──────▶│ DB │              │ App │──────▶│ DB │───────▶│ Debezium │▶│ Kafka │
+ └──┬──┘       └────┘              └─────┘       └────┘        └──────────┘ └───┬───┘
+    │ DEL user:42                                                               │
+    ▼                                                          invalidator consumer
+ ┌───────┐                                                             │ DEL user:42
+ │ Redis │                                                             ▼
+ └───────┘                                                         ┌───────┐
+                                                                   │ Redis │
+                                                                   └───────┘
+```
+
+- **App-driven delete-after-write** is simple. It misses writes from other services, scripts, and manual SQL, and it races when a slow reader repopulates the old value just after the delete.
+- **Write-through** (update DB, then `SET` in Redis) keeps hot keys warm but has the same partial-failure gap.
+- **CDC invalidation** uses the DB's change log as the single source of truth for "what changed". It catches every writer and lets you retry invalidations. The cost is another pipeline and some lag. See [Change Data Capture](/learn/notes/change-data-capture/).
+
+In every option, keep a **TTL as the safety net** so a missed invalidation heals itself.
+
+### Redis vs traditional databases
+
+| Dimension | Redis | RDBMS (Postgres/MySQL) |
+|---|---|---|
+| Latency | Sub-ms in memory | ms, depending on disk and buffer pool |
+| Data model | Keys → strings, hashes, lists, sets, zsets, streams, and more | Tables, rows, relations |
+| Query | By key and structure ops, plus optional Query Engine | SQL, joins, ad-hoc queries |
+| Durability | Configurable, with an async replication loss window | WAL with synchronous commit |
+| Consistency | Single-threaded command execution per shard, so each command is atomic | ACID transactions, constraints, isolation levels |
+| Scale-out | Redis Cluster: 16,384 hash slots, no cross-slot multi-key ops | Mostly vertical, plus read replicas and sharding layers |
+| Cost per GB | High (RAM) | Low (disk) |
+| Best at | Hot data, counters, coordination, ephemeral state | Durable records, integrity, reporting |
+
+### Redis in a microservices architecture
+
+```
+ client ─▶ API gateway ── rate limit (Redis) ──▶ service A ──▶ own DB
+                 │                                  │  └── cache (Redis, A's keys only)
+                 └── session/JWT denylist (Redis)   │
+                                                    ├── XADD events ─▶ Redis Stream / Kafka ─▶ service B
+                                                    └── lock / idempotency key (SET NX EX)
+```
+
+Common roles: gateway rate limiting, sessions or token denylists, per-service caches, idempotency keys (`SET idem:<request-id> 1 NX EX 86400`), short-lived locks, lightweight event fan-out (Pub/Sub for ephemeral events, Streams when you need replay), and service-level feature flags.
+
+**The anti-pattern** is a shared Redis used as an **integration database**, where service B reads service A's keys. That couples deployments and schemas just like a shared SQL DB would. Give each service its own keyspace or prefix, use ACL users per service (Redis 6+), and expose data through APIs or events. Treat Redis as a dependency that can fail: set timeouts, add a circuit breaker, and define a fallback.
+
+### Rate limiting: four algorithms
+
+Concepts and algorithm trade-offs are in [Rate Limiting](/learn/notes/rate-limiting/), and the full system design is in [HLD: Rate Limiter](/learn/notes/hld-rate-limiter/). Here is how each algorithm maps onto Redis.
+
+**1. Fixed window (`INCR` + `EXPIRE`).** One counter per caller per window.
+
+```
+MULTI
+INCR   rl:u42:29350112          # 29350112 = floor(unix_ts / 60)
+EXPIRE rl:u42:29350112 60 NX    # NX (Redis 7+): set TTL only if none exists
+EXEC
+# allow if the INCR result <= 100
+```
+
+It is cheap: one key and O(1) per request. Its weakness is bursts at window boundaries, where up to 2× the limit can get through across two adjacent windows. On **Redis 8.8+**, `INCREX` folds the increment, an upper bound, and the expiry into one atomic command:
+
+```
+INCREX rl:u42 BYINT 1 UBOUND 100 EX 60 ENX
+# reply: [new_value, actual_increment]; actual_increment = 0 means limited
+```
+
+**2. Sliding log (sorted set).** Store one member per request, scored by its timestamp. It is exact, but memory grows to O(limit) per caller.
+
+```lua
+-- KEYS[1]=log key  ARGV[1]=window_ms  ARGV[2]=limit  ARGV[3]=unique request id
+local t   = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, now - tonumber(ARGV[1]))
+if redis.call('ZCARD', KEYS[1]) < tonumber(ARGV[2]) then
+  redis.call('ZADD', KEYS[1], now, ARGV[3])
+  redis.call('PEXPIRE', KEYS[1], ARGV[1])
+  return 1
+end
+return 0
+```
+
+**3. Sliding window counter.** Keep two fixed-window counters and weight the previous one by how much of it still overlaps the sliding window: `estimate = prev × (1 − elapsed/window) + curr`. It uses O(1) memory and gives a good approximation. Cloudflare has written about using this approach.
+
+**4. Token bucket (Lua).** A bucket holds up to `capacity` tokens and refills at `rate` per ms. Each request spends `cost` tokens. This allows controlled bursts.
+
+```lua
+-- KEYS[1]=bucket  ARGV[1]=capacity  ARGV[2]=refill tokens per ms  ARGV[3]=cost
+local cap, rate, cost = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
+local t   = redis.call('TIME')                       -- server clock, not client clocks
+local now = tonumber(t[1]) * 1000 + tonumber(t[2]) / 1000
+local b   = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+local tokens = tonumber(b[1]) or cap
+local ts     = tonumber(b[2]) or now
+tokens = math.min(cap, tokens + (now - ts) * rate)
+local ok = 0
+if tokens >= cost then tokens = tokens - cost; ok = 1 end
+redis.call('HSET', KEYS[1], 'tokens', tokens, 'ts', now)
+redis.call('PEXPIRE', KEYS[1], math.ceil(cap / rate) + 1000)
+return ok
+```
+
+Why Lua: the read-compute-write must be atomic, or two concurrent requests both see the same token count. Using `TIME` plus writes inside a script is safe because scripts replicate by effects. That has been the default since Redis 5.0 and the only mode since 7.0. Pass every key through `KEYS` so the script is Cluster-safe.
+
+### Queues: lists, BLMOVE, Streams, and when not to use Redis
+
+**Simple queue:** `LPUSH` to produce, `BRPOP` to consume. If the worker crashes after popping, the job is lost.
+
+**Reliable queue:** atomically move the job into a per-worker processing list, then remove it once the work is done. `BLMOVE` (Redis 6.2) replaces the deprecated `BRPOPLPUSH`:
+
+```
+LPUSH  jobs '{"id":1,"type":"email"}'
+BLMOVE jobs jobs:processing:w1 RIGHT LEFT 5      # block up to 5 s
+# ... do the work ...
+LREM   jobs:processing:w1 1 '{"id":1,"type":"email"}'
+# a reaper re-queues items stuck in processing lists too long
+```
+
+**Streams** give you this as a built-in feature: an append-only log, consumer groups, a per-consumer pending entries list (PEL), acknowledgements, and claiming of stuck messages:
+
+```
+XADD jobs * type email to u42
+XGROUP CREATE jobs workers $ MKSTREAM
+XREADGROUP GROUP workers w1 COUNT 10 BLOCK 5000 STREAMS jobs >
+XACK jobs workers 1729500000000-0
+XAUTOCLAIM jobs workers w2 60000 0-0 COUNT 25    # take over jobs idle above 60 s (6.2+)
+```
+
+**Ideal for:** background jobs (emails, thumbnails, webhooks), short-lived work distribution, and fan-out where a backlog of minutes to hours fits in RAM. Libraries such as Sidekiq, Celery's Redis broker, and BullMQ build on these primitives.
+
+**Not ideal when** you need days of retention, replay by many independent consumer groups at high volume, ordered partitions at Kafka scale, or zero loss across failover. Async replication can drop acknowledged `XADD`s. Use [Kafka](/learn/notes/kafka-deep/) or a broker like RabbitMQ or SQS instead ([comparison](/learn/notes/pulsar-rabbitmq-sqs/)).
+
+### Full-page cache
+
+You cache the rendered HTML (or API JSON) of a whole page, keyed by everything that changes the output:
+
+```
+key   = fpc:v3:{sha1(host + path + sorted_query + lang + device_class)}
+value = gzip(html)      # store compressed bytes; Redis strings are binary-safe
+SET fpc:v3:ab12… <bytes> EX 300
+SADD tag:product:991 fpc:v3:ab12…     # tag index for targeted invalidation
+# on product 991 update: SMEMBERS tag:product:991 → DEL each → DEL tag set
+```
+
+Rules:
+
+- **Never** full-page-cache personalized or authenticated responses unless the user or segment is part of the key. Leaking one user's page to another is the classic incident.
+- Prefer a [CDN](/learn/notes/cdn-basics/) for public pages. Redis FPC fits pages that need origin logic, such as many variants or fast purge-by-tag.
+- Protect against stampedes on expiry with a lock or early refresh ([Cache Stampede & TTL](/learn/notes/cache-stampede-ttl/)).
+
+### Distributed locks: SET NX PX, tokens, and the Redlock debate
+
+**Single-instance lock** (the pattern on redis.io):
+
+```
+SET lock:order:991 7f3c9e1d-… NX PX 30000       # acquire: only if absent, auto-expire 30 s
+# release only if we still own it:
+DELEX lock:order:991 IFEQ 7f3c9e1d-…             # Redis 8.4+
+# before 8.4, the equivalent Lua:
+#   if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end
+```
+
+- **Why the random token:** without it, a client whose lock already expired could `DEL` a lock that another client now holds.
+- **Why the TTL:** a crashed holder can't deadlock everyone.
+- **Weakness:** replication is async. If the primary fails before the key reaches the replica, the promoted replica has no lock and a second client can acquire it.
+
+**Redlock** runs on N independent primaries (5 in the docs). The client tries to acquire the same key and token on all of them, using short per-node timeouts. It holds the lock only if a **majority** succeeded *and* the elapsed time is less than the TTL. Its remaining validity is the TTL minus the elapsed time minus a clock-drift margin.
+
+The debate, presented fairly:
+
+| Martin Kleppmann (2016) | antirez's reply |
+|---|---|
+| A process can pause (GC, page fault, network delay) after it believes it holds the lock, then write after expiry. Checking expiry before writing doesn't close that gap | Every auto-expiring lock has that problem. Redlock measures elapsed time around acquisition. The real question is what happens after the check, which no lease-based lock solves |
+| Correctness needs **fencing tokens**: a monotonically increasing number that the storage layer checks to reject stale writers. Redlock can't produce one without consensus | If the resource can check tokens, it can usually do its own check-and-set. Redlock's unique random value can serve that purpose |
+| Safety depends on bounded clock drift, network delay, and pauses, which real systems violate. Use ZooKeeper, etcd, or a DB with fencing for correctness-critical locks | Redlock needs only clocks that tick at roughly the same *rate*, not synchronized clocks. Agreed that Redis should use monotonic time |
+
+Practical takeaway:
+
+- **Efficiency locks** (avoid duplicate work, where an occasional double run is harmless): a single-instance `SET NX PX` is fine.
+- **Correctness locks** (must never double-execute): use a consensus-backed lock and **fencing tokens checked by the resource**, or design the operation to be idempotent.
+- The redis.io page itself now recommends fencing tokens and warns that TTLs don't use a monotonic clock.
+
+### Leaderboards and gaming
+
+Sorted sets are the canonical leaderboard: O(log N) updates, rank lookup in O(log N), and range reads in O(log N + M).
+
+```
+ZINCRBY lb:season7 50 player:42                 # add points
+ZRANGE  lb:season7 0 9 REV WITHSCORES           # top 10 (REV option, 6.2+)
+ZREVRANK lb:season7 player:42                   # 0-based rank, highest score first
+ZRANGE  lb:season7 <rank-5> <rank+5> REV          # "players around me": compute the indices client-side
+```
+
+- **Ties:** members with equal scores are ordered lexicographically. To break ties by "who got there first", encode time into the score, e.g. `score = points * 1e7 + (MAX_TS − ts)`. Two conditions keep this correct: `MAX_TS − ts` must stay below the multiplier (1e7 seconds is about 115 days, so measure `ts` from the season start), and the whole score must stay within a double's 2^53 exact-integer range.
+- **Time-boxed boards:** use one key per day, week, or season with a TTL. Build a weekly board from daily boards with `ZUNIONSTORE`.
+- **Other gaming uses:** player sessions and presence (hash plus TTL), matchmaking pools (zset scored by MMR, then pick a window by score), Pub/Sub for lobby chat and real-time events, per-player rate limits, and caches for inventories that are persisted elsewhere.
+
+### Real-time analytics: HLL, bitmaps, time series
+
+| Need | Structure | Commands | Cost |
+|---|---|---|---|
+| Unique visitors per page per day | HyperLogLog | `PFADD`, `PFCOUNT`, `PFMERGE` | ≤ 12 KB each, 0.81% standard error |
+| Daily active users, retention cohorts | Bitmap (bit = user id) | `SETBIT`, `BITCOUNT`, `BITOP AND/OR` | max_user_id / 8 bytes per day |
+| Counters per minute | String counters / hash fields | `INCR`, `HINCRBY` + TTL | Tiny |
+| Metrics series | Time series (part of Redis 8) | `TS.ADD`, `TS.RANGE … AGGREGATION` | Compressed chunks, retention |
+| Top-K trending | Sorted set or Top-K sketch | `ZINCRBY` / `TOPK.ADD` | Bounded |
+
+```
+PFADD uv:/pricing:2026-10-21 visitor:8812
+PFCOUNT uv:/pricing:2026-10-21
+SETBIT dau:2026-10-21 42 1
+BITOP AND retained dau:2026-10-20 dau:2026-10-21
+BITCOUNT retained
+TS.ADD cpu:host7 * 63.5
+TS.RANGE cpu:host7 - + AGGREGATION avg 60000     # 1-minute averages
+```
+
+A typical architecture: an event stream (Kafka or Redis Streams) feeds consumers that update Redis structures, and the dashboard reads Redis. Long-term history and heavy aggregations go to an OLAP store. Redis holds the hot, live view. See also [Probabilistic Data Structures](/learn/notes/probabilistic-data-structures/).
+
+### IoT
+
+- **Ingest buffer:** devices or gateways `XADD` readings into a capped stream, e.g. `XADD telemetry:site7 MAXLEN ~ 1000000 * dev 17 temp 23.4`. Consumer groups then fan the data out to storage and alerting.
+- **Latest-value cache / device shadow:** a hash per device holding the last reading and status. Apps read it without touching the time-series DB.
+- **Time series:** `TS.ADD` with retention and downsampling rules for recent windows.
+- **Geo:** `GEOADD fleet 77.59 12.97 truck:7` then `GEOSEARCH fleet FROMLONLAT 77.60 12.97 BYRADIUS 5 km ASC COUNT 10`.
+- **Commands to devices:** Pub/Sub for fire-and-forget, Streams when delivery must be tracked.
+- **Caveat:** memory is the limit. Keep raw history in a durable TSDB or object store, and keep Redis for the hot window.
+
+### Machine learning: feature store, vector search, semantic cache
+
+- **Online feature store.** Precomputed features live in hashes (`HSET feat:user:42 ctr_7d 0.031 orders_30d 4`), and the model server reads them with `HMGET` within the latency budget. Feature-store frameworks such as Feast support Redis as an online store.
+- **Vector search (Redis Query Engine).** Store embeddings in hashes or JSON, then build an index with a `VECTOR` field. Supported algorithms are `FLAT` (exact), `HNSW` (approximate), and `SVS-VAMANA` (added in Redis 8.2), with `L2`, `IP`, or `COSINE` distance. You can query KNN with metadata filters:
+
+```
+FT.CREATE docs ON HASH PREFIX 1 doc: SCHEMA
+  category TAG
+  emb VECTOR HNSW 6 TYPE FLOAT32 DIM 768 DISTANCE_METRIC COSINE
+FT.SEARCH docs "(@category:{sports})=>[KNN 10 @emb $vec AS dist]"
+  PARAMS 2 vec <768 float32 bytes> SORTBY dist DIALECT 2
+```
+
+- **Vector sets** (new data type in Redis 8.0, created by antirez): `VADD points VALUES 2 1.0 1.0 pt:A`, `VSIM points ELE pt:A WITHSCORES COUNT 4`. They are a lighter-weight option when you don't need a full index schema.
+- **Other uses:** semantic caching of LLM responses keyed by embedding similarity (RedisVL implements this), conversation memory, and prediction caching for repeated inputs.
+
+### Recommendation systems with sets and sorted sets
+
+```
+# co-occurrence: each time items A and B are bought together
+ZINCRBY covisit:item:123 1 item:456
+ZINCRBY covisit:item:456 1 item:123
+
+# candidates for user 42 from their last 3 items, weighted by recency
+ZUNIONSTORE rec:tmp:u42 3 covisit:item:123 covisit:item:77 covisit:item:9 WEIGHTS 1 0.6 0.3
+EXPIRE rec:tmp:u42 300
+ZRANGE rec:tmp:u42 0 49 REV WITHSCORES
+
+# drop already-seen items
+SMISMEMBER seen:u42 item:456 item:888 …         # 6.2+
+
+# "friends who also like X" style
+SINTER likes:item:991 friends:u42
+```
+
+The usual split: **offline** jobs (Spark or a model) compute candidate lists and scores and write them to Redis. **Online**, Redis merges, filters, and boosts in milliseconds. Pair this with vector KNN for content-based candidates. Keep keys in Cluster on the same slot with hash tags (`{u42}`) when one command needs several of them.
+
+### Testing code that uses Redis
+
+| Approach | Example | Pros | Cons |
+|---|---|---|---|
+| In-process fake | `fakeredis` (Python), `miniredis` (Go), `ioredis-mock` | Fast, no Docker | Command coverage and edge-case behaviour may differ |
+| Real Redis in a container | Testcontainers spinning up the official image | Real semantics, Lua, Streams, Cluster | Needs Docker, slower startup |
+| Shared dev instance | — | Easy | Flaky, tests collide. Avoid |
+| Mocking the client | Mockito, `unittest.mock` | Tests your branching logic | Tests nothing about Redis |
+
+The usual mix: unit-test logic against a fake or mock, and integration-test against a **real Redis on the same major version as prod** (scripts, `BLMOVE`, `XAUTOCLAIM`, eviction, TTL timing). Use `FLUSHDB` between tests, a unique key prefix per test, and inject time where TTL logic matters. Add failure tests: kill the container mid-test and assert that timeouts, retries, and fallbacks behave.
+
+### Async programming with Redis
+
+- **Python:** `redis.asyncio` (the former aioredis, now inside redis-py). `await r.get(k)`, async pipelines, async Pub/Sub.
+- **Java:** Lettuce `RedisAsyncCommands` returns `RedisFuture`/`CompletionStage`, and `RedisReactiveCommands` returns Reactor `Mono`/`Flux`.
+- **Node.js:** every client is promise-based. Commands issued in the same tick can be auto-pipelined.
+- **Go:** synchronous API, concurrency through goroutines sharing one pooled, goroutine-safe client. Pass `context.Context` for timeouts.
+
+Pitfalls:
+
+- A blocking call (`BLPOP`, `XREAD BLOCK`) on a shared multiplexed connection stalls everyone. Use a dedicated connection.
+- A synchronous client inside an event loop blocks the loop.
+- Unbounded concurrency floods Redis. Bound it with a semaphore or the pool size.
+- Always set a per-command timeout.
+
+### Reconnection and failure handling
+
+Redis will be unavailable sometimes: failover, restarts, network blips. Decide the behaviour up front:
+
+1. **Timeouts:** connect timeout around 100 ms to 1 s, and a command timeout sized to your SLO. Never use infinite timeouts.
+2. **Retry with exponential backoff plus jitter**, capped, and only for **idempotent** commands. Retrying `INCR` or `LPUSH` after an ambiguous timeout can double-apply. redis-py, Jedis, Lettuce, and go-redis all expose retry configuration.
+3. **Topology awareness:** use Sentinel- or Cluster-aware clients so a failover or `MOVED`/`ASK` redirect is followed automatically.
+4. **Circuit breaker:** after repeated failures, stop calling Redis for a cooldown instead of piling up threads.
+5. **Fallback per use case:** a cache falls back to the DB with load shedding. A rate limiter fails open or closed by policy. A lock fails closed, meaning "don't proceed". Sessions may force a re-login.
+6. **On reconnect:** re-subscribe to Pub/Sub channels, reload Lua scripts if `NOSCRIPT` appears, and flush any client-side cache.
+
+### Caching layer: pros and cons
+
+| Pros | Cons |
+|---|---|
+| Sub-ms reads, offloads the DB | Staleness and invalidation complexity |
+| Absorbs read spikes, protects the origin | Another tier to run, monitor, and pay RAM for |
+| Rich structures, so you cache *computed* views | Cold start / thundering herd after flush or failover |
+| TTL and eviction built in | Hot keys and big keys hit one shard, single-threaded |
+| Easy horizontal scale with Cluster | Failure-mode design needed (fallback, breaker) |
+
+### Idiomatic usage and design-pattern mapping
+
+- **Key naming:** `object-type:id:field`, e.g. `user:42:profile`. Use colons, short names, a version prefix for schema changes (`v2:`), and hash tags `{…}` for Cluster co-location.
+- **Always set TTLs** on cache-like data. Use `SCAN`, never `KEYS`, in production.
+- **Pick the structure for the access pattern,** not the shape of the object.
+- **Batch round-trips** with pipelines, `MGET`/`MSET`, and variadic commands. Use `MULTI`/`EXEC` or Lua for atomicity.
+- **Classic patterns mapped onto Redis:**
+  - Proxy / decorator → cache-aside wrapper around a repository
+  - Observer → Pub/Sub or keyspace notifications
+  - Producer-consumer → lists or Streams
+  - Singleton / leader election → lock with TTL
+  - Repository → Redis OM libraries
+  - Memoization → function results cached by argument hash
+  - Bulkhead → a separate Redis per concern (cache vs queue vs sessions), so cache eviction never deletes jobs
+
+### In-memory data grids: Hazelcast and Apache Ignite
+
+| | Redis | Hazelcast | Apache Ignite |
+|---|---|---|---|
+| Positioning | Data-structure server | In-memory data grid + stream processing | "Distributed database for high-performance computing with in-memory speed" |
+| Runtime | C server, any-language clients over RESP | Java. Embedded in the app JVM or client/server | Java. Server and client nodes, thin clients |
+| Data model | Typed structures per key | Distributed maps, queues, and other Java-friendly structures | Key-value caches plus SQL tables |
+| Query | Key ops, optional Query Engine | Predicates/SQL on maps | SQL with JDBC/ODBC drivers |
+| Compute | Lua / Functions next to data | Distributed compute and streaming jobs | Colocated compute, MapReduce-style tasks |
+| Persistence | RDB/AOF | Edition-dependent | Native persistence option |
+
+Choose a **data grid** when you live in the JVM and want near-cache or embedded data, compute colocated with partitions, or SQL over cached data. Choose **Redis** for language-agnostic, very low-latency structure operations with a simple operational model. The trade-off is that business logic stays in your services (or small Lua functions) instead of running inside the grid.
+
+### Redis in the NoSQL movement
+
+Redis appeared in 2009, during the NoSQL wave, when teams were moving past "one relational DB for everything". Its contribution was the idea that a database could expose **data structures** as its API, not just opaque values or documents. That made it the **complement** to other stores rather than a replacement: a polyglot-persistence architecture pairs a durable primary (relational, document, or wide-column) with Redis for the hot path. Over time the project took on document (JSON), search, time-series, probabilistic, and vector capabilities, which moved it toward a multi-model store. Those were folded into the core distribution with Redis 8.
+
+### Ecosystem evolution: a verified timeline
+
+| When | Event |
+|---|---|
+| Feb 2009 | Salvatore Sanfilippo (**antirez**) announces Redis. It grew out of his LLOOGG real-time analytics work |
+| 2010 → 2013 → 2015 | Sponsored by VMware (from March 2010), then Pivotal (from May 2013). antirez joins Redis Labs in 2015 |
+| 2018 | Redis Labs moves some *modules* to a source-available license. Core Redis stays BSD |
+| 2020 | antirez steps back as maintainer, and a core team takes over |
+| Aug 2021 | Redis Labs renames itself **Redis** (Redis Ltd.) |
+| 20 Mar 2024 | License change: starting with **Redis 7.4**, core is dual-licensed **RSALv2 / SSPLv1**. Neither is OSI-approved. Earlier versions stay BSD-3 |
+| 28 Mar 2024 | **Valkey** launched under the Linux Foundation, forked from Redis 7.2.4 under BSD-3, backed by AWS, Google Cloud, Oracle, Ericsson, Snap, and others. First release Valkey 7.2.5 in April 2024 |
+| Dec 2024 | antirez rejoins Redis |
+| 1 May 2025 | **Redis 8** adds **AGPLv3** as an additional license option and folds the former Redis Stack capabilities (JSON, time series, probabilistic types, Query Engine) into Redis Open Source. Introduces **vector sets** |
+| Oct 2025 | Valkey 9.0 GA (hash-field expiration, atomic slot migration, multiple DBs in cluster mode) |
+| 2025–2026 | Redis 8.x minor releases: SVS-VAMANA vector index (8.2), `DELEX` (8.4), stream idempotency and hot-key detection (8.6), `INCREX` and an Array type (8.8) |
+
+### What's new and what's next
+
+Stick to what's verifiable. Recent Redis Open Source releases have focused on:
+
+- AI workloads: vector sets, more vector index types and quantization, hybrid search.
+- Rate-limiting and coordination primitives: `INCREX`, `DELEX`.
+- Stream robustness: idempotency, `XNACK`.
+- Steady performance work on core commands.
+
+The RESP spec states that future versions *may* change the default protocol to RESP3 and that new features *may* require RESP3, so new client code should be ready for it. On the Valkey side, the project's stated priorities after the fork included cluster reliability (atomic slot migration shipped in 9.0) and multi-threaded performance. For anything beyond that, check the release notes rather than predicting.
+
+## How it works (one request through several patterns)
+
+```
+ POST /checkout  (session cookie sid=9f2c…, Idempotency-Key: abc)
+   │
+   ├─1─ EVALSHA token_bucket  KEYS rl:u42            → 1 (allowed)          [rate limit]
+   ├─2─ HGETALL sess:9f2c… ; PEXPIRE sess:9f2c… 1800000                     [session]
+   ├─3─ SET idem:abc 1 NX EX 86400                   → OK (first time)      [idempotency]
+   ├─4─ SET lock:cart:42 <token> NX PX 10000         → OK                   [efficiency lock]
+   ├─5─ DB transaction: create order (system of record)
+   ├─6─ XADD orders * id 7781 user 42                → consumers: email, analytics
+   ├─7─ ZINCRBY lb:buyers:2026-10 1 user:42 ; PFADD uv:checkout:2026-10-21 u42
+   └─8─ DELEX lock:cart:42 IFEQ <token>  (or the Lua compare-and-delete)
+```
+
+Each step uses its own key prefix, has a TTL where it makes sense, and has a defined behaviour when Redis is unreachable. The order itself is committed in the database, and Redis only coordinates and accelerates.
+
+## Real-world examples
+
+- **Twitter** has described using Redis heavily for timeline caching in its talks on scaling the home timeline.
+- **GitHub** has written about using Redis for background job queues (Resque, which it created, is Redis-backed).
+- **Sidekiq** (Ruby), **BullMQ** (Node.js), and **Celery** (Python, Redis broker) are widely deployed job systems built on Redis lists, sorted sets, and streams.
+- **Spring Session** and **express-session + connect-redis** are standard ways to externalize web sessions to Redis.
+- Managed offerings: AWS ElastiCache and MemoryDB, which now offer Valkey alongside Redis OSS engines, Google Memorystore, Azure Managed Redis (successor to the retiring Azure Cache for Redis), and Redis Cloud. In practice, choosing Redis now often also means choosing between Redis and Valkey.
+
+## Common pitfalls
+
+- **`INCR` then `EXPIRE` as two separate calls without atomicity.** A crash between them leaves a counter with no TTL that blocks the user forever. Use `MULTI`, Lua, `EXPIRE … NX`, or `INCREX`.
+- **Rate-limiter timestamps from client clocks.** Skewed app servers disagree. Use Redis `TIME` inside the script.
+- **Releasing a lock with plain `DEL`.** You may delete someone else's lock. Compare the token first.
+- **Using a Redis lock for correctness** (payments, exactly-once) without fencing or idempotency.
+- **Queue on an instance with `allkeys-lru`.** Eviction silently deletes jobs. Keep queues on a `noeviction` instance, separate from the cache.
+- **Pub/Sub as a durable queue.** Messages to disconnected subscribers are dropped.
+- **Unbounded sliding logs or streams.** Trim with `ZREMRANGEBYSCORE`, `XADD … MAXLEN ~`, or `XTRIM`.
+- **Full-page caching personalized pages.** This leaks data between users.
+- **Shared Redis as an integration DB** across microservices.
+- **Retrying non-idempotent commands blindly** after a timeout, which double-applies them.
+- **Testing only against fakes.** Lua, blocking commands, and Cluster behaviour then differ in prod.
+- **Leaderboard ties ignored.** Equal scores sort lexicographically by member, which may not be "first to reach".
+
+## Practice questions
+
+<Practice>
+
+<QA q="What role does Redis play in session caching, and how would you structure a session?" level="easy">
+
+Redis stores server-side session state so any app instance can serve any request. You don't need sticky sessions, and reads stay sub-ms.
+
+Structure: a random, unguessable session id in a `Secure; HttpOnly; SameSite` cookie, and a **hash** `sess:<id>` with fields like `uid`, `role`, `csrf`, `created_at`.
+
+- **Idle timeout:** `EXPIRE sess:<id> 1800`, refreshed on each request (sliding).
+- **Absolute timeout:** check `created_at` so a constantly used stolen session still dies.
+- **Logout:** `DEL`.
+- **Logout everywhere:** keep `user:<uid>:sessions` as a set and delete every member.
+
+Operationally, put sessions on an instance where eviction can't drop them (a dedicated instance or `volatile-*` policy with headroom). Enable persistence if a mass logout on restart is unacceptable.
+
+</QA>
+
+<QA q="What is the role of a Redis client library?" level="easy">
+
+It turns your language's function calls into RESP commands and RESP replies into native types. On top of that it handles:
+
+- **Connections:** pooling or multiplexing, TLS, AUTH/ACL user.
+- **Topology:** Cluster slot map and `MOVED`/`ASK` redirects, Sentinel primary discovery.
+- **Reliability:** timeouts, retries with backoff, reconnection, health checks.
+- **Throughput:** pipelining and transactions.
+- **Features:** script caching (`EVALSHA` with fallback), Pub/Sub, RESP3 and client-side caching, and helpers for Stack features (JSON, search, vector).
+
+Examples: redis-py, Jedis/Lettuce, node-redis/ioredis, go-redis, StackExchange.Redis.
+
+</QA>
+
+<QA q="How do you connect to Redis from a programming language of your choice?" level="easy">
+
+Python with redis-py, using a shared pool created once at startup:
+
+```python
+import redis
+pool = redis.ConnectionPool.from_url(
+    "rediss://app-user:secret@cache.internal:6380/0",   # rediss = TLS
+    max_connections=50, socket_timeout=0.2, socket_connect_timeout=0.5)
+r = redis.Redis(connection_pool=pool, decode_responses=True)
+r.ping()
+r.set("k", "v", ex=60)
+```
+
+Key points: reuse one client or pool per process (don't connect per request), set timeouts, use TLS and an ACL user in production, use `RedisCluster` or a Sentinel client for those topologies, and close the pool on shutdown. In Go, the equivalent is one `redis.NewClient(&redis.Options{…})` shared across goroutines.
+
+</QA>
+
+<QA q="Explain how you would integrate Redis into a typical web application." level="easy">
+
+Common integration points:
+
+1. **Cache-aside** for expensive reads (DB queries, upstream API calls), with TTLs and invalidation on write. Details in Cache Patterns.
+2. **Session store** for login state.
+3. **Rate limiting** in middleware or at the gateway.
+4. **Background jobs** via a Redis-backed queue library.
+5. **Full-page or fragment cache** for anonymous pages.
+6. **Real-time features:** counters, leaderboards, Pub/Sub for websocket fan-out across app servers.
+
+Wire it through one shared client per process, wrap calls with timeouts and a fallback, and namespace keys per feature.
+
+</QA>
+
+<QA q="Can Redis be used as a primary database? Why or why not?" level="medium">
+
+**It can,** and for some workloads it's a sound choice. **But** you must accept these constraints:
+
+1. **Durability window.** With AOF `everysec` (the default fsync policy) you can lose about 1 s of writes. `always` closes most of that at a throughput cost.
+2. **Async replication.** A failover can lose writes the old primary had acknowledged. `WAIT` reduces the window but isn't consensus.
+3. **RAM-bound size and cost.**
+4. **Limited querying:** no joins or ad-hoc SQL. Secondary indexes are manual or come from the Query Engine.
+5. **Transactions without rollback** and without constraints.
+
+Good fits: game state, leaderboards, feature stores, counters, ephemeral collaboration data, anything you can rebuild. Poor fits: financial ledgers, orders, inventory of record, reporting-heavy domains. A common compromise is a durable DB as the source of truth, with Redis as the low-latency serving layer.
+
+</QA>
+
+<QA q="What are the trade-offs of Redis versus a traditional relational database?" level="medium">
+
+Redis wins on **latency** (in-memory, sub-ms), **rich atomic data-structure operations** (counters, zsets, streams), and **simple horizontal scaling** with Cluster.
+
+It loses on:
+
+- **Durability guarantees:** async replication, fsync policy.
+- **Cost per GB:** RAM.
+- **Querying:** key-based, no joins.
+- **Integrity:** no foreign keys, constraints, or rollback.
+- **Multi-key operations in Cluster:** they must share a hash slot.
+
+The RDBMS is the reverse: durable, consistent, flexible queries, cheaper storage, but higher latency and harder write scaling. Most architectures use both, with the RDBMS as the system of record and Redis as cache, coordinator, and real-time view.
+
+</QA>
+
+<QA q="Discuss how Redis can be used together with a relational database." level="medium">
+
+Roles:
+
+- **Read cache:** cache-aside, or read-through via a library.
+- **Write-through:** update DB, then write the new value into Redis.
+- **Write-behind:** buffer high-rate counters in Redis, flush to the DB in batches, and accept a loss window.
+- **Precomputed views:** leaderboards, feeds, aggregates.
+- **Coordination:** locks, idempotency keys, rate limits.
+
+Keeping them consistent:
+
+- Delete or update the key after the DB commit (never before).
+- Better: drive invalidation from **CDC**, where the DB binlog flows through Debezium and Kafka to an invalidator that deletes the keys. This catches every writer and can be retried.
+- Always keep a TTL as a backstop.
+- For read-after-write consistency on the writer's own data, read from the DB, or write the new value into the cache, right after the update.
+
+</QA>
+
+<QA q="How does Redis interact with other components in a microservices architecture?" level="medium">
+
+Typical roles:
+
+- **API gateway:** rate limiting and the session or JWT denylist.
+- **Per-service cache:** private key prefix, its own ACL user.
+- **Idempotency store:** `SET idem:<key> … NX EX`.
+- **Coordination:** short-lived locks, leader election for schedulers.
+- **Messaging:** Pub/Sub for ephemeral notifications (cache invalidation broadcasts, websocket fan-out) and Streams for lightweight durable queues. Kafka remains the backbone for high-volume, long-retention events.
+- **Service-local real-time state:** counters, leaderboards.
+
+Anti-pattern: services reading each other's keys, which turns Redis into a hidden shared database. Treat it as an unreliable dependency: timeouts, circuit breakers, and a defined fallback for each use.
+
+</QA>
+
+<QA q="What would be an ideal use case for Redis queues, and when would you avoid them?" level="medium">
+
+**Ideal:**
+
+- Background jobs from web requests (emails, image resize, webhooks) with modest backlogs that fit in RAM.
+- Delayed jobs: a zset scored by run-at time, polled with `ZRANGE … BYSCORE` and moved to a ready list.
+- Priority queues.
+- Simple work distribution across workers.
+
+Use `BLMOVE` into a processing list (reliable list queue), or Streams with consumer groups, `XACK`, and `XAUTOCLAIM` for at-least-once delivery with redelivery of stuck messages.
+
+**Avoid** when you need long retention or replay, many independent consumer groups at high throughput, strict per-key ordering at scale, or durability across failover. Use Kafka, RabbitMQ, or SQS then. Also never put queues on an instance whose eviction policy can drop keys.
+
+</QA>
+
+<QA q="How would you use Redis for a full-page cache?" level="medium">
+
+Cache the rendered response body (compressed) under a key derived from everything that changes the output: host, path, normalized query, language, device class, and any segment. Example: `SET fpc:v3:<hash> <gzip bytes> EX 300`.
+
+- **Middleware:** check Redis before the controller runs. On a hit, return immediately with stored headers. On a miss, render, store, and return.
+- **Invalidation:** TTL plus tag sets (`SADD tag:product:991 <page key>`). On a product update, delete all pages in the tag set.
+- **Stampede protection:** a short lock or early-refresh window on hot pages.
+- **Never cache** responses that carry `Set-Cookie` or user-specific content unless the user or segment is in the key.
+- For public pages, a CDN usually beats Redis. Redis FPC fits cases needing origin logic or fast tag purges.
+
+</QA>
+
+<QA q="How do you test software that relies on Redis?" level="medium">
+
+Layer the tests:
+
+1. **Unit tests** mock the repository or cache interface, or use an in-process fake (`fakeredis` for Python, `miniredis` for Go). This is fast, but command coverage and edge cases can differ from real Redis.
+2. **Integration tests** against a **real** Redis of the same major version as production, started by Testcontainers (or docker-compose in CI). This is where you verify Lua scripts, blocking commands, Streams consumer groups, TTL expiry, and Cluster hash-tag routing.
+3. **Failure tests:** stop or pause the container mid-test and assert that timeouts, retries, circuit breaker, and fallback behave as designed.
+
+Hygiene: a unique key prefix or DB per test, `FLUSHDB` in setup, an injectable clock for TTL logic, and no shared dev instances.
+
+</QA>
+
+<QA q="Explain how to use Redis with asynchronous programming models." level="medium">
+
+Use the native async client of your stack:
+
+- Python `redis.asyncio` (`await r.get()`, async pipelines, async Pub/Sub).
+- Java Lettuce async (`RedisFuture`) or reactive (`Mono`/`Flux`).
+- Node.js promise-based node-redis or ioredis.
+- Go: one goroutine-safe pooled client with `context.Context` deadlines.
+
+Benefits: one thread can keep many commands in flight, and multiplexed clients pipeline automatically.
+
+Watch out for:
+
+- Blocking commands (`BLPOP`, `XREAD BLOCK`) on a shared multiplexed connection stall every caller. Use a dedicated connection.
+- Never call a sync client from inside an event loop.
+- Bound concurrency so a burst doesn't open thousands of connections or flood Redis.
+- Use per-command timeouts and cancellation.
+- Pub/Sub subscribers need their own connection: under RESP2, a connection that has subscribed can only run subscribe-related commands (plus `PING`).
+
+</QA>
+
+<QA q="How do you handle reconnection when the Redis server becomes unavailable?" level="medium">
+
+1. **Fail fast:** short connect and command timeouts.
+2. **Retry with capped exponential backoff and jitter,** but only idempotent operations. An `INCR` that timed out may have executed.
+3. Use **Sentinel- or Cluster-aware** clients so failovers and slot moves are followed automatically.
+4. A **circuit breaker** stops hammering a dead server and frees threads.
+5. **Per-use-case fallback:** cache → DB with load shedding, rate limiter → fail open or closed by policy, lock → fail closed, session → re-auth.
+6. **After reconnecting:** re-subscribe channels, re-load scripts on `NOSCRIPT`, flush local client-side caches (invalidations may have been missed), and warm critical keys gradually to avoid a herd.
+7. Alert on reconnect storms.
+
+</QA>
+
+<QA q="What are the pros and cons of using Redis as a caching layer?" level="medium">
+
+**Pros:**
+
+- Sub-ms reads.
+- Big reduction in DB load and cost.
+- Absorbs spikes.
+- Can cache computed structures, not just rows.
+- TTL and eviction built in.
+- Scales with Cluster and replicas.
+- Mature clients everywhere.
+
+**Cons:**
+
+- Stale data and invalidation complexity.
+- Extra infrastructure and RAM cost.
+- Cold-cache and stampede risk after flushes or failovers.
+- Hot or big keys concentrate load on one single-threaded shard.
+- Another failure mode to design for.
+- Cluster limits multi-key operations to one slot.
+- Consistency between cache and DB is eventual unless you work hard.
+
+Rule of thumb: cache when the read-to-write ratio is high, staleness is tolerable for the TTL, and the origin is the bottleneck.
+
+</QA>
+
+<QA q="What are idiomatic ways to use Redis, and how do common design patterns map onto it?" level="medium">
+
+Idioms:
+
+- `type:id:field` key names, with version prefixes for schema changes.
+- TTL on anything cache-like.
+- `SCAN`, never `KEYS`.
+- Choose the structure by access pattern (zset for ranking, hash for objects with partial updates, HLL for unique counts).
+- Batch with pipelines and variadic commands.
+- Use Lua or Functions for read-modify-write atomicity.
+- Hash tags for co-location in Cluster.
+- Separate instances for cache and for queues or sessions.
+
+Design patterns:
+
+| Pattern | Redis form |
+|---|---|
+| Proxy / decorator | Cache-aside around a repository |
+| Observer | Pub/Sub or keyspace notifications |
+| Producer–consumer | Lists or Streams |
+| Leader election / mutex | `SET NX PX` + token |
+| Memoization | Results keyed by argument hash |
+| Bulkhead | Separate instances per concern |
+| Outbox-like buffering | Streams before a durable sink |
+
+</QA>
+
+<QA q="How would you use Redis in a real-time analytics platform?" level="medium">
+
+Redis holds the **live, hot view**, while the durable history lives in OLAP or a data lake.
+
+Ingest events into Streams (or consume from Kafka). Consumers update purpose-built structures:
+
+- **HLL** for unique visitors (`PFADD`, at most 12 KB, about 0.81% error, mergeable across days with `PFMERGE`).
+- **Bitmaps** for DAU and retention (`SETBIT` per user id, `BITOP AND` across days, `BITCOUNT`).
+- `INCR`/`HINCRBY` counters per minute bucket with TTL.
+- Sorted sets or Top-K for trending items.
+- Time series (`TS.ADD`, `TS.RANGE … AGGREGATION`) for metrics with retention.
+
+Dashboards read Redis directly. Keep keys time-bucketed with TTLs so memory stays bounded.
+
+</QA>
+
+<QA q="How is Redis used in IoT applications?" level="medium">
+
+- **Ingestion buffer:** devices or gateways `XADD` telemetry into capped streams (`MAXLEN ~`), and consumer groups fan out to storage, alerting, and ML.
+- **Device shadow / last-known state:** a hash per device, read by apps without querying history.
+- **Time series** with retention and downsampling for recent windows.
+- **Geo** (`GEOADD`, `GEOSEARCH`) for fleets and nearby-asset queries.
+- **Command and control:** Pub/Sub for fire-and-forget, Streams when delivery must be acknowledged.
+- **Rate limiting** noisy devices.
+
+Constraints: memory bounds history, so offload raw data to a TSDB or object store. Edge deployments may run small Redis instances on gateways for local buffering when the uplink is down.
+
+</QA>
+
+<QA q="What role does Redis play in gaming applications?" level="medium">
+
+- **Leaderboards** with sorted sets: `ZINCRBY`, `ZRANGE … REV WITHSCORES`, `ZREVRANK`. Per-season or per-day keys, combined with `ZUNIONSTORE`.
+- **Player sessions and presence:** hash + TTL, heartbeat refresh.
+- **Matchmaking pools:** zset by skill rating; pick opponents in a score window and remove them atomically with Lua.
+- **Real-time events and chat:** Pub/Sub, or Streams if history matters.
+- **Rate limiting and anti-cheat counters.**
+- **Caching** inventories and profiles persisted in a durable DB.
+- **Ephemeral match state** that's rebuilt if lost.
+
+Tie handling (equal scores sort by member name) usually needs a composite score to give "first to reach wins".
+
+</QA>
+
+<QA q="Discuss the usage of Redis in machine learning systems." level="medium">
+
+1. **Online feature store:** precomputed features in hashes and read with `HMGET` at inference time. Frameworks like Feast support Redis as the online store, while an offline store keeps history for training.
+2. **Vector database:** the Redis Query Engine indexes embeddings (`FLAT`, `HNSW`, and since 8.2 `SVS-VAMANA`; `L2`/`IP`/`COSINE`) and runs KNN with metadata filters via `FT.SEARCH … DIALECT 2`. That enables RAG retrieval and similarity search. Redis 8 also adds **vector sets** (`VADD`/`VSIM`) as a simpler native type.
+3. **Semantic cache** for LLM calls, e.g. via RedisVL.
+4. **Prediction cache** for repeated inputs.
+5. **Real-time aggregates** (counters, HLL) that feed features.
+6. **Queues** for async inference jobs.
+
+</QA>
+
+<QA q="How do you implement rate limiting with Redis? Compare the main algorithms." level="hard">
+
+| Algorithm | Redis implementation | Memory | Accuracy |
+|---|---|---|---|
+| Fixed window | `INCR` + `EXPIRE … NX` in `MULTI`, or `INCREX … UBOUND n EX w ENX` on 8.8+ | O(1) | Up to 2× burst at boundaries |
+| Sliding log | Zset of timestamps. Lua runs `ZREMRANGEBYSCORE`, `ZCARD`, `ZADD`, `PEXPIRE` | O(limit) per caller | Exact |
+| Sliding window counter | Two window counters with weighted estimate | O(1) | Close approximation |
+| Token bucket | Hash `tokens, ts`. Lua refills by elapsed time, spends cost | O(1) | Smooth rate plus allowed bursts |
+
+Implementation rules:
+
+- Atomic read-modify-write (Lua or a single command).
+- Server time via `TIME`, not client clocks.
+- Keys passed via `KEYS` for Cluster.
+- A TTL on every limiter key.
+- A decision on fail-open vs fail-closed when Redis is down.
+
+For global limits across regions, accept per-region approximation or a central counter with added latency. See the rate-limiting notes for the full design.
+
+</QA>
+
+<QA q="Design a recommendation feature using Redis data structures." level="hard">
+
+1. **Offline:** a batch job or model computes item-to-item similarity, written to `ZADD sim:item:<id> <score> <other>`. Optionally precompute per-user candidates.
+2. **Online signals:** on each purchase or view, `ZINCRBY covisit:item:A 1 item:B` (and the reverse), and push the item into a capped recent list for the user (`LPUSH` + `LTRIM`).
+3. **Serving:** union the similarity zsets of the user's last N items with recency weights, `ZUNIONSTORE rec:tmp:u42 N … WEIGHTS …` (short TTL). Then `ZRANGE rec:tmp:u42 0 99 REV WITHSCORES`.
+4. **Filter** already-seen or purchased items with a set and `SMISMEMBER`. Apply business rules (in stock, category caps) in the app.
+5. **Social / collaborative bits:** `SINTER likes:item:X friends:u42`.
+6. **Content-based candidates:** vector KNN on item embeddings.
+
+Cluster note: keys used together in one command need the same hash tag. Otherwise merge in the application.
+
+</QA>
+
+<QA q="How do you implement a distributed lock with Redis, and what does the Redlock debate teach?" level="hard">
+
+**Single instance:**
+
+- Acquire with `SET lock:x <random token> NX PX 30000`.
+- Release only if the value still equals your token: `DELEX lock:x IFEQ <token>` on 8.4+, or a compare-and-delete Lua script before that.
+- The token prevents deleting someone else's lock. The TTL prevents deadlock on crash.
+- Async replication means failover can lose the lock.
+
+**Redlock:** N independent primaries (5 in the docs). The lock is acquired if a majority succeed within less than the TTL, and its validity is the TTL minus elapsed time minus a drift margin.
+
+**Kleppmann's critique:** process pauses or delays after acquisition can let two holders act at once. Correctness requires **fencing tokens** checked by the resource, which Redlock can't generate. Its safety relies on timing assumptions.
+
+**antirez's reply:** every lease-based lock shares the post-check pause problem. Redlock needs only bounded clock *rate* error. A random unique value can be used for check-and-set on the resource. He agreed monotonic time should be used.
+
+**Practical takeaway:** use Redis locks for efficiency. For correctness, use consensus-backed locks plus fencing, or make operations idempotent.
+
+</QA>
+
+<QA q="How has the Redis ecosystem evolved over the years?" level="hard">
+
+- **2009:** antirez announces Redis, born from his real-time analytics work.
+- **Sponsorship:** VMware (2010), then Pivotal (2013), then Redis Labs, which hired antirez in 2015.
+- **2018:** modules moved to source-available while core stayed BSD.
+- **2020:** antirez steps back and a core team maintains Redis.
+- **2021:** Redis Labs becomes Redis Ltd.
+- **20 March 2024:** from 7.4 the core moves to RSALv2/SSPLv1, which are not OSI open source.
+- **28 March 2024:** the Linux Foundation launches **Valkey**, a BSD fork of 7.2.4 backed by AWS, Google Cloud, Oracle, and others. Cloud providers start offering Valkey.
+- **December 2024:** antirez rejoins Redis.
+- **May 2025:** Redis 8 adds **AGPLv3** as an option and merges Stack features (JSON, search/vector, time series, probabilistic) into Redis Open Source, plus new vector sets.
+- **Since then:** both projects ship quickly. Valkey 9.0 brought atomic slot migration and hash-field TTLs; Redis 8.x added `DELEX`, `INCREX`, and new vector indexes.
+
+The ecosystem is now two compatible-but-diverging lines, plus managed services built on each.
+
+</QA>
+
+<QA q="Compare in-memory data grids like Hazelcast and Apache Ignite with Redis." level="hard">
+
+**Data grids** (Java-centric):
+
+- Partitioned maps with near-caching. They can run **embedded** in the application JVM (Hazelcast) or as server/client nodes.
+- **Compute colocated with data** (entry processors, distributed tasks).
+- SQL over cached data. Ignite has JDBC/ODBC drivers and a native persistence option, and describes itself as a distributed database.
+- Hazelcast adds stream processing.
+
+**Redis:**
+
+- A language-agnostic C server reached over RESP, with a rich set of typed structures and very low per-op latency.
+- Simple operations (one process per shard, single-threaded command execution).
+- Server-side logic limited to Lua/Functions and modules.
+
+**When to choose which:**
+
+- Pick a grid when your stack is JVM-heavy and you want embedded caching, data-local compute, or SQL on cached data.
+- Pick Redis for polyglot services, data-structure workloads (rate limits, leaderboards, queues), and operational simplicity.
+
+**Impact:** grids blur the cache/compute boundary, while Redis keeps a sharp "fast structure store" boundary and leaves logic in services.
+
+</QA>
+
+<QA q="Discuss the role of Redis in the NoSQL movement." level="hard">
+
+Redis arrived in 2009 alongside the wave of non-relational stores built for web-scale workloads. Its distinct contribution was making **data structures the API**: lists, sets, sorted sets, and hashes with atomic server-side operations, instead of opaque values (memcached) or documents. It proved the value of in-memory, single-threaded, simple-to-reason-about servers and popularised **polyglot persistence**, with a durable primary DB plus Redis for the hot path.
+
+It never tried to replace relational databases for systems of record. It became the default complement. Over time Redis moved toward multi-model (JSON, search, time series, vectors), and Redis 8 folded these capabilities into the core. The 2024 license change and the Valkey fork show the commercial tension that many NoSQL-era projects (MongoDB, Elastic) also went through.
+
+</QA>
+
+<QA q="What new features have recent Redis versions introduced, and what do you expect next?" level="hard">
+
+**Verifiable recent additions:**
+
+- Hash-field TTL (`HEXPIRE`, 7.4).
+- Redis 8: Stack features merged into the core, vector sets, an AGPLv3 option.
+- 8.2: the `SVS-VAMANA` vector index.
+- 8.4: `DELEX` for compare-and-delete.
+- 8.6: stream idempotency, hot-key detection, new eviction policies.
+- 8.8: `INCREX` atomic window counter, an Array data type, `XNACK`.
+- Steady performance work in every release.
+
+**Reasonable expectations, framed as trends rather than promises:**
+
+- More AI and vector capabilities.
+- More single-command primitives for common patterns (rate limiting, locking).
+- Continued Cluster operability work.
+- Gradual movement toward RESP3. The protocol spec says the default may change and new features may require RESP3.
+
+On the Valkey side, check the project's roadmap and release notes. Say clearly in an interview that anything beyond shipped features is speculation.
+
+</QA>
+
+<QA q="Your API gateway rate limiter uses Redis. Redis primary fails over and for 20 seconds every call times out. What should happen, and how do you design for it?" level="scenario">
+
+Decide the policy per limiter **before** the incident:
+
+- **Fail open** (allow traffic) for abuse-protection limits on normal endpoints, so customers aren't punished for an infra fault.
+- **Fail closed** (deny) for limits that protect a fragile downstream or cost money, such as SMS or payment attempts.
+
+Mechanics:
+
+- A short command timeout (a few ms) so the gateway doesn't stall.
+- A circuit breaker that skips Redis entirely while open.
+- A **local in-memory fallback limiter** per gateway node (coarse limit ÷ node count).
+- Metrics and alerts on fallback mode.
+
+After failover, counters may be partly lost (async replication), which briefly over-admits. That's acceptable for rate limiting. Use a Sentinel- or Cluster-aware client so it reconnects to the new primary automatically.
+
+</QA>
+
+<QA q="A job queue built on Redis lists sometimes loses jobs and sometimes runs a job twice. Diagnose and fix." level="scenario">
+
+**Losses:**
+
+1. Workers use `BRPOP`, so a crash after the pop loses the job. Switch to `BLMOVE jobs processing:<worker> …` and `LREM` after success, with a reaper that re-queues stale items.
+2. The instance has `allkeys-lru` and evicts queue keys under memory pressure. Move queues to a `noeviction` instance.
+3. Failover lost recent `LPUSH`es due to async replication. Accept it, or use a durable broker for critical jobs.
+
+**Duplicates:** the reaper or `XAUTOCLAIM` re-delivers a job whose worker was slow but alive. That's inherent to at-least-once delivery. Make handlers **idempotent** (dedupe with `SET done:<job_id> 1 NX EX …` or a DB unique key).
+
+Consider Streams for built-in PEL, ack, and claim, and Kafka or SQS if durability needs are strict.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="A fixed-window limiter runs `INCR key` and then, in a separate call, `EXPIRE key 60`. What is the most serious risk?" options={["The counter overflows after 2^31 requests", "If the process dies between the two calls, the key never expires and the user stays blocked", "EXPIRE resets the counter to zero", "INCR is not atomic under concurrency"]} answer={1}>
+
+`INCR` is atomic on its own, but the pair isn't. A crash between the calls leaves a counter with no TTL, which never resets. Fix it with `MULTI`/`EXEC`, Lua, `EXPIRE … NX`, or `INCREX … ENX`. `EXPIRE` doesn't touch the value, and 64-bit counters don't overflow in practice.
+
+</MCQ>
+
+<MCQ q="Why does the token-bucket Lua script call `redis.call('TIME')` instead of taking the timestamp as an argument from the app?" options={["Lua cannot parse numeric arguments", "TIME is faster than reading ARGV", "All app servers then share one clock (Redis), avoiding skew between app hosts", "Scripts that write may never accept arguments"]} answer={2}>
+
+Different app servers' clocks drift, which would make the bucket refill inconsistently. Using the server's clock gives one time source. Writes after `TIME` are safe because scripts replicate by effects (the default since 5.0, the only mode since 7.0).
+
+</MCQ>
+
+<MCQ q="Which is the correct way to release a Redis lock acquired with `SET lock:x token NX PX 30000`?" options={["`DEL lock:x`", "`EXPIRE lock:x 0`", "`SET lock:x '' XX`", "Delete only if the stored value equals your token (`DELEX lock:x IFEQ token`, or a compare-and-delete Lua script)"]} answer={3}>
+
+A plain `DEL` or `EXPIRE` could remove a lock that another client acquired after yours expired. Compare-and-delete makes release safe. `DELEX … IFEQ` does it natively from Redis 8.4.
+
+</MCQ>
+
+<MCQ q="A worker pops a job with `BRPOP` and crashes before finishing. What pattern prevents the job from being lost?" options={["`BLMOVE` the job into a per-worker processing list and `LREM` it after success", "Use `LPUSH` with a TTL", "Publish the job with `PUBLISH` instead", "Increase the `BRPOP` timeout"]} answer={0}>
+
+`BLMOVE` atomically moves the job into a processing list, so it still exists if the worker dies, and a reaper can re-queue it. Pub/Sub drops messages for absent subscribers, and timeouts don't change the loss.
+
+</MCQ>
+
+<MCQ q="Your leaderboard shows two players with equal scores in an order your product team calls wrong. Why?" options={["Sorted sets order randomly on ties", "Equal scores are ordered lexicographically by member name", "ZADD always places newer members first", "Ties are ordered by insertion time"]} answer={1}>
+
+Members with the same score are ordered lexicographically. To get 'first to reach the score wins', encode time into the score, e.g. points scaled up plus (MAX_TS − ts), where the time part stays below the scale factor and the total stays within 2^53.
+
+</MCQ>
+
+<MCQ q="Which structure best fits 'unique visitors per page per day' for millions of pages, when about 1% error is acceptable?" options={["A Set per page per day", "A Sorted Set scored by timestamp", "A HyperLogLog per page per day", "A List with LPUSH and LLEN"]} answer={2}>
+
+A HyperLogLog uses at most 12 KB with about 0.81% standard error regardless of cardinality, and it can be merged across days with `PFMERGE`. Sets give exact counts but memory grows with the number of visitors. Lists count duplicates.
+
+</MCQ>
+
+<MCQ q="What is the main drawback of a multiplexing client (one shared connection) compared to a connection pool?" options={["It cannot use TLS", "It cannot pipeline commands", "It cannot talk to Redis Cluster", "Blocking commands such as BLPOP would stall every caller sharing the connection"]} answer={3}>
+
+Multiplexers route many callers' commands over one connection and even pipeline them automatically. A blocking pop holds that connection, so it needs a dedicated connection.
+
+</MCQ>
+
+<MCQ q="Which statement about RESP3 is correct?" options={["Connections start in RESP2; a client opts into RESP3 with `HELLO 3`, gaining types such as maps and push messages", "RESP3 is required for all Redis 7 commands", "RESP3 replaced RESP2 entirely in Redis 6", "RESP3 is a binary protocol unrelated to RESP2"]} answer={0}>
+
+RESP3 was added as opt-in in Redis 6.0 and is mostly a superset of RESP2. Regular commands work under both protocols; what changes is the reply types. Push messages let client-side caching invalidations arrive on the data connection.
+
+</MCQ>
+
+<MCQ q="According to Kleppmann's critique, what does a correctness-critical lock need that Redlock cannot provide on its own?" options={["A larger number of Redis nodes", "Fencing tokens: monotonically increasing numbers that the protected resource checks to reject stale writers", "Shorter TTLs", "AOF with appendfsync always"]} answer={1}>
+
+A paused client can wake up after its lease expired and still write. Only a resource-side check of a monotonically increasing token rejects that write. More nodes, shorter TTLs, or fsync don't remove the pause problem.
+
+</MCQ>
+
+<MCQ q="Which licensing statement is accurate?" options={["Redis has been AGPL-only since 2009", "Valkey is licensed under SSPLv1", "Starting with Redis 7.4, core Redis moved from BSD-3 to dual RSALv2/SSPLv1, and Redis 8 added AGPLv3 as another option", "The 2024 change was retroactive to all earlier Redis versions"]} answer={2}>
+
+The March 2024 change applied from 7.4 onward, and earlier versions stay BSD-3. Valkey forked 7.2.4 under BSD-3. Redis 8 (May 2025) added AGPLv3, an OSI-approved license, as an option.
+
+</MCQ>
+
+<MCQ q="Several microservices read and write each other's keys in one shared Redis. What is the main architectural problem?" options={["Redis cannot handle that many connections", "Keys from different services hash to the same slot", "It disables persistence", "Redis becomes a hidden integration database, coupling services' schemas and deployments"]} answer={3}>
+
+Sharing a datastore across services couples them, much like a shared SQL schema does. Give each service its own keyspace or prefix and ACL user, and communicate through APIs or events.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **Session:** `HSET sess:<id> …` + `EXPIRE` (sliding), plus an absolute limit. Keep on a non-evicting instance.
+- **Primary DB?** Only if the data fits RAM and a loss window is acceptable (async replication, `everysec` fsync). Otherwise Redis is the fast layer in front of a durable DB.
+- **Clients:** redis-py, Jedis/Lettuce, node-redis/ioredis, go-redis. Use one pool or multiplexer per process. Blocking commands need a dedicated connection. RESP3 via `HELLO 3`.
+- **Rate limit:**
+  - Fixed window: `INCR`+`EXPIRE NX` atomically, or `INCREX` on 8.8+.
+  - Sliding log: zset in Lua.
+  - Sliding counter: weighted two windows.
+  - Token bucket: Lua with `TIME`.
+- **Queue:** `BLMOVE` + `LREM` (reliable list), or Streams + `XACK` + `XAUTOCLAIM`. Use Kafka or SQS when durability or retention matter.
+- **Lock:** `SET k token NX PX`. Release with compare-and-delete (`DELEX IFEQ` on 8.4+). For correctness, use fencing or consensus.
+- **Leaderboard:** zset `ZINCRBY` / `ZRANGE … REV WITHSCORES` / `ZREVRANK`. Ties sort lexicographically.
+- **Analytics:** HLL (12 KB, 0.81%), bitmaps (DAU), counters with TTL, time series in Redis 8.
+- **ML:** online features in hashes, vector KNN via `FT.CREATE … VECTOR`, vector sets (8.0), semantic cache.
+- **Testing:** fakes for unit tests, Testcontainers real Redis for integration, plus failure injection.
+- **History:**
+  - 2009 antirez.
+  - Mar 2024 RSAL/SSPL, then Valkey (LF, BSD) 8 days later.
+  - May 2025 Redis 8 adds AGPLv3 and folds in Stack features.
+
+## Go deeper
+
+- **redis.io — Distributed locks (Redlock):** [redis.io/docs/latest/develop/clients/patterns/distributed-locks](https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/)
+- **redis.io — Client libraries overview:** [redis.io/docs/latest/develop/clients](https://redis.io/docs/latest/develop/clients/) and [Connection pools and multiplexing](https://redis.io/docs/latest/develop/clients/pools-and-muxing/)
+- **redis.io — RESP protocol spec (RESP2 vs RESP3):** [redis.io/docs/latest/develop/reference/protocol-spec](https://redis.io/docs/latest/develop/reference/protocol-spec/)
+- **redis.io — Client-side caching reference:** [redis.io/docs/latest/develop/reference/client-side-caching](https://redis.io/docs/latest/develop/reference/client-side-caching/)
+- **redis.io — `LMOVE` reliable-queue pattern:** [redis.io/docs/latest/commands/lmove](https://redis.io/docs/latest/commands/lmove/) and [`INCREX`](https://redis.io/docs/latest/commands/increx/)
+- **redis.io — Vector search:** [redis.io/docs/latest/develop/ai/search-and-query/vectors](https://redis.io/docs/latest/develop/ai/search-and-query/vectors/)
+- **Licensing history:** [Redis adopts dual source-available licensing (2024)](https://redis.io/blog/redis-adopts-dual-source-available-licensing/), [Redis 8 AGPLv3 (2025)](https://redis.io/blog/agplv3/), [Valkey history](https://valkey.io/topics/history/)
+- **Martin Kleppmann:** [How to do distributed locking](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html), and **antirez's reply:** [Is Redlock safe?](http://antirez.com/news/101)
+- **Book:** *Redis in Action* (Josiah Carlson). The chapters on sessions, counters, locks, and queues are still the best pattern intuition.

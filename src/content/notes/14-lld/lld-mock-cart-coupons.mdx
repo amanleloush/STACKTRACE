@@ -1,0 +1,947 @@
+---
+title: "Mock (90 min): Shopping Cart with Coupons"
+phase: "14-lld"
+order: 149
+tags: ["lld", "machine-coding", "mock", "java", "interview", "e-commerce", "pricing"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 120
+prerequisites: ["machine-coding-strategy", "solid-principles", "behavioral-patterns", "java-concurrency-locks"]
+summary: "The 'unseen problem' 90-minute mock — cart, inventory, stackable coupons, best-coupon selection and stock-reserving checkout with money in minor units — with a 10-point rubric, escalating hints, interviewer twists and a hidden, compiled-and-tested Java 21 reference solution."
+---
+
+## Definition (interview-ready)
+
+This mock asks you to build the cart and pricing module of an online store: cart, inventory, stackable coupons, best-coupon selection and a checkout that never oversells. The core entities are `Money` (a `long` count of paise, never `double`), `Product`, `Cart`, `Inventory`, `Coupon`, `PricingEngine` and `CheckoutService`. A coupon is split into three parts: a `Discount` strategy per type (percent, flat, category percent, buy X get Y), a list of `Condition` predicates for eligibility (minimum cart value, expiry checked with an injected `Clock`, category present), and limits (a cap and a stackable flag) applied in one place. Pricing is a fixed pipeline: item-level discounts before cart-level ones, each step working on the running total and clamped at zero. Best-coupon reuses the same pricing method. Checkout prices first, then reserves every line all-or-nothing under one lock.
+
+**One-liner:** Money in integer paise, each coupon as a discount Strategy plus eligibility conditions plus a cap, a fixed item-then-cart discount pipeline that best-coupon reuses, and an atomic all-or-nothing stock reservation at checkout.
+
+## How to use this mock
+
+This one is deliberately **less familiar** than parking lot or Snake and Ladder. There's no memorised answer to lean on, so it tests what a real round tests: can you turn a vague, rule-heavy brief into clean code under time pressure?
+
+- **Set a 90-minute timer.** Suggested split: 8 minutes clarifying, 12 designing, 45 building the core (cart, pricing, checkout), 15 tests and edge cases, 10 for a twist and cleanup. Scale of the plan in [Machine Coding Rounds: A 60-Minute Strategy](/learn/notes/machine-coding-strategy/).
+- **No references** — no search, no AI, no old code. IDE and JDK only.
+- **Write runnable Java** (17+; the reference uses 21). Prove it with a `main` and assertion-style tests.
+- **Write your assumptions down** before coding. This problem has many genuinely ambiguous rules (what does "minimum cart value" measure? which discount applies first?). Picking a rule and stating it is the skill.
+- **Prioritise.** If at minute 50 checkout doesn't work end-to-end, drop BOGO or best-coupon and finish the core.
+- Don't open hints until you're stuck for 5+ minutes; open them in order. Read the twists list only after the timer.
+
+## The problem
+
+> **Build the cart and pricing module of an online store.** In-memory, no UI, no database.
+>
+> **Catalog and inventory**
+> - Products have a SKU, name, unit price and category.
+> - Inventory tracks available units per SKU.
+>
+> **Cart**
+> - A user can **add** a product with a quantity, **update** a quantity, and **remove** a product.
+> - The cart shows lines and a **subtotal**.
+>
+> **Coupons** — a coupon has a code and one discount. Support:
+> - **Percentage off** the cart (e.g. 10% off).
+> - **Flat amount off** the cart (e.g. Rs 200 off).
+> - **Buy X get Y free** on a specific product (e.g. buy 1 mug, get 1 free).
+> - **Category-specific** percentage off (e.g. 20% off apparel only).
+>
+> Coupons may have conditions and limits:
+> - A **minimum cart value**.
+> - An **expiry** time.
+> - A **maximum discount cap** (e.g. 10% off, up to Rs 150).
+> - **Stacking rules**: some coupons can be combined with others, some can't. When several apply, the **order** in which discounts are applied must be well-defined.
+>
+> **Pricing and checkout**
+> - Compute the final price for a cart and a set of coupon codes, with a breakdown of each discount. **Money must be exact** — no floating point errors.
+> - Offer **"apply best coupon"**: given the cart and all coupons, pick the option that saves the customer the most.
+> - **Checkout** validates the coupons, computes the price and **reserves inventory** for every line. If any item is short, nothing is reserved. Two customers must never both buy the last unit.
+>
+> Provide a demo and tests. The interviewer may add a requirement or two mid-round.
+
+## Evaluation rubric
+
+Score yourself out of **10**.
+
+| # | Area | Points | Strong | Weak |
+|---|---|---|---|---|
+| 1 | **Money done right** | 1 | Integer **minor units** (paise/cents) in a small `Money` value type, explicit rounding (floor discounts), overflow-checked arithmetic, never negative. | `double` prices; `0.1 + 0.2` bugs; rounding happens "wherever". |
+| 2 | **Working core flow** | 2 | Add/update/remove, subtotal, price with coupons, checkout with reservation — all run end-to-end from `main`. | Beautiful interfaces, but checkout or pricing doesn't run. |
+| 3 | **Discount types are pluggable** | 2 | A `Discount` **strategy** per type (percent, flat, BOGO, category); adding a new type is one new class. Caps applied uniformly outside the strategies. | A `switch (couponType)` inside the pricing loop, with the cap logic copy-pasted into every branch. |
+| 4 | **Eligibility is separate from the discount** | 1 | Conditions (min cart value, expiry, category present) are small composable predicate objects (**Specification** style) with readable failure reasons; time comes from an injected `Clock`. | Expiry and min-value checks hard-coded in each coupon type; `Instant.now()` called directly so expiry can't be tested. |
+| 5 | **Stacking and ordering rules** | 1 | Clear, stated policy: exclusive vs stackable coupons, duplicates rejected, item-level before cart-level, each step works on the running total, total never below zero. Best-coupon search follows the same rules. | Order depends on whatever order the user typed; total can go negative; best-coupon picks a combination checkout would reject. |
+| 6 | **Checkout and concurrency** | 2 | Validate coupons **before** touching stock; reserve all lines **atomically** (all-or-nothing) under a lock; a multi-threaded test shows no overselling. | Check-then-decrement per line without a lock; a failure midway leaves half the items reserved. |
+| 7 | **Tests and edge cases** | 1 | Tests for rounding, cap, min-value boundary, expiry boundary, BOGO counts, clamping, stacking errors, all-or-nothing checkout, concurrency. | Only the happy path. |
+
+**Bonus talking points:** why floor (not round) discounts; how you'd persist reservations with a TTL; why the "all stackables together" set is the best stackable subset (see the reference design).
+
+Rough reading: **9–10** strong hire, **7–8** pass, **5–6** borderline, **below 5** not yet.
+
+## Hints
+
+<QA q="Hint 1 — Where do I start, and how do I represent money?" level="easy">
+
+Start with **values**, then the **flow**. A `Money` record holding a `long` of minor units (paise) with `plus`, `minus`, `times`, `percent` and `min` — and nothing else. Use `Math.addExact` / `Math.multiplyExact` so overflow throws instead of wrapping. Decide a rounding rule once: `percent` **floors**, so a discount is never larger than promised.
+
+Then `Product` (record), `Catalog`, `Inventory`, `Cart` holding SKU-to-quantity, and a `CartLine(product, qty)` with `total()`. Get "add items, print subtotal" running in the first 25 minutes.
+
+</QA>
+
+<QA q="Hint 2 — How do I keep coupon types from turning into one giant switch?" level="medium">
+
+Split a coupon into **three independent parts**:
+
+1. **What it gives** — a `Discount` strategy: `Money compute(context, runningTotal)`. One small class per type: `PercentOff`, `FlatOff`, `CategoryPercentOff`, `BuyXGetYFree`. See Strategy in [Behavioral Patterns](/learn/notes/behavioral-patterns/).
+2. **When it's allowed** — a list of `Condition`s, each a named predicate over a `PricingContext(lines, subtotal, now)`: `minCartValue`, `expiresAt`, `containsCategory`. The coupon is eligible when all hold; the first failing condition's name becomes the error message.
+3. **Limits** — `maxDiscount` cap and a `stackable` flag, applied by the `Coupon` itself, so no strategy re-implements them.
+
+Get "now" from an injected `java.time.Clock` so tests can use `Clock.fixed(...)` and probe the exact expiry instant.
+
+</QA>
+
+<QA q="Hint 3 — How do stacking, ordering and best-coupon fit together?" level="hard">
+
+Pick a policy and state it:
+
+- More than one coupon is allowed only if **all are stackable**; the same code twice is rejected.
+- Discounts run in **phases**: **item-level** (BOGO, category) first, then **cart-level** (percent, flat). Within a phase, keep the order given (a stable sort by phase does this).
+- Each step computes on the **running total** after earlier steps, is **capped**, and is **clamped** so the total never goes below zero.
+
+That's a pipeline: each step takes the previous step's output — the Chain of Responsibility idea without needing linked handler objects.
+
+For **best coupon**, the candidates are: each eligible coupon **alone**, plus **all eligible stackable coupons together**. Price each candidate with the same `price()` method and take the biggest saving. Reusing `price()` guarantees the recommendation is something checkout will accept.
+
+For **checkout**, order matters: look up and validate coupons and compute the price (no side effects), **then** reserve inventory in one synchronized, all-or-nothing method, **then** clear the cart.
+
+</QA>
+
+## Reference solution
+
+Hidden by default. Compare **after** scoring yourself.
+
+<QA q="Reference design — assumptions, classes and patterns" level="medium">
+
+**Assumptions stated up front:**
+
+- Money is in **paise** (`long`). Percentage discounts **floor** to the paisa. Totals never go negative.
+- **Minimum cart value** is checked against the **subtotal before discounts**.
+- A coupon is valid while `now` is strictly **before** its expiry instant.
+- `Cart.add` does a **soft** stock check for fast feedback; **checkout** is the real, atomic check.
+- No payments, users, taxes or shipping. One cart per user session, so `Cart` itself isn't thread-safe; `Inventory` is shared and is.
+
+**Classes:**
+
+```text
+  Money (record, long paise)          Product (record: sku, name, price, category)
+  Catalog  sku -> Product             Inventory  sku -> available   [synchronized]
+  Cart     sku -> qty  --lines()-->   CartLine(product, qty)
+
+  Coupon (record) -----------------------------------------------------------+
+   | code                                                                    |
+   | discount: Discount  -------- «interface» Discount  (Strategy)           |
+   |                              phase(): ITEM | CART                       |
+   |                              compute(ctx, running): Money               |
+   |                                ^ PercentOff  ^ FlatOff                  |
+   |                                ^ CategoryPercentOff  ^ BuyXGetYFree     |
+   | conditions: List<Condition>  - Condition(description, Predicate)        |
+   |                                (Specification-style: minCartValue,     |
+   |                                 expiresAt, containsCategory)            |
+   | maxDiscount: Optional<Money>, stackable: boolean                        |
+   | discountOn(ctx, running) = min(compute, cap, running)                   |
+   +-------------------------------------------------------------------------+
+
+  PricingEngine(Clock)
+    price(lines, coupons) -> PriceBreakdown(subtotal, List<AppliedDiscount>, total)
+        validate stacking + eligibility -> sort by phase -> run pipeline
+    bestOffer(lines, allCoupons) -> Optional<PriceBreakdown>
+
+  CheckoutService(Inventory, PricingEngine, coupons by code)
+    checkout(cart, codes) -> Order      (price first, then reserve, then clear cart)
+```
+
+**Why these choices:**
+
+| Decision | Reason |
+|---|---|
+| `Money` as a record over `long` paise | Exact arithmetic, cheap, immutable. Overflow-checked with `Math.*Exact`. `BigDecimal` also works but is overkill when every amount is whole paise. |
+| `Discount` strategy + `phase()` | New discount type = new class. The phase tells the engine where it sits in the pipeline, so ordering isn't scattered. |
+| `Condition` as named predicates | Reusable across coupons, testable alone, and the description doubles as the error message ("requires cart value at least Rs 1500.00"). |
+| Cap and clamp in `Coupon.discountOn` | Written once, applies to every discount type. |
+| Fixed pipeline: ITEM then CART, stable within phase | Deterministic totals regardless of the order the user typed codes in across phases. |
+| `bestOffer` reuses `price` | The recommendation always obeys the stacking rules. |
+| Validate before reserving | A bad coupon must not leave stock reserved. |
+| One `synchronized` `Inventory` | All-or-nothing multi-SKU reservation without deadlocks: there's only one lock. Per-SKU locks acquired in sorted SKU order scale better — mention it as the next step. See [Java Concurrency: Locks](/learn/notes/java-concurrency-locks/). |
+
+**Why "all stackables together" is the best stackable combination.** Every pipeline step maps the running total `x` to `x - discount(x)`, and for every discount type here that function never decreases as `x` grows (percent: `x` times a factor; flat or fixed amount: `max(0, x - D)`; caps keep it monotone). Adding one more coupon can only lower the running total at that point, and everything after it is monotone, so the final total can only go down. Conditions are checked on the original subtotal, so adding a coupon never makes another ineligible. Hence the full stackable set is at least as good as any subset of it (applied in the same order), and best-offer needs to price only `n + 1` candidates instead of `2^n`. If a twist breaks monotonicity (say, conditions evaluated on the discounted total), you'd have to search subsets. One caveat: this compares sets, not orders. Within the CART phase the order still changes the total (10% then Rs 100 flat saves more than Rs 100 flat then 10%), and the reference keeps the input order there. If "best" must also mean best order, fix a within-phase rule in the design too, for example percent before flat.
+
+</QA>
+
+<QA q="Reference code — full Java 21 program (Main.java)" level="hard">
+
+One file: package-private classes and a public `Main`. Run with `javac Main.java && java Main`.
+
+```java
+import java.time.*;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Predicate;
+
+// ---------- Money: always integer minor units (paise), never double ----------
+
+record Money(long minor) implements Comparable<Money> {
+    static final Money ZERO = new Money(0);
+
+    Money {
+        if (minor < 0) throw new IllegalArgumentException("money cannot be negative: " + minor);
+    }
+
+    static Money paise(long p) { return new Money(p); }
+    static Money rupees(long r) { return new Money(Math.multiplyExact(r, 100L)); }
+
+    Money plus(Money o) { return new Money(Math.addExact(minor, o.minor)); }
+    Money minus(Money o) { return new Money(minor - o.minor); }          // throws if it would go negative
+    Money times(long n) { return new Money(Math.multiplyExact(minor, n)); }
+    Money percent(int pct) { return new Money(Math.multiplyExact(minor, pct) / 100); } // floors: never over-discount
+    Money min(Money o) { return compareTo(o) <= 0 ? this : o; }
+
+    public int compareTo(Money o) { return Long.compare(minor, o.minor); }
+    public String toString() { return "Rs %d.%02d".formatted(minor / 100, minor % 100); }
+}
+
+// ---------- Catalog, inventory, cart ----------
+
+record Product(String sku, String name, Money price, String category) {}
+
+final class Catalog {
+    private final Map<String, Product> products = new HashMap<>();
+
+    void add(Product p) { products.put(p.sku(), p); }
+
+    Product get(String sku) {
+        Product p = products.get(sku);
+        if (p == null) throw new IllegalArgumentException("unknown product: " + sku);
+        return p;
+    }
+}
+
+class OutOfStockException extends RuntimeException {
+    OutOfStockException(String sku, int wanted, int available) {
+        super("out of stock: " + sku + " wanted " + wanted + ", available " + available);
+    }
+}
+
+final class Inventory {
+    private final Map<String, Integer> available = new HashMap<>();
+
+    synchronized void addStock(String sku, int qty) { available.merge(sku, qty, Integer::sum); }
+    synchronized int available(String sku) { return available.getOrDefault(sku, 0); }
+
+    /** All-or-nothing: check every line first, then decrement. One lock => no partial reservations. */
+    synchronized void reserve(Map<String, Integer> items) {
+        items.forEach((sku, qty) -> {
+            int have = available(sku);
+            if (have < qty) throw new OutOfStockException(sku, qty, have);
+        });
+        items.forEach((sku, qty) -> available.merge(sku, -qty, Integer::sum));
+    }
+
+    synchronized void release(Map<String, Integer> items) {   // payment failed / order cancelled
+        items.forEach(this::addStock);
+    }
+}
+
+record CartLine(Product product, int quantity) {
+    Money total() { return product.price().times(quantity); }
+}
+
+final class Cart {                 // one cart per user session: not shared across threads
+    private final Catalog catalog;
+    private final Inventory inventory;
+    private final Map<String, Integer> quantities = new LinkedHashMap<>();
+
+    Cart(Catalog catalog, Inventory inventory) {
+        this.catalog = catalog;
+        this.inventory = inventory;
+    }
+
+    void add(String sku, int qty) {
+        if (qty <= 0) throw new IllegalArgumentException("quantity must be positive: " + qty);
+        update(sku, quantities.getOrDefault(sku, 0) + qty);
+    }
+
+    void update(String sku, int qty) {
+        if (qty < 0) throw new IllegalArgumentException("quantity cannot be negative: " + qty);
+        catalog.get(sku);                                          // validates the SKU
+        if (qty == 0) { quantities.remove(sku); return; }
+        int have = inventory.available(sku);                        // soft check; checkout re-checks
+        if (qty > have) throw new OutOfStockException(sku, qty, have);
+        quantities.put(sku, qty);
+    }
+
+    void remove(String sku) { quantities.remove(sku); }
+    void clear() { quantities.clear(); }
+    boolean isEmpty() { return quantities.isEmpty(); }
+    Map<String, Integer> quantities() { return Map.copyOf(quantities); }
+
+    List<CartLine> lines() {
+        return quantities.entrySet().stream()
+                .map(e -> new CartLine(catalog.get(e.getKey()), e.getValue())).toList();
+    }
+}
+
+// ---------- Coupons: eligibility (Specification) + discount (Strategy) ----------
+
+record PricingContext(List<CartLine> lines, Money subtotal, Instant now) {}
+
+/** A named, reusable predicate. A coupon ANDs a list of these. */
+record Condition(String description, Predicate<PricingContext> test) {
+    static Condition minCartValue(Money min) {
+        return new Condition("cart value at least " + min, c -> c.subtotal().compareTo(min) >= 0);
+    }
+
+    static Condition expiresAt(Instant expiry) {
+        return new Condition("order before " + expiry, c -> c.now().isBefore(expiry));
+    }
+
+    static Condition containsCategory(String category) {
+        return new Condition("an item in category " + category,
+                c -> c.lines().stream().anyMatch(l -> l.product().category().equals(category)));
+    }
+}
+
+enum Phase { ITEM, CART }          // item-level discounts first, then cart-level on what is left
+
+interface Discount {
+    Phase phase();
+    Money compute(PricingContext ctx, Money runningTotal);
+}
+
+record PercentOff(int percent) implements Discount {
+    public Phase phase() { return Phase.CART; }
+    public Money compute(PricingContext ctx, Money running) { return running.percent(percent); }
+}
+
+record FlatOff(Money amount) implements Discount {
+    public Phase phase() { return Phase.CART; }
+    public Money compute(PricingContext ctx, Money running) { return amount; }
+}
+
+record CategoryPercentOff(String category, int percent) implements Discount {
+    public Phase phase() { return Phase.ITEM; }
+    public Money compute(PricingContext ctx, Money running) {
+        return ctx.lines().stream().filter(l -> l.product().category().equals(category))
+                .map(CartLine::total).reduce(Money.ZERO, Money::plus).percent(percent);
+    }
+}
+
+record BuyXGetYFree(String sku, int buy, int free) implements Discount {
+    public Phase phase() { return Phase.ITEM; }
+    public Money compute(PricingContext ctx, Money running) {
+        return ctx.lines().stream().filter(l -> l.product().sku().equals(sku))
+                .map(l -> l.product().price().times((long) (l.quantity() / (buy + free)) * free))
+                .reduce(Money.ZERO, Money::plus);
+    }
+}
+
+class CouponException extends RuntimeException {
+    CouponException(String msg) { super(msg); }
+}
+
+record Coupon(String code, Discount discount, List<Condition> conditions,
+              Optional<Money> maxDiscount, boolean stackable) {
+
+    Optional<String> unmetCondition(PricingContext ctx) {
+        return conditions.stream().filter(c -> !c.test().test(ctx)).map(Condition::description).findFirst();
+    }
+
+    Money discountOn(PricingContext ctx, Money running) {
+        Money d = discount.compute(ctx, running);
+        if (maxDiscount.isPresent()) d = d.min(maxDiscount.get());
+        return d.min(running);                                     // total can never go below zero
+    }
+
+    static Builder builder(String code, Discount discount) { return new Builder(code, discount); }
+
+    static final class Builder {
+        private final String code;
+        private final Discount discount;
+        private final List<Condition> conditions = new ArrayList<>();
+        private Money cap;
+        private boolean stackable;
+
+        private Builder(String code, Discount discount) {
+            this.code = code.toUpperCase(Locale.ROOT);
+            this.discount = discount;
+        }
+
+        Builder when(Condition c) { conditions.add(c); return this; }
+        Builder maxDiscount(Money m) { cap = m; return this; }
+        Builder stackable() { stackable = true; return this; }
+        Coupon build() { return new Coupon(code, discount, List.copyOf(conditions), Optional.ofNullable(cap), stackable); }
+    }
+}
+
+record AppliedDiscount(String code, Money amount) {}
+
+record PriceBreakdown(Money subtotal, List<AppliedDiscount> discounts, Money total) {
+    Money totalDiscount() { return subtotal.minus(total); }
+
+    String format() {
+        StringBuilder sb = new StringBuilder("  subtotal        " + subtotal + "\n");
+        discounts.forEach(d -> sb.append("  - %-13s %s%n".formatted(d.code(), d.amount())));
+        return sb.append("  total           ").append(total).toString();
+    }
+}
+
+// ---------- Pricing: a fixed pipeline (Chain-style) over the chosen coupons ----------
+
+final class PricingEngine {
+    private final Clock clock;
+
+    PricingEngine(Clock clock) { this.clock = clock; }
+
+    PriceBreakdown price(List<CartLine> lines, List<Coupon> coupons) {
+        Money subtotal = lines.stream().map(CartLine::total).reduce(Money.ZERO, Money::plus);
+        PricingContext ctx = new PricingContext(lines, subtotal, clock.instant());
+
+        if (coupons.stream().map(Coupon::code).distinct().count() != coupons.size())
+            throw new CouponException("the same coupon cannot be applied twice");
+        if (coupons.size() > 1)
+            coupons.stream().filter(c -> !c.stackable()).findFirst().ifPresent(c -> {
+                throw new CouponException(c.code() + " cannot be combined with other coupons");
+            });
+        for (Coupon c : coupons)
+            c.unmetCondition(ctx).ifPresent(why -> {
+                throw new CouponException(c.code() + " not applicable, requires " + why);
+            });
+
+        List<Coupon> ordered = new ArrayList<>(coupons);            // stable sort keeps input order per phase
+        ordered.sort(Comparator.comparing((Coupon c) -> c.discount().phase()));
+        Money running = subtotal;
+        List<AppliedDiscount> applied = new ArrayList<>();
+        for (Coupon c : ordered) {
+            Money d = c.discountOn(ctx, running);
+            running = running.minus(d);
+            applied.add(new AppliedDiscount(c.code(), d));
+        }
+        return new PriceBreakdown(subtotal, applied, running);
+    }
+
+    /** Best = max discount among: each eligible coupon alone, and all eligible stackable coupons together. */
+    Optional<PriceBreakdown> bestOffer(List<CartLine> lines, Collection<Coupon> available) {
+        Money subtotal = lines.stream().map(CartLine::total).reduce(Money.ZERO, Money::plus);
+        PricingContext ctx = new PricingContext(lines, subtotal, clock.instant());
+        List<Coupon> eligible = available.stream().filter(c -> c.unmetCondition(ctx).isEmpty()).toList();
+
+        List<List<Coupon>> candidates = new ArrayList<>();
+        eligible.forEach(c -> candidates.add(List.of(c)));
+        List<Coupon> stackables = eligible.stream().filter(Coupon::stackable).toList();
+        if (stackables.size() > 1) candidates.add(stackables);
+
+        return candidates.stream().map(set -> price(lines, set))
+                .max(Comparator.comparing(PriceBreakdown::totalDiscount));
+    }
+}
+
+// ---------- Checkout ----------
+
+record Order(String id, Map<String, Integer> items, PriceBreakdown price) {}
+
+final class CheckoutService {
+    private final Inventory inventory;
+    private final PricingEngine pricing;
+    private final Map<String, Coupon> coupons = new LinkedHashMap<>();
+    private final AtomicLong orderIds = new AtomicLong();
+
+    CheckoutService(Inventory inventory, PricingEngine pricing) {
+        this.inventory = inventory;
+        this.pricing = pricing;
+    }
+
+    void addCoupon(Coupon c) { coupons.put(c.code(), c); }
+    Collection<Coupon> coupons() { return Collections.unmodifiableCollection(coupons.values()); }
+
+    Coupon coupon(String code) {
+        Coupon c = coupons.get(code.toUpperCase(Locale.ROOT));
+        if (c == null) throw new CouponException("unknown coupon: " + code);
+        return c;
+    }
+
+    Order checkout(Cart cart, List<String> codes) {
+        if (cart.isEmpty()) throw new IllegalStateException("cart is empty");
+        List<Coupon> chosen = codes.stream().map(this::coupon).toList();
+        PriceBreakdown price = pricing.price(cart.lines(), chosen);  // validate coupons before touching stock
+        Map<String, Integer> items = cart.quantities();
+        inventory.reserve(items);                                    // all-or-nothing, throws if short
+        cart.clear();
+        return new Order("ORD-" + orderIds.incrementAndGet(), items, price);
+    }
+}
+
+public class Main {
+    static final Instant NOW = Instant.parse("2026-10-21T10:00:00Z");
+
+    static Catalog catalog() {
+        Catalog c = new Catalog();
+        c.add(new Product("TSHIRT", "Cotton T-shirt", Money.rupees(499), "apparel"));
+        c.add(new Product("JEANS", "Slim Jeans", Money.rupees(1299), "apparel"));
+        c.add(new Product("MUG", "Coffee Mug", Money.rupees(249), "home"));
+        c.add(new Product("EARBUDS", "Wireless Earbuds", Money.rupees(1999), "electronics"));
+        return c;
+    }
+
+    static List<Coupon> sampleCoupons() {
+        return List.of(
+                Coupon.builder("SAVE10", new PercentOff(10))
+                        .when(Condition.minCartValue(Money.rupees(1000))).maxDiscount(Money.rupees(150)).build(),
+                Coupon.builder("FLAT200", new FlatOff(Money.rupees(200)))
+                        .when(Condition.minCartValue(Money.rupees(1500))).stackable().build(),
+                Coupon.builder("APPAREL20", new CategoryPercentOff("apparel", 20))
+                        .when(Condition.containsCategory("apparel")).maxDiscount(Money.rupees(300)).stackable().build(),
+                Coupon.builder("MUGBOGO", new BuyXGetYFree("MUG", 1, 1)).stackable().build(),
+                Coupon.builder("DIWALI50", new PercentOff(50))
+                        .when(Condition.expiresAt(Instant.parse("2026-10-01T00:00:00Z"))).build());
+    }
+
+    public static void main(String[] args) {
+        Catalog catalog = catalog();
+        Inventory inventory = new Inventory();
+        Map.of("TSHIRT", 10, "JEANS", 5, "MUG", 3, "EARBUDS", 2).forEach(inventory::addStock);
+        PricingEngine pricing = new PricingEngine(Clock.fixed(NOW, ZoneOffset.UTC));
+        CheckoutService checkout = new CheckoutService(inventory, pricing);
+        sampleCoupons().forEach(checkout::addCoupon);
+
+        Cart cart = new Cart(catalog, inventory);
+        cart.add("TSHIRT", 2);
+        cart.add("JEANS", 1);
+        cart.add("MUG", 1);
+        cart.update("MUG", 2);
+        cart.add("EARBUDS", 1);
+        cart.remove("EARBUDS");
+        System.out.println("cart: " + cart.lines().stream().map(l -> l.product().sku() + " x" + l.quantity()).toList());
+
+        System.out.println("\nSAVE10 alone (10%, capped at Rs 150):");
+        System.out.println(pricing.price(cart.lines(), List.of(checkout.coupon("save10"))).format());
+
+        for (List<String> codes : List.of(List.of("DIWALI50"), List.of("SAVE10", "FLAT200"))) {
+            try {
+                pricing.price(cart.lines(), codes.stream().map(checkout::coupon).toList());
+            } catch (CouponException e) {
+                System.out.println("\n" + codes + " rejected: " + e.getMessage());
+            }
+        }
+
+        PriceBreakdown best = pricing.bestOffer(cart.lines(), checkout.coupons()).orElseThrow();
+        System.out.println("\nBest offer:");
+        System.out.println(best.format());
+
+        List<String> bestCodes = best.discounts().stream().map(AppliedDiscount::code).toList();
+        Order order = checkout.checkout(cart, bestCodes);
+        System.out.println("\nPlaced " + order.id() + " for " + order.price().total()
+                + "; stock now TSHIRT=" + inventory.available("TSHIRT") + " MUG=" + inventory.available("MUG")
+                + "; cart empty=" + cart.isEmpty());
+
+        Cart greedy = new Cart(catalog, inventory);
+        try {
+            greedy.add("EARBUDS", 3);
+        } catch (OutOfStockException e) {
+            System.out.println("\nadd rejected: " + e.getMessage());
+        }
+    }
+}
+```
+
+**Real output** of `java Main` (JDK 21.0.1):
+
+```text
+cart: [TSHIRT x2, JEANS x1, MUG x2]
+
+SAVE10 alone (10%, capped at Rs 150):
+  subtotal        Rs 2795.00
+  - SAVE10        Rs 150.00
+  total           Rs 2645.00
+
+[DIWALI50] rejected: DIWALI50 not applicable, requires order before 2026-10-01T00:00:00Z
+
+[SAVE10, FLAT200] rejected: SAVE10 cannot be combined with other coupons
+
+Best offer:
+  subtotal        Rs 2795.00
+  - APPAREL20     Rs 300.00
+  - MUGBOGO       Rs 249.00
+  - FLAT200       Rs 200.00
+  total           Rs 2046.00
+
+Placed ORD-1 for Rs 2046.00; stock now TSHIRT=8 MUG=1; cart empty=true
+
+add rejected: out of stock: EARBUDS wanted 3, available 2
+```
+
+Read the best offer: APPAREL20 is 20% of the Rs 2297 apparel subtotal = Rs 459.40, capped to Rs 300; MUGBOGO frees one Rs 249 mug; both are item-level so they run first; FLAT200 is cart-level so it runs last. SAVE10 alone would save only Rs 150 (10% = Rs 279.50, capped), and DIWALI50 is expired.
+
+</QA>
+
+<QA q="Reference tests — plain-Java test harness (Tests.java) and its output" level="hard">
+
+Covers money rounding and overflow, cart operations, every discount type, caps, clamping, eligibility boundaries (inclusive minimum, exclusive expiry), stacking errors, phase ordering, best-offer selection, all-or-nothing checkout, and two concurrency tests: 200 buyers racing for 10 units, and opposite-order multi-SKU carts.
+
+```java
+import java.time.*;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class Tests {
+    static int passed, failed;
+
+    static void check(String name, boolean ok) {
+        if (ok) passed++; else failed++;
+        System.out.println((ok ? "PASS " : "FAIL ") + name);
+    }
+
+    static void throwsIt(String name, Class<? extends Throwable> type, Runnable r) {
+        try { r.run(); check(name, false); }
+        catch (Throwable t) { check(name + " (" + t.getClass().getSimpleName() + ")", type.isInstance(t)); }
+    }
+
+    static Catalog catalog = Main.catalog();
+    static PricingEngine pricing = new PricingEngine(Clock.fixed(Main.NOW, ZoneOffset.UTC));
+
+    static Inventory stock(int each) {
+        Inventory inv = new Inventory();
+        for (String sku : List.of("TSHIRT", "JEANS", "MUG", "EARBUDS")) inv.addStock(sku, each);
+        return inv;
+    }
+
+    static Cart cart(Inventory inv, Object... skuQty) {
+        Cart c = new Cart(catalog, inv);
+        for (int i = 0; i < skuQty.length; i += 2) c.add((String) skuQty[i], (Integer) skuQty[i + 1]);
+        return c;
+    }
+
+    static Money discount(Cart c, Coupon... coupons) {
+        return pricing.price(c.lines(), List.of(coupons)).totalDiscount();
+    }
+
+    public static void main(String[] args) throws Exception {
+        // Money
+        check("percent floors (10% of 333 paise = 33)", Money.paise(333).percent(10).equals(Money.paise(33)));
+        check("money formats", Money.paise(123405).toString().equals("Rs 1234.05"));
+        throwsIt("money never negative", IllegalArgumentException.class, () -> Money.paise(100).minus(Money.paise(101)));
+        throwsIt("overflow detected", ArithmeticException.class, () -> Money.paise(Long.MAX_VALUE).times(2));
+
+        // Cart
+        Inventory inv = stock(5);
+        Cart c = cart(inv, "TSHIRT", 2, "TSHIRT", 1);
+        check("add merges quantities", c.quantities().get("TSHIRT") == 3);
+        c.update("TSHIRT", 0);
+        check("update to 0 removes line", c.isEmpty());
+        throwsIt("unknown sku", IllegalArgumentException.class, () -> cart(stock(5), "SOCKS", 1));
+        throwsIt("zero add rejected", IllegalArgumentException.class, () -> cart(stock(5), "MUG", 0));
+        throwsIt("add beyond stock", OutOfStockException.class, () -> cart(stock(5), "MUG", 4, "MUG", 2));
+
+        // Discount strategies
+        Cart big = cart(stock(10), "TSHIRT", 2, "JEANS", 1, "MUG", 2);   // 998 + 1299 + 498 = 2795
+        check("subtotal", pricing.price(big.lines(), List.of()).total().equals(Money.rupees(2795)));
+        Coupon pct = Coupon.builder("P10", new PercentOff(10)).build();
+        check("percent off", discount(big, pct).equals(Money.paise(27950)));
+        Coupon capped = Coupon.builder("P10C", new PercentOff(10)).maxDiscount(Money.rupees(150)).build();
+        check("cap applies", discount(big, capped).equals(Money.rupees(150)));
+        Coupon apparel = Coupon.builder("APP", new CategoryPercentOff("apparel", 10)).build();
+        check("category-only discount (10% of 2297)", discount(big, apparel).equals(Money.paise(22970)));
+        Coupon bogo = Coupon.builder("BOGO", new BuyXGetYFree("TSHIRT", 1, 1)).build();
+        check("BOGO qty 3 => 1 free", discount(cart(stock(10), "TSHIRT", 3), bogo).equals(Money.rupees(499)));
+        check("BOGO qty 4 => 2 free", discount(cart(stock(10), "TSHIRT", 4), bogo).equals(Money.rupees(998)));
+        Coupon b2g1 = Coupon.builder("B2G1", new BuyXGetYFree("TSHIRT", 2, 1)).build();
+        check("buy 2 get 1, qty 5 => 1 free", discount(cart(stock(10), "TSHIRT", 5), b2g1).equals(Money.rupees(499)));
+        check("BOGO on absent sku => 0", discount(big, Coupon.builder("X", new BuyXGetYFree("EARBUDS", 1, 1)).build())
+                .equals(Money.ZERO));
+        Coupon huge = Coupon.builder("HUGE", new FlatOff(Money.rupees(5000))).build();
+        check("flat bigger than cart clamps to zero total",
+                pricing.price(big.lines(), List.of(huge)).total().equals(Money.ZERO));
+
+        // Eligibility (specifications)
+        Coupon min = Coupon.builder("MIN3K", new FlatOff(Money.rupees(100))).when(Condition.minCartValue(Money.rupees(3000))).build();
+        throwsIt("min cart value enforced", CouponException.class, () -> discount(big, min));
+        Coupon minOk = Coupon.builder("MIN", new FlatOff(Money.rupees(100))).when(Condition.minCartValue(Money.rupees(2795))).build();
+        check("min cart value is inclusive", discount(big, minOk).equals(Money.rupees(100)));
+        Coupon expiresNow = Coupon.builder("EXP", new FlatOff(Money.rupees(1))).when(Condition.expiresAt(Main.NOW)).build();
+        throwsIt("expired exactly at expiry instant", CouponException.class, () -> discount(big, expiresNow));
+        Coupon later = Coupon.builder("LATER", new FlatOff(Money.rupees(1)))
+                .when(Condition.expiresAt(Main.NOW.plusSeconds(1))).build();
+        check("valid one second before expiry", discount(big, later).equals(Money.rupees(1)));
+        throwsIt("category condition", CouponException.class,
+                () -> discount(cart(stock(5), "MUG", 1), Coupon.builder("A", new FlatOff(Money.rupees(1)))
+                        .when(Condition.containsCategory("apparel")).build()));
+
+        // Stacking and ordering
+        Coupon flat = Coupon.builder("F100", new FlatOff(Money.rupees(100))).stackable().build();
+        Coupon pctS = Coupon.builder("P10S", new PercentOff(10)).stackable().build();
+        throwsIt("exclusive coupon cannot combine", CouponException.class, () -> discount(big, pct, flat));
+        throwsIt("same coupon twice", CouponException.class, () -> discount(big, flat, flat));
+        PriceBreakdown ordered = pricing.price(big.lines(), List.of(pctS, flat));
+        check("input order kept within a phase: 10% then flat",
+                ordered.discounts().get(0).amount().equals(Money.paise(27950)) && ordered.total().equals(Money.paise(241550)));
+        Coupon appS = Coupon.builder("APPS", new CategoryPercentOff("apparel", 10)).stackable().build();
+        PriceBreakdown phased = pricing.price(big.lines(), List.of(pctS, appS));
+        check("ITEM phase runs before CART phase regardless of input order",
+                phased.discounts().get(0).code().equals("APPS")
+                        && phased.discounts().get(1).amount().equals(Money.paise(25653)));   // 10% of 2565.30, floored
+
+        // Best offer
+        Collection<Coupon> all = Main.sampleCoupons();
+        PriceBreakdown best = pricing.bestOffer(big.lines(), all).orElseThrow();
+        check("best offer stacks APPAREL20+MUGBOGO+FLAT200 = 749", best.totalDiscount().equals(Money.rupees(749)));
+        PriceBreakdown bestSmall = pricing.bestOffer(cart(stock(5), "EARBUDS", 1).lines(), all).orElseThrow();
+        check("earbuds-only cart: FLAT200 (200) beats SAVE10 (199.90 capped to 150)",
+                bestSmall.discounts().get(0).code().equals("FLAT200") && bestSmall.totalDiscount().equals(Money.rupees(200)));
+        check("nothing eligible => empty", pricing.bestOffer(cart(stock(5), "MUG", 1).lines(),
+                List.of(all.iterator().next())).isEmpty());
+
+        // Checkout
+        Inventory shop = stock(3);
+        CheckoutService service = new CheckoutService(shop, pricing);
+        Main.sampleCoupons().forEach(service::addCoupon);
+        Cart buy = cart(shop, "MUG", 2, "TSHIRT", 1);
+        Order o = service.checkout(buy, List.of("mugbogo"));
+        check("checkout reserves stock and clears cart",
+                shop.available("MUG") == 1 && shop.available("TSHIRT") == 2 && buy.isEmpty()
+                        && o.price().total().equals(Money.rupees(249 + 499)));
+        Cart tooMany = cart(shop, "TSHIRT", 2, "MUG", 1);
+        shop.reserve(Map.of("MUG", 1));                                  // someone else buys the last mug
+        throwsIt("checkout fails when stock vanished", OutOfStockException.class,
+                () -> service.checkout(tooMany, List.of()));
+        check("failed checkout is all-or-nothing", shop.available("TSHIRT") == 2 && !tooMany.isEmpty());
+        Cart withBad = cart(shop, "TSHIRT", 1);
+        throwsIt("bad coupon fails checkout", CouponException.class, () -> service.checkout(withBad, List.of("NOPE")));
+        check("bad coupon reserved nothing", shop.available("TSHIRT") == 2);
+        throwsIt("empty cart", IllegalStateException.class, () -> service.checkout(new Cart(catalog, shop), List.of()));
+        shop.release(Map.of("MUG", 1));
+        check("release returns stock", shop.available("MUG") == 1);
+
+        // Concurrency 1: 200 buyers race for 10 units => exactly 10 orders, never negative stock.
+        Inventory hot = new Inventory();
+        hot.addStock("EARBUDS", 10);
+        CheckoutService hotService = new CheckoutService(hot, pricing);
+        AtomicInteger ok = new AtomicInteger(), sold = new AtomicInteger();
+        List<Cart> carts = new ArrayList<>();
+        for (int i = 0; i < 200; i++) carts.add(cart(hot, "EARBUDS", 1));   // all added while stock looked fine
+        try (ExecutorService pool = Executors.newFixedThreadPool(16)) {
+            for (Cart k : carts)
+                pool.submit(() -> {
+                    try { hotService.checkout(k, List.of()); ok.incrementAndGet(); }
+                    catch (OutOfStockException e) { sold.incrementAndGet(); }
+                });
+        }
+        check("exactly 10 of 200 checkouts succeed, 190 see out-of-stock",
+                ok.get() == 10 && sold.get() == 190 && hot.available("EARBUDS") == 0);
+
+        // Concurrency 2: opposite-order multi-SKU carts don't deadlock or oversell.
+        Inventory pair = new Inventory();
+        pair.addStock("TSHIRT", 50);
+        pair.addStock("MUG", 50);
+        CheckoutService pairService = new CheckoutService(pair, pricing);
+        AtomicInteger pairOk = new AtomicInteger();
+        List<Cart> pairCarts = new ArrayList<>();
+        for (int i = 0; i < 100; i++)
+            pairCarts.add(i % 2 == 0 ? cart(pair, "TSHIRT", 1, "MUG", 1) : cart(pair, "MUG", 1, "TSHIRT", 1));
+        try (ExecutorService pool = Executors.newVirtualThreadPerTaskExecutor()) {
+            for (Cart k : pairCarts) {
+                pool.submit(() -> {
+                    try { pairService.checkout(k, List.of()); pairOk.incrementAndGet(); }
+                    catch (OutOfStockException ignored) { }
+                });
+            }
+        }
+        check("100 opposite-order carts: 50 succeed, stock exactly 0/0",
+                pairOk.get() == 50 && pair.available("TSHIRT") == 0 && pair.available("MUG") == 0);
+
+        System.out.printf("%n%d passed, %d failed%n", passed, failed);
+        if (failed > 0) System.exit(1);
+    }
+}
+```
+
+**Real output** of `javac Main.java Tests.java && java Tests` (run three times, same result each time):
+
+```text
+PASS percent floors (10% of 333 paise = 33)
+PASS money formats
+PASS money never negative (IllegalArgumentException)
+PASS overflow detected (ArithmeticException)
+PASS add merges quantities
+PASS update to 0 removes line
+PASS unknown sku (IllegalArgumentException)
+PASS zero add rejected (IllegalArgumentException)
+PASS add beyond stock (OutOfStockException)
+PASS subtotal
+PASS percent off
+PASS cap applies
+PASS category-only discount (10% of 2297)
+PASS BOGO qty 3 => 1 free
+PASS BOGO qty 4 => 2 free
+PASS buy 2 get 1, qty 5 => 1 free
+PASS BOGO on absent sku => 0
+PASS flat bigger than cart clamps to zero total
+PASS min cart value enforced (CouponException)
+PASS min cart value is inclusive
+PASS expired exactly at expiry instant (CouponException)
+PASS valid one second before expiry
+PASS category condition (CouponException)
+PASS exclusive coupon cannot combine (CouponException)
+PASS same coupon twice (CouponException)
+PASS input order kept within a phase: 10% then flat
+PASS ITEM phase runs before CART phase regardless of input order
+PASS best offer stacks APPAREL20+MUGBOGO+FLAT200 = 749
+PASS earbuds-only cart: FLAT200 (200) beats SAVE10 (199.90 capped to 150)
+PASS nothing eligible => empty
+PASS checkout reserves stock and clears cart
+PASS checkout fails when stock vanished (OutOfStockException)
+PASS failed checkout is all-or-nothing
+PASS bad coupon fails checkout (CouponException)
+PASS bad coupon reserved nothing
+PASS empty cart (IllegalStateException)
+PASS release returns stock
+PASS exactly 10 of 200 checkouts succeed, 190 see out-of-stock
+PASS 100 opposite-order carts: 50 succeed, stock exactly 0/0
+
+39 passed, 0 failed
+```
+
+</QA>
+
+## Follow-up twists an interviewer might add
+
+Real rounds often add a requirement at minute 50–70 to see whether the design bends or breaks. Try to answer each in one or two sentences before opening it.
+
+<QA q="Twist — each coupon can be used at most N times in total (or once per user)" level="medium">
+
+Add a usage counter keyed by coupon code (and user ID for per-user limits), e.g. `ConcurrentHashMap` of `AtomicInteger`. Pricing only **checks** remaining uses; checkout **claims** a use atomically (`compute` or a compare-and-set loop that refuses to pass the limit) in the same step as reserving inventory, and gives it back if reservation fails. A plain check-then-increment would let two users both take the last use.
+
+</QA>
+
+<QA q="Twist — reserved stock must be released if payment doesn't finish within 10 minutes" level="medium">
+
+Turn the reservation into an object: `Reservation(id, items, expiresAt)` stored in the inventory, with states `HELD`, `CONFIRMED`, `RELEASED`. Checkout returns it; `confirm(id)` on payment success, `release(id)` on failure; a scheduled sweeper (using the injected `Clock`) releases expired holds. `release` must be idempotent so a late payment callback and the sweeper can't double-return stock.
+
+</QA>
+
+<QA q="Twist — add a 'free shipping' coupon and a delivery fee" level="easy">
+
+Add a `shippingFee` line to `PriceBreakdown` and a new `Discount` type in a third phase, `SHIPPING`, that discounts only the fee. The enum `Phase` gains one constant; no existing discount class changes.
+
+</QA>
+
+<QA q="Twist — 'cheapest item free' or 'buy any 3 apparel items, cheapest free'" level="medium">
+
+A new strategy: collect matching units (expand quantities), sort by unit price, and free the cheapest `floor(count / 3)` units. Lives entirely in a new `Discount` class at the ITEM phase — this is exactly the change the strategy split pays for.
+
+</QA>
+
+<QA q="Twist — percentages like 12.5% must be supported" level="easy">
+
+Store **basis points** (1 bp = 0.01%) instead of whole percent: `amount * bps / 10_000`, still floored, still `multiplyExact`. Only `Money.percent` and the two percentage discount constructors change.
+
+</QA>
+
+<QA q="Twist — the minimum cart value must be checked after item-level discounts" level="hard">
+
+Evaluate conditions per phase: pass the running total into the context the condition sees. Note what this breaks: adding an item-level coupon can now make a cart-level coupon **ineligible**, so the "all stackables" shortcut is no longer guaranteed best — best-offer must search subsets (fine for a handful of coupons; prune by phase or use a greedy heuristic for many). Saying this out loud is a strong signal.
+
+</QA>
+
+<QA q="Twist — split the discount across lines for refunds and GST (proportional allocation)" level="hard">
+
+Allocate each cart-level discount to lines in proportion to line totals, flooring each share, then give the leftover paise one by one to the lines with the largest fractional remainders so shares add up **exactly** to the discount (largest-remainder method). Store per-line net amounts on the `Order`. A partial return then refunds that line's net, not its list price.
+
+</QA>
+
+<QA q="Twist — prices can change while items sit in the cart" level="medium">
+
+The reference already looks up the product's **current** price on every `lines()` call, so checkout always charges today's price. If the rule is "honour the price when added", store a price snapshot in the cart line and, at checkout, either honour it or show the change and ask for confirmation. Say which one you chose.
+
+</QA>
+
+<QA q="Twist — inventory is hot: thousands of checkouts per second on different SKUs" level="hard">
+
+Replace the single lock with **per-SKU locks** (or per-SKU `AtomicInteger` with compare-and-set). For multi-SKU carts, acquire locks in **sorted SKU order** to avoid deadlock, check all, decrement all, release. In a real service the source of truth moves to a database with a conditional update (`UPDATE stock SET available = available - ? WHERE sku = ? AND available >= ?`) inside one transaction.
+
+</QA>
+
+## Self-review checklist
+
+- [ ] No `double` or `float` anywhere near money; amounts are integer minor units.
+- [ ] I stated my rounding rule, and it's applied in exactly one place.
+- [ ] Each discount type is its own class; adding a new one doesn't touch the pricing loop.
+- [ ] Caps and the "never below zero" clamp are written once, not per type.
+- [ ] Eligibility rules are separate objects with readable failure messages.
+- [ ] Expiry uses an injected `Clock`, and I tested the exact expiry instant.
+- [ ] Exclusive coupons can't be combined; duplicate codes are rejected.
+- [ ] Discount order is defined by the design (phases, plus a stated rule within a phase), not left to whatever order the user typed.
+- [ ] Best-coupon reuses the same pricing method checkout uses.
+- [ ] Checkout validates coupons before reserving stock.
+- [ ] Reservation is all-or-nothing and atomic; a multi-threaded test proves no overselling.
+- [ ] A failed checkout leaves the cart and stock unchanged.
+- [ ] I can name two twists and the exact class I'd add or change for each.
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="Why store prices as a long count of paise rather than a double of rupees?" options={["long arithmetic is the only kind Java can do in a record", "Binary floating point can't represent most decimal fractions exactly, so sums and percentages drift by tiny amounts", "double cannot hold values above one lakh", "Databases reject double columns for money"]} answer={1}>
+
+Values like 0.1 have no exact binary representation, so repeated additions and percentages accumulate errors. Integer minor units are exact, and you choose rounding explicitly. The other options are false: doubles hold huge values, records can use any type, and databases accept floating types (they're just wrong for money).
+
+</MCQ>
+
+<MCQ q="A coupon gives 10% off a cart of Rs 3.33 (333 paise). With the reference's floor rule, what is the discount?" options={["34 paise", "33.3 paise", "33 paise", "Rs 0.30"]} answer={2}>
+
+333 times 10 divided by 100 is 33.3, and integer division floors it to 33 paise. Fractional paise can't exist in minor units, and flooring means the store never gives more than the stated percentage.
+
+</MCQ>
+
+<MCQ q="Which split best keeps coupon logic extensible?" options={["One Coupon class with a type enum and a switch in calculate()", "A Discount strategy per type, eligibility as separate condition objects, and cap or stacking handled once in Coupon", "A subclass of Cart for each coupon type", "Store coupon formulas as strings and evaluate them at runtime"]} answer={1}>
+
+Separating what a coupon gives, when it's allowed, and its limits means each axis changes independently: a new discount type is one class, a new rule is one condition. A type switch grows with every type; subclassing Cart mixes concerns; runtime string formulas are fragile and untestable.
+
+</MCQ>
+
+<MCQ q="Why does the reference inject a Clock into PricingEngine instead of calling Instant.now()?" options={["Instant.now() is deprecated since Java 17", "Clock is faster than Instant", "Tests can use Clock.fixed to check behaviour exactly at and around an expiry instant", "Clock automatically converts to the user's time zone"]} answer={2}>
+
+With `Clock.fixed(...)` the test controls 'now', so it can assert that a coupon is rejected at the expiry instant and accepted one second earlier. `Instant.now()` isn't deprecated; speed and time zones aren't the reason.
+
+</MCQ>
+
+<MCQ q="A cart has SKU A and SKU B. Checkout decrements A, then finds B is out of stock and throws. What should have prevented the problem?" options={["Retrying the checkout three times", "Checking and decrementing all lines inside one atomic, all-or-nothing operation — check every line first, then decrement, under one lock", "Decrementing B first", "Catching the exception and ignoring it"]} answer={1}>
+
+The bug is a partial reservation. Doing the check for every line and then every decrement inside a single critical section makes the reservation all-or-nothing. Changing the order just moves the bug; retries and swallowing exceptions hide it.
+
+</MCQ>
+
+<MCQ q="Coupons: P = 10% off cart (stackable), F = Rs 100 off cart (stackable). Subtotal Rs 1000. Applied in order P then F, what is the total?" options={["Rs 800", "Rs 810", "Rs 790", "Rs 900"]} answer={0}>
+
+P takes 10% of 1000 = 100, leaving 900; F takes 100, leaving 800. In the opposite order F leaves 900 and P takes 90, giving 810 — which is exactly why the order must be defined by the design and stated.
+
+</MCQ>
+
+<MCQ q="Why does bestOffer only need to price each coupon alone plus all stackable coupons together, not every subset?" options={["Because the interviewer said so", "Because every discount step maps the running total through a non-decreasing function, so adding another stackable coupon can only lower the final total", "Because stackable coupons are always worth less than exclusive ones", "Because Java streams cannot enumerate subsets"]} answer={1}>
+
+Each step's output never decreases as its input grows, and adding a coupon only lowers the running total at some point, so the final total can only fall. With eligibility checked on the original subtotal, the full stackable set dominates every subset. This breaks if eligibility depends on the discounted total.
+
+</MCQ>
+
+<MCQ q="Two hundred threads each try to check out 1 unit of an item with 10 in stock using the reference Inventory. What happens?" options={["Exactly 10 succeed and 190 get OutOfStockException; stock ends at 0", "About 10 succeed, but occasionally 11 because of a race", "All 200 succeed and stock goes to -190", "The program deadlocks because every thread waits on the same lock"]} answer={0}>
+
+`reserve` is `synchronized`, so the check and the decrement happen atomically and only 10 can pass. One lock can't deadlock with itself (deadlock needs at least two locks acquired in different orders). The test harness runs exactly this scenario.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR
+
+- **Money:** `long` minor units in a `Money` record; floor discounts; `Math.*Exact` for overflow; never negative.
+- **Coupon = discount + conditions + limits.** `Discount` strategy per type (percent, flat, category, BOGO), `Condition` predicates for eligibility (min value, expiry via injected `Clock`, category), cap and clamp applied once in `Coupon`.
+- **Stacking policy, stated:** exclusive coupons stand alone; no duplicates; ITEM phase before CART phase; each step on the running total; total never below zero.
+- **Best coupon:** each eligible coupon alone plus all eligible stackables together, priced by the same `price()` method. The full stackable set is optimal because every step is monotone.
+- **Checkout:** look up and validate coupons, price, then reserve **all lines atomically**, then clear the cart. Prove no overselling with a multi-threaded test.
+- **Twists to rehearse:** usage limits (atomic claim), reservation TTL, free shipping phase, cheapest-item-free, basis points, proportional discount allocation for refunds, per-SKU locks in sorted order.

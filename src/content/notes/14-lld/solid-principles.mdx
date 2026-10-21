@@ -1,0 +1,571 @@
+---
+title: "SOLID Principles with Real Examples"
+phase: "14-lld"
+order: 133
+tags: ["lld", "oop", "design", "java", "solid"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 22
+prerequisites: []
+summary: "The five SOLID principles explained in plain English with violating and refactored Java examples from e-commerce and payments, how interviewers probe each one, and when applying them becomes over-engineering."
+---
+
+## Definition (interview-ready)
+
+**SOLID** is a set of five object-oriented design principles. Robert C. Martin ("Uncle Bob") collected and promoted them, and Michael Feathers later coined the acronym. They all aim at one thing: **code that is easy to change without breaking other code.**
+
+| Letter | Principle | One-line meaning |
+|---|---|---|
+| **S** | Single Responsibility | A module should answer to one group of people (one "actor"), so it has one reason to change. |
+| **O** | Open/Closed | You should be able to add new behaviour by adding new code, not by editing working code. |
+| **L** | Liskov Substitution | A subclass must be usable anywhere its parent is expected, without surprising the caller. |
+| **I** | Interface Segregation | Don't force clients to depend on methods they don't use. Prefer small, focused interfaces. |
+| **D** | Dependency Inversion | Business logic should depend on abstractions (interfaces), not on concrete details like a specific database or payment gateway. |
+
+How to say it in an interview: *"SOLID is about managing change. Each principle reduces the blast radius when requirements change: SRP splits code by who asks for changes, OCP lets me add variants without touching tested code, LSP keeps polymorphism safe, ISP keeps interfaces small, and DIP points dependencies from details toward policy."*
+
+**One-liner:** SOLID is five object-oriented design principles (Single Responsibility, Open/Closed, Liskov Substitution, Interface Segregation, Dependency Inversion) that keep code easy to change by limiting how far each change spreads.
+
+## Why it matters
+
+- **LLD and machine-coding rounds** grade on extensibility. The interviewer will add a requirement halfway ("now support UPI", "now add a gift-card discount") and watch how much code you have to edit.
+- **Code reviews** use SOLID vocabulary constantly: "this class does too much", "this `if-else` on type will grow forever", "inject this instead of calling `new`".
+- **Testability.** Code that follows DIP can be unit-tested with fakes. Code that calls `new StripeClient()` inside business logic cannot.
+- **Frameworks are built on it.** Spring's whole design (interfaces + dependency injection) is DIP and OCP in practice.
+
+But SOLID is a set of **heuristics, not laws**. Applied blindly, it produces a jungle of one-method interfaces and factories nobody needed. Strong candidates know both sides.
+
+## Core concepts
+
+### S — Single Responsibility Principle (SRP)
+
+**Plain English.** The popular version is "a class should do one thing", which is too vague to be useful. Martin's sharper version (from *Clean Architecture* and his 2014 blog post) is: **a module should be responsible to one, and only one, actor.** An actor is a group of people who ask for changes: finance, operations, the DBA team, the marketing team. *Gather together things that change for the same reason; separate things that change for different reasons.*
+
+**Violation.**
+
+```java
+public class Invoice {
+    private final Order order;
+
+    public BigDecimal calculateTotal() { /* tax rules: owned by Finance */ }
+    public String renderPdf()          { /* layout: owned by Marketing/Brand */ }
+    public void saveToDb()             { /* SQL: owned by the platform team */ }
+    public void emailToCustomer()      { /* SMTP: owned by the comms team */ }
+}
+```
+
+Four different teams can ask for changes to this one class. A GST rule change and a font change now touch the same file, conflict in the same merge, and risk breaking each other. A test of tax logic needs a database and an SMTP server.
+
+**Refactored.**
+
+```java
+public class InvoiceCalculator {            // Finance's rules
+    public BigDecimal total(Order order) { ... }
+}
+public class InvoicePdfRenderer {           // Brand's layout
+    public byte[] render(Invoice invoice) { ... }
+}
+public interface InvoiceRepository {        // persistence
+    void save(Invoice invoice);
+}
+public class InvoiceMailer {                // delivery
+    public void send(Invoice invoice, byte[] pdf) { ... }
+}
+```
+
+A thin `InvoiceService` can orchestrate them. Each class now changes for one reason, and the tax logic is a pure function you can test in milliseconds.
+
+**How interviewers probe it.**
+- "Who would ask you to change this class?" If you name more than one team, it probably violates SRP.
+- "Is a class with one method automatically SRP-compliant?" No. SRP is about reasons to change, not method count. A 10-method `TaxCalculator` that only Finance touches is fine.
+- "Doesn't SRP lead to too many classes?" Good answer: split when two reasons to change actually show up, not preemptively.
+
+**Over-engineering warning.** Splitting a 40-line class into `OrderValidator`, `OrderValidatorFactory`, `OrderValidationResultMapper` before anything forces it. If two responsibilities always change together, they are one responsibility.
+
+### O — Open/Closed Principle (OCP)
+
+**Plain English.** *Software entities should be open for extension but closed for modification.* Bertrand Meyer coined the phrase in 1988 (*Object-Oriented Software Construction*), originally meaning extension through inheritance. Martin's modern version means: **put an abstraction at the point of variation, so a new variant is a new class, not an edit to a `switch`.**
+
+**Violation.**
+
+```java
+public class DiscountService {
+    public BigDecimal apply(Cart cart, String couponType) {
+        switch (couponType) {
+            case "FLAT":       return cart.total().subtract(new BigDecimal("100"));
+            case "PERCENT":    return cart.total().multiply(new BigDecimal("0.90"));
+            case "BUY1GET1":   return applyBogo(cart);
+            // every new campaign = edit this method, retest all cases
+            default: throw new IllegalArgumentException(couponType);
+        }
+    }
+}
+```
+
+**Refactored (Strategy pattern).**
+
+```java
+public interface DiscountRule {
+    boolean supports(Coupon coupon);
+    BigDecimal apply(Cart cart, Coupon coupon);
+}
+
+public class FlatDiscount implements DiscountRule { ... }
+public class PercentDiscount implements DiscountRule { ... }
+public class BuyOneGetOne implements DiscountRule { ... }
+
+public class DiscountService {
+    private final List<DiscountRule> rules;           // injected (Spring can inject all beans)
+
+    public DiscountService(List<DiscountRule> rules) { this.rules = rules; }
+
+    public BigDecimal apply(Cart cart, Coupon coupon) {
+        return rules.stream()
+            .filter(r -> r.supports(coupon))
+            .findFirst()
+            .orElseThrow(() -> new UnsupportedCouponException(coupon))
+            .apply(cart, coupon);
+    }
+}
+```
+
+A new "first-order" discount is one new class. `DiscountService` and existing rules stay untouched and stay tested. In Spring, declaring each rule as a bean and taking a `List<DiscountRule>` in the constructor wires them automatically.
+
+**How interviewers probe it.**
+- They add a requirement mid-round ("add wallet payments") and count the files you edit.
+- "Can any code be 100% closed?" No. You choose which axes of change to protect against. Martin calls this *strategic closure*. Guess wrong and the abstraction is dead weight.
+- "Is a `switch` always an OCP violation?" No. One `switch` inside a factory that maps a config string to a strategy is fine. The smell is the *same* `switch` repeated in many places.
+
+**Over-engineering warning.** If there is one payment method today and no roadmap for a second, a `PaymentStrategy` interface with one implementation is speculation. Wait for the second variant (the "rule of three" is a common heuristic), then extract.
+
+### L — Liskov Substitution Principle (LSP)
+
+**Plain English.** Barbara Liskov introduced the idea in a 1987 keynote ("Data Abstraction and Hierarchy"), and Liskov and Jeannette Wing formalised it in 1994 as *behavioural subtyping*. In practice: **if code works with a `Parent`, it must keep working when handed any `Child`, with no type checks and no surprises.** A subclass must:
+
+- accept at least what the parent accepts (don't **strengthen preconditions**),
+- deliver at least what the parent promises (don't **weaken postconditions**),
+- keep the parent's invariants,
+- not throw new kinds of exceptions the caller can't expect.
+
+"Is-a" in the real world is not enough. The question is whether the **behaviour** is substitutable.
+
+**Violation.**
+
+```java
+public class PaymentMethod {
+    public RefundResult refund(Payment p, BigDecimal amount) { ... }
+}
+
+public class CashOnDelivery extends PaymentMethod {
+    @Override
+    public RefundResult refund(Payment p, BigDecimal amount) {
+        throw new UnsupportedOperationException("COD can't be refunded online");
+    }
+}
+
+// Caller written against PaymentMethod now breaks at runtime:
+paymentMethod.refund(payment, amount);   // boom for COD
+```
+
+The tell-tale sign is the fix people reach for: `if (pm instanceof CashOnDelivery) { ... }` scattered through the codebase. Every `instanceof` check on a subtype is a hint that LSP is broken.
+
+**Refactored.** Model the real capabilities instead of pretending all methods are the same:
+
+```java
+public interface PaymentMethod {
+    PaymentResult charge(Order order);
+}
+public interface Refundable {
+    RefundResult refund(Payment p, BigDecimal amount);
+}
+
+public class CardPayment implements PaymentMethod, Refundable { ... }
+public class UpiPayment  implements PaymentMethod, Refundable { ... }
+public class CashOnDelivery implements PaymentMethod { ... }   // no refund method to lie about
+```
+
+Now the compiler stops anyone from calling `refund` on COD. COD refunds go through a separate bank-transfer flow.
+
+The classic textbook example is `Square extends Rectangle`: setting the width of a square also changes its height, so code that does `r.setWidth(5); r.setHeight(4); assert r.area() == 20` fails for a square.
+
+A real JDK example: `List.of(...)` returns an immutable list whose `add` throws `UnsupportedOperationException`. The `List` interface documents those methods as *optional operations*, so it is technically allowed, but it is the same trade-off and catches people out in exactly the way LSP warns about.
+
+**How interviewers probe it.**
+- "Square/Rectangle: what's wrong?" Explain behaviour, not geometry.
+- "A subclass overrides a method to throw `UnsupportedOperationException`. Problem?" Yes, unless the parent contract explicitly says the operation is optional.
+- "How would you detect LSP violations?" `instanceof` checks, overridden methods that do nothing or throw, and tests of the parent that fail when run against the child (contract tests).
+
+**Over-engineering warning.** Don't split interfaces to the point where every class implements six one-method interfaces just to be "pure". Model the capabilities your callers actually branch on.
+
+### I — Interface Segregation Principle (ISP)
+
+**Plain English.** *Clients should not be forced to depend on methods they do not use.* A fat interface couples every client to every method. When one method's signature changes, every implementer and every client has to recompile, retest or redeploy, even ones that never call it.
+
+**Violation.**
+
+```java
+public interface SellerOperations {
+    void listProduct(Product p);
+    void updateInventory(String sku, int qty);
+    void fulfilOrder(String orderId);
+    SettlementReport downloadSettlement(LocalDate month);
+    void runAdCampaign(Campaign c);
+}
+
+// A warehouse integration only fulfils orders, but must implement everything:
+public class WarehouseAdapter implements SellerOperations {
+    public void fulfilOrder(String orderId) { ... }
+    public void listProduct(Product p) { throw new UnsupportedOperationException(); }
+    public void runAdCampaign(Campaign c) { throw new UnsupportedOperationException(); }
+    // ... more stubs
+}
+```
+
+Notice that the ISP violation forces an LSP violation (methods that throw).
+
+**Refactored.**
+
+```java
+public interface Catalog      { void listProduct(Product p); }
+public interface Inventory    { void updateInventory(String sku, int qty); }
+public interface Fulfilment   { void fulfilOrder(String orderId); }
+public interface Settlements  { SettlementReport downloadSettlement(LocalDate month); }
+public interface Advertising  { void runAdCampaign(Campaign c); }
+
+public class WarehouseAdapter implements Fulfilment, Inventory { ... }
+```
+
+Each client depends only on the role it uses. The full seller portal class can still implement all five.
+
+**How interviewers probe it.**
+- "How is ISP different from SRP?" SRP is about the *implementing* class and who changes it. ISP is about the *client's view*: what a caller is forced to know about.
+- They show an interface with `UnsupportedOperationException` stubs and ask what's wrong.
+- "Role interfaces vs header interfaces?" A role interface is shaped by what one client needs; a header interface just copies every public method of a class. Prefer role interfaces.
+
+**Over-engineering warning.** One method per interface everywhere is its own smell. Group methods that clients always use together.
+
+### D — Dependency Inversion Principle (DIP)
+
+**Plain English.** Two parts:
+
+1. **High-level modules should not depend on low-level modules. Both should depend on abstractions.**
+2. **Abstractions should not depend on details. Details should depend on abstractions.**
+
+"High-level" means business policy (place an order, settle a seller). "Low-level" means mechanisms (MySQL, Razorpay's SDK, Kafka). The "inversion": in naive layering, the order service depends on the MySQL class. With DIP, the order layer **owns** an interface (`OrderRepository`) and the MySQL code depends on and implements *that*. The source-code arrow now points from detail to policy.
+
+**Violation.**
+
+```java
+public class CheckoutService {
+    private final RazorpayClient gateway = new RazorpayClient("key", "secret");
+    private final MySqlOrderDao dao = new MySqlOrderDao();
+
+    public void checkout(Cart cart) {
+        Order order = Order.from(cart);
+        dao.insert(order);
+        gateway.createPayment(order.getId(), order.getTotal());
+    }
+}
+```
+
+Switching to another gateway means editing checkout logic. Unit tests hit a real gateway and a real database.
+
+**Refactored.**
+
+```java
+// Owned by the checkout (high-level) module
+public interface PaymentGateway { PaymentResult charge(OrderId id, Money amount); }
+public interface OrderRepository { void save(Order order); }
+
+public class CheckoutService {
+    private final PaymentGateway gateway;
+    private final OrderRepository orders;
+
+    public CheckoutService(PaymentGateway gateway, OrderRepository orders) {
+        this.gateway = gateway;
+        this.orders = orders;
+    }
+
+    public void checkout(Cart cart) {
+        Order order = Order.from(cart);
+        orders.save(order);
+        gateway.charge(order.id(), order.total());
+    }
+}
+
+// Low-level details implement the high-level interfaces
+public class RazorpayGateway implements PaymentGateway { ... }
+public class JpaOrderRepository implements OrderRepository { ... }
+```
+
+In tests, pass a `FakePaymentGateway` and an in-memory repository. This is the core idea behind hexagonal ("ports and adapters") and Clean Architecture.
+
+**How interviewers probe it.**
+- "What's the difference between DIP and dependency injection?" (see below — very common).
+- "Who should own the interface, the caller or the implementer?" The caller (high-level policy). If the interface lives in the MySQL module and mirrors MySQL concepts, the dependency hasn't really been inverted.
+- "Should every class have an interface?" No. Value objects, entities, and stable library classes (`String`, `BigDecimal`, `LocalDate`) don't need one.
+
+**Over-engineering warning.** An `IUserService` with exactly one `UserServiceImpl`, no second implementation, and no test double is ceremony. Mocking frameworks can mock concrete classes too. Introduce the interface at real boundaries: I/O, third-party services, things that vary.
+
+### Dependency Injection vs Dependency Inversion vs IoC
+
+| Term | What it is | Level |
+|---|---|---|
+| **Dependency Inversion (DIP)** | A *design principle*: depend on abstractions; details depend on policy. | Architecture / source-code dependencies |
+| **Dependency Injection (DI)** | A *technique*: an object receives its collaborators (constructor, setter, field) instead of creating them. | Object wiring |
+| **Inversion of Control (IoC)** | A broader idea: a framework calls your code and controls the flow ("don't call us, we'll call you"). A DI container is one form. | Framework design |
+
+You can do DI without DIP: injecting a concrete `MySqlOrderDao` through the constructor is injection, but checkout still depends on MySQL. You can follow DIP without a container: wire everything by hand in `main()`. Spring gives you both by making constructor injection of interface-typed dependencies the default style.
+
+Prefer **constructor injection**: dependencies are explicit, fields can be `final`, objects can't exist half-built, and tests just call the constructor. *Effective Java* has an item on exactly this ("Prefer dependency injection to hardwiring resources").
+
+### Related ideas you should be able to name
+
+- **DRY (Don't Repeat Yourself)** — from *The Pragmatic Programmer* (Hunt and Thomas, 1999): every piece of **knowledge** should have a single, authoritative representation. It is about duplicated *knowledge*, not duplicated *text*. Two identical-looking validation methods for "seller PAN" and "customer PAN" may change for different reasons; merging them couples two actors (an SRP violation). Wrong DRY is worse than duplication.
+- **KISS (Keep It Simple)** — prefer the simplest design that solves today's problem clearly. An `if` is better than a strategy hierarchy when there are two stable cases.
+- **YAGNI (You Aren't Gonna Need It)** — from Extreme Programming: don't build features or extension points for requirements you only imagine. It is the counterweight to OCP.
+- **Composition over inheritance** — one of the two core principles in the GoF book's introduction ("favor object composition over class inheritance"; the other is "program to an interface, not an implementation"). *Effective Java* repeats it. Inheritance couples the subclass to the parent's implementation details (the "fragile base class" problem), and Java allows only one superclass. Composition lets you combine behaviours and swap them at runtime.
+
+```java
+// Inheritance: a LoggingPaymentGateway that extends RazorpayGateway only works for Razorpay.
+// Composition (a decorator): works for any gateway, and can be stacked.
+public class LoggingGateway implements PaymentGateway {
+    private final PaymentGateway delegate;
+    public LoggingGateway(PaymentGateway delegate) { this.delegate = delegate; }
+
+    public PaymentResult charge(OrderId id, Money amount) {
+        log.info("charge order={} amount={}", id, amount);
+        return delegate.charge(id, amount);
+    }
+}
+```
+
+- **Law of Demeter** ("talk only to your immediate friends") — avoid `order.getCustomer().getAddress().getCity()` chains; ask `order` for what you need.
+
+## How it works (applying SOLID in a machine-coding round)
+
+A practical sequence that interviewers reward:
+
+1. **Model the nouns** (Order, Cart, Payment, Coupon) as plain classes or records. No interfaces yet.
+2. **Find the axes of variation** in the problem statement: payment methods, discount types, notification channels, pricing rules. These are where OCP/strategy interfaces go.
+3. **Find the I/O boundaries**: storage, external gateways, clocks, ID generators. Put interfaces there (DIP) so you can use in-memory implementations in the round.
+4. **Keep services thin** and single-purpose (SRP). An orchestrating service is fine as long as the rules live elsewhere.
+5. **Wire by constructor** in a `main` or a small factory.
+6. When a new requirement arrives, **show** that it's a new class plus one line of wiring.
+
+```
+          high-level policy                      low-level details
+   ┌─────────────────────────────┐        ┌──────────────────────────┐
+   │ CheckoutService             │        │ RazorpayGateway          │
+   │   uses PaymentGateway ◄─────┼────────┤   implements it          │
+   │   uses OrderRepository ◄────┼────────┤ JpaOrderRepository       │
+   │   uses List<DiscountRule> ◄─┼────┐   │ InMemoryOrderRepository  │
+   └─────────────────────────────┘    │   └──────────────────────────┘
+                                      └── FlatDiscount, PercentDiscount ...
+   Arrows point toward the abstractions owned by the policy layer.
+```
+
+## Real-world examples
+
+- **Spring Framework** is built around DIP and DI: beans depend on interfaces, the container injects implementations, and constructor injection is the recommended style for required dependencies.
+- **Servlet filters and Spring `HandlerInterceptor`s** follow OCP: you add behaviour to the request pipeline by registering a new filter, not by editing the dispatcher.
+- **JDBC** is DIP at industry scale: your code depends on `java.sql.Connection`, `PreparedStatement` and friends; each database vendor ships a driver that implements them.
+- **`java.util.Collections.unmodifiableList` and `List.of`** show the LSP tension of "optional operations": the `List` contract permits `add` to throw, so it is legal, but callers must know it.
+
+## Common pitfalls
+
+- **Treating SRP as "one method per class".** It's about reasons to change.
+- **Interfaces for everything.** `FooService` + `FooServiceImpl` pairs with no second implementation add indirection, not flexibility.
+- **Guessing the wrong axis for OCP.** You build a plugin system for payment methods, and the change that actually comes is multi-currency.
+- **"Fixing" LSP violations with `instanceof`.** The type check spreads to every caller.
+- **Fat "Manager"/"Util" classes** that collect unrelated static helpers.
+- **Over-applying DRY** by merging code that only looks the same.
+- **Field injection** (`@Autowired` on private fields): hides dependencies, prevents `final`, makes tests need reflection or a container.
+- **Inheritance for code reuse** (`class OrderService extends BaseService`), creating a fragile base class that everything depends on.
+- **Interfaces owned by the low-level module**, so "inversion" is just an extra layer pointing the same direction.
+
+## Practice questions
+
+<Practice>
+
+<QA q="What does SOLID stand for? One sentence each." level="easy">
+
+- **SRP**: a module should have one reason to change, meaning it answers to one actor.
+- **OCP**: add new behaviour by adding code, not by modifying tested code.
+- **LSP**: subtypes must be substitutable for their base type without breaking callers.
+- **ISP**: clients shouldn't depend on methods they don't use; keep interfaces focused.
+- **DIP**: high-level policy and low-level details both depend on abstractions owned by the policy side.
+
+</QA>
+
+<QA q="Is a class with a single method guaranteed to follow SRP?" level="easy">
+
+No. SRP is about **reasons to change**, not size. A single `process()` method that computes tax, writes to MySQL and sends an email has three reasons to change. A `TaxCalculator` with ten methods that only change when Finance's rules change is fine. Martin's own wording is that a module should be responsible to one actor.
+
+</QA>
+
+<QA q="What is the difference between Dependency Inversion and Dependency Injection?" level="easy">
+
+**DIP** is a design principle about the direction of source-code dependencies: business logic depends on abstractions it owns, and infrastructure implements them. **DI** is a technique for supplying an object's collaborators from outside (usually via the constructor). DI is a common way to *achieve* DIP, but you can inject a concrete class (DI without DIP) or wire interfaces by hand in `main()` (DIP without a container).
+
+</QA>
+
+<QA q="Why is Square extends Rectangle the classic LSP violation?" level="easy">
+
+A `Rectangle` lets you set width and height independently, and callers rely on that: after `setWidth(5); setHeight(4)` they expect area 20. A `Square` must keep sides equal, so `setHeight` also changes the width and the area becomes 16. Code written for `Rectangle` breaks when given a `Square`. The lesson: substitutability is about **behaviour**, not real-world "is-a". Fixes: make shapes immutable, or don't relate them by inheritance.
+
+</QA>
+
+<QA q="How do ISP and SRP differ?" level="medium">
+
+SRP looks at a class from the **implementer's** side: how many groups of people can force it to change? ISP looks at an interface from the **client's** side: is a caller forced to depend on methods it never uses? A class can satisfy SRP yet expose a fat interface to many different clients. The usual fix is to split it into role interfaces and have the one class implement several of them.
+
+</QA>
+
+<QA q="Show how you would make a payment flow open for new payment methods." level="medium">
+
+Introduce a `PaymentMethod` (or `PaymentProcessor`) interface with `charge(Order)`; implement `CardPayment`, `UpiPayment`, `WalletPayment`. A small registry maps the method type to the implementation, for example a `Map` built from all beans injected as a `List<PaymentProcessor>`. Checkout calls `registry.get(type).charge(order)`. Adding net banking is a new class plus registration; checkout and existing processors are untouched. Mention that the one place that maps type → implementation is allowed to `switch`; the smell is repeated switches across the codebase.
+
+</QA>
+
+<QA q="A subclass overrides a method only to throw UnsupportedOperationException. What's wrong, and when is it acceptable?" level="medium">
+
+Callers written against the parent will fail at runtime, which breaks LSP and usually means the parent interface is too fat (an ISP problem). Fix it by splitting capabilities into separate interfaces so the subclass simply doesn't have that method. It's acceptable only when the parent's contract **explicitly** documents the operation as optional, as `java.util.List` does for `add`/`remove`; even then, callers must be prepared for it.
+
+</QA>
+
+<QA q="Who should own the interface in DIP — the caller or the implementer? Why?" level="medium">
+
+The **caller** (the high-level policy). The interface should be shaped by what checkout needs (`charge(orderId, money)`), not by what the vendor SDK offers. If the interface lives in the infrastructure module and mirrors its concepts, business code still depends on infrastructure's vocabulary and packaging; the arrow hasn't really been inverted. Ports and adapters makes this explicit: the domain defines ports, adapters implement them.
+
+</QA>
+
+<QA q="What does 'composition over inheritance' mean and why is it preferred?" level="medium">
+
+Build behaviour by **holding** collaborators (has-a) rather than **extending** a class (is-a). Inheritance couples a subclass to the parent's internal implementation, so a change in the parent can silently break children (the fragile base class problem). Java also allows only one superclass. Composition lets you swap behaviour at runtime, combine several behaviours, and wrap objects with decorators (for example a `LoggingGateway` wrapping any `PaymentGateway`). Inheritance is still right for true subtypes designed for extension.
+
+</QA>
+
+<QA q="DRY says don't repeat yourself. When is duplicating code the right call?" level="medium">
+
+When the two pieces of code represent **different knowledge** that happens to look the same today. DRY, as defined in *The Pragmatic Programmer*, is about knowledge having one authoritative representation, not about identical text. Merging seller-payout rounding and customer-refund rounding into one helper couples two actors; when one changes, the other breaks. Duplicate until you're sure the two share a reason to change.
+
+</QA>
+
+<QA q="When does following SOLID become over-engineering?" level="hard">
+
+When abstractions are built for change that hasn't happened and isn't likely: a `FooService` interface with one implementation and no test double, factory classes that only call one constructor, one-method interfaces everywhere, or strategy hierarchies for two stable cases. The costs are more files, more indirection, and harder navigation. Use YAGNI and the rule of three: put abstractions at real I/O boundaries and at axes of variation you can point to in the requirements, and extract others when the second or third variant appears.
+
+</QA>
+
+<QA q="Field injection vs constructor injection in Spring — which and why?" level="hard">
+
+Prefer **constructor injection** for required dependencies. It makes dependencies visible in the signature, allows `final` fields, guarantees the object is never half-built, and lets unit tests just call `new Service(fakeA, fakeB)` without a container or reflection. A long constructor is also a useful SRP warning sign. Field injection hides dependencies and ties the class to the container. Setter injection fits optional dependencies.
+
+</QA>
+
+<QA q="Your OrderService is 2,000 lines and handles pricing, inventory, notifications and invoices. How would you refactor it safely?" level="scenario">
+
+1. Add characterization tests around the current behaviour (or at least the critical paths).
+2. Identify actors / reasons to change: pricing (business), inventory (ops), notifications (comms), invoicing (finance).
+3. Extract one responsibility at a time behind an interface owned by `OrderService` (`PricingEngine`, `InventoryReserver`, `OrderNotifier`), moving code with an IDE refactoring and keeping the old public API.
+4. Inject the new collaborators through the constructor.
+5. Ship each extraction separately. `OrderService` ends up as a thin orchestrator. Avoid a big-bang rewrite. See the strangler and refactoring notes linked below.
+
+</QA>
+
+<QA q="Mid-round, the interviewer says: add a 'first order' discount, a 'bank offer' discount, and allow stacking two discounts. How does your design absorb this?" level="scenario">
+
+If discounts are already a `DiscountRule` strategy, the two new rules are new classes. Stacking is a new composite: a `StackedDiscount` that holds a list of rules and applies them in order (Composite pattern), plus a policy that decides the order and caps (for example percentage before flat, max discount cap). Existing rules and the checkout service don't change. Call out the edge cases: rounding, rules that are mutually exclusive, and keeping rule evaluation deterministic so the price shown equals the price charged.
+
+</QA>
+
+<QA q="A teammate wraps every class in an interface 'for DIP'. Unit tests use Mockito anyway. How do you push back?" level="scenario">
+
+Agree with the goal, challenge the placement. DIP pays off at **boundaries** (databases, gateways, queues, clocks) and where several implementations really exist. Domain services with one implementation gain only indirection; Mockito can mock concrete classes, and plain fakes are often better. Propose a rule: interfaces for ports to the outside world and for real variation points; concrete classes elsewhere, extracted when needed. Reversibility matters: extracting an interface later is a cheap IDE refactor.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="According to Robert C. Martin's refined definition, SRP means a module should..." options={["Contain exactly one public method", "Be responsible to one, and only one, actor", "Never exceed 200 lines", "Have exactly one interface"]} answer={1}>
+
+Martin restates SRP in terms of actors: the groups of people who request changes. Method count, line count and interface count are not the criterion.
+
+</MCQ>
+
+<MCQ q="Which change best demonstrates the Open/Closed Principle?" options={["Adding a new case to an existing switch on payment type", "Copy-pasting CheckoutService to make CheckoutServiceV2", "Adding a new PaymentProcessor implementation and registering it, without editing checkout", "Making all fields public so subclasses can change them"]} answer={2}>
+
+OCP means new behaviour arrives as new code behind an existing abstraction. Editing a switch modifies tested code, copy-paste duplicates it, and public fields break encapsulation.
+
+</MCQ>
+
+<MCQ q="A subclass strengthens a precondition, rejecting inputs the parent accepted. Which principle is violated?" options={["Liskov Substitution", "Interface Segregation", "Single Responsibility", "DRY"]} answer={0}>
+
+Behavioural subtyping requires that subtypes accept at least what the parent accepts. Callers that were valid against the parent now fail, which breaks substitutability.
+
+</MCQ>
+
+<MCQ q="A warehouse adapter must implement runAdCampaign() and listProduct() just to provide fulfilOrder(). Which principle is most directly violated?" options={["Open/Closed", "Dependency Inversion", "Interface Segregation", "Law of Demeter"]} answer={2}>
+
+The client is forced to depend on methods it doesn't use: a fat interface. Splitting into role interfaces fixes it. The stubs that throw would also cause LSP problems.
+
+</MCQ>
+
+<MCQ q="Which statement about DIP vs dependency injection is correct?" options={["They are two names for the same thing", "DI is a technique for supplying collaborators; DIP is a principle about dependency direction", "DIP requires a DI container such as Spring", "DI always guarantees DIP"]} answer={1}>
+
+DI is a wiring technique; DIP is about depending on abstractions owned by policy. You can inject a concrete class (DI without DIP) or hand-wire interfaces in main (DIP without a container).
+
+</MCQ>
+
+<MCQ q="Under DIP, where should the PaymentGateway interface used by CheckoutService ideally live?" options={["In the Razorpay SDK", "In the checkout (high-level) module, shaped by what checkout needs", "In a shared utils jar used by everyone", "Nowhere; use the concrete class"]} answer={1}>
+
+The high-level policy owns the abstraction, and the gateway adapter implements it. If the interface lives with the vendor code, business logic still depends on the vendor's vocabulary.
+
+</MCQ>
+
+<MCQ q="Two methods look identical: one rounds seller payouts, the other rounds customer refunds. Finance owns one, Customer Support owns the other. What is the best call?" options={["Merge them into one helper for DRY", "Keep them separate because they represent different knowledge with different reasons to change", "Make one call the other", "Move both into a static Utils class"]} answer={1}>
+
+DRY is about knowledge, not text. Merging couples two actors, which is an SRP problem: a payout change would silently alter refunds.
+
+</MCQ>
+
+<MCQ q="Which of these is the strongest sign of over-engineering?" options={["An interface for a payment gateway with Razorpay and a test fake", "A strategy interface for discounts with five rule types", "An IOrderMapper interface with one implementation, no fake, mocked nowhere", "Constructor injection of a repository"]} answer={2}>
+
+An interface with one implementation and no second use (not even a test double) adds indirection without flexibility. The others sit at real boundaries or real variation points.
+
+</MCQ>
+
+<MCQ q="Why is constructor injection usually preferred over field injection?" options={["It is faster at runtime", "Dependencies are explicit, fields can be final, and tests can construct the object without a container", "Spring cannot inject fields", "It avoids the need for interfaces"]} answer={1}>
+
+Constructor injection makes the object complete and immutable after construction and easy to test. Spring can inject fields; runtime speed and interfaces are not the reasons.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **SRP**: one actor per module. Ask "who would request this change?"
+- **OCP**: new variant = new class behind an existing interface. Protect only the axes that really vary.
+- **LSP**: subtypes keep the parent's contract. No stronger preconditions, weaker guarantees, or surprise exceptions. `instanceof` checks are a smell.
+- **ISP**: role-shaped interfaces; no stub methods that throw.
+- **DIP**: policy owns interfaces; infrastructure implements them. Constructor-inject them.
+- **DI** is the technique, **DIP** the principle, **IoC** the framework-calls-you idea.
+- **DRY** = one home per piece of knowledge, not per piece of text. **KISS** and **YAGNI** keep SOLID honest.
+- **Composition over inheritance**: decorators and strategies over deep class trees.
+- Interview move: when a new requirement arrives, show it's a new class plus one line of wiring.
+
+## Go deeper
+
+- **Robert C. Martin**: [The Single Responsibility Principle](https://blog.cleancoder.com/uncle-bob/2014/05/08/SingleReponsibilityPrinciple.html) (the "actor" framing).
+- **Book**: *Clean Architecture* by Robert C. Martin, Part III (Design Principles).
+- **Book**: *Design Patterns: Elements of Reusable Object-Oriented Software* (Gamma, Helm, Johnson, Vlissides), Chapter 1 for "program to an interface" and "favor composition".
+- **Book**: *Effective Java*, 3rd ed., Joshua Bloch, chapters on classes/interfaces and dependency injection.
+- **Spring docs**: [Dependency Injection](https://docs.spring.io/spring-framework/reference/core/beans/dependencies/factory-collaborators.html).
+- **Refactoring Guru**: [Strategy pattern](https://refactoring.guru/design-patterns/strategy) (the usual OCP tool).
+- Related notes: [Creational patterns](/learn/notes/creational-patterns/), [Refactoring and tech debt](/learn/notes/refactoring-tech-debt/), [DDD basics](/learn/notes/ddd-basics/).

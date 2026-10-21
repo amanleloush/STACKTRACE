@@ -1,0 +1,518 @@
+---
+title: "Keys and ER Modeling: Super, Candidate, Primary, Foreign"
+phase: "11-sql-dbms"
+order: 113
+tags: ["sql", "dbms", "data-modeling"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 20
+prerequisites: ["sql-execution-order-joins"]
+summary: "Every kind of key (super, candidate, primary, alternate, composite, foreign, surrogate vs natural), referential integrity and ON DELETE actions, and how to turn an ER diagram into tables."
+---
+
+## Definition (interview-ready)
+
+A **key** is a set of columns used to identify rows. The family, from loosest to tightest:
+
+- A **superkey** is any set of columns that uniquely identifies every row. Extra columns are allowed.
+- A **candidate key** is a *minimal* superkey: drop any column and it stops being unique.
+- The **primary key** is the one candidate key you pick as the main identifier. It must be unique and NOT NULL.
+- The other candidate keys are **alternate keys**. You enforce them with `UNIQUE` constraints.
+- A **foreign key** is a column (or columns) in one table whose values must match a key in another table. This rule is called **referential integrity**.
+
+**ER modeling** (entity-relationship modeling) is how you design these tables before writing SQL. You draw the *things* (entities), their *properties* (attributes) and how they *relate* (relationships with cardinality 1:1, 1:N or M:N). Then you map the diagram to tables with a short set of rules.
+
+**One-liner:** A candidate key is a minimal set of columns that uniquely identifies a row, the primary key is the one you choose, and a foreign key points at another table's key to enforce referential integrity; ER modeling designs entities, attributes and 1:1, 1:N and M:N relationships first, then maps them to tables.
+
+## Why it matters
+
+- Keys are how a database **stops bad data at the door**. A missing `UNIQUE` on email means two accounts with the same email, sooner or later. A missing foreign key means orders that point to customers who no longer exist.
+- Interviewers use keys to check whether you know the vocabulary *precisely*. "What's the difference between a superkey and a candidate key?" is a classic warm-up.
+- Schema design rounds ("design the tables for a library / food delivery / e-commerce app") are really ER modeling exercises. Getting the M:N relationships and the weak entities right is most of the score.
+- Keys are the input to [normalization](/learn/notes/normalization/). You cannot decide what normal form a table is in until you know its candidate keys.
+
+## Core concepts
+
+### One running example
+
+We will use one table for every key type:
+
+```
+employee
+┌────────┬──────────────────┬────────────┬────────┬─────────┬────────────┐
+│ emp_id │ email            │ pan        │ name   │ dept_id │ phone      │
+├────────┼──────────────────┼────────────┼────────┼─────────┼────────────┤
+│ 101    │ asha@corp.com    │ ABCPA1234K │ Asha   │ 10      │ 9800000001 │
+│ 102    │ ravi@corp.com    │ BCDPR2345L │ Ravi   │ 20      │ NULL       │
+│ 103    │ meena@corp.com   │ CDEPM3456M │ Asha   │ 10      │ 9800000003 │
+└────────┴──────────────────┴────────────┴────────┴─────────┴────────────┘
+```
+
+Business rules: every employee has a unique id, a unique work email and a unique PAN (an Indian tax ID). Names can repeat. Phone is optional.
+
+Important: keys come from **business rules**, not from the rows you happen to see. Right now every `phone` is different, but that doesn't make `phone` a key. Two employees could share a desk phone tomorrow.
+
+### Superkey
+
+Any set of columns that can never repeat across rows.
+
+- `emp_id` is a superkey.
+- `(emp_id, name)` is a superkey too. Adding columns to a superkey always gives another superkey.
+- `(email, dept_id, phone)` is a superkey, because it contains `email`.
+- `(name, dept_id)` is **not**: two Ashas can work in dept 10.
+
+A table has many superkeys. The full set of all columns is always one (in a proper relation, where duplicate rows are not allowed).
+
+### Candidate key
+
+A superkey with nothing extra. Remove any column and it stops being unique.
+
+- Candidate keys here: `emp_id`, `email`, `pan`.
+- `(emp_id, name)` is a superkey but not a candidate key, because `emp_id` alone is already unique.
+
+A candidate key can have several columns. It is still minimal if no *proper subset* of it is unique. Attributes that appear in **any** candidate key are called **prime attributes**. This term matters a lot in normalization.
+
+### Primary key and alternate keys
+
+You pick one candidate key to be the **primary key**:
+
+- It must be **unique** and **NOT NULL**. SQL enforces both.
+- A table has at most one primary key.
+- In MySQL InnoDB, the primary key is also the **clustered index**: the table's rows are physically stored in primary key order. (Postgres stores rows in a heap, and the primary key is a normal B-tree index.)
+
+The leftover candidate keys (`email`, `pan`) become **alternate keys**. Declare them with `UNIQUE` so the database still enforces them:
+
+```sql
+CREATE TABLE employee (
+  emp_id   BIGINT       PRIMARY KEY,
+  email    VARCHAR(255) NOT NULL UNIQUE,   -- alternate key
+  pan      CHAR(10)     NOT NULL UNIQUE,   -- alternate key
+  name     VARCHAR(100) NOT NULL,
+  dept_id  INT          NOT NULL REFERENCES department(dept_id),
+  phone    VARCHAR(15)
+);
+```
+
+Note a subtle difference: a `UNIQUE` column can hold NULLs. In both Postgres and MySQL, multiple NULLs are allowed in a `UNIQUE` column by default, because NULL is not equal to NULL. So if an alternate key must always be present, add `NOT NULL` too. (Postgres 15+ also offers `UNIQUE NULLS NOT DISTINCT` to treat NULLs as equal.)
+
+### Composite key
+
+A key made of **two or more columns**. The classic case is a junction table:
+
+```sql
+CREATE TABLE enrollment (
+  student_id BIGINT REFERENCES student(student_id),
+  course_id  BIGINT REFERENCES course(course_id),
+  grade      CHAR(2),
+  PRIMARY KEY (student_id, course_id)   -- composite primary key
+);
+```
+
+Neither column is unique alone (a student takes many courses; a course has many students), but the pair is. Column order in a composite key matters for the index: `(student_id, course_id)` serves "courses of a student" lookups well, but not "students in a course". Add a second index on `course_id` if you need both directions.
+
+### Foreign key and referential integrity
+
+A foreign key says: "every value here must exist as a key over there".
+
+```sql
+CREATE TABLE department (
+  dept_id INT PRIMARY KEY,
+  name    VARCHAR(100) NOT NULL
+);
+
+-- in employee:
+dept_id INT NOT NULL REFERENCES department(dept_id)
+```
+
+Rules:
+
+- The referenced columns must be a primary key or have a `UNIQUE` constraint.
+- A foreign key value can be NULL (unless you add NOT NULL). A NULL means "no related row", and it is not checked.
+- The database checks the rule on **both sides**: inserting a child with an unknown `dept_id` fails, and deleting a parent that still has children triggers the `ON DELETE` action.
+
+**Indexing the foreign key.** MySQL InnoDB requires an index on the foreign key columns and creates one automatically if none exists. **Postgres does not** create one. Without it, every delete on the parent has to scan the whole child table to look for references. Index your foreign keys in Postgres.
+
+### ON DELETE / ON UPDATE actions
+
+What happens to children when you delete (or change the key of) a parent?
+
+| Action | Effect on child rows | Typical use |
+|---|---|---|
+| `NO ACTION` (default) | Reject the delete if children exist | Safe default |
+| `RESTRICT` | Reject the delete if children exist | Same idea, stricter (see below) |
+| `CASCADE` | Delete (or update) the children too | Weak entities: order → order_items |
+| `SET NULL` | Set the child's FK to NULL | Optional link: post → deleted author |
+| `SET DEFAULT` | Set the child's FK to its default value | Rare |
+
+Vendor details that interviewers like:
+
+- **Postgres**: `NO ACTION` checks the rule at the end of the statement and can be **deferred** to commit time (with `DEFERRABLE`). `RESTRICT` checks immediately and can never be deferred. Postgres 15+ lets you name which columns `SET NULL` / `SET DEFAULT` touch, e.g. `ON DELETE SET NULL (author_id)`.
+- **MySQL InnoDB**: `NO ACTION` is the same as `RESTRICT` (checked immediately). The parser accepts `SET DEFAULT`, but InnoDB rejects tables that use it. Cascaded changes do **not** fire triggers.
+
+**How to say it in an interview:** "I default to `RESTRICT`/`NO ACTION`, so nothing disappears by accident. I use `CASCADE` only for rows that can't exist without their parent, like order line items. For financial data I usually don't delete at all; I soft-delete with a status column."
+
+### Natural vs surrogate keys
+
+- A **natural key** comes from the real world and has business meaning: email, PAN, ISBN, a country code.
+- A **surrogate key** is made up by the system and has no meaning: an auto-increment number or a UUID.
+
+| | Natural key | Surrogate key |
+|---|---|---|
+| Meaning | Has business meaning | None |
+| Stability | Can change (people change emails) | Never changes |
+| Size | Often long strings | Small (8-byte integer) or 16-byte UUID |
+| Joins | Wide FKs everywhere | Narrow FKs |
+| Uniqueness of the real thing | Enforced by the PK itself | Needs a separate `UNIQUE` on the natural key |
+
+The common, sensible design: **surrogate primary key + `UNIQUE` constraint on the natural key**. You get stable, compact joins *and* the business rule is still enforced.
+
+Generating surrogates:
+
+- Auto-increment: MySQL `AUTO_INCREMENT`, Postgres `GENERATED ... AS IDENTITY` (Postgres 10+; older code uses `SERIAL`).
+- UUIDs: no central counter, so any service can make them. But **random UUIDs (v4)** as an InnoDB primary key scatter inserts across the whole clustered index, which causes page splits and poor cache use. **Time-ordered UUIDs (v7, standardised in RFC 9562 in 2024)** keep inserts mostly in order. Postgres 18 added a built-in `uuidv7()` function. See [distributed ID generation](/learn/notes/distributed-id-generation/) for Snowflake-style IDs.
+
+### ER modeling building blocks
+
+**Entities** are things you store data about: Customer, Order, Product. An **entity set** becomes a table; each entity becomes a row.
+
+**Attributes** describe entities. Kinds you must know:
+
+| Kind | Meaning | Example | How it maps to tables |
+|---|---|---|---|
+| Simple | Can't be split | `price` | One column |
+| Composite | Made of parts | `address` = street, city, pincode | One column per part |
+| Multivalued | Many values per entity | a customer's phone numbers | **A separate table** |
+| Derived | Computed from other data | `age` from `date_of_birth`; order total | Usually **not stored**; compute it or use a view |
+| Key | Identifies the entity | `customer_id` | Primary key |
+
+**Weak entities** can't be identified on their own. They need their owner's key plus their own **partial key** (also called a discriminator).
+
+- An `order_item` with `line_no = 1` means nothing until you know which order it belongs to. Its key is `(order_id, line_no)`.
+- A weak entity has **total participation** in its identifying relationship: it can't exist without the owner. That is why `ON DELETE CASCADE` fits here.
+
+**Relationships** connect entities. Three properties describe them:
+
+1. **Degree**: how many entity sets take part. Binary (2) is the norm. Ternary (3) is used when a fact only makes sense for all three together, e.g. "doctor *prescribes* drug *to* patient".
+2. **Cardinality** (the maximum): 1:1, 1:N or M:N.
+3. **Participation** (the minimum):
+   - **Total**: every entity must take part. Every order must have a customer.
+   - **Partial**: taking part is optional. A customer may have zero orders.
+
+Relationships can have their own attributes. The `quantity` of a product in an order belongs to neither Order nor Product. It belongs to the relationship between them.
+
+A relationship can also link an entity set to **itself** (a recursive relationship): an employee *manages* other employees.
+
+```
+ ER sketch (Chen-style, simplified)
+
+ [Customer] 1 ──── places ──── N [Order] 1 ════ contains ════ N [[OrderItem]] N ──── refers to ──── 1 [Product]
+                   (total on Order side)        (weak entity, identifying relationship)
+
+ [[ ]] = weak entity      ════ = identifying relationship / total participation
+```
+
+### Generalization / specialization (ISA)
+
+Sometimes entity types share a parent: `Payment` is either a `CardPayment` or a `UpiPayment`. Three ways to map it:
+
+| Strategy | Tables | Pros | Cons |
+|---|---|---|---|
+| Single table | One `payment` table with a `type` column and nullable subtype columns | No joins, simple | Many NULLs, weak constraints |
+| Table per subtype + parent ("class table") | `payment` + `card_payment` + `upi_payment`, sharing the PK | Clean, constraints per subtype | A join for full details |
+| Table per concrete type | `card_payment`, `upi_payment` only, each with all common columns | No joins per type | Querying "all payments" needs a `UNION` |
+
+## How it works
+
+### Mapping an ER diagram to tables
+
+Apply these rules in order:
+
+1. **Strong entity** → a table. Simple attributes become columns. Pick a primary key.
+2. **Composite attribute** → flatten into one column per part (`addr_street`, `addr_city`, `addr_pincode`).
+3. **Multivalued attribute** → a new table: `(owner_pk, value)` with both columns as the primary key.
+4. **Derived attribute** → don't store it, unless you have a measured performance reason. Then keep it in sync deliberately.
+5. **Weak entity** → a table whose primary key is `(owner_pk, partial_key)`. The owner key is also a foreign key, usually `ON DELETE CASCADE`.
+6. **1:N relationship** → put a foreign key on the **N side**. Relationship attributes go there too. If participation on the N side is total, make the FK `NOT NULL`.
+7. **1:1 relationship** → a foreign key on either side, with a `UNIQUE` constraint on it. Prefer the side with total participation, so the FK is never NULL. (Sometimes you just merge the two tables.)
+8. **M:N relationship** → a **junction table** (also called a join table, link table or associative table). Its columns are the two foreign keys plus any relationship attributes. Its primary key is usually the pair of foreign keys.
+9. **Ternary relationship** → a table with three foreign keys. Its key depends on the cardinalities.
+
+### Worked mapping: e-commerce
+
+```sql
+CREATE TABLE customer (
+  customer_id  BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  email        VARCHAR(255) NOT NULL UNIQUE,          -- natural key kept unique
+  name         VARCHAR(100) NOT NULL,
+  addr_street  VARCHAR(200),                           -- composite attribute, flattened
+  addr_city    VARCHAR(100),
+  addr_pincode CHAR(6)
+);
+
+CREATE TABLE customer_phone (                          -- multivalued attribute
+  customer_id BIGINT REFERENCES customer(customer_id) ON DELETE CASCADE,
+  phone       VARCHAR(15),
+  PRIMARY KEY (customer_id, phone)
+);
+
+CREATE TABLE product (
+  product_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  sku        VARCHAR(40) NOT NULL UNIQUE,
+  name       VARCHAR(200) NOT NULL,
+  price      NUMERIC(12,2) NOT NULL
+);
+
+CREATE TABLE orders (                                   -- 1:N customer → orders
+  order_id    BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  customer_id BIGINT NOT NULL REFERENCES customer(customer_id),  -- total participation
+  placed_at   TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX ON orders (customer_id);                  -- Postgres won't do this for you
+
+CREATE TABLE order_item (                               -- weak entity + M:N orders ↔ product
+  order_id   BIGINT REFERENCES orders(order_id) ON DELETE CASCADE,
+  line_no    INT,
+  product_id BIGINT NOT NULL REFERENCES product(product_id),
+  quantity   INT NOT NULL CHECK (quantity > 0),        -- relationship attribute
+  unit_price NUMERIC(12,2) NOT NULL,                   -- price at order time
+  PRIMARY KEY (order_id, line_no)
+);
+CREATE INDEX ON order_item (product_id);
+```
+
+Two decisions worth saying out loud:
+
+- `order_item.unit_price` looks like it duplicates `product.price`, but it doesn't. It is the price **at the time of purchase**, which is a different fact. Prices change; old orders must not.
+- The order total is a **derived attribute**. It is not stored here; it is `SUM(quantity * unit_price)`. If reads need it fast, you could store it and keep it consistent in the same transaction.
+
+## Real-world examples
+
+- **MySQL InnoDB** uses the primary key as the clustered index, and every secondary index stores the primary key value as its row pointer. So a wide primary key (say, a long string natural key) makes **every** secondary index bigger. This is one documented reason to prefer compact surrogate keys in InnoDB.
+- **Postgres** documentation explicitly notes that declaring a foreign key does not create an index on the referencing columns, and recommends adding one because deletes on the parent must scan the child.
+- **Postgres 18** added `uuidv7()` for time-ordered UUIDs, following **RFC 9562** (2024), which standardised UUID versions 6, 7 and 8.
+
+## Common pitfalls
+
+- **Deriving keys from sample data.** Uniqueness in today's rows isn't a key. Ask what the business guarantees.
+- **Forgetting the `UNIQUE` on the natural key** after adding a surrogate key. Now two rows can have the same email, and the surrogate key hides it.
+- **No index on foreign keys in Postgres.** Parent deletes become full scans of the child table, and you get lock contention.
+- **`ON DELETE CASCADE` everywhere.** One delete of a customer silently wipes orders, payments and invoices. Cascade only into weak entities.
+- **Storing a multivalued attribute as a comma-separated string** (`'98000001,98000002'`). You can't index it, constrain it or join on it properly.
+- **Modeling an M:N relationship with a foreign key on one side.** It only allows one partner per row. M:N always needs a junction table.
+- **Putting relationship attributes on an entity.** `quantity` on `product` is wrong; it belongs on the order_item junction.
+- **Random UUIDv4 as the InnoDB primary key** on a write-heavy table. Use a sequence or a time-ordered ID instead.
+- **Using a mutable natural key as the PK.** When an email changes, every referencing row has to change (or `ON UPDATE CASCADE` fans out).
+
+## Practice questions
+
+<Practice>
+
+<QA q="What is the difference between a superkey and a candidate key?" level="easy">
+
+A **superkey** is any set of columns that uniquely identifies rows, and it may contain extra columns. A **candidate key** is a *minimal* superkey: removing any column makes it non-unique. In `employee`, `(emp_id, name)` is a superkey but not a candidate key, because `emp_id` alone is unique. Every candidate key is a superkey; not every superkey is a candidate key.
+
+</QA>
+
+<QA q="What is the difference between a primary key and a unique key?" level="easy">
+
+- **Primary key**: exactly one per table, NOT NULL is implied, and it is the row's main identifier (in InnoDB also the clustered index).
+- **Unique key**: you can have many, and the columns can be NULL. Multiple NULLs are allowed by default in Postgres and MySQL, since NULL is never equal to NULL.
+
+Alternate candidate keys are enforced with `UNIQUE` plus `NOT NULL`.
+
+</QA>
+
+<QA q="What is a composite key? Give an example where it is the natural choice." level="easy">
+
+A key made of two or more columns, where no single column is unique alone. Junction tables are the natural case: `enrollment(student_id, course_id)` with `PRIMARY KEY (student_id, course_id)`. A student appears in many rows and so does a course, but each pair appears once.
+
+</QA>
+
+<QA q="What is referential integrity and how does a database enforce it?" level="easy">
+
+The rule that every foreign key value must match an existing key in the referenced table (or be NULL). The database checks it on **insert/update of the child** (unknown parent → error) and on **delete/update of the parent** (apply the `ON DELETE` / `ON UPDATE` action: reject, cascade, set NULL or set default).
+
+</QA>
+
+<QA q="Explain CASCADE, SET NULL, RESTRICT and NO ACTION. When would you use each?" level="medium">
+
+- `CASCADE`: deleting the parent deletes the children. Use it for weak entities that can't exist alone (order → order_items).
+- `SET NULL`: the child's FK becomes NULL. Use it for optional links (a blog post whose author account is deleted).
+- `RESTRICT` / `NO ACTION`: reject the delete while children exist. The safe default for important data.
+
+In Postgres, `NO ACTION` can be deferred to commit time with a deferrable constraint, and `RESTRICT` cannot. In MySQL InnoDB they behave the same.
+
+</QA>
+
+<QA q="Natural key or surrogate key for a users table? Defend your choice." level="medium">
+
+Surrogate primary key (identity column or time-ordered ID) **plus** `UNIQUE NOT NULL` on the natural key (email).
+
+- Emails change; a surrogate never does, so foreign keys in other tables never need updating.
+- Joins and indexes stay small (8 bytes vs a long string). In InnoDB this matters even more because every secondary index stores the PK.
+- The `UNIQUE` constraint still enforces the business rule.
+
+A natural key is fine for small, stable reference data, like ISO country codes.
+
+</QA>
+
+<QA q="Why might a random UUID primary key hurt write performance in MySQL InnoDB?" level="medium">
+
+InnoDB stores rows in a B+ tree ordered by primary key (the clustered index). Random UUIDv4 values land on random leaf pages, so inserts touch pages all over the tree. That causes page splits, half-empty pages and a working set that doesn't fit in the buffer pool. Sequential IDs, or time-ordered UUIDv7, append near the right edge of the tree instead. UUIDs are also 16 bytes, and that size is repeated in every secondary index.
+
+</QA>
+
+<QA q="What is a weak entity? How do you map it to a table?" level="medium">
+
+An entity that can't be identified by its own attributes alone. It needs its owner's key plus a **partial key**. Example: `order_item` identified by `(order_id, line_no)`.
+
+Mapping: a table whose primary key is `(owner_pk, partial_key)`. The owner key is also a foreign key, usually `ON DELETE CASCADE`, because the weak entity has total participation in the identifying relationship.
+
+</QA>
+
+<QA q="How do you map 1:1, 1:N and M:N relationships to tables?" level="medium">
+
+- **1:N**: a foreign key on the N side (`orders.customer_id`). Make it NOT NULL if participation is total.
+- **1:1**: a foreign key on one side with a `UNIQUE` constraint, preferably on the side with total participation. Or merge the tables if they are always used together.
+- **M:N**: a junction table with both foreign keys, a composite primary key on the pair, and any relationship attributes (e.g. `quantity`, `enrolled_at`).
+
+</QA>
+
+<QA q="How do multivalued, composite and derived attributes map to tables?" level="medium">
+
+- **Composite** (address): one column per component.
+- **Multivalued** (phone numbers): a separate table `(owner_id, value)` with both as the primary key. Never a comma-separated string.
+- **Derived** (age, order total): normally not stored. Compute it in queries or a view. Store it only for measured performance needs, and update it in the same transaction as its inputs.
+
+</QA>
+
+<QA q="What is the difference between cardinality and participation in an ER diagram?" level="medium">
+
+**Cardinality** is the *maximum* number of related entities (1 or many). **Participation** is the *minimum*: total (must take part, at least 1) or partial (may take part, 0 allowed). Customer places Order is 1:N. Participation is total on the Order side (every order has a customer) and partial on the Customer side (a customer may have no orders). Total participation maps to a `NOT NULL` foreign key.
+
+</QA>
+
+<QA q="When do you need a ternary relationship instead of three binary ones?" level="hard">
+
+When the fact is about all three entities **together** and can't be rebuilt from pairs. Doctor-prescribes-Drug-to-Patient: knowing which doctors treat which patients, which doctors prescribe which drugs, and which patients take which drugs does not tell you *who prescribed what to whom*. Joining the three binary tables can produce combinations that never happened. Map it to a table with three foreign keys (plus attributes like dosage and date).
+
+</QA>
+
+<QA q="How would you model a Payment that can be a card payment or a UPI payment?" level="hard">
+
+It's a generalization (ISA). Three options:
+
+1. **Single table** with a `type` column and nullable subtype columns. Fast and simple, but many NULLs and weak constraints.
+2. **Parent + subtype tables** sharing the primary key. Clean constraints, one join to get details. Usually my default for transactional systems.
+3. **One table per concrete type**. No joins per type, but "all payments" needs a `UNION` and shared constraints are duplicated.
+
+Choose by query pattern: if most queries touch all payment types, a single table or parent table wins.
+
+</QA>
+
+<QA q="Design the schema for a library: books, copies, members, loans. Walk through keys and relationships." level="scenario">
+
+- `book(book_id PK, isbn UNIQUE, title, ...)`: the title-level entity.
+- `book_copy(book_id FK, copy_no, PK(book_id, copy_no), shelf)`: a **weak entity**. Copy 3 only means something for a given book. Alternatively, give it a surrogate `copy_id` plus `UNIQUE(book_id, copy_no)`, which keeps loan FKs narrow.
+- `author(author_id PK, name)` and `book_author(book_id, author_id, PK(both))`: **M:N** via a junction table.
+- `member(member_id PK, email UNIQUE, ...)`.
+- `loan(loan_id PK, copy_id FK, member_id FK, borrowed_at, due_at, returned_at NULL)`: a member borrows copies over time, so it's an event table, not a simple junction (the same pair can repeat).
+- Rule "a copy can only be on one open loan": a partial unique index in Postgres, `CREATE UNIQUE INDEX ON loan (copy_id) WHERE returned_at IS NULL` (a plain `UNIQUE` constraint can't take a `WHERE`).
+
+Use `RESTRICT` on loans (don't delete members with loan history) and `CASCADE` only from book to book_copy, if at all.
+
+</QA>
+
+<QA q="A teammate stored tags as a comma-separated column on the posts table. Searching posts by tag is slow and duplicates appear. What do you propose?" level="scenario">
+
+Tags are a **multivalued attribute**, and posts-to-tags is really **M:N**. Create `tag(tag_id PK, name UNIQUE)` and `post_tag(post_id FK, tag_id FK, PRIMARY KEY(post_id, tag_id))`, plus an index on `post_tag(tag_id)` for the tag → posts lookup. The composite PK stops duplicate tags on a post, the `UNIQUE` on name stops near-duplicate tags, and the search becomes an indexed join instead of a `LIKE '%tag%'` scan. Migrate by splitting existing strings in a backfill.
+
+</QA>
+
+<QA q="Deleting a single customer in Postgres takes seconds and blocks other writes. The customer has no orders. Why?" level="scenario">
+
+`orders.customer_id` references `customer` but has **no index**. Postgres doesn't create FK indexes automatically. To check the `ON DELETE` rule it must scan the whole `orders` table looking for that customer_id, even if there are none, for every deleted customer. Fix: `CREATE INDEX CONCURRENTLY ON orders(customer_id)`. Check all other FKs that reference `customer` too.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="Table R has candidate keys emp_id and email. Which of these is a superkey but NOT a candidate key?" options={["emp_id", "email", "(email, name)", "name"]} answer={2}>
+
+`(email, name)` is unique because it contains `email`, but it isn't minimal. `emp_id` and `email` are candidate keys (and therefore also superkeys). `name` alone isn't unique, so it isn't a key at all.
+
+</MCQ>
+
+<MCQ q="What is a prime attribute?" options={["An attribute of the primary key only", "An attribute that belongs to at least one candidate key", "An attribute with a NOT NULL constraint", "An attribute with an index"]} answer={1}>
+
+Prime means 'part of some candidate key', not only the chosen primary key. This definition is central to 2NF and 3NF.
+
+</MCQ>
+
+<MCQ q="How many NULLs can a standard UNIQUE column hold in Postgres or MySQL by default?" options={["None", "Exactly one", "Many, because NULLs are not considered equal", "Only if the column is also a foreign key"]} answer={2}>
+
+By default NULL is not equal to NULL, so multiple NULLs don't violate uniqueness. Postgres 15+ can change this with `NULLS NOT DISTINCT`. Add `NOT NULL` when an alternate key must always be present.
+
+</MCQ>
+
+<MCQ q="You declare a foreign key on orders.customer_id in Postgres. What happens to indexing?" options={["Postgres creates an index on orders.customer_id automatically", "No index is created on the referencing column; you should usually add one", "The customer table loses its primary key index", "Postgres refuses the FK until an index exists"]} answer={1}>
+
+Postgres requires the *referenced* side to be unique (so it is indexed), but doesn't index the *referencing* column. MySQL InnoDB, by contrast, creates one automatically if missing.
+
+</MCQ>
+
+<MCQ q="In Postgres, what is the difference between ON DELETE RESTRICT and ON DELETE NO ACTION?" options={["None at all", "RESTRICT cascades, NO ACTION does not", "NO ACTION can be deferred to commit time with a deferrable constraint; RESTRICT is checked immediately", "NO ACTION silently ignores the violation"]} answer={2}>
+
+Both reject deletes that would leave orphans. NO ACTION is checked after the statement and can be deferred to the end of the transaction. RESTRICT can't be deferred. In MySQL InnoDB the two are equivalent.
+
+</MCQ>
+
+<MCQ q="How should an M:N relationship between students and courses be mapped?" options={["A course_id column on student", "A student_id column on course", "A junction table with both foreign keys and a composite key", "A comma-separated list of course IDs on student"]} answer={2}>
+
+A single FK column on either side allows only one partner per row. A junction table holds one row per pair and can carry relationship attributes such as grade.
+
+</MCQ>
+
+<MCQ q="Which mapping fits a weak entity order_item owned by orders?" options={["PK (line_no) only", "PK (order_id, line_no), with order_id an FK, usually ON DELETE CASCADE", "No primary key", "PK (product_id)"]} answer={1}>
+
+A weak entity is identified by its owner's key plus its partial key. It can't exist without the owner, so cascading the delete is the usual choice.
+
+</MCQ>
+
+<MCQ q="Which attribute is best stored in a separate table?" options={["A customer's date of birth", "A customer's multiple phone numbers", "A customer's age", "A product's price"]} answer={1}>
+
+Multivalued attributes get their own table. Date of birth and price are simple attributes, and age is derived from date of birth, so it normally isn't stored.
+
+</MCQ>
+
+<MCQ q="Every order must have a customer, but a customer may have no orders. How is this expressed in the schema?" options={["orders.customer_id NOT NULL foreign key", "customer.order_id NOT NULL", "A UNIQUE constraint on orders.customer_id", "A junction table customer_order"]} answer={0}>
+
+Total participation of orders in the 1:N relationship means the FK on the N side is NOT NULL. A UNIQUE constraint would make it 1:1, and a junction table would allow M:N.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **Superkey** = unique. **Candidate key** = minimal superkey. **Primary key** = the chosen candidate key (unique + NOT NULL). **Alternate keys** = the other candidate keys → `UNIQUE NOT NULL`.
+- **Prime attribute** = part of *any* candidate key.
+- **Composite key** = multi-column key; column order matters for the index.
+- **Foreign key** → referential integrity. Defaults to `NO ACTION`. `CASCADE` only into weak entities. `SET NULL` for optional links.
+- Postgres: index your FKs yourself; `NO ACTION` is deferrable, `RESTRICT` isn't. InnoDB: auto-indexes FKs; `NO ACTION` = `RESTRICT`; no `SET DEFAULT`.
+- **Surrogate PK + UNIQUE natural key** is the default. In InnoDB, avoid random UUIDv4 PKs; prefer sequences or UUIDv7.
+- ER: entities → tables; composite → flatten; multivalued → own table; derived → don't store; weak → PK (owner, partial key).
+- 1:N → FK on N side. 1:1 → FK + UNIQUE. M:N → junction table. Total participation → NOT NULL.
+
+## Go deeper
+
+- **PostgreSQL docs**: [Constraints, including foreign keys and referential actions](https://www.postgresql.org/docs/current/ddl-constraints.html).
+- **MySQL 8.4 docs**: [FOREIGN KEY constraints](https://dev.mysql.com/doc/refman/8.4/en/create-table-foreign-keys.html).
+- **PostgreSQL docs**: [Identity columns](https://www.postgresql.org/docs/current/ddl-identity-columns.html).
+- **Book**: Silberschatz, Korth, Sudarshan, *Database System Concepts*, chapters on the relational model and E-R modeling ([db-book.com](https://db-book.com/)).
+- **Book**: Ramakrishnan and Gehrke, *Database Management Systems*, chapter 2 (The Entity-Relationship Model) ([book site](https://pages.cs.wisc.edu/~dbbook/)).
+- Next: [Normalization](/learn/notes/normalization/), which uses candidate keys to decide how to split tables.

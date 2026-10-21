@@ -1,0 +1,497 @@
+---
+title: "Memory and Garbage Collection: Stack, Heap, GC Algorithms"
+phase: "12-runtimes-os"
+order: 119
+tags: ["runtimes", "gc", "jvm", "go", "python", "memory"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 18
+prerequisites: ["compilation-jit-bytecode"]
+summary: "Where your objects live (stack vs heap, escape analysis), how runtimes free them (reference counting vs tracing, mark-sweep, compacting, copying, generational), how the JVM, Go and CPython collectors differ, and how to read GC symptoms and hunt leaks in production."
+---
+
+## Definition (interview-ready)
+
+Every program needs memory for two kinds of data:
+
+- **The stack**: one per thread. It holds function call **frames** (local variables, arguments, return address). It's allocated and freed automatically, in LIFO order, just by moving a pointer when functions are called and return. Very fast, but data on it dies when the function returns.
+- **The heap**: one shared pool for data that must outlive a function call or whose size isn't known in advance. Something has to decide when heap memory can be reused.
+
+**Garbage collection (GC)** is the runtime automatically finding heap objects the program can no longer reach and reclaiming their memory. There are two main families:
+
+- **Reference counting**: each object counts how many references point to it and is freed when the count hits zero (CPython).
+- **Tracing**: periodically start from the **roots** (stacks, globals, registers), follow every pointer, mark what's reachable, and reclaim the rest (JVM, Go, .NET, V8).
+
+**One-liner:** Garbage collection automatically frees heap objects the program can no longer reach, either by reference counting or by tracing from the roots; it trades CPU time and memory headroom for safety, and each collector picks a point on the triangle of pause time, throughput and memory footprint.
+
+## Why it matters
+
+- **Latency.** A stop-the-world pause freezes every application thread. A 2-second full GC shows up as a 2-second p99 spike, timeouts, and maybe a Kafka consumer kicked from its group or a node marked dead by health checks.
+- **Throughput and cost.** GC CPU is CPU you pay for. Too small a heap means GC runs constantly.
+- **OOM kills.** In containers, a heap sized carelessly against the container limit gets the process killed by the kernel, with no Java stack trace at all.
+- **Leaks still happen** in GC languages. GC frees *unreachable* objects. If you keep a reference by accident, it's not garbage.
+- Interviewers use GC to test whether you understand what your runtime is doing under load.
+
+## Core concepts
+
+### Stack vs heap: what lives where
+
+```
+ Thread 1 stack         Thread 2 stack              Heap (shared)
+ ┌──────────────┐       ┌──────────────┐       ┌──────────────────────────┐
+ │ main()       │       │ worker()     │       │  Order{id=7, items=…} ◄──┼── ref from stack
+ │  order ──────┼───┐   │  i = 3       │       │  ArrayList[…]            │
+ │ price()      │   │   │  buf ────────┼──┐    │  byte[4096]  ◄───────────┼── ref from stack
+ │  total = 42  │   └──►│              │  └───►│  String "hello"          │
+ └──────────────┘       └──────────────┘       └──────────────────────────┘
+   frames pushed/popped                          objects freed by the GC
+   on call/return
+```
+
+| | Stack | Heap |
+|---|---|---|
+| Scope | One per thread (or per goroutine in Go) | Shared by all threads |
+| Lifetime | Until the function returns | Until no longer reachable (GC) or freed manually |
+| Allocation cost | Move a pointer | Find free space (often a fast "bump pointer" in a thread-local buffer), and later GC cost |
+| Size | Small: a JVM thread stack is typically around 1 MB (`-Xss`); Go goroutine stacks start at a few KB and grow | Large: GBs |
+| Failure mode | `StackOverflowError` (deep recursion) | `OutOfMemoryError`, OOM kill |
+
+In **Java**, primitives and references inside a method live in the frame, but every object created with `new` is, *by the language model*, on the heap. In **Python**, everything is an object on the heap; frames hold references. In **Go**, the compiler decides per variable, using escape analysis.
+
+### Escape analysis
+
+**Escape analysis** is the compiler asking: "Can a reference to this object leave the function (be returned, stored in a field or global, sent to another goroutine or thread)?" If not, the object doesn't need to live on the GC heap.
+
+**Go** uses it to decide stack vs heap. You can see the decisions:
+
+```go
+type point struct{ x, y int }
+
+func sum() int        { p := point{1, 2}; return p.x + p.y } // p stays on the stack
+func newPoint() *point { p := point{1, 2}; return &p }       // p escapes
+```
+
+```
+$ go build -gcflags=-m esc.go
+./esc.go:6:26: moved to heap: p
+```
+
+Returning `&p` is perfectly safe in Go: the compiler simply allocates `p` on the heap. Common reasons things escape: returning pointers, storing in interfaces, closures that outlive the call, and values too large or of unknown size.
+
+**Java (HotSpot C2)** also does escape analysis, enabled by default since Java 6u23, but it doesn't literally move objects to the stack. For objects that never escape, C2 does **scalar replacement**: it breaks the object into its fields, keeps them in registers or the frame, and removes the allocation entirely. It can also remove locks on thread-local objects (**lock elision**). This only happens in C2-compiled hot code (see [Compiled vs Interpreted, Bytecode and JIT](/learn/notes/compilation-jit-bytecode/)).
+
+### Manual vs automatic memory management
+
+| Approach | Languages | Pros | Cons |
+|---|---|---|---|
+| Manual (`malloc`/`free`, `new`/`delete`) | C, C++ | Full control, no GC pauses | Use-after-free, double free, leaks, buffer overflows |
+| Ownership / RAII at compile time | Rust (and C++ smart pointers) | Freed deterministically, no GC, memory-safe (Rust) | Steeper learning curve, borrow checker |
+| Reference counting | CPython, Swift (ARC), C++ `shared_ptr` | Frees immediately and predictably | Count updates cost CPU; cycles leak without extra help |
+| Tracing GC | Java, Go, C#, JavaScript | Handles cycles, simple for programmers, fast allocation | Pauses, extra memory headroom, less predictable timing |
+
+### Reference counting (CPython)
+
+Every CPython object has a reference count. Assigning it to a variable, putting it in a list, or passing it as an argument increments the count; dropping a reference decrements it. At zero, the object is freed **immediately**. That's why, in CPython, a file object whose last reference disappears is closed right away. Still use `with`: other Python implementations (like PyPy) don't use reference counting.
+
+```python
+import sys
+a = []
+b = a
+print(sys.getrefcount(a))   # 3: a, b, and the temporary argument
+```
+
+The flaw: **cycles**. If two objects reference each other and nothing else references them, both counts stay at 1 forever.
+
+```python
+class Node: pass
+x = Node(); y = Node()
+x.other = y; y.other = x
+del x, y      # counts never reach 0 — only the cycle collector can free them
+```
+
+So CPython adds a **cyclic garbage collector** (the `gc` module) that only looks at *container* objects (lists, dicts, class instances…). Its trick, from the CPython internals docs:
+
+1. Copy each container's refcount into a scratch field.
+2. For every container, subtract one from the scratch count of each container it references. What's left is the number of references coming from **outside** the group.
+3. Anything with an outside reference is reachable, and so is everything reachable from it. The rest is an unreachable cycle and gets freed.
+
+The default build's cycle collector is **generational**: new containers start in the youngest generation and get promoted if they survive, so long-lived objects are scanned less often. Version notes: 3.14.0 to 3.14.4 shipped an incremental collector that was reverted to the 3.13 generational design in 3.14.5 after reports of memory pressure; the **free-threaded** build's collector is non-generational and pauses other threads while it runs. `gc.disable()` turns off only the cycle collector — reference counting keeps working.
+
+### Tracing GC: the three classic algorithms
+
+All tracing collectors start with **marking**: begin at the roots and follow every reference, marking each object reached. Unmarked objects are garbage. They differ in what happens next.
+
+**1. Mark-sweep.** Walk the heap and put unmarked objects on free lists.
+
+```
+before:  [A][x][B][x][x][C][x]       x = garbage
+after:   [A][ ][B][ ][ ][C][ ]       holes reused via free lists
+```
+
+Doesn't move objects (fine for languages with raw pointers). Leaves **fragmentation**: plenty of free memory in total, but maybe no single hole large enough.
+
+**2. Mark-compact.** After marking, slide live objects together and update every pointer to them.
+
+```
+after:   [A][B][C][            ]     one contiguous free region
+```
+
+No fragmentation and allocation becomes a simple pointer bump. Costs extra passes and requires updating references.
+
+**3. Copying (semi-space / evacuation).** Split memory into regions. Copy live objects from the "from" space into the "to" space, then treat the whole "from" space as empty.
+
+```
+from: [A][x][B][x][x][C]   ──copy live──►   to: [A][B][C][      ]
+```
+
+Cost is proportional to **live** objects, not heap size, so it's great when most objects are dead. Downside: needs spare space to copy into.
+
+### The generational hypothesis
+
+The **weak generational hypothesis**: *most objects die young.* Request objects, temporary strings, iterators, DTOs — created and dropped within milliseconds. A few objects (caches, connection pools, config) live for the whole process.
+
+Generational collectors exploit that:
+
+```
+ ┌────────── young generation ──────────┐ ┌──────── old generation ────────┐
+ │ eden (new objects) │ survivor │ surv. │ │ long-lived objects             │
+ └──────────────────────────────────────┘ └────────────────────────────────┘
+   frequent, cheap minor GCs (copying)       rare, expensive major/full GCs
+   survivors age; old enough ─────────────► promoted
+```
+
+- **Minor GC** collects only the young generation, usually with copying. Since most objects are dead, there's little to copy. Fast.
+- Objects that survive several minor GCs are **promoted** to the old generation, which is collected rarely.
+- The catch: an old object can point to a young one. To avoid scanning the whole old generation on every minor GC, the runtime uses a **write barrier** (a small piece of code run on every reference store) to record old-to-young pointers in a **remembered set / card table**.
+
+### Concurrent marking and tri-color invariant
+
+To shrink pauses, modern collectors mark **while the application keeps running**. The standard model is **tri-color marking**:
+
+- **White**: not yet seen (garbage if still white at the end).
+- **Grey**: reached, but its references haven't been scanned yet.
+- **Black**: reached and fully scanned.
+
+Marking moves objects white → grey → black until no grey objects remain. The danger: while marking runs, the application (the "mutator") could store a pointer to a white object into a black object and delete the only other path to it. The collector would never revisit the black object and would free a live object. **Barriers** prevent this: a **write barrier** (Go, G1, CMS, and the marking phase of Shenandoah and generational ZGC) records or shades pointers as they are written, so the invariant becomes "no black object points to a white object without the GC knowing". Collectors that also move objects concurrently (ZGC, Shenandoah) add a **load barrier**, which checks each reference as it is read and fixes it up if the object has moved.
+
+### JVM collectors
+
+Serial, Parallel and G1 split the heap into young and old generations. ZGC has been generational since JDK 21, and Shenandoah is single-generation unless you turn on its generational mode.
+
+| Collector | Flag | How it works | Pauses | Best for |
+|---|---|---|---|---|
+| **Serial** | `-XX:+UseSerialGC` | One thread, stop-the-world for everything | Long for big heaps | Small heaps (around 100 MB), single CPU, tiny containers |
+| **Parallel** | `-XX:+UseParallelGC` | Many threads, but still stop-the-world | Can be 1 s or more on big heaps | Max **throughput**: batch jobs where pauses don't matter. Default before JDK 9 |
+| **G1** | `-XX:+UseG1GC` | Heap split into equal **regions**; concurrent marking; copies live objects out of the regions with the most garbage first ("garbage first") | Aims for a pause goal, `-XX:MaxGCPauseMillis` (default 200 ms) | **Default since JDK 9** (JEP 248). Balanced, general purpose |
+| **ZGC** | `-XX:+UseZGC` | Marking *and* relocation (compaction) run concurrently, using colored pointers and load barriers | Sub-millisecond, independent of heap size | Low latency, heaps up to 16 TB. Production since JDK 15; **generational since JDK 21** (JEP 439), generational by default in JDK 23, non-generational mode removed in JDK 24 |
+| **Shenandoah** | `-XX:+UseShenandoahGC` | Concurrent marking *and* concurrent compaction | Short, independent of heap size | Low latency. Production since JDK 15 (JEP 379); generational mode experimental in JDK 24, product feature in JDK 25 (still not the default) |
+
+G1 details interviewers like:
+
+- **Young-only phase**, then once old-gen occupancy crosses the IHOP threshold, a **concurrent marking** cycle, then **mixed collections** that evacuate young regions plus the old regions with the most garbage.
+- **Humongous objects**: anything at least half a region is put into contiguous dedicated regions, and can waste space. Lots of big arrays → consider a bigger `-XX:G1HeapRegionSize`.
+- If concurrent work can't keep up, G1 falls back to a slow **Full GC** (stop-the-world compaction). Frequent full GCs are a red flag.
+
+The core trade-off:
+
+```
+ throughput ◄──────────────────────────────────────────► low pause
+   Parallel            G1                  ZGC / Shenandoah
+   (all STW,           (balanced,          (mostly concurrent; costs
+    max throughput)     pause goal)         barrier overhead and CPU headroom)
+```
+
+Concurrent collectors aren't free: they need spare CPU to run alongside the app, and barriers add a little cost to every reference load or store. If allocation outpaces the collector, they stall allocating threads.
+
+For heap layout, metaspace and JVM memory flags, see [JVM Memory](/learn/notes/jvm-memory/).
+
+### Go's garbage collector
+
+From the runtime source and the Go GC guide, Go's collector is:
+
+- **Concurrent mark-sweep**: most work runs alongside your goroutines. There are two short stop-the-world phases (sweep termination and mark termination) per cycle.
+- **Tri-color**, with a **write barrier** that is switched on only during marking.
+- **Non-moving** (no compaction) and **non-generational**. The Go team tried generational designs and found the write barrier cost too high; escape analysis already keeps many short-lived objects on goroutine stacks, which takes away much of the generational win.
+- **Green Tea** (experiment in Go 1.25, default in Go 1.26): same mark-sweep algorithm, but it scans memory a page at a time instead of jumping from object to object, which is friendlier to CPU caches. The Go 1.26 notes expect roughly 10–40% less GC overhead for GC-heavy programs.
+
+**Pacing with GOGC.** Go doesn't have a fixed heap size. After each cycle it sets a target:
+
+```
+target heap = live heap + (live heap + GC roots) × GOGC / 100
+```
+
+`GOGC=100` (the default) means "let the heap grow by about 100% of what was live before collecting again". Doubling `GOGC` roughly doubles memory overhead and halves GC CPU. `GOGC=off` disables GC.
+
+**GOMEMLIMIT** (Go 1.19+) sets a **soft** limit on the Go runtime's total memory. As memory approaches the limit, the GC runs more often. It's soft because if live data truly exceeds it, Go would rather keep running than spin forever. The runtime caps GC at roughly **50% of CPU** over a time window, so a too-low limit causes at most about a 2x slowdown instead of a total stall ("death spiral").
+
+The container recipe: set `GOMEMLIMIT` to roughly 90% of the container memory limit (leaving room for non-Go memory such as cgo and the binary). Some teams also raise `GOGC` or set `GOGC=off` with a limit so the GC only works hard when memory actually gets tight.
+
+Watch it with `GODEBUG=gctrace=1` (one line per GC cycle) or `runtime/metrics`. See [Go Runtime and Scheduler](/learn/notes/go-runtime-scheduler/) for goroutine stacks.
+
+### Comparing the three runtimes
+
+| | JVM (G1 default) | Go | CPython |
+|---|---|---|---|
+| Main mechanism | Tracing, generational | Tracing, concurrent mark-sweep | Reference counting + cycle collector |
+| Moves objects? | Yes (copying/compaction) | No | No |
+| Generational? | Yes (ZGC and Shenandoah too, in recent JDKs) | No | Cycle collector: yes in the default build |
+| Main knobs | `-Xmx`, `-Xms`, collector choice, `MaxGCPauseMillis` | `GOGC`, `GOMEMLIMIT` | `gc.set_threshold`, `gc.disable`, `gc.freeze` |
+| Typical pain | Pauses, full GCs, heap sizing in containers | GC CPU with high allocation rates | Refcount overhead; cycles with finalizers; memory not returned to the OS |
+
+### GC tuning signals (what to look at, and say, in an interview)
+
+Before tuning, **measure**. Turn on GC logs (`-Xlog:gc*` on JDK 9+, `GODEBUG=gctrace=1` in Go) and look at:
+
+- **Pause times** (p99, max) vs your latency SLO.
+- **GC CPU share**: how much CPU goes to GC. High = heap too small or allocation rate too high.
+- **Allocation rate** (MB/s): the biggest lever. Allocating less beats any flag.
+- **Promotion rate**: lots of objects surviving to old gen means premature promotion or real long-lived growth.
+- **Live heap after GC** over time: a sawtooth whose **floor keeps rising** = leak. A flat floor = healthy.
+- **Full GCs** (JVM): should be rare to never with G1.
+
+Fix in this order:
+
+1. **Allocate less**: reuse buffers, avoid boxing, stream instead of loading everything, fix N+1 object creation.
+2. **Right-size the heap**: in containers use `-XX:MaxRAMPercentage` (JVM) or `GOMEMLIMIT` (Go) so the runtime knows the real limit. Leave room for off-heap memory, thread stacks and metaspace.
+3. **Pick the right collector**: latency-critical with big heaps → ZGC; throughput batch → Parallel; general → G1.
+4. Only then touch fine-grained flags.
+
+### Memory leaks in garbage-collected languages
+
+GC frees only what's **unreachable**. A leak in Java, Go or Python means something reachable is holding references you forgot about:
+
+- **Unbounded caches and static maps**: `static Map` used as a cache with no eviction. Use a bounded cache (Caffeine, `functools.lru_cache(maxsize=…)`).
+- **Listeners and callbacks** registered and never unregistered.
+- **`ThreadLocal` in thread pools** (Java): pool threads never die, so their thread-local values never go away. Always `remove()`.
+- **Goroutine leaks** (Go): goroutines blocked forever on a channel or a request without a timeout. Each holds its stack and everything it references. Watch `runtime.NumGoroutine()` and use contexts with deadlines.
+- **Sub-slices** (Go): a small slice of a huge array keeps the whole array alive. Copy what you need.
+- **Unclosed resources**: connections, file handles, native buffers. These leak outside the heap.
+- **Python**: module-level lists or dicts that only grow; `lru_cache` on methods (it holds `self`); reference cycles involving objects with `__del__` in old Python versions.
+- **Off-heap memory** (direct `ByteBuffer`s, native libraries, cgo): the heap looks fine, but the process's RSS keeps growing.
+
+Hunting tools: heap dumps and Eclipse MAT or JFR (JVM), `pprof` heap profiles (Go), `tracemalloc` and `gc.get_objects()` (Python). Compare two snapshots taken some time apart and look at what grew.
+
+## How it works (a G1 young GC, step by step)
+
+1. Request threads allocate objects in **TLABs** (thread-local allocation buffers) inside eden regions — usually just a pointer bump, no locking.
+2. Eden fills up. G1 triggers a **young GC**: a stop-the-world pause with many parallel GC threads.
+3. Roots are scanned: thread stacks, static fields, and the **remembered sets** of young regions (old-to-young pointers recorded by the write barrier).
+4. Live objects in eden are **copied** to survivor regions. Objects in survivors that are old enough are copied to old regions (**promotion**).
+5. Eden regions are now completely free. The pause ends — typically milliseconds, because few objects were alive.
+6. As old regions fill and cross IHOP, a **concurrent mark** runs alongside the app, and later **mixed GCs** evacuate the old regions with the most garbage.
+
+## Real-world examples
+
+- **JDK 9** made G1 the default collector (JEP 248), replacing Parallel, on the reasoning that limiting pauses matters more to most users than maximum throughput.
+- **JDK 21** added generational ZGC (JEP 439); **JDK 23** made it ZGC's default mode (JEP 474); **JDK 24** removed non-generational ZGC (JEP 490).
+- **Go 1.19** added the soft memory limit (`GOMEMLIMIT`), so a service can tell the GC about its real memory budget instead of relying on `GOGC` alone.
+- **Go 1.26** turned on the Green Tea collector by default.
+- **CPython 3.14.5** reverted the incremental cycle collector because of memory pressure reports in production.
+
+## Common pitfalls
+
+- **Saying "Java allocates on the stack after escape analysis".** HotSpot does scalar replacement, not stack allocation.
+- **Setting `-Xmx` equal to the container limit.** Metaspace, thread stacks, code cache and direct buffers live outside the heap; the kernel OOM-kills the process.
+- **Calling `System.gc()` or `gc.collect()` to "fix" memory.** It hides the problem and can cause full pauses.
+- **Huge heaps with a throughput collector** in latency-sensitive services: rare but multi-second pauses.
+- **Tuning flags before reducing allocation.**
+- **Assuming Go's GC compacts or is generational.** It does neither.
+- **Thinking `gc.disable()` stops all Python memory freeing.** Reference counting continues; only cycles go uncollected.
+- **Ignoring goroutine and `ThreadLocal` leaks** because "the language has GC".
+- **Not looking at the floor of the heap sawtooth.** Peaks don't tell you about leaks; the post-GC floor does.
+
+## Practice questions
+
+<Practice>
+
+<QA q="What is the difference between the stack and the heap?" level="easy">
+
+The **stack** is per thread and holds call frames: local variables, arguments and return addresses. It's allocated and freed by moving a pointer on call and return, so it's very fast, but data dies when the function returns. The **heap** is shared memory for data that must outlive a call or whose size is dynamic; it's freed manually or by a garbage collector. Stack overflows come from deep recursion; heap exhaustion gives OutOfMemoryError or an OOM kill.
+
+</QA>
+
+<QA q="What is the generational hypothesis and how do collectors use it?" level="easy">
+
+Most objects die young. Generational collectors split the heap into a young and an old generation. New objects go into the young generation, which is collected often and cheaply, usually by copying the few survivors. Objects that survive several collections are promoted to the old generation, which is collected rarely. A write barrier records old-to-young pointers so a minor GC doesn't need to scan the old generation.
+
+</QA>
+
+<QA q="How does CPython manage memory?" level="easy">
+
+Mainly with **reference counting**: every object counts references to it and is freed immediately when the count reaches zero. Reference counting can't free **cycles** (A references B, B references A), so CPython also runs a **cyclic garbage collector** over container objects. In the default build it is generational, so young objects are checked more often. `gc.disable()` only turns off the cycle collector; reference counting keeps working.
+
+</QA>
+
+<QA q="Compare mark-sweep, mark-compact and copying collection." level="medium">
+
+All three mark live objects from the roots first.
+
+- **Mark-sweep** frees unmarked objects in place. No object movement, but fragmentation.
+- **Mark-compact** slides live objects together and updates pointers. No fragmentation, bump-pointer allocation, but extra passes.
+- **Copying** copies live objects to a fresh space and frees the old one wholesale. Cost is proportional to live data, ideal when most objects are dead (young generation), but it needs spare space.
+
+</QA>
+
+<QA q="What is escape analysis? How do Go and Java use it differently?" level="medium">
+
+The compiler checks whether a reference to an object can leave its function (returned, stored globally, captured, sent to another thread). **Go** uses it to choose stack vs heap: non-escaping values go on the goroutine stack; `go build -gcflags=-m` prints decisions like `moved to heap: p`. **Java** (HotSpot C2) doesn't stack-allocate; for non-escaping objects it does **scalar replacement**, turning fields into locals so the allocation disappears, and can elide locks on thread-local objects. It only applies in C2-compiled hot code.
+
+</QA>
+
+<QA q="Explain tri-color marking and why concurrent collectors need barriers." level="medium">
+
+Objects are **white** (unvisited), **grey** (visited, children not scanned), or **black** (fully scanned). Marking turns roots grey and repeatedly blackens grey objects while greying their children; whatever is still white at the end is garbage. When the application runs concurrently, it could store a pointer to a white object into a black one and remove the other path to it, so a live object would be freed. **Barriers** prevent that: a write barrier records or shades pointers on store (Go, G1). Collectors that also relocate objects concurrently (ZGC, Shenandoah) add a load barrier that fixes up references to moved objects when they are read.
+
+</QA>
+
+<QA q="Compare the JVM's Serial, Parallel, G1, ZGC and Shenandoah collectors." level="medium">
+
+- **Serial**: single-threaded, stop-the-world. Small heaps and tiny containers.
+- **Parallel**: multi-threaded but stop-the-world. Max throughput, long pauses. Default before JDK 9.
+- **G1**: region-based, concurrent marking, evacuates regions with the most garbage first, targets a pause goal (`MaxGCPauseMillis`, default 200 ms). **Default since JDK 9.**
+- **ZGC**: concurrent marking and relocation with load barriers and colored pointers, sub-millisecond pauses independent of heap size, generational since JDK 21 (default mode JDK 23).
+- **Shenandoah**: concurrent marking and compaction, short pauses independent of heap size; generational mode is a product feature in JDK 25 but not the default.
+
+Throughput vs pause time vs memory/CPU headroom: you can't max all three.
+
+</QA>
+
+<QA q="How does Go's garbage collector work, and why is it not generational?" level="medium">
+
+It's a **concurrent, tri-color, non-moving mark-sweep** collector. Most marking runs alongside goroutines, with a write barrier enabled only during marking, and two short stop-the-world phases per cycle. It's **non-generational** because the Go team found the write barrier cost of their generational experiments too high, and escape analysis already keeps many short-lived values on goroutine stacks. Since Go 1.26 the Green Tea implementation scans memory page by page for better cache locality.
+
+</QA>
+
+<QA q="What do `GOGC` and `GOMEMLIMIT` do?" level="medium">
+
+`GOGC` (default 100) sets how much the heap may grow relative to the live heap (plus roots) before the next GC: target = live + (live + roots) × GOGC/100. Higher → less GC CPU, more memory. `GOMEMLIMIT` (Go 1.19+) is a **soft** cap on total Go runtime memory; near it, the GC runs more often regardless of GOGC. GC CPU is capped at about 50% to avoid a death spiral. In containers set `GOMEMLIMIT` a bit below the container limit.
+
+</QA>
+
+<QA q="Can you have a memory leak in a garbage-collected language? Give examples." level="medium">
+
+Yes. GC frees unreachable objects; a leak is objects that stay **reachable** by mistake. Examples: unbounded static maps or caches, listeners never unregistered, `ThreadLocal` values on pool threads, goroutines blocked forever on channels, small Go sub-slices pinning huge arrays, Python module-level lists that only grow, `lru_cache` on methods holding `self`, and off-heap leaks (direct buffers, native memory, unclosed connections). Diagnose with heap snapshots over time and look at what grows.
+
+</QA>
+
+<QA q="What are the main G1 phases, and what is a humongous object?" level="hard">
+
+G1 cycles through a **young-only** phase (stop-the-world, parallel evacuation of eden and survivors) and, when old-gen occupancy passes the IHOP threshold, a **concurrent marking** cycle (with short Remark and Cleanup pauses), followed by a **space-reclamation** phase of **mixed collections** that also evacuate the old regions with the most garbage. If it can't keep up, it falls back to a stop-the-world **Full GC**. A **humongous object** is one at least half a region in size; it's allocated in contiguous dedicated regions, can waste space, and is reclaimed less eagerly. Many large arrays → consider a larger region size or reducing those allocations.
+
+</QA>
+
+<QA q="Why do concurrent collectors like ZGC not give you low latency for free?" level="hard">
+
+They move work from pauses into the background, which costs: **barriers** on reference loads or stores slow the application a little; GC threads need **spare CPU** running alongside the app; and they need **memory headroom**, because the app keeps allocating while a cycle is in progress. If allocation outpaces collection, application threads get stalled (allocation stalls), which looks like a pause anyway. You trade throughput and memory for pause times.
+
+</QA>
+
+<QA q="A Java service in Kubernetes is OOM-killed (exit 137) but the heap dump shows the heap was only 60% used. What is going on?" level="scenario">
+
+The kernel killed the process because **total process memory** (RSS) exceeded the container limit, not because the Java heap filled up. Non-heap memory adds up: metaspace, thread stacks (one per thread), JIT code cache, GC data structures, direct `ByteBuffer`s (Netty), and native libraries. Fixes: size the heap as a percentage of the container (`-XX:MaxRAMPercentage`, leaving 25% or more for non-heap), cap direct memory (`-XX:MaxDirectMemorySize`), check thread count, and use Native Memory Tracking (`-XX:NativeMemoryTracking=summary` with `jcmd VM.native_memory`) to see where the rest goes.
+
+</QA>
+
+<QA q="p99 latency on a Java API has periodic 3-second spikes, and GC logs show Full GC events. How do you approach it?" level="scenario">
+
+1. Confirm the correlation in GC logs (`-Xlog:gc*`): Full GC timestamps match the spikes.
+2. Find the cause: is the post-GC heap floor rising (a **leak**, so take heap dumps and compare), is the **allocation or promotion rate** too high, are there **humongous allocations**, or did concurrent marking start too late (to-space exhausted)?
+3. Fix the cause first: remove the leak, reduce allocation, bound caches.
+4. Then tune: more heap headroom, start marking earlier (lower IHOP), and if latency is the priority with a large heap, switch to **generational ZGC**.
+
+</QA>
+
+<QA q="A Go service's CPU is 30% higher than expected and pprof shows lots of time in `runtime.gcBgMarkWorker` and `mallocgc`. What do you do?" level="scenario">
+
+The service is GC-bound because it **allocates heavily**. First reduce allocation: use `pprof` allocation profiles to find hotspots, check `-gcflags=-m` for values escaping to the heap unnecessarily (interfaces, returned pointers, closures), reuse buffers with `sync.Pool`, and preallocate slices and maps. Then tune: if memory is available, raise `GOGC` to trade memory for fewer cycles, and set `GOMEMLIMIT` near the container limit so the GC stays relaxed until memory is actually tight. On Go 1.26+, Green Tea is already on by default.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="Which JVM collector became the default in JDK 9?" options={["Parallel", "G1", "ZGC", "Serial"]} answer={1}>
+
+JEP 248 made G1 the default on server-class configurations in JDK 9, replacing Parallel. ZGC is opt-in, and Serial is only picked automatically on small or single-CPU machines.
+
+</MCQ>
+
+<MCQ q="What does reference counting fail to reclaim on its own?" options={["Objects with a single reference", "Large objects", "Objects created in a loop", "Unreachable reference cycles"]} answer={3}>
+
+Objects in a cycle keep each other's counts above zero even when nothing outside points to them, which is why CPython adds a cycle collector. The other options are reclaimed normally.
+
+</MCQ>
+
+<MCQ q="What does HotSpot's escape analysis do for an object that never escapes a hot method?" options={["Allocates it on the thread stack", "Moves it straight to the old generation", "Scalar-replaces it, removing the allocation in C2-compiled code", "Marks it as a GC root"]} answer={2}>
+
+Oracle's docs state that HotSpot does not replace heap allocation with stack allocation; it removes scalar-replaceable allocations (and their locks) in C2 code. Promotion and roots are unrelated.
+
+</MCQ>
+
+<MCQ q="Which statement about Go's garbage collector is correct?" options={["It is a concurrent, non-moving, non-generational mark-sweep collector", "It is a generational copying collector", "It uses reference counting with a cycle detector", "It stops the world for the entire mark phase"]} answer={0}>
+
+The Go runtime describes its GC as concurrent, non-generational and non-compacting mark-sweep, with only short stop-the-world phases at sweep termination and mark termination.
+
+</MCQ>
+
+<MCQ q="With GOGC=100, roughly when does the next Go GC cycle start?" options={["Every 100 ms", "When the heap reaches 100 MB", "When the heap has grown by about 100% of the live heap plus roots since the last cycle", "After 100 allocations"]} answer={2}>
+
+The target is live + (live + roots) × GOGC/100, so 100 lets the heap roughly double. It is not time-based, size-based or count-based.
+
+</MCQ>
+
+<MCQ q="Why is GOMEMLIMIT a soft limit?" options={["It only applies on Linux", "The runtime caps GC CPU at roughly 50% so it keeps running instead of thrashing when live data exceeds the limit", "It is ignored when GOGC is set", "It only counts goroutine stacks"]} answer={1}>
+
+If live memory truly exceeds the limit, a hard limit would make the GC run forever. Go caps GC CPU so the program at worst slows down. It works with GOGC=off and covers runtime-managed memory broadly.
+
+</MCQ>
+
+<MCQ q="A Java service's heap usage after each GC keeps rising across hours. What does that most likely indicate?" options={["A healthy sawtooth pattern", "The young generation is too large", "The JIT is warming up", "A memory leak: objects remain reachable and accumulate"]} answer={3}>
+
+The post-GC floor is live data; if it keeps climbing, something is holding references. A healthy sawtooth returns to a flat floor, and young-gen size or JIT warmup don't cause steady live-data growth.
+
+</MCQ>
+
+<MCQ q="What is the main purpose of a write barrier in a generational or concurrent collector?" options={["Encrypt references in memory", "Record or shade pointer stores so the GC does not miss live objects or old-to-young references", "Prevent two threads from writing the same field", "Flush CPU caches before GC"]} answer={1}>
+
+Write barriers track old-to-young pointers (remembered sets) and preserve the tri-color invariant during concurrent marking. They are not about encryption, mutual exclusion or cache flushing.
+
+</MCQ>
+
+<MCQ q="Which JDK release removed ZGC's non-generational mode?" options={["JDK 17", "JDK 21", "JDK 24", "JDK 11"]} answer={2}>
+
+JEP 439 added generational ZGC in JDK 21, JEP 474 made it the default mode in JDK 23, and JEP 490 removed the non-generational mode in JDK 24.
+
+</MCQ>
+
+<MCQ q="A copying collector's cost is mainly proportional to what?" options={["The number of live objects copied", "The total heap size", "The number of threads", "The number of dead objects"]} answer={0}>
+
+Copying only touches survivors; dead objects are freed wholesale with their space. That is why copying suits the young generation, where most objects are dead.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **Stack**: per thread, frames, pointer-bump, dies on return. **Heap**: shared, outlives calls, needs freeing.
+- **Escape analysis**: Go → stack vs heap (`-gcflags=-m`). Java C2 → scalar replacement and lock elision, not stack allocation.
+- **Refcounting** (CPython): immediate frees, cycles need the cycle collector. **Tracing**: mark from roots, then sweep / compact / copy.
+- **Generational hypothesis**: most objects die young → cheap frequent young GCs, rare old GCs, write barrier for old-to-young pointers.
+- **Tri-color + barriers** make concurrent marking safe.
+- **JVM**: Serial (tiny), Parallel (throughput), **G1 default since 9** (pause goal 200 ms), **ZGC** (sub-ms; generational since 21, only mode since 24), **Shenandoah** (concurrent compaction; generational product in 25).
+- **Go**: concurrent tri-color mark-sweep, non-moving, non-generational; `GOGC=100`, `GOMEMLIMIT` soft limit (1.19+); Green Tea default in 1.26.
+- **Tuning**: measure (GC logs) → allocate less → size heap for the container → choose collector → then flags. Rising post-GC floor = leak.
+- **Leaks with GC**: unbounded caches, listeners, ThreadLocal, goroutine leaks, sub-slices, off-heap memory.
+
+## Go deeper
+
+- **Oracle**: [HotSpot Virtual Machine Garbage Collection Tuning Guide (JDK 21)](https://docs.oracle.com/en/java/javase/21/gctuning/).
+- **OpenJDK**: [JEP 439 Generational ZGC](https://openjdk.org/jeps/439), [ZGC project](https://openjdk.org/projects/zgc/), [Shenandoah project](https://openjdk.org/projects/shenandoah/).
+- **Go**: [A Guide to the Go Garbage Collector](https://go.dev/doc/gc-guide) and [The Green Tea Garbage Collector](https://go.dev/blog/greenteagc).
+- **Go blog**: [Getting to Go: The Journey of Go's Garbage Collector](https://go.dev/blog/ismmkeynote).
+- **CPython**: [Garbage collector internals](https://github.com/python/cpython/blob/main/InternalDocs/garbage_collector.md) and the [gc module docs](https://docs.python.org/3/library/gc.html).
+- **Book**: [The Garbage Collection Handbook](https://www.routledge.com/The-Garbage-Collection-Handbook-The-Art-of-Automatic-Memory-Management/Jones-Hosking-Moss/p/book/9781032218038) by Jones, Hosking and Moss.

@@ -1,0 +1,1107 @@
+---
+title: "LLD: Parking Lot"
+phase: "14-lld"
+order: 139
+tags: ["lld", "machine-coding", "java", "design-patterns", "concurrency", "parking-lot"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 45
+prerequisites: ["machine-coding-strategy", "solid-principles", "creational-patterns", "behavioral-patterns"]
+summary: "A complete, tested Java 21 machine-coding solution for the multi-level parking lot — spot types, entry and exit gates, tickets, pluggable pricing and allocation (Strategy), vehicle and spot creation (Factory), why Singleton hurts and DI wins, payments, and lock-free concurrency-safe spot assignment."
+---
+
+## Definition (interview-ready)
+
+A parking lot system assigns a spot to each vehicle at an entry gate and issues a ticket; at exit it computes the fee, takes payment and frees the spot, with many gates working at the same time. The core entities are a `ParkingLot` with `Level`s of small, medium and large `ParkingSpot`s, sealed `Vehicle` records built by a `VehicleFactory`, `Ticket` and `Receipt` records, and a `ParkingService` that the gates call. Spot allocation, pricing and payment are Strategy interfaces injected through the constructor, and `DailyCapPricing` is a Decorator over any pricing rule. For concurrency, each spot is claimed with a compare-and-set on an `AtomicReference`, `putIfAbsent` stops the same plate entering twice, and `activeTickets.remove` makes each exit happen once. The lot is built once and injected instead of being a Singleton, so tests can build small lots.
+
+**One-liner:** Levels of sized spots, Strategy for allocation, pricing and payment, factories for vehicles and spots, and lock-free spot claims with compare-and-set so two gates never hand out the same spot.
+
+## Problem statement
+
+> Design and implement a parking lot system.
+>
+> - The lot has **multiple levels**. Each level has spots of different sizes: **small, medium and large**.
+> - Vehicles are **motorcycles, cars and trucks**. A motorcycle needs a small spot, a car a medium spot, a truck a large spot.
+> - The lot has several **entry gates** and **exit gates** that work at the same time.
+> - At entry, the system assigns a spot and issues a **ticket**. At exit, it computes the **fee**, takes **payment** (cash, card or UPI) and frees the spot.
+> - Fees are **hourly** and depend on the vehicle type.
+> - Show how many spots are free on each level, per size.
+> - Write a demo `main` and make it easy to change pricing and how spots are chosen.
+
+This is the most common machine-coding problem of all, so interviewers grade it strictly: they have seen hundreds of versions. The [Machine Coding Rounds strategy note](/learn/notes/machine-coding-strategy/) uses a small version as its worked example. This note goes further: multi-level layout, overflow allocation, gates, payments with failure handling, a pricing decorator, the Singleton question, and a concurrency story you can defend line by line.
+
+## Clarifying questions to ask
+
+Ask these in the first five minutes and write the answers as a comment at the top of your file.
+
+| Question | Assumed answer |
+|---|---|
+| Can a smaller vehicle take a bigger spot when its own size is full? | Yes, as a configurable policy. Default: smallest spot that fits, overflow upwards. Never downwards. |
+| Which spot is "best"? | Lowest level first, then lowest spot number (closest to the ramp). |
+| How is the fee computed? | Per started hour by vehicle type, minimum one hour. Optional daily cap. |
+| Is payment real? | No. A `PaymentProcessor` interface; a stub that approves. Payment can fail; the car then stays inside. |
+| Can the same plate be inside twice? | No. Reject a second entry. |
+| Lost tickets, reservations, monthly passes? | Out of scope; mention as extensions. |
+| Persistence, UI, REST? | No. In memory, driven by `main` and tests. |
+| Concurrency? | Yes: several gates call the service at once. No spot may be given to two vehicles. |
+| Money type? | Whole rupees as `long`. Say you'd use `BigDecimal` or paise if fractions appear. |
+
+## Requirements
+
+**Functional (in scope)**
+
+1. Build a lot with N levels and a configurable number of small, medium and large spots per level.
+2. Park: given vehicle type and plate at an entry gate, claim a spot and return a ticket.
+3. Exit: given a ticket and payment method at an exit gate, compute the fee, charge, free the spot, return a receipt.
+4. Quote the fee for a ticket without exiting.
+5. Availability per level and spot size.
+6. Pluggable spot allocation and pricing.
+
+**Non-functional**
+
+- Thread-safe under concurrent gates: no double assignment, no double exit, no duplicate plate.
+- Testable: time and payment are injected.
+- Extensible: new vehicle type, pricing rule or allocation rule without editing the service.
+
+**Out of scope:** reservations, lost-ticket penalties, display boards, EV charging, persistence. Each appears in [Extensions](#extensions-interviewers-ask-for).
+
+## Entities and relationships
+
+```text
+                      ┌─────────────────────────── ParkingService ───────────────────────────┐
+ EntryGate ──park()──►│ activeTickets: ticketId -> Ticket   (ConcurrentHashMap)              │◄──exit()── ExitGate
+     │                │ plateToTicket: plate -> ticketId    (ConcurrentHashMap)              │
+     │ uses           │                                                                      │
+     ▼                │  ◆── SpotAllocationStrategy ◁── NearestExactFit, SmallestAvailableFit │
+ VehicleFactory       │  ◆── PricingStrategy        ◁── HourlyPricing, DailyCapPricing(wraps)│
+     │ creates        │  ◆── PaymentProcessor (functional interface)                         │
+     ▼                │  ◆── Clock                                                           │
+ «sealed» Vehicle     │  ───► ParkingLot ◆── Level 1..* ◆── ParkingSpot 1..*                 │
+   ├ Motorcycle       └──────────────────────────────────────────────────────────────────────┘
+   ├ Car                         ▲ built by SpotFactory / ParkingLot.of(levels, layout)
+   └ Truck
+ Ticket(id, plate, vehicleType, spotId, entryTime, entryGate)    Receipt(ticketId, ..., amount, method)
+ VehicleType ──minSize──► SpotSize { SMALL < MEDIUM < LARGE }    PaymentMethod { CASH, CARD, UPI }
+```
+
+- A `ParkingLot` **has** levels; a `Level` **has** spots (composition: they are created together and never change).
+- A `Ticket` **refers to** a spot by id and a vehicle by plate. IDs across aggregates keep tickets small immutable records.
+- `ParkingService` **depends on** four interfaces, all injected through its constructor.
+
+## Design patterns used and why
+
+| Pattern | Where | Why it earns its place |
+|---|---|---|
+| **Strategy** | `SpotAllocationStrategy`, `PricingStrategy`, `PaymentProcessor` | These are the axes the interviewer says will change. Swapping "exact fit" for "smallest available fit", or hourly for weekend pricing, is a new class plus one line in `main`. See [Strategy](/learn/notes/behavioral-patterns/). |
+| **Factory** | `VehicleFactory`, `SpotFactory`, `ParkingLot.of` | Only one place maps `VehicleType` to a class and normalises plates; only one place turns a layout into numbered spots. Gates and tests never call constructors directly. See [Factory](/learn/notes/creational-patterns/). |
+| **Decorator** | `DailyCapPricing` wraps any `PricingStrategy` | Adds a rule (daily cap) without touching hourly pricing; caps can wrap weekend pricing too. See [Decorator](/learn/notes/structural-patterns/). |
+| **Singleton (discussed, then avoided)** | "There is only one parking lot" | Tempting, but it hides a global and makes tests share state. We build the lot once and inject it. Details below. |
+
+### Singleton and the testability caveat
+
+Many candidates write `ParkingLot.getInstance()`. If the interviewer asks for it, you can write a correct lazy singleton in a few lines using the initialization-on-demand holder idiom (the JVM's class-initialisation guarantees make it thread-safe without locks):
+
+```java
+// Option A: classic lazy singleton (initialization-on-demand holder idiom).
+final class ParkingLotHolder {
+    private ParkingLotHolder() {}
+    private static final class Lazy {                 // loaded on first access to Lazy.INSTANCE
+        static final ParkingLot INSTANCE = ParkingLot.of("City Centre", 3,
+                Map.of(SpotSize.SMALL, 10, SpotSize.MEDIUM, 40, SpotSize.LARGE, 5));
+    }
+    static ParkingLot get() { return Lazy.INSTANCE; }  // thread-safe via class-init guarantees, no locks
+}
+
+// Option B (preferred): build once in main / your DI container and pass it in.
+// ParkingService never knows whether there is one lot or five, and tests build tiny lots.
+// ParkingLot lot = ParkingLot.of(...);
+// ParkingService service = new ParkingService(lot, allocator, pricing, payments, clock);
+```
+
+Then explain why you didn't use it:
+
+- **Tests share state.** Every test gets the same lot; one test's parked cars leak into the next. You can't build a one-spot lot to test "lot full".
+- **Hidden dependency.** A class that calls `ParkingLotHolder.get()` doesn't declare the lot in its constructor, so readers and tests can't see or replace it.
+- **"Only one" is a deployment fact, not a class property.** Tomorrow the company runs five lots. With injection, that's five `ParkingService` instances; with a singleton, it's a rewrite.
+
+**How to say it in an interview:** "There is one lot per process, but I'll enforce that by constructing it once in `main` and injecting it — same effect as a Singleton, but tests can build their own small lots. In Spring, a singleton-scoped bean gives this for free." The full set of singleton variants is in [Creational Patterns](/learn/notes/creational-patterns/).
+
+## Solution walkthrough
+
+Build it in this order; each step compiles on its own, so you always have something runnable.
+
+### Step 1: enums that carry rules
+
+```java
+/** Declared smallest to largest: compareTo() gives the "is it big enough?" check. */
+enum SpotSize { SMALL, MEDIUM, LARGE }
+
+enum VehicleType {
+    MOTORCYCLE(SpotSize.SMALL), CAR(SpotSize.MEDIUM), TRUCK(SpotSize.LARGE);
+
+    private final SpotSize minSize;
+    VehicleType(SpotSize minSize) { this.minSize = minSize; }
+    SpotSize minSize() { return minSize; }
+}
+
+enum PaymentMethod { CASH, CARD, UPI }
+```
+
+Declaring sizes from small to large lets `compareTo` answer "is this spot big enough?" without a lookup table. Each `VehicleType` knows the minimum size it needs, so no `switch` on vehicle type appears anywhere else.
+
+### Step 2: vehicles and the factory
+
+```java
+sealed interface Vehicle permits Motorcycle, Car, Truck {
+    String plate();
+    VehicleType type();
+}
+record Motorcycle(String plate) implements Vehicle { public VehicleType type() { return VehicleType.MOTORCYCLE; } }
+record Car(String plate)        implements Vehicle { public VehicleType type() { return VehicleType.CAR; } }
+record Truck(String plate)      implements Vehicle { public VehicleType type() { return VehicleType.TRUCK; } }
+
+/** The only place that knows which class backs which VehicleType. */
+final class VehicleFactory {
+    private VehicleFactory() {}
+    static Vehicle create(VehicleType type, String plate) {
+        if (type == null) throw new IllegalArgumentException("vehicle type required");
+        if (plate == null || plate.isBlank()) throw new IllegalArgumentException("plate required");
+        String p = plate.trim().toUpperCase(Locale.ROOT);   // ROOT: no locale surprises (e.g. Turkish i)
+        return switch (type) {                 // exhaustive: adding an enum constant breaks the build here
+            case MOTORCYCLE -> new Motorcycle(p);
+            case CAR        -> new Car(p);
+            case TRUCK      -> new Truck(p);
+        };
+    }
+}
+```
+
+`Vehicle` is a **sealed interface** (Java 17+): only these three records may implement it, and each is a record because a vehicle in this system is just data. The factory validates and normalises the plate (so `ka01ab1234` and `KA01AB1234` are the same car) and uses an exhaustive `switch` expression: adding `BUS` to `VehicleType` will not compile until the factory handles it. If vehicle types later need behaviour (an EV that needs a charger), it goes into these classes.
+
+### Step 3: the spot, with an atomic claim
+
+```java
+final class ParkingSpot {
+    private final String id;
+    private final int level;
+    private final int number;
+    private final SpotSize size;
+    private final AtomicReference<String> occupant = new AtomicReference<>(); // plate, or null when free
+
+    ParkingSpot(int level, int number, SpotSize size) {
+        this.level = level; this.number = number; this.size = size;
+        this.id = level + "-" + size.name().charAt(0) + number;     // e.g. 1-M2
+    }
+
+    String id() { return id; }
+    int level() { return level; }
+    SpotSize size() { return size; }
+    boolean isFree() { return occupant.get() == null; }
+
+    /** Atomic claim: if two gates race for this spot, exactly one CAS succeeds. */
+    boolean tryOccupy(String plate) { return occupant.compareAndSet(null, plate); }
+
+    void release(String plate) {
+        if (!occupant.compareAndSet(plate, null))
+            throw new IllegalStateException(id + " is not held by " + plate);
+    }
+}
+```
+
+This is the heart of the concurrency design. The spot's state is a single `AtomicReference` holding the plate of the occupant, or `null`. `tryOccupy` uses **compare-and-set** (CAS — "set it to my plate only if it's still null", done atomically by the CPU): if two gates race for the same spot, exactly one CAS succeeds and the other gets `false` and moves on. `release` checks that the right car is leaving, which catches bugs where a stale ticket frees someone else's spot. See [Atomics and CAS](/learn/notes/java-concurrency-locks/).
+
+### Step 4: levels, spot factory and the lot
+
+```java
+record Level(int number, List<ParkingSpot> spots) {
+    Level { spots = List.copyOf(spots); }
+}
+
+/** Builds spots and levels from a layout, so ParkingLot never does "new ParkingSpot" itself. */
+final class SpotFactory {
+    private SpotFactory() {}
+    static Level createLevel(int levelNo, Map<SpotSize, Integer> layout) {
+        List<ParkingSpot> spots = new ArrayList<>();
+        int n = 1;
+        for (SpotSize size : SpotSize.values())                 // stable order: SMALL, MEDIUM, LARGE
+            for (int i = 0; i < layout.getOrDefault(size, 0); i++)
+                spots.add(new ParkingSpot(levelNo, n++, size));
+        return new Level(levelNo, spots);
+    }
+}
+
+final class ParkingLot {
+    private final String name;
+    private final List<Level> levels;
+    private final Map<String, ParkingSpot> spotsById;
+
+    ParkingLot(String name, List<Level> levels) {
+        this.name = name;
+        this.levels = List.copyOf(levels);
+        this.spotsById = this.levels.stream().flatMap(l -> l.spots().stream())
+                .collect(Collectors.toUnmodifiableMap(ParkingSpot::id, s -> s));
+    }
+
+    static ParkingLot of(String name, int levelCount, Map<SpotSize, Integer> perLevel) {
+        List<Level> levels = new ArrayList<>();
+        for (int i = 1; i <= levelCount; i++) levels.add(SpotFactory.createLevel(i, perLevel));
+        return new ParkingLot(name, levels);
+    }
+
+    String name() { return name; }
+    List<Level> levels() { return levels; }
+    ParkingSpot spot(String id) { return spotsById.get(id); }
+}
+```
+
+`SpotFactory` turns a layout like "1 small, 2 medium, 1 large" into numbered spots (`1-S1`, `1-M2`, `1-M3`, `1-L4`). The lot's structure is **immutable** after construction (`List.copyOf`, `toUnmodifiableMap`), so threads can read it freely without locks; only each spot's occupant changes, and that is atomic.
+
+### Step 5: allocation strategies
+
+```java
+interface SpotAllocationStrategy {
+    /** Must atomically claim the spot it returns (via tryOccupy). */
+    Optional<ParkingSpot> allocate(ParkingLot lot, Vehicle vehicle);
+}
+
+/** Exact size only; lowest level first, then lowest spot number. */
+final class NearestExactFit implements SpotAllocationStrategy {
+    public Optional<ParkingSpot> allocate(ParkingLot lot, Vehicle v) {
+        return claimFirst(lot, v, v.type().minSize());
+    }
+    static Optional<ParkingSpot> claimFirst(ParkingLot lot, Vehicle v, SpotSize size) {
+        for (Level level : lot.levels())
+            for (ParkingSpot s : level.spots())
+                if (s.size() == size && s.isFree() && s.tryOccupy(v.plate())) return Optional.of(s);
+        return Optional.empty();
+    }
+}
+
+/** Try the smallest size that fits; if those are all taken, overflow into bigger spots. */
+final class SmallestAvailableFit implements SpotAllocationStrategy {
+    public Optional<ParkingSpot> allocate(ParkingLot lot, Vehicle v) {
+        for (SpotSize size : SpotSize.values()) {
+            if (size.compareTo(v.type().minSize()) < 0) continue;   // too small
+            Optional<ParkingSpot> s = NearestExactFit.claimFirst(lot, v, size);
+            if (s.isPresent()) return s;
+        }
+        return Optional.empty();
+    }
+}
+```
+
+The contract is written on the interface: a strategy must **claim** the spot it returns. That keeps "find a free spot" and "take it" as one atomic step, which avoids the classic check-then-act race (two threads both see spot 1-M2 free, both take it). The `isFree()` check is only a cheap filter before the CAS. `SmallestAvailableFit` reuses the exact-fit loop for each size from the vehicle's minimum upwards.
+
+Scanning is O(total spots), which is fine for an interview-sized lot. For thousands of spots, say you'd keep a free-spot index per size — for example a `ConcurrentSkipListSet` ordered by (level, number) — and `pollFirst()` it.
+
+### Step 6: pricing, and a decorator
+
+```java
+interface PricingStrategy {
+    long fee(Ticket ticket, Instant exitTime);   // whole rupees; use BigDecimal if paise matter
+}
+
+/** Per-hour rate by vehicle type; partial hours round up; minimum one hour. */
+final class HourlyPricing implements PricingStrategy {
+    private final Map<VehicleType, Long> ratePerHour;
+    HourlyPricing(Map<VehicleType, Long> ratePerHour) { this.ratePerHour = Map.copyOf(ratePerHour); }
+
+    public long fee(Ticket t, Instant exit) {
+        long minutes = Duration.between(t.entryTime(), exit).toMinutes();
+        long hours = Math.max(1, (minutes + 59) / 60);
+        Long rate = ratePerHour.get(t.vehicleType());
+        if (rate == null) throw new IllegalStateException("no rate for " + t.vehicleType());
+        return hours * rate;
+    }
+}
+
+/** Decorator over any PricingStrategy: never charge more than capPerDay for each started day. */
+final class DailyCapPricing implements PricingStrategy {
+    private final PricingStrategy inner;
+    private final long capPerDay;
+    DailyCapPricing(PricingStrategy inner, long capPerDay) { this.inner = inner; this.capPerDay = capPerDay; }
+
+    public long fee(Ticket t, Instant exit) {
+        long minutes = Duration.between(t.entryTime(), exit).toMinutes();
+        long days = Math.max(1, (minutes + 1439) / 1440);
+        return Math.min(inner.fee(t, exit), days * capPerDay);
+    }
+}
+```
+
+`(minutes + 59) / 60` is integer ceiling division: 60 minutes is 1 hour, 61 minutes is 2. `Duration.toMinutes()` drops leftover seconds, so billing is by whole minutes (60 minutes 30 seconds still counts as 1 hour). `Math.max(1, ...)` enforces the one-hour minimum. `DailyCapPricing` wraps any other strategy and charges the smaller of the inner fee and the cap times the number of started days.
+
+### Step 7: payment and tickets
+
+```java
+@FunctionalInterface
+interface PaymentProcessor {
+    boolean charge(String ticketId, long amount, PaymentMethod method);   // true = approved
+}
+
+// ============================== Tickets, receipts, errors ==============================
+
+record Ticket(String id, String plate, VehicleType vehicleType, String spotId, Instant entryTime, String entryGate) {}
+
+record Receipt(String ticketId, String plate, String spotId, Duration parked, long amount, PaymentMethod method) {}
+
+class ParkingException extends RuntimeException { ParkingException(String m) { super(m); } }
+class ParkingFullException extends ParkingException {
+    ParkingFullException(VehicleType t) { super("No free spot for " + t); }
+}
+class AlreadyParkedException extends ParkingException {
+    AlreadyParkedException(String plate) { super(plate + " is already inside"); }
+}
+class InvalidTicketException extends ParkingException {
+    InvalidTicketException(String id) { super("Unknown or already closed ticket " + id); }
+}
+class PaymentFailedException extends ParkingException {
+    PaymentFailedException(String id, long amount) { super("Payment of " + amount + " declined for " + id); }
+}
+```
+
+`PaymentProcessor` has one method, so a lambda can implement it — tests pass `(id, amount, method) -> false` to simulate a decline. `Ticket` and `Receipt` are records. All domain errors extend one unchecked `ParkingException`, so the demo can catch them in one place.
+
+### Step 8: the service
+
+```java
+final class ParkingService {
+    private static final String PENDING = "PENDING";
+
+    private final ParkingLot lot;
+    private final SpotAllocationStrategy allocator;
+    private final PricingStrategy pricing;
+    private final PaymentProcessor payments;
+    private final Clock clock;
+    private final Map<String, Ticket> activeTickets = new ConcurrentHashMap<>();   // ticketId -> ticket
+    private final Map<String, String> plateToTicket = new ConcurrentHashMap<>();   // plate -> ticketId
+    private final AtomicLong ticketSeq = new AtomicLong();
+
+    ParkingService(ParkingLot lot, SpotAllocationStrategy allocator, PricingStrategy pricing,
+                   PaymentProcessor payments, Clock clock) {
+        this.lot = lot; this.allocator = allocator; this.pricing = pricing;
+        this.payments = payments; this.clock = clock;
+    }
+
+    Ticket park(Vehicle v, String gateId) {
+        // 1. Reserve the plate atomically so the same car can't enter twice via two gates.
+        if (plateToTicket.putIfAbsent(v.plate(), PENDING) != null) throw new AlreadyParkedException(v.plate());
+        try {
+            // 2. The strategy claims a spot with CAS; losers of a race just try the next spot.
+            ParkingSpot spot = allocator.allocate(lot, v).orElseThrow(() -> new ParkingFullException(v.type()));
+            Ticket t = new Ticket("T" + ticketSeq.incrementAndGet(), v.plate(), v.type(),
+                                  spot.id(), clock.instant(), gateId);
+            activeTickets.put(t.id(), t);
+            plateToTicket.put(v.plate(), t.id());
+            return t;
+        } catch (RuntimeException e) {
+            plateToTicket.remove(v.plate(), PENDING);   // undo the reservation
+            throw e;
+        }
+    }
+
+    long quote(String ticketId) {
+        Ticket t = activeTickets.get(ticketId);
+        if (t == null) throw new InvalidTicketException(ticketId);
+        return pricing.fee(t, clock.instant());
+    }
+
+    Receipt exit(String ticketId, PaymentMethod method) {
+        // remove() is the atomic "find and claim": two exit gates can't both process one ticket.
+        Ticket t = activeTickets.remove(ticketId);
+        if (t == null) throw new InvalidTicketException(ticketId);
+        Instant now = clock.instant();
+        long amount = pricing.fee(t, now);
+        if (!payments.charge(t.id(), amount, method)) {
+            activeTickets.put(t.id(), t);               // car is still inside; ticket stays valid
+            throw new PaymentFailedException(t.id(), amount);
+        }
+        lot.spot(t.spotId()).release(t.plate());
+        plateToTicket.remove(t.plate(), t.id());
+        return new Receipt(t.id(), t.plate(), t.spotId(), Duration.between(t.entryTime(), now), amount, method);
+    }
+```
+
+The two flows, step by step:
+
+- **Park.** (1) `putIfAbsent(plate, PENDING)` atomically reserves the plate, so two gates can't admit the same car. (2) The strategy claims a spot with CAS. (3) Create and store the ticket, then replace `PENDING` with the ticket id. If anything throws (lot full), the reservation is removed with `remove(plate, PENDING)` — the two-argument form only removes it if it is still our placeholder.
+- **Exit.** `activeTickets.remove(ticketId)` is an atomic "find and claim": when two exit gates scan the same ticket, only one gets it back, the other gets `null` and an `InvalidTicketException`. The fee is computed, payment is charged, and only after approval is the spot released. If payment is declined, the ticket is **put back**, so the car is still inside and can pay another way.
+
+### Step 9: gates
+
+```java
+final class EntryGate {
+    private final String id;
+    private final ParkingService service;
+    EntryGate(String id, ParkingService service) { this.id = id; this.service = service; }
+    Ticket admit(VehicleType type, String plate) { return service.park(VehicleFactory.create(type, plate), id); }
+}
+
+final class ExitGate {
+    private final String id;
+    private final ParkingService service;
+    ExitGate(String id, ParkingService service) { this.id = id; this.service = service; }
+    Receipt process(String ticketId, PaymentMethod method) { return service.exit(ticketId, method); }
+}
+
+```
+
+Gates are thin: they convert input (type + plate) into domain objects and stamp their id on the ticket. Everything else lives in the service, so adding gate 3 or gate 30 is just `new EntryGate("N3", service)`.
+
+## Full solution code
+
+One file, `Main.java`, Java 21. Compile and run with `javac Main.java && java Main`.
+
+```java
+import java.time.*;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
+
+// ============================== Enums ==============================
+
+/** Declared smallest to largest: compareTo() gives the "is it big enough?" check. */
+enum SpotSize { SMALL, MEDIUM, LARGE }
+
+enum VehicleType {
+    MOTORCYCLE(SpotSize.SMALL), CAR(SpotSize.MEDIUM), TRUCK(SpotSize.LARGE);
+
+    private final SpotSize minSize;
+    VehicleType(SpotSize minSize) { this.minSize = minSize; }
+    SpotSize minSize() { return minSize; }
+}
+
+enum PaymentMethod { CASH, CARD, UPI }
+
+// ============================== Vehicles (Factory) ==============================
+
+sealed interface Vehicle permits Motorcycle, Car, Truck {
+    String plate();
+    VehicleType type();
+}
+record Motorcycle(String plate) implements Vehicle { public VehicleType type() { return VehicleType.MOTORCYCLE; } }
+record Car(String plate)        implements Vehicle { public VehicleType type() { return VehicleType.CAR; } }
+record Truck(String plate)      implements Vehicle { public VehicleType type() { return VehicleType.TRUCK; } }
+
+/** The only place that knows which class backs which VehicleType. */
+final class VehicleFactory {
+    private VehicleFactory() {}
+    static Vehicle create(VehicleType type, String plate) {
+        if (type == null) throw new IllegalArgumentException("vehicle type required");
+        if (plate == null || plate.isBlank()) throw new IllegalArgumentException("plate required");
+        String p = plate.trim().toUpperCase(Locale.ROOT);   // ROOT: no locale surprises (e.g. Turkish i)
+        return switch (type) {                 // exhaustive: adding an enum constant breaks the build here
+            case MOTORCYCLE -> new Motorcycle(p);
+            case CAR        -> new Car(p);
+            case TRUCK      -> new Truck(p);
+        };
+    }
+}
+
+// ============================== Spots, levels, lot ==============================
+
+final class ParkingSpot {
+    private final String id;
+    private final int level;
+    private final int number;
+    private final SpotSize size;
+    private final AtomicReference<String> occupant = new AtomicReference<>(); // plate, or null when free
+
+    ParkingSpot(int level, int number, SpotSize size) {
+        this.level = level; this.number = number; this.size = size;
+        this.id = level + "-" + size.name().charAt(0) + number;     // e.g. 1-M2
+    }
+
+    String id() { return id; }
+    int level() { return level; }
+    SpotSize size() { return size; }
+    boolean isFree() { return occupant.get() == null; }
+
+    /** Atomic claim: if two gates race for this spot, exactly one CAS succeeds. */
+    boolean tryOccupy(String plate) { return occupant.compareAndSet(null, plate); }
+
+    void release(String plate) {
+        if (!occupant.compareAndSet(plate, null))
+            throw new IllegalStateException(id + " is not held by " + plate);
+    }
+}
+
+record Level(int number, List<ParkingSpot> spots) {
+    Level { spots = List.copyOf(spots); }
+}
+
+/** Builds spots and levels from a layout, so ParkingLot never does "new ParkingSpot" itself. */
+final class SpotFactory {
+    private SpotFactory() {}
+    static Level createLevel(int levelNo, Map<SpotSize, Integer> layout) {
+        List<ParkingSpot> spots = new ArrayList<>();
+        int n = 1;
+        for (SpotSize size : SpotSize.values())                 // stable order: SMALL, MEDIUM, LARGE
+            for (int i = 0; i < layout.getOrDefault(size, 0); i++)
+                spots.add(new ParkingSpot(levelNo, n++, size));
+        return new Level(levelNo, spots);
+    }
+}
+
+final class ParkingLot {
+    private final String name;
+    private final List<Level> levels;
+    private final Map<String, ParkingSpot> spotsById;
+
+    ParkingLot(String name, List<Level> levels) {
+        this.name = name;
+        this.levels = List.copyOf(levels);
+        this.spotsById = this.levels.stream().flatMap(l -> l.spots().stream())
+                .collect(Collectors.toUnmodifiableMap(ParkingSpot::id, s -> s));
+    }
+
+    static ParkingLot of(String name, int levelCount, Map<SpotSize, Integer> perLevel) {
+        List<Level> levels = new ArrayList<>();
+        for (int i = 1; i <= levelCount; i++) levels.add(SpotFactory.createLevel(i, perLevel));
+        return new ParkingLot(name, levels);
+    }
+
+    String name() { return name; }
+    List<Level> levels() { return levels; }
+    ParkingSpot spot(String id) { return spotsById.get(id); }
+}
+
+// ============================== Strategies ==============================
+
+interface SpotAllocationStrategy {
+    /** Must atomically claim the spot it returns (via tryOccupy). */
+    Optional<ParkingSpot> allocate(ParkingLot lot, Vehicle vehicle);
+}
+
+/** Exact size only; lowest level first, then lowest spot number. */
+final class NearestExactFit implements SpotAllocationStrategy {
+    public Optional<ParkingSpot> allocate(ParkingLot lot, Vehicle v) {
+        return claimFirst(lot, v, v.type().minSize());
+    }
+    static Optional<ParkingSpot> claimFirst(ParkingLot lot, Vehicle v, SpotSize size) {
+        for (Level level : lot.levels())
+            for (ParkingSpot s : level.spots())
+                if (s.size() == size && s.isFree() && s.tryOccupy(v.plate())) return Optional.of(s);
+        return Optional.empty();
+    }
+}
+
+/** Try the smallest size that fits; if those are all taken, overflow into bigger spots. */
+final class SmallestAvailableFit implements SpotAllocationStrategy {
+    public Optional<ParkingSpot> allocate(ParkingLot lot, Vehicle v) {
+        for (SpotSize size : SpotSize.values()) {
+            if (size.compareTo(v.type().minSize()) < 0) continue;   // too small
+            Optional<ParkingSpot> s = NearestExactFit.claimFirst(lot, v, size);
+            if (s.isPresent()) return s;
+        }
+        return Optional.empty();
+    }
+}
+
+interface PricingStrategy {
+    long fee(Ticket ticket, Instant exitTime);   // whole rupees; use BigDecimal if paise matter
+}
+
+/** Per-hour rate by vehicle type; partial hours round up; minimum one hour. */
+final class HourlyPricing implements PricingStrategy {
+    private final Map<VehicleType, Long> ratePerHour;
+    HourlyPricing(Map<VehicleType, Long> ratePerHour) { this.ratePerHour = Map.copyOf(ratePerHour); }
+
+    public long fee(Ticket t, Instant exit) {
+        long minutes = Duration.between(t.entryTime(), exit).toMinutes();
+        long hours = Math.max(1, (minutes + 59) / 60);
+        Long rate = ratePerHour.get(t.vehicleType());
+        if (rate == null) throw new IllegalStateException("no rate for " + t.vehicleType());
+        return hours * rate;
+    }
+}
+
+/** Decorator over any PricingStrategy: never charge more than capPerDay for each started day. */
+final class DailyCapPricing implements PricingStrategy {
+    private final PricingStrategy inner;
+    private final long capPerDay;
+    DailyCapPricing(PricingStrategy inner, long capPerDay) { this.inner = inner; this.capPerDay = capPerDay; }
+
+    public long fee(Ticket t, Instant exit) {
+        long minutes = Duration.between(t.entryTime(), exit).toMinutes();
+        long days = Math.max(1, (minutes + 1439) / 1440);
+        return Math.min(inner.fee(t, exit), days * capPerDay);
+    }
+}
+
+@FunctionalInterface
+interface PaymentProcessor {
+    boolean charge(String ticketId, long amount, PaymentMethod method);   // true = approved
+}
+
+// ============================== Tickets, receipts, errors ==============================
+
+record Ticket(String id, String plate, VehicleType vehicleType, String spotId, Instant entryTime, String entryGate) {}
+
+record Receipt(String ticketId, String plate, String spotId, Duration parked, long amount, PaymentMethod method) {}
+
+class ParkingException extends RuntimeException { ParkingException(String m) { super(m); } }
+class ParkingFullException extends ParkingException {
+    ParkingFullException(VehicleType t) { super("No free spot for " + t); }
+}
+class AlreadyParkedException extends ParkingException {
+    AlreadyParkedException(String plate) { super(plate + " is already inside"); }
+}
+class InvalidTicketException extends ParkingException {
+    InvalidTicketException(String id) { super("Unknown or already closed ticket " + id); }
+}
+class PaymentFailedException extends ParkingException {
+    PaymentFailedException(String id, long amount) { super("Payment of " + amount + " declined for " + id); }
+}
+
+// ============================== Service ==============================
+
+final class ParkingService {
+    private static final String PENDING = "PENDING";
+
+    private final ParkingLot lot;
+    private final SpotAllocationStrategy allocator;
+    private final PricingStrategy pricing;
+    private final PaymentProcessor payments;
+    private final Clock clock;
+    private final Map<String, Ticket> activeTickets = new ConcurrentHashMap<>();   // ticketId -> ticket
+    private final Map<String, String> plateToTicket = new ConcurrentHashMap<>();   // plate -> ticketId
+    private final AtomicLong ticketSeq = new AtomicLong();
+
+    ParkingService(ParkingLot lot, SpotAllocationStrategy allocator, PricingStrategy pricing,
+                   PaymentProcessor payments, Clock clock) {
+        this.lot = lot; this.allocator = allocator; this.pricing = pricing;
+        this.payments = payments; this.clock = clock;
+    }
+
+    Ticket park(Vehicle v, String gateId) {
+        // 1. Reserve the plate atomically so the same car can't enter twice via two gates.
+        if (plateToTicket.putIfAbsent(v.plate(), PENDING) != null) throw new AlreadyParkedException(v.plate());
+        try {
+            // 2. The strategy claims a spot with CAS; losers of a race just try the next spot.
+            ParkingSpot spot = allocator.allocate(lot, v).orElseThrow(() -> new ParkingFullException(v.type()));
+            Ticket t = new Ticket("T" + ticketSeq.incrementAndGet(), v.plate(), v.type(),
+                                  spot.id(), clock.instant(), gateId);
+            activeTickets.put(t.id(), t);
+            plateToTicket.put(v.plate(), t.id());
+            return t;
+        } catch (RuntimeException e) {
+            plateToTicket.remove(v.plate(), PENDING);   // undo the reservation
+            throw e;
+        }
+    }
+
+    long quote(String ticketId) {
+        Ticket t = activeTickets.get(ticketId);
+        if (t == null) throw new InvalidTicketException(ticketId);
+        return pricing.fee(t, clock.instant());
+    }
+
+    Receipt exit(String ticketId, PaymentMethod method) {
+        // remove() is the atomic "find and claim": two exit gates can't both process one ticket.
+        Ticket t = activeTickets.remove(ticketId);
+        if (t == null) throw new InvalidTicketException(ticketId);
+        Instant now = clock.instant();
+        long amount = pricing.fee(t, now);
+        if (!payments.charge(t.id(), amount, method)) {
+            activeTickets.put(t.id(), t);               // car is still inside; ticket stays valid
+            throw new PaymentFailedException(t.id(), amount);
+        }
+        lot.spot(t.spotId()).release(t.plate());
+        plateToTicket.remove(t.plate(), t.id());
+        return new Receipt(t.id(), t.plate(), t.spotId(), Duration.between(t.entryTime(), now), amount, method);
+    }
+
+    /** level -> size -> free count, in level order. */
+    Map<Integer, Map<SpotSize, Long>> availability() {
+        Map<Integer, Map<SpotSize, Long>> out = new TreeMap<>();
+        for (Level level : lot.levels()) {
+            Map<SpotSize, Long> counts = new EnumMap<>(SpotSize.class);
+            for (SpotSize s : SpotSize.values()) counts.put(s, 0L);
+            for (ParkingSpot s : level.spots()) if (s.isFree()) counts.merge(s.size(), 1L, Long::sum);
+            out.put(level.number(), counts);
+        }
+        return out;
+    }
+
+    int activeCount() { return activeTickets.size(); }
+}
+
+// ============================== Gates ==============================
+
+final class EntryGate {
+    private final String id;
+    private final ParkingService service;
+    EntryGate(String id, ParkingService service) { this.id = id; this.service = service; }
+    Ticket admit(VehicleType type, String plate) { return service.park(VehicleFactory.create(type, plate), id); }
+}
+
+final class ExitGate {
+    private final String id;
+    private final ParkingService service;
+    ExitGate(String id, ParkingService service) { this.id = id; this.service = service; }
+    Receipt process(String ticketId, PaymentMethod method) { return service.exit(ticketId, method); }
+}
+
+/** Test/demo clock we can move forward by hand. */
+final class MutableClock extends Clock {
+    private volatile Instant now;
+    MutableClock(Instant start) { this.now = start; }
+    void advance(Duration d) { now = now.plus(d); }
+    @Override public Instant instant() { return now; }
+    @Override public ZoneId getZone() { return ZoneOffset.UTC; }
+    @Override public Clock withZone(ZoneId zone) { return this; }
+}
+
+// ============================== Demo ==============================
+
+public class Main {
+    public static void main(String[] args) {
+        ParkingLot lot = ParkingLot.of("City Centre", 2,
+                Map.of(SpotSize.SMALL, 1, SpotSize.MEDIUM, 2, SpotSize.LARGE, 1));
+        MutableClock clock = new MutableClock(Instant.parse("2026-01-01T09:00:00Z"));
+        PricingStrategy pricing = new DailyCapPricing(new HourlyPricing(Map.of(
+                VehicleType.MOTORCYCLE, 20L, VehicleType.CAR, 50L, VehicleType.TRUCK, 100L)), 400);
+        ParkingService service = new ParkingService(lot, new SmallestAvailableFit(), pricing,
+                (ticketId, amount, method) -> true, clock);
+        EntryGate north = new EntryGate("N1", service);
+        EntryGate south = new EntryGate("S1", service);
+        ExitGate exit = new ExitGate("X1", service);
+
+        Ticket c1 = north.admit(VehicleType.CAR, "ka01ab1234");
+        Ticket c2 = south.admit(VehicleType.CAR, "KA02CD5678");
+        Ticket b1 = north.admit(VehicleType.MOTORCYCLE, "KA03EF0001");
+        System.out.println("Parked: " + c1.plate() + " @ " + c1.spotId() + ", "
+                + c2.plate() + " @ " + c2.spotId() + ", " + b1.plate() + " @ " + b1.spotId());
+
+        north.admit(VehicleType.CAR, "KA04GH1111");
+        south.admit(VehicleType.CAR, "KA06KL3333");
+        Ticket c5 = north.admit(VehicleType.CAR, "KA05IJ2222");
+        System.out.println("Fifth car overflows to " + c5.spotId());
+        System.out.println("Availability: " + service.availability());
+
+        try { south.admit(VehicleType.CAR, "KA01AB1234"); }
+        catch (ParkingException e) { System.out.println("Rejected: " + e.getMessage()); }
+
+        south.admit(VehicleType.TRUCK, "MH12TR9999");
+        try { north.admit(VehicleType.TRUCK, "MH12TR8888"); }
+        catch (ParkingException e) { System.out.println("Rejected: " + e.getMessage()); }
+
+        clock.advance(Duration.ofMinutes(130));
+        System.out.println("Quote for " + c1.id() + ": " + service.quote(c1.id()));
+        Receipt r = exit.process(c1.id(), PaymentMethod.UPI);
+        System.out.println("Receipt: " + r);
+
+        try { exit.process(c1.id(), PaymentMethod.CASH); }
+        catch (ParkingException e) { System.out.println("Rejected: " + e.getMessage()); }
+
+        clock.advance(Duration.ofHours(20));
+        System.out.println("Car after ~22h pays (capped): " + exit.process(c2.id(), PaymentMethod.CARD).amount());
+        System.out.println("Availability: " + service.availability());
+    }
+}
+```
+
+**Demo output** (real output from running the program above):
+
+```text
+Parked: KA01AB1234 @ 1-M2, KA02CD5678 @ 1-M3, KA03EF0001 @ 1-S1
+Fifth car overflows to 1-L4
+Availability: {1={SMALL=0, MEDIUM=0, LARGE=0}, 2={SMALL=1, MEDIUM=0, LARGE=1}}
+Rejected: KA01AB1234 is already inside
+Rejected: No free spot for TRUCK
+Quote for T1: 150
+Receipt: Receipt[ticketId=T1, plate=KA01AB1234, spotId=1-M2, parked=PT2H10M, amount=150, method=UPI]
+Rejected: Unknown or already closed ticket T1
+Car after ~22h pays (capped): 400
+Availability: {1={SMALL=0, MEDIUM=2, LARGE=0}, 2={SMALL=1, MEDIUM=0, LARGE=0}}
+```
+
+Reading the output: two cars and a bike fill level 1's medium and small spots; two more cars fill level 2's medium spots; the fifth car overflows into the large spot `1-L4` because the default strategy is `SmallestAvailableFit`. A second entry for the same plate is rejected, as is a second truck once both large spots are taken. Two hours ten minutes rounds up to three hours (3 × 50 = 150). A second exit with the same ticket is rejected. A car parked for about 22 hours would owe 23 × 50 = 1150, but the daily cap brings it to 400.
+
+## Concurrency and edge cases
+
+| Race or edge case | What could go wrong | How the design handles it |
+|---|---|---|
+| Two gates pick the same free spot | Two cars, one spot | `tryOccupy` is a CAS; one wins, the loser keeps scanning. No locks, no blocking. |
+| Same plate at two entry gates | Car "inside twice", two tickets | `plateToTicket.putIfAbsent` reserves the plate atomically before allocation. |
+| Lot full after the plate was reserved | Plate stuck as `PENDING` forever | The catch block calls `remove(plate, PENDING)` and rethrows. |
+| Same ticket at two exit gates | Charged twice, spot released twice | `activeTickets.remove(id)` hands the ticket to exactly one caller. |
+| Payment declined | Spot freed without payment | Spot is released only after approval; ticket is put back on decline. |
+| Release by the wrong car | A stale ticket frees someone else's spot | `release(plate)` is a CAS from that plate to `null`, and throws otherwise. |
+| Clock and rounding | Off-by-one hour, zero fee | Injected `Clock`; ceil division; minimum one hour; tests at 0, 60 and 61 minutes. |
+| Unknown or blank input | Null plate, missing rate | Factory validates plates; pricing throws `IllegalStateException` for a type with no rate. |
+
+Why no `synchronized` on `park`? One big lock would also be correct and is a fine first answer, but it serialises every gate even when they want different spots. The CAS design lets gates proceed in parallel and only "collides" on the exact spot being contested. Small honest caveats to mention: while a payment is in progress, a second exit attempt for the same ticket sees it as invalid (it's temporarily removed), and availability counts are a snapshot that may be slightly stale under concurrent updates — both are acceptable for a display.
+
+## Testing it
+
+JUnit 5 style tests (these were compiled and run against the solution):
+
+```java
+import static org.junit.jupiter.api.Assertions.*;
+
+import java.time.*;
+import java.util.*;
+import java.util.concurrent.*;
+import org.junit.jupiter.api.Test;
+
+class ParkingServiceTest {
+    private final MutableClock clock = new MutableClock(Instant.parse("2026-01-01T09:00:00Z"));
+    private final PricingStrategy hourly = new HourlyPricing(Map.of(
+            VehicleType.MOTORCYCLE, 20L, VehicleType.CAR, 50L, VehicleType.TRUCK, 100L));
+
+    private ParkingService service(ParkingLot lot, SpotAllocationStrategy strategy, PaymentProcessor payments) {
+        return new ParkingService(lot, strategy, hourly, payments, clock);
+    }
+
+    @Test
+    void parksOnLowestLevelFirst() {
+        ParkingService s = service(ParkingLot.of("T", 2, Map.of(SpotSize.MEDIUM, 1)), new NearestExactFit(), (t, a, m) -> true);
+        assertEquals("1-M1", s.park(new Car("A"), "G").spotId());
+        assertEquals("2-M1", s.park(new Car("B"), "G").spotId());
+    }
+
+    @Test
+    void throwsWhenFullAndReleasesPlateReservation() {
+        ParkingService s = service(ParkingLot.of("T", 1, Map.of(SpotSize.MEDIUM, 1)), new NearestExactFit(), (t, a, m) -> true);
+        s.park(new Car("A"), "G");
+        assertThrows(ParkingFullException.class, () -> s.park(new Car("B"), "G"));
+        assertThrows(ParkingFullException.class, () -> s.park(new Car("B"), "G"));   // not AlreadyParked
+    }
+
+    @Test
+    void smallestFitOverflowsToBiggerSpot() {
+        ParkingService s = service(ParkingLot.of("T", 1, Map.of(SpotSize.SMALL, 1, SpotSize.LARGE, 1)),
+                new SmallestAvailableFit(), (t, a, m) -> true);
+        s.park(new Motorcycle("M1"), "G");
+        assertEquals("1-L2", s.park(new Motorcycle("M2"), "G").spotId());
+    }
+
+    @Test
+    void feeRoundsUpToNextHour() {
+        ParkingService s = service(ParkingLot.of("T", 1, Map.of(SpotSize.MEDIUM, 1)), new NearestExactFit(), (t, a, m) -> true);
+        Ticket t = s.park(new Car("A"), "G");
+        clock.advance(Duration.ofMinutes(61));
+        assertEquals(100L, s.exit(t.id(), PaymentMethod.CASH).amount());
+    }
+
+    @Test
+    void sameTicketCannotExitTwice() {
+        ParkingService s = service(ParkingLot.of("T", 1, Map.of(SpotSize.MEDIUM, 1)), new NearestExactFit(), (t, a, m) -> true);
+        Ticket t = s.park(new Car("A"), "G");
+        s.exit(t.id(), PaymentMethod.UPI);
+        assertThrows(InvalidTicketException.class, () -> s.exit(t.id(), PaymentMethod.UPI));
+    }
+
+    @Test
+    void declinedPaymentKeepsCarInside() {
+        ParkingLot lot = ParkingLot.of("T", 1, Map.of(SpotSize.MEDIUM, 1));
+        ParkingService s = service(lot, new NearestExactFit(), (t, a, m) -> m != PaymentMethod.CARD);
+        Ticket t = s.park(new Car("A"), "G");
+        assertThrows(PaymentFailedException.class, () -> s.exit(t.id(), PaymentMethod.CARD));
+        assertFalse(lot.spot("1-M1").isFree());
+        assertEquals(50L, s.exit(t.id(), PaymentMethod.UPI).amount());   // ticket still valid
+    }
+
+    @Test
+    void concurrentGatesNeverDoubleAssignASpot() throws Exception {
+        ParkingService s = service(ParkingLot.of("Big", 5, Map.of(SpotSize.MEDIUM, 10)), new NearestExactFit(), (t, a, m) -> true);
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        CountDownLatch start = new CountDownLatch(1);
+        List<Future<Ticket>> results = new ArrayList<>();
+        for (int i = 0; i < 200; i++) {
+            String plate = "C" + i;
+            results.add(pool.submit(() -> { start.await(); return s.park(new Car(plate), "G"); }));
+        }
+        start.countDown();
+        Set<String> spots = new HashSet<>();
+        int full = 0;
+        for (Future<Ticket> f : results) {
+            try { spots.add(f.get().spotId()); }
+            catch (ExecutionException e) { if (e.getCause() instanceof ParkingFullException) full++; }
+        }
+        pool.shutdown();
+        assertEquals(50, spots.size());      // 50 distinct spots handed out
+        assertEquals(150, full);             // everyone else told the lot is full
+    }
+}
+```
+
+Besides these, a plain-Java harness exercised 33 checks, including three more multi-threaded scenarios: the same plate arriving at 8 gates at once (exactly one ticket), the same ticket at 8 exit gates (exactly one receipt), and 8 gates each running 500 park/exit cycles against a 10-spot lot (every spot free and no active tickets at the end). All passed on repeated runs.
+
+## Extensions interviewers ask for
+
+| Ask | Change | What stays untouched |
+|---|---|---|
+| Weekend or peak-hour pricing | New `PricingStrategy` (reads the entry time's day or hour); can still be wrapped by `DailyCapPricing` | Service, gates, allocation |
+| "Bikes must never take car spots" | Use `NearestExactFit`, or a new strategy with an allowed-sizes map | Everything else |
+| EV spots with chargers | Add a `hasCharger` flag on `ParkingSpot`, an `ElectricCar` record, and an `EvFirstAllocation` strategy that prefers charger spots | Pricing, payment, gates |
+| Display board per level | **Observer**: the service publishes `SpotOccupied`/`SpotFreed` events to listeners after park and exit | Allocation, pricing |
+| Lost ticket | `exitByPlate(plate)` using `plateToTicket`, plus a `LostTicketPricing` decorator adding a penalty | Spots, gates |
+| Reservations | A `RESERVED` state on the spot (or a reservation id as the occupant), with expiry driven by the injected clock | Pricing, payment |
+| Multiple lots | One `ParkingService` per lot, or a `Map<String, ParkingService>` registry | No singleton to undo |
+| Persistence | Move the two maps behind a `TicketRepository` interface with an in-memory implementation; add a DB one later | Strategies, gates |
+
+## Common mistakes
+
+1. **One god class.** A `ParkingLot` that parks, prices, pays and prints. Split into lot (structure), strategies (rules), service (flow), gates (input).
+2. **`switch (vehicleType)` in several places.** Put the rule on the enum (`minSize`) or behind a strategy.
+3. **Check-then-act on spots.** `if (spot.isFree()) spot.occupy()` from two threads assigns one spot twice. Claim atomically.
+4. **`synchronized` on a method but shared state elsewhere**, or locking on different objects in different methods. Pick one mechanism and apply it consistently.
+5. **Freeing the spot before payment succeeds.** A declined card then lets the car out for free.
+6. **Calling `Instant.now()` inside pricing.** Time-based logic becomes untestable. Inject a `Clock`.
+7. **Using `double` for money.** Use `long` minor units or `BigDecimal`.
+8. **Singleton for the lot.** Hard to test, hides the dependency, blocks multi-lot support. Inject instead.
+9. **Returning `null` on failure.** Throw named exceptions (`ParkingFullException`, `InvalidTicketException`) so the demo and tests read clearly.
+10. **No demo of edge cases.** Show full lot, duplicate plate, double exit and declined payment, not just the happy path.
+
+## Practice questions
+
+<Practice>
+
+<QA q="Which parts of the parking lot did you put behind interfaces, and why only those?" level="easy">
+
+Spot allocation, pricing and payment — plus `Clock`, which is already an abstract class in `java.time`. These are the things the problem statement or interviewer says can vary, or that touch the outside world (payment, time) and need fakes in tests. Levels, spots, tickets and gates are concrete because they have one obvious implementation; interfaces there would add noise without adding flexibility.
+
+</QA>
+
+<QA q="How does the design guarantee two gates never give the same spot to two cars?" level="easy">
+
+Each spot holds its occupant in an `AtomicReference`. Allocation strategies don't just find a free spot, they **claim** it with `compareAndSet(null, plate)`. CAS is atomic, so if two threads target the same spot only one succeeds; the other gets `false` and continues to the next spot. The multi-threaded test (200 cars, 50 spots, 8 threads) confirms 50 distinct spots and 150 rejections.
+
+</QA>
+
+<QA q="Why is VehicleFactory useful when the vehicle classes are tiny records?" level="easy">
+
+It is the single place that maps a `VehicleType` to a class, validates and normalises the plate, and will grow when creation gets more complex (an EV with battery size, a vehicle loaded from a registry). Gates and tests call `VehicleFactory.create(type, plate)` and never depend on concrete classes. The exhaustive `switch` also makes adding a new type a compile error until the factory handles it.
+
+</QA>
+
+<QA q="What is the problem with making ParkingLot a Singleton, and what do you do instead?" level="medium">
+
+A singleton is global mutable state: tests share one lot and leak cars into each other, you can't construct a tiny lot to test the full case, and classes that call `getInstance()` hide that dependency. It also bakes "exactly one lot" into the class when it's really a deployment decision. Instead, build the lot once in `main` (or a DI container, where beans are singleton-scoped by default) and pass it to `ParkingService` through the constructor. You get one instance in production and full control in tests.
+
+</QA>
+
+<QA q="Walk through what happens if payment is declined at exit." level="medium">
+
+`exit` first removes the ticket from `activeTickets` (claiming it), computes the fee and calls the payment processor. On decline, it puts the ticket back and throws `PaymentFailedException`. The spot was never released and the plate mapping is untouched, so the car is still inside and the same ticket can be paid with another method. Releasing the spot only after a successful charge is the key ordering.
+
+</QA>
+
+<QA q="Why does park reserve the plate with a PENDING placeholder instead of checking a set of parked plates?" level="medium">
+
+A separate "is it parked?" check followed by "add it" is a check-then-act race: two gates scanning the same plate could both pass the check. `putIfAbsent` makes check and insert one atomic step. The placeholder is needed because the ticket id isn't known until a spot is claimed. If allocation fails, `remove(plate, PENDING)` removes it only if it is still our placeholder.
+
+</QA>
+
+<QA q="How would you compute the fee if the first 30 minutes are free and after that it's hourly?" level="medium">
+
+Write a new `PricingStrategy`, for example `GracePeriodPricing`, as a decorator: if the stay is at most 30 minutes return 0, otherwise delegate to the wrapped strategy (or subtract the grace period before delegating, depending on the rule the interviewer states). Wire it in `main`: `new DailyCapPricing(new GracePeriodPricing(hourly, Duration.ofMinutes(30)), 400)`. No change to the service or other strategies — that's Open/Closed in practice.
+
+</QA>
+
+<QA q="The allocation scan is O(number of spots). How would you make it faster for a 10,000-spot lot?" level="hard">
+
+Keep a free-spot index per size: for example a `ConcurrentSkipListSet` of spots ordered by (level, number). Allocation becomes `pollFirst()` (O(log n), removing it atomically from the set) followed by `tryOccupy` as a safety check; release adds the spot back. With exact-size rules that's one index per size; for overflow, try each size's index in order. You trade a little memory and bookkeeping for O(log n) allocation and keep the same strategy interface.
+
+</QA>
+
+<QA q="Could you use one synchronized method for park and exit instead of CAS and ConcurrentHashMap? Trade-offs?" level="hard">
+
+Yes, and it's a perfectly acceptable first version: one lock makes every check-then-act sequence atomic and is easy to reason about. The cost is that all gates queue behind one lock even when they want different spots, and any slow work inside it (calling a payment gateway) blocks everyone. The CAS design lets gates run in parallel and only contend on the exact spot or ticket. Whatever you choose, never hold a lock while calling an external payment service.
+
+</QA>
+
+<QA q="Interviewer: add a display board on each level that updates on every park and exit. How?" level="scenario">
+
+Use the Observer pattern. Define `interface ParkingEventListener` with a method receiving events like `SpotOccupied(spotId, level, size)` and `SpotFreed(...)` (records). `ParkingService` takes a list of listeners in its constructor and notifies them after a successful park and after a successful exit. `LevelDisplayBoard` implements the listener and keeps its own counters. Notify outside any critical section, and decide whether a listener failure should affect parking (usually not — catch and log).
+
+</QA>
+
+<QA q="Interviewer: a car can now be moved by an attendant to a different spot. What changes?" level="scenario">
+
+Add `move(ticketId, targetSpotId)` to the service. Claim the target spot first with `tryOccupy(plate)`; if that fails, the move fails and nothing changed. Then replace the ticket in `activeTickets` with a copy pointing to the new spot (records are immutable, so create a new one), and finally release the old spot. Doing it in this order means the car always holds at least one spot. To stop a concurrent exit from racing the move, claim the ticket with `remove` first and put the new one back, the same way `exit` does.
+
+</QA>
+
+<QA q="A test of fee rounding passes locally but fails in CI around midnight. What's likely wrong and how does the design prevent it?" level="scenario">
+
+The code probably calls `Instant.now()` or `LocalDateTime.now()` inside pricing, so results depend on the real clock and time zone. The design injects a `Clock`; tests use a `MutableClock` fixed to a known instant and advance it explicitly, so 61 minutes is always 61 minutes. Calculations use `Instant` and `Duration`, which have no time zone or daylight-saving ambiguity.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="Two entry gates call park at the same moment and both target spot 1-M2. With the CAS design, what happens?" options={["Both get 1-M2 and one later fails at exit", "One CAS succeeds; the other moves on to the next free spot", "Both threads block until a lock is released", "The second gate gets a ConcurrentModificationException"]} answer={1}>
+
+`compareAndSet(null, plate)` is atomic. Exactly one thread changes the occupant from null; the other sees `false` and the strategy continues scanning. There is no lock, so neither thread blocks.
+
+</MCQ>
+
+<MCQ q="Which pattern does DailyCapPricing implement?" options={["Factory Method", "Singleton", "Decorator", "Observer"]} answer={2}>
+
+It implements the same `PricingStrategy` interface and wraps another `PricingStrategy`, adding behaviour (the cap) around the wrapped call. That is a Decorator. The wrapped object itself is a Strategy.
+
+</MCQ>
+
+<MCQ q="A car stays 61 minutes and the car rate is 50 per hour. What does HourlyPricing charge?" options={["50", "51", "100", "150"]} answer={2}>
+
+`(61 + 59) / 60 = 2` started hours, so 2 × 50 = 100. Partial hours round up; the minimum is one hour.
+
+</MCQ>
+
+<MCQ q="Why does exit call activeTickets.remove(id) first instead of get(id) and remove later?" options={["remove is faster than get", "remove atomically hands the ticket to exactly one caller, preventing double exit", "get is not thread-safe on ConcurrentHashMap", "To free memory early"]} answer={1}>
+
+`get` is thread-safe too, but get-then-remove is two steps: two exit gates could both get the ticket and both charge. `remove` returns the ticket to one caller and `null` to everyone else, making the claim atomic.
+
+</MCQ>
+
+<MCQ q="What is the main testability problem with ParkingLot.getInstance()?" options={["It is not thread-safe", "Tests share global state and cannot substitute a small or fake lot", "It uses too much memory", "Java does not allow private constructors"]} answer={1}>
+
+A holder-idiom singleton is thread-safe. The problem is that every caller reaches the same global instance through a static method, so tests can't isolate or replace it. Constructor injection fixes this.
+
+</MCQ>
+
+<MCQ q="Payment is declined at the exit gate. What should the system state be afterwards?" options={["Spot free, ticket closed", "Spot occupied, ticket still valid", "Spot free, ticket still valid", "Spot occupied, ticket closed"]} answer={1}>
+
+The car hasn't left, so its spot must stay occupied, and it needs a valid ticket to retry with another payment method. The solution releases the spot only after approval and puts the ticket back on decline.
+
+</MCQ>
+
+<MCQ q="Where should the rule a truck needs a large spot live?" options={["In an if-else chain inside ParkingService.park", "In each EntryGate", "On the VehicleType enum (minSize), used by allocation strategies", "In the Ticket record"]} answer={2}>
+
+Putting the rule on the enum keeps it in one place. Strategies ask `type().minSize()` and compare sizes; there are no `switch` statements on vehicle type spread around the service and gates.
+
+</MCQ>
+
+<MCQ q="The interviewer asks for weekend pricing. What is the smallest correct change?" options={["Add an if for weekends inside HourlyPricing and ParkingService", "Add a new PricingStrategy class and pass it in main", "Make PricingStrategy a Singleton", "Add a weekend flag to every Ticket"]} answer={1}>
+
+Pricing is already a Strategy, so a new rule is a new class wired in `main`. Editing existing classes violates Open/Closed and risks breaking hourly pricing.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **Entities:** `ParkingLot` has `Level`s has `ParkingSpot`s; sealed `Vehicle` records; `Ticket`, `Receipt` records; enums `SpotSize`, `VehicleType(minSize)`, `PaymentMethod`.
+- **Patterns:** Strategy (allocation, pricing, payment), Factory (`VehicleFactory`, `SpotFactory`), Decorator (`DailyCapPricing`), Singleton only as a discussion — inject the lot instead.
+- **Concurrency:** spot claim = CAS on `AtomicReference`; duplicate plate = `putIfAbsent`; double exit = `remove(id)`; release only after payment; immutable lot structure.
+- **Pricing:** `hours = max(1, (minutes + 59) / 60)`; injected `Clock`; money as `long` or `BigDecimal`.
+- **Demo:** happy path, overflow to bigger spot, full lot, duplicate plate, double exit, declined payment, cap.
+- **Extensions:** new strategy classes, Observer for display boards, repository interface for persistence, one service per lot.
+
+## Go deeper
+
+- [Java SE 21 API: AtomicReference](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/atomic/AtomicReference.html)
+- [Java SE 21 API: ConcurrentHashMap](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ConcurrentHashMap.html)
+- [Java SE 21 API: java.time.Clock](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/time/Clock.html)
+- Related notes: [Machine Coding Strategy](/learn/notes/machine-coding-strategy/), [Java Ramp-Up for Machine Coding](/learn/notes/python-to-java-ramp-up/), [SOLID Principles](/learn/notes/solid-principles/), [Creational Patterns](/learn/notes/creational-patterns/), [Behavioral Patterns](/learn/notes/behavioral-patterns/), [Structural Patterns](/learn/notes/structural-patterns/), [Java Concurrency and Locks](/learn/notes/java-concurrency-locks/)

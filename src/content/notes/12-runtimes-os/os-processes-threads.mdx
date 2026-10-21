@@ -1,0 +1,516 @@
+---
+title: "Processes, Threads, Context Switches and System Calls"
+phase: "12-runtimes-os"
+order: 122
+tags: ["os", "linux", "processes", "threads", "scheduling"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 18
+prerequisites: ["os-concurrency"]
+summary: "What a process and a thread really are inside the kernel, how fork/exec/wait work, what a context switch costs, how Linux picks the next task (CFS, then EEVDF since 6.6), and how a system call crosses from user mode into the kernel."
+---
+
+## Definition (interview-ready)
+
+A **process** is a running program plus everything the OS needs to run it: its own **virtual address space** (code, heap, stack), open files, credentials and signal handlers. A **thread** is one flow of execution inside a process. Threads in the same process **share the address space and open files**, but each has its own **registers, program counter and stack**.
+
+A **context switch** is the kernel saving the CPU state of one task and loading another's. A **system call** is how a user program asks the kernel to do something privileged (read a file, open a socket, create a process). The CPU switches from **user mode** to **kernel mode**, runs kernel code, and switches back.
+
+**One-liner:** A process is an isolation boundary with its own address space; a thread is a scheduling unit inside it that shares that memory but has its own stack and registers, and Linux schedules threads, which is why switching between threads of the same process is cheaper.
+
+## Why it matters
+
+- **Capacity planning.** "Why does a thread-per-request server fall over at 10K connections?" Each thread has a stack and a kernel task, and every extra runnable thread adds context switches.
+- **Debugging.** High `sy` CPU, a huge `cs` column in `vmstat`, or a process stuck in state `D` are everyday production clues. You can only read them if you know what's underneath.
+- **Runtimes.** Go's goroutines, Java's virtual threads and Python's event loop exist because OS threads and syscalls have real costs. See [Go runtime scheduler](/learn/notes/go-runtime-scheduler/), [Java executors and virtual threads](/learn/notes/java-executors-virtual-threads/) and [Python GIL and event loop](/learn/notes/python-gil-event-loop/).
+- **Containers.** A container is just a process with namespaces and cgroups. See [Docker and containers](/learn/notes/docker-containers/).
+
+The basics (race conditions, mutexes, concurrency vs parallelism) live in [OS Concurrency](/learn/notes/os-concurrency/). This note goes one level down: what the kernel actually does.
+
+## Core concepts
+
+### Process vs thread: what is shared
+
+Analogy: a process is a **house** (walls, kitchen, fridge). Threads are **people living in the house**. They share the fridge (heap) and the front door keys (file descriptors), but each person has their own to-do list (stack) and is doing their own thing right now (registers, program counter).
+
+| Resource | Shared by threads of one process? | Separate per process? |
+|---|---|---|
+| Code (text segment) | Yes | Yes (but read-only pages may be shared physically) |
+| Heap and global variables | **Yes** | Yes |
+| Open file descriptors, sockets | **Yes** | Yes (a child gets copies after `fork`) |
+| Current working directory, user ID | Yes | Yes |
+| Signal handlers | Yes | Yes |
+| Stack | **No, one per thread** | Yes |
+| Registers, program counter, stack pointer | **No, one per thread** | Yes |
+| Thread-local storage | No | Yes |
+| Pending signals / signal mask | Mask is per thread | Yes |
+
+Consequences:
+
+- One thread can corrupt memory every other thread uses. One crashing thread (say a segfault) usually **kills the whole process**.
+- Two processes can't see each other's memory unless they set up shared memory or `mmap` a shared file. That's the isolation Chrome relies on when it runs tabs in separate processes.
+- Threads talk through shared memory (fast, needs locks). Processes talk through IPC: pipes, sockets, shared memory, signals (slower, but safer).
+
+### How Linux actually models this
+
+In the Linux kernel, processes and threads are both **tasks**, each described by a `task_struct`. The difference is what they share:
+
+- `fork()` creates a task with a **copy** of the parent's address space (copy-on-write, see [Virtual Memory](/learn/notes/os-virtual-memory/)).
+- `pthread_create()` (glibc's NPTL) calls `clone()` with flags like `CLONE_VM | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD`, so the new task **shares** memory, file table and signal handlers.
+
+So on Linux a "thread" is a task that shares almost everything with its siblings. Each thread has its own kernel ID (TID). The process ID you see (`getpid()`) is really the **thread group ID**, the TID of the first thread. This 1:1 model (one user thread = one kernel task) is why `top -H` or `ps -eLf` can show every thread.
+
+### PCB and TCB
+
+The textbook name for the kernel's per-process record is the **Process Control Block (PCB)**. Per-thread state lives in a **Thread Control Block (TCB)**. On Linux both are `task_struct`.
+
+A PCB holds:
+
+- **Identity**: PID, parent PID, user and group IDs.
+- **State**: running, ready, blocked, and so on.
+- **CPU context**: saved registers and program counter, used when the task is switched out.
+- **Memory info**: pointer to the page tables / memory descriptor.
+- **Open files**: the file descriptor table.
+- **Scheduling info**: priority, nice value, accumulated runtime.
+- **Accounting and signals**: CPU time used, pending signals, handlers.
+
+A TCB is the per-thread subset: registers, program counter, stack pointer, thread state, scheduling info, thread-local storage pointer.
+
+### Process states
+
+The classic five-state model:
+
+```
+         admitted          scheduler dispatch
+  NEW ────────────► READY ────────────────► RUNNING ──── exit ───► TERMINATED
+                      ▲   ◄──────────────────  │
+                      │      preempted /       │  waits for I/O,
+                      │      time slice over   │  lock, sleep
+                      │                        ▼
+                      └──── event done ──── BLOCKED (waiting)
+```
+
+- **Ready**: could run, waiting for a CPU.
+- **Running**: on a CPU right now.
+- **Blocked**: waiting for something (disk, network, a lock, a timer). It won't run even if a CPU is free.
+
+What Linux shows you (`ps`, `top`, `/proc/PID/status`):
+
+| Letter | Meaning |
+|---|---|
+| `R` | Running **or runnable** (Linux merges running and ready) |
+| `S` | Interruptible sleep: waiting, can be woken by a signal |
+| `D` | Uninterruptible sleep: usually waiting on disk or NFS I/O; even `kill -9` waits until it returns |
+| `T` / `t` | Stopped (by a signal like SIGSTOP) / stopped by a debugger or tracer |
+| `Z` | Zombie: exited, but the parent hasn't collected its exit status yet |
+| `X` | Dead (you'll almost never see it) |
+
+Interview gold: **load average on Linux counts tasks in `R` and `D`**, which is why a box with a hung NFS mount can show a high load average with idle CPUs.
+
+### fork, exec, wait
+
+Unix splits "start a program" into two steps.
+
+```c
+pid_t pid = fork();              // 1. clone the current process
+if (pid == 0) {
+    // child: same code, same memory (copy-on-write), fork() returned 0
+    execvp("ls", argv);          // 2. replace this process image with /bin/ls
+    _exit(127);                  // only reached if exec failed
+} else if (pid > 0) {
+    int status;
+    waitpid(pid, &status, 0);    // 3. parent blocks until the child exits
+} else {
+    perror("fork");
+}
+```
+
+- **`fork()`** returns **twice**: 0 in the child, the child's PID in the parent, -1 on failure. On Linux it's implemented with copy-on-write, so its main cost is copying page tables, not memory. Since glibc 2.3.3, the `fork()` wrapper actually calls `clone()`.
+- **`exec*()`** loads a new program into the **current** process. Same PID, open file descriptors stay open (unless marked close-on-exec), but code, heap and stack are replaced. It doesn't return on success.
+- **`wait()` / `waitpid()`** lets the parent collect the child's exit status.
+
+Why split them? Between `fork` and `exec`, the child can rearrange its own world, like redirecting stdout to a file or closing descriptors. That's exactly how a shell runs `ls > out.txt`.
+
+**Zombies and orphans:**
+
+- **Zombie**: the child exited but the parent never called `wait`. The kernel keeps a tiny record (PID, exit status) so the parent can read it later. Thousands of zombies can exhaust the PID space. Fix the parent, or handle `SIGCHLD`.
+- **Orphan**: the parent died first. The child is re-parented to `init` (PID 1) or a designated subreaper, which reaps it. This is why containers need a proper PID 1 (e.g., `tini`, or `docker run --init`) that reaps children.
+
+**Gotcha:** `fork()` in a multithreaded program copies **only the calling thread**. If another thread held a mutex at that moment, the child inherits a locked mutex with no owner to unlock it. The man page says the child should call only async-signal-safe functions until it calls `exec`.
+
+### Context switching
+
+A context switch happens when the kernel stops running task A on a CPU and starts running task B.
+
+**What gets saved and restored:**
+
+- General-purpose registers, program counter, stack pointer, flags.
+- Floating point / SIMD register state (often saved lazily or only when used).
+- The kernel stack pointer for the task.
+- **If B is in a different process**: the page-table base register (CR3 on x86) is switched to B's page tables.
+
+**Two kinds:**
+
+| | Voluntary | Involuntary (preemption) |
+|---|---|---|
+| Trigger | Task blocks: I/O, lock wait, `sleep`, `epoll_wait` | Time slice expired, or a higher-priority task woke up |
+| Typical cause | I/O-bound work, lock contention | CPU-bound work, too many runnable threads |
+| Where to see it | `voluntary_ctxt_switches` in `/proc/PID/status` | `nonvoluntary_ctxt_switches` in the same file |
+
+A high involuntary count means your threads want more CPU than they get (too many threads, or CPU throttling in a container). A high voluntary count means they keep blocking.
+
+**What it costs.** The direct cost (saving and loading registers, running the scheduler) is small, on the order of microseconds. The **indirect cost** usually matters more:
+
+- **TLB effects.** The TLB caches virtual-to-physical translations. Switching to another process changes the address space, so old entries become useless. Modern CPUs tag entries with an address-space ID (PCID on x86, ASID on ARM) so the kernel doesn't always have to flush, but the new task still starts with few useful entries.
+- **Cold CPU caches.** Task B's data isn't in L1/L2. It pays memory latency until the caches warm up.
+- **Thread vs process switch.** Switching between two threads of the **same** process keeps the page tables and the TLB entries, so it's cheaper.
+
+Rule of thumb: one switch is cheap, but tens of thousands per second per core starts to show up as lost throughput and tail latency. That's the main argument for event loops and user-space schedulers (goroutines, virtual threads), which switch without entering the kernel.
+
+### Mode switch is not a context switch
+
+A **system call** switches the CPU from user mode to kernel mode **within the same task**. No other task runs. That's a **mode switch**, much cheaper than a context switch. A syscall only causes a context switch if it blocks (e.g., `read` on a socket with no data), and then the scheduler picks someone else.
+
+### CPU scheduling basics
+
+The scheduler decides which ready task runs next on each CPU. Classic algorithms you should be able to name:
+
+| Algorithm | Idea | Weakness |
+|---|---|---|
+| FCFS (first come, first served) | Run in arrival order | Convoy effect: one long job delays everyone |
+| SJF / SRTF | Shortest job (or shortest remaining time) first | Needs to know job length; long jobs can starve |
+| Round robin | Each task gets a fixed time slice, then goes to the back | Slice too small = switch overhead; too big = FCFS |
+| Priority | Highest priority runs | Starvation; fixed with **aging** |
+| MLFQ (multi-level feedback queue) | Tasks move between priority queues based on behaviour; interactive tasks stay high | Tuning; gaming the scheduler |
+
+Key metrics: **turnaround time** (finish minus arrival), **response time** (first run minus arrival), throughput, fairness.
+
+**Linux:**
+
+- **CFS (Completely Fair Scheduler)**, the default from Linux 2.6.23 until 6.6. Each task has a **virtual runtime** (`vruntime`) that grows as it runs, scaled by its weight (from its **nice** value, -20 to 19). The task with the smallest vruntime runs next. Tasks are kept in a red-black tree ordered by vruntime.
+- **EEVDF (Earliest Eligible Virtual Deadline First)**, the default since **Linux 6.6**. It keeps the fair-share idea but adds two concepts:
+  - **Lag**: how much CPU a task is owed compared with its fair share. Only tasks with lag of zero or more are **eligible**.
+  - **Virtual deadline**: computed from the task's requested time slice. Among eligible tasks, the one with the **earliest virtual deadline** runs next.
+  - Since Linux 6.12, a task can ask for a shorter slice (through `sched_setattr()`), which gives it an earlier deadline and lower latency, without getting more total CPU.
+- Real-time policies `SCHED_FIFO` and `SCHED_RR` sit above the normal fair class: a runnable real-time task always beats a normal one.
+
+How to say it: *"Linux used CFS, a vruntime-based fair scheduler, for years. Since 6.6 the default is EEVDF, which is still fair-share but picks the eligible task with the earliest virtual deadline, so latency-sensitive tasks can request shorter slices."*
+
+### System calls: user mode and kernel mode
+
+The CPU has privilege levels. User code runs in **user mode** (ring 3 on x86). It can't touch hardware, page tables or other processes' memory. The kernel runs in **kernel mode** (ring 0). Any privileged operation goes through a syscall.
+
+**How a syscall happens on Linux x86-64:**
+
+```
+ user space                                kernel space
+ ──────────                                ────────────
+ read(fd, buf, n)            (glibc wrapper)
+   rax = syscall number (read)
+   rdi, rsi, rdx = fd, buf, n
+   syscall instruction  ────────────────►  CPU switches to ring 0,
+                                           jumps to the kernel entry point
+                                           save user registers
+                                           look up the handler in the syscall table
+                                           run the handler (may block → context switch)
+                                           put the result in rax
+   ◄──────────────────────────────────────  return to user mode (sysret)
+ glibc: if rax is a small negative number → set errno, return -1
+```
+
+- Arguments go in `rdi, rsi, rdx, r10, r8, r9`; the syscall number goes in `rax`; the result comes back in `rax`.
+- Errors come back as negative numbers; the libc wrapper turns them into `-1` plus `errno`.
+- Older 32-bit x86 used the software interrupt `int 0x80`. The idea is the same: a controlled trap into the kernel.
+
+**Common syscalls by category:**
+
+| Category | Examples |
+|---|---|
+| Process | `fork`/`clone`, `execve`, `wait4`, `exit_group`, `kill` |
+| Files | `openat`, `read`, `write`, `close`, `fsync`, `lseek` |
+| Memory | `mmap`, `munmap`, `brk`, `mprotect`, `madvise` |
+| Network | `socket`, `connect`, `accept4`, `sendto`, `recvfrom`, `epoll_wait` |
+| Sync | `futex` (the kernel half of pthread mutexes and condition variables) |
+
+### vDSO: syscalls without entering the kernel
+
+Some calls are so frequent (reading the clock) that even a mode switch is too expensive. The kernel maps a tiny shared library, the **vDSO** (virtual dynamic shared object), into every process. On x86-64 it exports `clock_gettime`, `gettimeofday`, `time` and `getcpu`. glibc calls these as normal functions: they read data the kernel keeps updated in a shared page, so **no trap into the kernel happens**. That's why you usually won't see `clock_gettime` in `strace` output.
+
+## How it works (a shell runs `ls`, end to end)
+
+```
+1. bash calls fork()  → clone() syscall → kernel creates a new task_struct,
+   copies page tables (copy-on-write), marks the child READY.
+2. Scheduler eventually picks the child. Context switch: save bash's registers,
+   load the child's registers, switch CR3 to the child's page tables.
+3. Child calls execve("/bin/ls") → kernel throws away the old address space,
+   maps the ls binary and the dynamic loader, sets up a fresh stack.
+4. ls runs in user mode. For each directory read it makes getdents64 syscalls
+   (mode switch, same task). Output goes out through write(1, ...).
+5. Meanwhile bash is BLOCKED in wait4(). It uses no CPU.
+6. ls calls exit_group(). It becomes a ZOMBIE; the kernel sends SIGCHLD to bash.
+7. bash wakes (READY → RUNNING), wait4 returns the exit status, the zombie is reaped.
+```
+
+### Observing it
+
+```bash
+# Every syscall a command makes, with timing
+strace -f -tt -T ls /tmp            # -f: follow children/threads, -T: time in each call
+
+# Syscall summary (counts, errors, time) for a running process
+strace -c -f -p <pid>
+
+# Per-thread CPU view
+top -H -p <pid>
+
+# System-wide: r (runnable), b (blocked), cs (context switches/s), us/sy/wa/st CPU %
+vmstat 1
+
+# Voluntary vs involuntary context switches for one process
+grep ctxt /proc/<pid>/status
+
+# Thread count and state
+grep -E 'State|Threads' /proc/<pid>/status
+```
+
+How to read `vmstat`:
+
+- `r` consistently above the number of cores → CPU saturation.
+- `b` high → tasks stuck in uninterruptible I/O wait.
+- `cs` very high with high `sy` → too many threads or lock thrashing.
+- `wa` high → waiting on disk. `st` high → your VM's host is stealing CPU.
+
+Note: `strace` uses `ptrace`, which stops the traced process on each syscall. It can slow a busy service **a lot**. In production prefer lower-overhead tools like `perf trace` or eBPF tools (see [Production debugging](/learn/notes/production-debugging/)).
+
+## Real-world examples
+
+- **Chrome** runs sites in separate renderer processes so a crash or exploit in one is contained by the process boundary.
+- **PostgreSQL** uses a **process per connection** (the postmaster forks a backend). That's why connection poolers like PgBouncer are standard: thousands of backend processes waste memory and context switches. See [Postgres internals](/learn/notes/postgres-internals/).
+- **Nginx** uses a few worker processes, each running an event loop (`epoll`) that handles thousands of connections, instead of a thread per connection.
+- **Redis** executes commands on a single main thread, avoiding locks and context switches for its core data path.
+- **Go** multiplexes many goroutines onto a small number of OS threads, and **Java 21 virtual threads** do the same for Java. Both turn many blocking calls into cheap user-space switches.
+
+## Common pitfalls
+
+- **Thinking threads are free.** Each OS thread has a kernel task and a stack (often a multi-MB virtual reservation by default). Thousands of runnable threads mean constant context switching.
+- **`fork()` from a multithreaded program, then doing real work in the child.** Locks held by other threads are copied in a locked state. Call `exec` quickly, or use `posix_spawn`.
+- **Not reaping children** → zombies pile up. In containers, a PID 1 that doesn't reap causes this.
+- **Treating load average as CPU usage.** On Linux it includes tasks in `D` state (waiting on I/O).
+- **Running `strace` on a hot production process** and taking it down. It's a debugger, not a profiler.
+- **Too many small syscalls.** One `write` per byte or per log line wastes mode switches. Buffer, then write.
+- **Ignoring container CPU limits.** A CFS quota that's too low causes throttling, which shows up as involuntary context switches and latency spikes.
+
+## Practice questions
+
+<Practice>
+
+<QA q="What is the difference between a process and a thread?" level="easy">
+
+A **process** has its own virtual address space, file descriptor table, credentials and signal handlers. It's an isolation boundary. A **thread** is a flow of execution inside a process. Threads share the address space (heap, globals, code) and open files, but each has its own stack, registers and program counter.
+
+Practical effects: threads communicate cheaply through shared memory but need synchronization, and one bad thread can crash the whole process. Processes are isolated and need IPC to communicate.
+
+</QA>
+
+<QA q="What does a PCB contain?" level="easy">
+
+The Process Control Block is the kernel's record of a process: PID and parent PID, state, saved CPU context (registers, program counter), memory-management info (page tables), open file table, scheduling info (priority, runtime), credentials, signal state and accounting. On Linux it's `task_struct`, and threads get their own `task_struct` too.
+
+</QA>
+
+<QA q="Walk through the process states. What does state D in ps mean?" level="easy">
+
+The classic states are new, ready, running, blocked (waiting) and terminated. Linux shows `R` (running or runnable), `S` (interruptible sleep), `D` (uninterruptible sleep), `T` (stopped), `Z` (zombie).
+
+`D` means the task is waiting inside the kernel for something that can't be interrupted, usually disk or NFS I/O. Signals, even SIGKILL, are delivered only after the operation returns. Many tasks in `D` point to a slow or hung storage device and raise the load average.
+
+</QA>
+
+<QA q="What does `fork()` return, and why are fork and exec separate calls?" level="easy">
+
+`fork()` returns 0 in the child, the child's PID in the parent, and -1 on failure. `exec` replaces the current program image with a new one and doesn't return on success.
+
+They're separate so the child can set up its environment between them: redirect stdin/stdout, close descriptors, change directory, drop privileges. That's how a shell implements `cmd > file` and pipes.
+
+</QA>
+
+<QA q="What is a zombie process and what is an orphan?" level="medium">
+
+A **zombie** has exited but its parent hasn't called `wait()`. The kernel keeps its PID and exit status. It uses no CPU or memory beyond that small entry, but too many can exhaust PIDs. Fix: the parent should reap children (handle `SIGCHLD` and call `waitpid`).
+
+An **orphan** is a child whose parent died. It's re-parented to PID 1 (or a subreaper), which reaps it when it exits. In containers, your app may be PID 1, so use an init like `tini` that reaps.
+
+</QA>
+
+<QA q="What exactly is saved during a context switch, and why is a thread switch cheaper than a process switch?" level="medium">
+
+Saved: general-purpose registers, program counter, stack pointer, flags, FPU/SIMD state, and the kernel stack pointer. If the next task belongs to a different process, the kernel also switches the page-table base register (CR3 on x86).
+
+Within the same process the address space doesn't change, so page tables stay and the TLB entries stay valid. Across processes the TLB entries for the old address space become useless (PCID/ASID tagging avoids a full flush but the new task still starts cold), and CPU caches hold the wrong data. Those indirect costs dominate.
+
+</QA>
+
+<QA q="What is the difference between voluntary and involuntary context switches? How do you see them?" level="medium">
+
+**Voluntary**: the task gave up the CPU because it blocked (I/O, lock, sleep). **Involuntary**: the kernel preempted it because its slice ran out or a higher-priority task woke.
+
+See them in `/proc/PID/status` (`voluntary_ctxt_switches`, `nonvoluntary_ctxt_switches`) or with `pidstat -w`. Many involuntary switches mean CPU contention or CPU quota throttling. Many voluntary switches mean lots of blocking, often on I/O or locks.
+
+</QA>
+
+<QA q="Is a system call a context switch?" level="medium">
+
+Not necessarily. A syscall is a **mode switch**: the same task moves from user mode into kernel mode and back. No other task runs. It becomes a context switch only if the syscall blocks (e.g., reading a socket with no data) and the scheduler runs another task.
+
+A mode switch is far cheaper than a context switch, but still not free, which is why the vDSO and batching exist.
+
+</QA>
+
+<QA q="How does a system call work on Linux x86-64?" level="medium">
+
+The libc wrapper puts the syscall number in `rax` and up to six arguments in `rdi, rsi, rdx, r10, r8, r9`, then executes the `syscall` instruction. The CPU switches to kernel mode and jumps to the kernel's entry point, which saves user registers, looks up the handler in the syscall table and runs it. The result goes into `rax`, and the kernel returns to user mode. A negative return value is an error code; libc converts it into `-1` and sets `errno`.
+
+</QA>
+
+<QA q="What is the vDSO and why does it exist?" level="medium">
+
+A small shared library the kernel maps into every process. It provides fast versions of very frequent calls (on x86-64: `clock_gettime`, `gettimeofday`, `time`, `getcpu`) that read kernel-maintained data from a shared page without trapping into the kernel. It turns a syscall into a plain function call. That's why clock reads are cheap and why they don't appear in `strace`.
+
+</QA>
+
+<QA q="How does Linux CFS pick the next task, and what changed with EEVDF?" level="hard">
+
+**CFS** tracks a weighted virtual runtime per task (lower nice value = higher weight = vruntime grows more slowly). It keeps runnable tasks in a red-black tree and runs the one with the smallest vruntime, so everyone converges to a fair share.
+
+**EEVDF** became the default in Linux 6.6. It still aims for fair shares, but each task has a **lag** (CPU owed versus its fair share) and a **virtual deadline** derived from its time slice. Only tasks with non-negative lag are eligible, and among them the earliest virtual deadline runs. Since 6.12, tasks can request shorter slices (via `sched_setattr()`) to get lower latency without getting more CPU in total. This replaces many of CFS's latency heuristics with a more principled rule.
+
+</QA>
+
+<QA q="Why can `fork()` be dangerous in a multithreaded program?" level="hard">
+
+The child gets a copy of the whole address space but only **one** thread, the one that called `fork`. If another thread was holding a mutex (say inside `malloc` or a logging library), the child has that mutex locked forever, with no thread to unlock it. Calling such a function in the child deadlocks. POSIX says the child should only call async-signal-safe functions until `exec`. Use `posix_spawn`, or fork early before creating threads.
+
+</QA>
+
+<QA q="Compare thread-per-request with an event loop for a server handling 50K mostly idle connections." level="hard">
+
+Thread-per-request: simple blocking code, but 50K OS threads means 50K kernel tasks and stacks, a big memory footprint, scheduler overhead and lots of context switches when traffic arrives.
+
+Event loop (`epoll`): a few threads wait for readiness on all sockets and run short callbacks. Few context switches, small memory. Downside: code must never block the loop, and CPU-heavy work needs a separate pool.
+
+Middle ground: user-space threads (goroutines, Java virtual threads) give blocking-style code with event-loop-like costs, because the runtime parks them in user space and multiplexes them onto a few OS threads.
+
+</QA>
+
+<QA q="Your service's p99 latency rose after moving to Kubernetes. vmstat shows modest CPU use but nonvoluntary_ctxt_switches is climbing fast. What's going on?" level="scenario">
+
+Likely **CPU throttling from a cgroup CPU limit**. The CFS bandwidth controller gives the container a quota per period (by default 100 ms). A multithreaded app can burn its whole quota early in the period, then all its threads are throttled until the next period, even if the node has idle CPU. That shows up as involuntary switches and latency spikes, while average CPU looks fine.
+
+Check `nr_throttled` and `throttled_time` in the cgroup's `cpu.stat`. Fixes: raise or remove the CPU limit, reduce thread pool sizes, set runtime parallelism to match the quota (e.g., `GOMAXPROCS`, JVM container awareness). See [Kubernetes](/learn/notes/kubernetes/).
+
+</QA>
+
+<QA q="A host shows load average 40 on 8 cores, yet top shows CPUs mostly idle. Explain and debug." level="scenario">
+
+Linux load average counts tasks in `R` **and** `D`. Idle CPUs plus high load means many tasks are stuck in uninterruptible sleep, usually waiting on storage (a slow disk, a hung NFS or network volume).
+
+Debug: `vmstat 1` (look at `b` and `wa`), `ps -eo state,pid,cmd | grep '^D'` to find the stuck tasks, `cat /proc/PID/stack` (as root) to see where they wait in the kernel, `iostat -x 1` for device latency and utilization, and `dmesg` for I/O errors or hung task warnings.
+
+</QA>
+
+<QA q="A Java service spends 30 percent of CPU in sys time. How do you find out why?" level="scenario">
+
+High system time means a lot of time in the kernel: too many syscalls, page faults, or context switches.
+
+1. `vmstat 1`: is `cs` very high? Then look at thread counts and lock contention.
+2. `pidstat -w -t -p PID 1`: which threads switch most.
+3. `strace -c -f -p PID` for a few seconds **on a canary** (it's slow): which syscalls dominate. Typical culprits: tiny unbuffered `write`s (logging), `futex` storms from lock contention, `epoll_wait` spinning with zero timeouts, many `mmap`/`munmap` calls.
+4. `perf top` or a flame graph to see kernel stacks with lower overhead.
+5. Also check page faults (`pidstat -r`), since faults are counted as system time.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="Which of these is NOT shared between threads of the same process?" options={["Heap", "Open file descriptors", "Stack", "Global variables"]} answer={2}>
+
+Each thread has its own stack, registers and program counter. The heap, globals, code and the file descriptor table are shared by all threads in the process.
+
+</MCQ>
+
+<MCQ q="In the parent, what does a successful fork() return?" options={["0", "The child's PID", "The parent's PID", "1"]} answer={1}>
+
+`fork()` returns the child's PID in the parent and 0 in the child. It returns -1 only on failure.
+
+</MCQ>
+
+<MCQ q="On Linux, what does a process in state Z mean?" options={["It is using too much memory", "It is stuck in disk I/O", "It is stopped by a debugger", "It has exited but its parent has not reaped it yet"]} answer={3}>
+
+A zombie has exited and keeps only its exit status until the parent calls `wait`. Disk I/O waits show as `D`, debugger stops as `t`.
+
+</MCQ>
+
+<MCQ q="Why is switching between two threads of the same process cheaper than between two processes?" options={["The address space stays the same, so page tables and TLB entries stay valid", "Threads do not have registers", "The kernel does not get involved", "Threads share a stack"]} answer={0}>
+
+Same process means same page tables, so no address-space switch and the TLB stays useful. Threads still have their own registers and stacks, and the kernel still performs the switch.
+
+</MCQ>
+
+<MCQ q="What is the default fair scheduler for normal tasks in Linux 6.6 and later?" options={["CFS", "O(1) scheduler", "EEVDF", "MLFQ"]} answer={2}>
+
+Linux 6.6 replaced CFS with EEVDF (Earliest Eligible Virtual Deadline First). The O(1) scheduler was replaced by CFS in 2.6.23. MLFQ is a textbook design.
+
+</MCQ>
+
+<MCQ q="Why does clock_gettime usually not show up in strace output?" options={["strace hides time calls by default", "It runs in the vDSO without entering the kernel", "It is not a real function", "It only runs in kernel threads"]} answer={1}>
+
+On x86-64 Linux, `clock_gettime` is served by the vDSO, a kernel-provided shared library in user space, so no syscall happens for strace to catch.
+
+</MCQ>
+
+<MCQ q="A task blocks in read() on an empty socket. Which statement is true?" options={["Only a mode switch happens, the task keeps the CPU", "The kernel busy-waits until data arrives", "The process is killed", "The task enters a sleep state and the scheduler context-switches to another task"]} answer={3}>
+
+The syscall is a mode switch at first. Because no data is ready, the task sleeps (`S`) and the scheduler runs another task, which is a voluntary context switch.
+
+</MCQ>
+
+<MCQ q="Which registers carry the first three syscall arguments on Linux x86-64?" options={["rdi, rsi, rdx", "rax, rbx, rcx", "r10, r8, r9", "rsp, rbp, rip"]} answer={0}>
+
+Arguments 1 to 6 go in `rdi, rsi, rdx, r10, r8, r9`, and the syscall number goes in `rax`.
+
+</MCQ>
+
+<MCQ q="What does Linux load average count?" options={["Only tasks using CPU", "CPU utilization percentage", "Tasks that are runnable or in uninterruptible sleep", "Number of threads in the system"]} answer={2}>
+
+Linux counts both runnable (`R`) and uninterruptible (`D`) tasks, so heavy I/O waits raise load average even with idle CPUs.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **Process** = address space + resources (isolation). **Thread** = execution context inside it (own stack and registers, shared heap and fds).
+- Linux: both are **tasks** (`task_struct`). Threads are `clone()`s that share memory. PID = thread group ID.
+- States: `R` runnable, `S` sleep, `D` uninterruptible (I/O), `T` stopped, `Z` zombie.
+- `fork` (copy-on-write clone, returns twice) → `exec` (replace image) → `wait` (reap). Not reaping = zombies.
+- **Context switch**: save/restore registers; across processes also switch page tables. Real cost = cold TLB and caches.
+- **Voluntary** (blocked) vs **involuntary** (preempted) switches: `/proc/PID/status`.
+- **Syscall** = mode switch (user to kernel), not necessarily a context switch. x86-64: `syscall`, number in `rax`.
+- **vDSO**: `clock_gettime` and friends without entering the kernel.
+- Scheduler: **CFS** (vruntime) until 6.5, **EEVDF** (lag + virtual deadline) since 6.6.
+- Tools: `strace -c` (slow!), `top -H`, `vmstat 1` (`r`, `b`, `cs`, `sy`, `wa`, `st`), `pidstat -w`.
+
+## Go deeper
+
+- **OSTEP** (free): [Operating Systems: Three Easy Pieces](https://pages.cs.wisc.edu/~remzi/OSTEP/), especially [Limited Direct Execution](https://pages.cs.wisc.edu/~remzi/OSTEP/cpu-mechanisms.pdf), [Process API](https://pages.cs.wisc.edu/~remzi/OSTEP/cpu-api.pdf) and [MLFQ scheduling](https://pages.cs.wisc.edu/~remzi/OSTEP/cpu-sched-mlfq.pdf).
+- **Kernel docs**: [EEVDF scheduler](https://docs.kernel.org/scheduler/sched-eevdf.html).
+- **LWN**: [An EEVDF CPU scheduler for Linux](https://lwn.net/Articles/925371/).
+- **Man pages**: [fork(2)](https://man7.org/linux/man-pages/man2/fork.2.html), [syscall(2)](https://man7.org/linux/man-pages/man2/syscall.2.html), [vdso(7)](https://man7.org/linux/man-pages/man7/vdso.7.html), [strace(1)](https://man7.org/linux/man-pages/man1/strace.1.html), [vmstat(8)](https://man7.org/linux/man-pages/man8/vmstat.8.html).
+- **Book**: Silberschatz, Galvin, Gagne, *Operating System Concepts*, chapters on processes, threads and CPU scheduling.
+- Next: [Virtual Memory, Paging and the Page Cache](/learn/notes/os-virtual-memory/) and [Synchronization and Deadlocks](/learn/notes/os-synchronization-deadlocks/).

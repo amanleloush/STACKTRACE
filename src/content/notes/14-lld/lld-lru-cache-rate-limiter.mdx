@@ -1,0 +1,799 @@
+---
+title: "LLD: LRU Cache and a Thread-Safe Rate Limiter"
+phase: "14-lld"
+order: 140
+tags: ["lld", "machine-coding", "java", "concurrency", "caching", "rate-limiting"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 45
+prerequisites: ["behavioral-patterns", "java-concurrency-locks", "java-collections-hashmap", "rate-limiting"]
+summary: "Two classic machine-coding rounds in one note: a generic O(1) LRU cache (LinkedHashMap and hand-rolled), and a per-key, thread-safe rate limiter with token bucket and sliding-window strategies, an injectable clock and a multi-threaded test."
+---
+
+## Definition (interview-ready)
+
+You are building two small, thread-safe components. An **LRU cache** is a fixed-capacity key-value store that, when full, evicts the least recently used entry, with O(1) `get` and `put`. The design is a `HashMap` from key to node plus a doubly linked list kept in recency order (or `LinkedHashMap` with `accessOrder = true` and `removeEldestEntry`). Because `get` reorders the list, every operation takes one exclusive lock. A **rate limiter** answers allow or reject per client key. The design is a `RateLimiter` interface (Strategy) with one class per algorithm (token bucket, sliding-window log, sliding-window counter), per-key state in a `ConcurrentHashMap` created with `computeIfAbsent`, a lock per key so different clients never contend, and an injected monotonic clock so tests can move time without sleeping.
+
+**One-liner:** An LRU cache is a HashMap plus a doubly linked list under one lock, giving O(1) get and put with least-recently-used eviction; a rate limiter is a Strategy interface over token bucket or sliding window, with per-key state in a ConcurrentHashMap, a lock per key and an injected clock.
+
+## Problem statement
+
+These two problems come up together because they test the same skills: a small data structure, a clean interface, and **getting thread safety right**. An interviewer usually gives them like this.
+
+**Part A: LRU cache.**
+
+> Build an in-memory cache with a fixed capacity. `get(key)` returns the value if present. `put(key, value)` inserts or updates. When the cache is full and a new key arrives, evict the **least recently used** entry. Both operations must be O(1). Make it generic and safe to use from many threads.
+
+**Part B: Rate limiter.**
+
+> Build a rate limiter that answers `tryAcquire(clientId)` with allow or reject. Each client gets its own limit, for example "at most 100 requests per minute". Support at least two algorithms and make it easy to add more. It will be called from many request threads at once, and it must **never let more requests through than the limit**.
+
+**LRU** means "least recently used": the entry that was read or written longest ago is the first to go. The intuition is a stack of books on your desk. Every time you use a book you put it on top. When the desk is full, you remove the book at the bottom.
+
+## Clarifying questions to ask
+
+| Question | Sensible assumed answer |
+|---|---|
+| Does `get` count as a "use" for LRU? | Yes. Both `get` and `put` make the key most recently used. |
+| Does `put` on an existing key count as a use? Does it change size? | Yes, it updates the value and moves the key to most recent; size is unchanged. |
+| Are null keys or values allowed? | No null keys. `get` returns `Optional` so "missing" is explicit. |
+| Capacity 0? | Reject it in the constructor. |
+| Do we need TTL (time-based expiry)? | Out of scope; mention as an extension. |
+| Rate limiter: single process or distributed across servers? | Single JVM. The distributed version is in [HLD: Distributed Rate Limiter](/learn/notes/hld-rate-limiter/). |
+| Should bursts be allowed? | Token bucket allows bursts up to the bucket size (so a window can see capacity plus refill); sliding window caps every window at the limit (exactly for the log, approximately for the counter). Implement both behind one interface. |
+| What does reject mean — block, throw, or return false? | Return `false`. The caller decides (HTTP 429, retry, drop). |
+| Same limit for all clients? | Yes for the core; per-tier limits are an extension. |
+| How will we test time-based behaviour? | Inject a time source so tests can move time forward without `Thread.sleep`. |
+
+## Requirements
+
+**Functional**
+
+- `Cache` with `get` and `put`, generic `LRUCache` with key type K and value type V, fixed capacity, LRU eviction.
+- `RateLimiter.tryAcquire(String key)` returning a boolean.
+- Algorithms: token bucket, sliding-window log, sliding-window counter.
+- Limits are applied **per key** (per user, API key or IP).
+
+**Non-functional**
+
+- O(1) `get` and `put` for the cache. Token bucket and window counter are O(1) per call; the sliding log is amortised O(1) but stores up to `limit` timestamps per key.
+- Thread-safe: no lost updates, no corrupted list, **no over-admission** (letting in more requests than allowed).
+- Different keys should not block each other in the rate limiter.
+- Deterministic tests: no sleeps, no flaky timing.
+
+**Out of scope:** persistence, distributed limits across servers, TTL, cache statistics, async loading.
+
+## Entities and relationships
+
+```
+            Part A                                     Part B
+   +-----------------------+                 +----------------------------+
+   | interface Cache<K,V>  |                 |   interface RateLimiter    |
+   | get(K): Optional<V>   |                 |   tryAcquire(key): boolean |
+   | put(K,V), size()      |                 +-------------+--------------+
+   +-----------+-----------+                               | implements
+        implements                     +-------------------+--------------------+
+     +---------+-----------+           |                   |                    |
+     |                     |   TokenBucket        SlidingWindowLog     SlidingWindowCounter
+ LinkedHashMapLRUCache  LRUCache   RateLimiter      RateLimiter            RateLimiter
+ (wraps LinkedHashMap  (HashMap<K,Node>  | has            | has                  | has
+  accessOrder=true)     + doubly linked  v                v                      v
+                         list + lock)  CHM<key,Bucket>  CHM<key,Deque<Long>>   CHM<key,Window>
+                                          \                |                     /
+                                           +-------- uses Ticker (time) ------+
+                                                 SYSTEM = System::nanoTime
+                                                 FakeTicker (tests)
+```
+
+CHM is `ConcurrentHashMap`. Each limiter owns a map from key to that key's private state, and each piece of state has its own lock.
+
+## Design patterns used and why
+
+- **Strategy** — `RateLimiter` is the strategy interface; each algorithm is one class. The API gateway or filter that calls it doesn't know which one it has, so switching algorithms is a one-line change in wiring. See [Behavioral Patterns](/learn/notes/behavioral-patterns/).
+- **Dependency injection of a time source** — `Ticker` is passed in through the constructor (Dependency Inversion from [SOLID](/learn/notes/solid-principles/)). Production passes `System::nanoTime`; tests pass a `FakeTicker` they control.
+- **Template-like reuse via composition** — the LRU logic is written against the `Cache` interface, so a caller can swap the `LinkedHashMap` version for the hand-rolled one (or for a library cache) without changes.
+- **Per-key state objects** — `Bucket` and `Window` encapsulate "my state plus my lock". This is what gives **fine-grained locking**: one lock per key instead of one for the whole limiter.
+
+What we deliberately do *not* add: a factory hierarchy, a decorator chain, or an abstract base class. Nothing in the requirements needs them. See [Machine-Coding Strategy](/learn/notes/machine-coding-strategy/) on not over-engineering.
+
+## Solution walkthrough
+
+### Part A, step 1: LRU with `LinkedHashMap`
+
+`LinkedHashMap` is a `HashMap` that also keeps a doubly linked list through its entries. Its 3-argument constructor `LinkedHashMap(int initialCapacity, float loadFactor, boolean accessOrder)` picks the list order:
+
+- `accessOrder = false` (default): insertion order.
+- `accessOrder = true`: **access order** — `get`, `put`, `getOrDefault`, `compute*`, `merge` and `putIfAbsent` move the entry to the end. The head of the list is therefore the least recently used entry.
+
+It also has a hook: `protected boolean removeEldestEntry(Map.Entry eldest)`. The JDK calls it from `put` and `putAll` **after** inserting a new entry. If you return `true`, the map removes the eldest entry (the head). So an LRU cache is about five lines:
+
+```java
+new LinkedHashMap<K, V>(16, 0.75f, true) {
+    @Override
+    protected boolean removeEldestEntry(Map.Entry<K, V> eldest) {
+        return size() > capacity;
+    }
+};
+```
+
+Two details interviewers probe:
+
+1. **`get` is a write here.** The `LinkedHashMap` Javadoc says that in an access-ordered map, merely calling `get` is a *structural modification* (it relinks the list). So two threads calling only `get` at the same time can still corrupt the list. That's why every method in `LinkedHashMapLRUCache` is `synchronized`, including `get`.
+2. **A read-write lock does not help.** `ReentrantReadWriteLock` lets many readers in at once, but our "reads" mutate the list, so they would need the write lock anyway.
+
+How to say it in an interview: "LinkedHashMap with accessOrder true plus removeEldestEntry gives me LRU in five lines. Because get reorders the list, I need an exclusive lock for both get and put."
+
+### Part A, step 2: hand-rolled HashMap + doubly linked list
+
+Many interviewers then say "now do it without `LinkedHashMap`". The classic design (also in the DSA page [LRU Cache](/learn/dsa/lru-cache/)):
+
+```
+ index: HashMap<K, Node>   (key -> the node holding it)
+
+ head(sentinel) <-> [c] <-> [a] <-> [d] <-> tail(sentinel)
+   LRU side                                    MRU side
+```
+
+- The **HashMap** finds a node in O(1).
+- The **doubly linked list** keeps recency order. Because each node knows both neighbours, we can unlink it in O(1) without searching.
+- Two **sentinel** (dummy) nodes, `head` and `tail`, mean the list is never empty, so there are no null checks for "first node" or "last node".
+
+Operations:
+
+- `get(k)`: look up the node; if found, unlink it and re-link it just before `tail` (most recent).
+- `put(k, v)` existing key: update the value, move to tail.
+- `put(k, v)` new key: if full, remove `head.next` (the least recent) from both the list and the map, then add the new node before `tail`.
+
+The node must store its **key** as well as its value. When we evict `head.next`, the key is how we remove it from the HashMap.
+
+### Part A, step 3: thread safety options
+
+| Option | How | Verdict |
+|---|---|---|
+| `synchronized` on every method | Simplest; intrinsic lock on the cache object | Correct; fine for an interview |
+| `ReentrantLock` | Explicit `lock()` / `unlock()` in `try/finally` | Same correctness; adds `tryLock` with timeout and fairness options |
+| `Collections.synchronizedMap(new LinkedHashMap(...))` | JDK wrapper | Correct for single calls; compound actions (check-then-put) still need external locking |
+| `ConcurrentHashMap` alone | Lock-free reads, fine-grained writes | **Not enough.** It has no recency order. You still need a list, and updating map + list must be one atomic step |
+| Production library | Caffeine (Window TinyLFU eviction, buffered reads) | What you'd actually use; say so, then implement your own because that's the exercise |
+
+Why `ConcurrentHashMap` alone isn't enough: LRU needs **two structures to change together** (the index and the order). `ConcurrentHashMap` makes each map call atomic, but between "map says key exists" and "move node to tail" another thread can evict that node. The invariant spans both structures, so one lock must cover both. See [Java Concurrency and Locks](/learn/notes/java-concurrency-locks/) for `ReentrantLock` vs `synchronized`.
+
+Our `LRUCache` uses a single `ReentrantLock`. A coarse lock is the honest answer here: every operation, even `get`, mutates the list. To scale further, real caches **shard** (N independent LRU caches chosen by key hash, each with its own lock; you lose exact global LRU order) or **buffer** reads and replay them later, as Caffeine does.
+
+### Part B, step 1: the interface and the clock
+
+```java
+interface RateLimiter { boolean tryAcquire(String key); }
+
+interface Ticker {
+    long nanos();
+    Ticker SYSTEM = System::nanoTime;
+}
+```
+
+Why a `Ticker` and not `System.currentTimeMillis()` everywhere?
+
+- **Testability.** Tests use `FakeTicker`, an `AtomicLong` you move forward with `advanceMillis(500)`. No `Thread.sleep`, no flaky tests.
+- **Monotonic time.** `System.nanoTime()` only measures elapsed time and is not tied to the wall clock. The wall clock (`currentTimeMillis`) can jump backwards when NTP corrects it, which could mint or destroy tokens.
+
+If your codebase already uses `java.time.Clock` (or `java.time.InstantSource`, added in Java 17), injecting that is the same idea; it is wall-clock based, so it fits windows aligned to calendar time.
+
+### Part B, step 2: token bucket
+
+Intuition: each key has a bucket that holds up to `capacity` tokens. Tokens drip in at `refillPerSecond`. A request takes one token; no token, no entry. A full bucket allows a **burst** of `capacity` requests at once, then the rate settles to the refill rate. Details and comparison with leaky bucket are in [Rate Limiting](/learn/notes/rate-limiting/).
+
+We refill **lazily**: no background thread. On each call we compute how much time passed since the last refill and add `elapsed * rate` tokens, capped at capacity. That makes each call O(1) and keeps idle keys free.
+
+```java
+synchronized boolean tryConsume(long now) {
+    if (now > lastRefill) {
+        tokens = Math.min(capacity, tokens + (now - lastRefill) * tokensPerNano);
+        lastRefill = now;
+    }
+    if (tokens >= 1) { tokens -= 1; return true; }
+    return false;
+}
+```
+
+The refill-then-check-then-decrement is a **read-modify-write**. Without the lock, two threads could both see `tokens = 1` and both take it. That is exactly the over-admission bug.
+
+### Part B, step 3: per-key state with `computeIfAbsent`
+
+```java
+Bucket bucket = buckets.computeIfAbsent(key, k -> new Bucket(capacity, ticker.nanos()));
+return bucket.tryConsume(ticker.nanos());
+```
+
+`ConcurrentHashMap.computeIfAbsent` runs atomically: if two threads see a new key at the same moment, the mapping function runs once and both get the **same** `Bucket`. The naive version is broken:
+
+```java
+// BROKEN: check-then-act race
+Bucket b = buckets.get(key);
+if (b == null) { b = new Bucket(...); buckets.put(key, b); } // two threads -> two buckets -> double the limit
+```
+
+Keep the mapping function short and side-effect free; the Javadoc warns that other updates to the map may block while it runs.
+
+**Lock granularity.** The map is shared, but each `Bucket` has its own monitor. Thread A limiting "alice" never waits for thread B limiting "bob". Only requests for the *same* key serialise, and they must, because they share one counter.
+
+### Part B, step 4: sliding-window log
+
+Keep a queue of timestamps of admitted requests per key. On each call, drop timestamps older than the window, then admit if fewer than `limit` remain. It's **exact** (never more than `limit` in any window-length span) but stores up to `limit` timestamps per key. `ArrayDeque` isn't thread-safe, so we `synchronized (log)` on that key's deque.
+
+### Part B, step 5: sliding-window counter
+
+Keep only two counts per key: the previous fixed window and the current one. Estimate the rolling count as:
+
+```
+estimate = previous * (1 - fractionOfCurrentWindowElapsed) + current
+```
+
+Admit if `estimate` is less than `limit`. It's O(1) memory and smooths the boundary spike of a plain fixed window, but it **assumes requests in the previous window were spread evenly**, so it's an approximation. If more than one full window passed, the previous count is treated as 0.
+
+## Full solution code
+
+One file, Java 21. `javac Main.java && java Main`.
+
+```java
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import java.util.concurrent.locks.*;
+
+// ===================== Part A: LRU cache =====================
+
+interface Cache<K, V> {
+    Optional<V> get(K key);
+    void put(K key, V value);
+    int size();
+}
+
+/** Version 1: let LinkedHashMap do the bookkeeping. */
+final class LinkedHashMapLRUCache<K, V> implements Cache<K, V> {
+    private final Map<K, V> map;
+
+    LinkedHashMapLRUCache(int capacity) {
+        if (capacity <= 0) throw new IllegalArgumentException("capacity must be > 0");
+        // accessOrder = true: get/put move the entry to the end (most recent)
+        this.map = new LinkedHashMap<>(16, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<K, V> eldest) {
+                return size() > capacity; // called by put after inserting
+            }
+        };
+    }
+
+    // get() reorders the list, so it is a WRITE: every method takes the same lock
+    public synchronized Optional<V> get(K key) { return Optional.ofNullable(map.get(key)); }
+    public synchronized void put(K key, V value) { map.put(key, value); }
+    public synchronized int size() { return map.size(); }
+}
+
+/** Version 2: hand-rolled HashMap + doubly-linked list, O(1) get/put. */
+final class LRUCache<K, V> implements Cache<K, V> {
+    private static final class Node<K, V> {
+        final K key;
+        V value;
+        Node<K, V> prev, next;
+        Node(K key, V value) { this.key = key; this.value = value; }
+    }
+
+    private final int capacity;
+    private final Map<K, Node<K, V>> index = new HashMap<>();
+    private final Node<K, V> head = new Node<>(null, null); // sentinel: LRU side
+    private final Node<K, V> tail = new Node<>(null, null); // sentinel: MRU side
+    private final ReentrantLock lock = new ReentrantLock();
+
+    LRUCache(int capacity) {
+        if (capacity <= 0) throw new IllegalArgumentException("capacity must be > 0");
+        this.capacity = capacity;
+        head.next = tail;
+        tail.prev = head;
+    }
+
+    public Optional<V> get(K key) {
+        lock.lock();
+        try {
+            Node<K, V> node = index.get(key);
+            if (node == null) return Optional.empty();
+            moveToTail(node);
+            return Optional.ofNullable(node.value);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public void put(K key, V value) {
+        lock.lock();
+        try {
+            Node<K, V> node = index.get(key);
+            if (node != null) {          // update + mark as recently used
+                node.value = value;
+                moveToTail(node);
+                return;
+            }
+            if (index.size() == capacity) { // evict least recently used
+                Node<K, V> lru = head.next;
+                unlink(lru);
+                index.remove(lru.key);
+            }
+            node = new Node<>(key, value);
+            linkBeforeTail(node);
+            index.put(key, node);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public int size() {
+        lock.lock();
+        try { return index.size(); } finally { lock.unlock(); }
+    }
+
+    /** Keys from least to most recently used (for demos and tests). */
+    List<K> keysLruToMru() {
+        lock.lock();
+        try {
+            List<K> keys = new ArrayList<>();
+            for (Node<K, V> n = head.next; n != tail; n = n.next) keys.add(n.key);
+            return keys;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private void moveToTail(Node<K, V> node) { unlink(node); linkBeforeTail(node); }
+
+    private void unlink(Node<K, V> node) {
+        node.prev.next = node.next;
+        node.next.prev = node.prev;
+    }
+
+    private void linkBeforeTail(Node<K, V> node) {
+        node.prev = tail.prev;
+        node.next = tail;
+        tail.prev.next = node;
+        tail.prev = node;
+    }
+}
+
+// ===================== Part B: rate limiter =====================
+
+/** Time source we can fake in tests. Monotonic nanoseconds, like System.nanoTime(). */
+interface Ticker {
+    long nanos();
+    Ticker SYSTEM = System::nanoTime;
+}
+
+final class FakeTicker implements Ticker {
+    private final AtomicLong now = new AtomicLong();
+    public long nanos() { return now.get(); }
+    void advanceMillis(long ms) { now.addAndGet(TimeUnit.MILLISECONDS.toNanos(ms)); }
+}
+
+/** Strategy interface: every algorithm answers the same question. */
+interface RateLimiter {
+    boolean tryAcquire(String key);
+}
+
+/** Token bucket: holds up to `capacity` tokens, refills continuously. Allows bursts. */
+final class TokenBucketRateLimiter implements RateLimiter {
+    private final long capacity;
+    private final double tokensPerNano;
+    private final Ticker ticker;
+    private final ConcurrentHashMap<String, Bucket> buckets = new ConcurrentHashMap<>();
+
+    TokenBucketRateLimiter(long capacity, long refillPerSecond, Ticker ticker) {
+        if (capacity <= 0 || refillPerSecond <= 0) throw new IllegalArgumentException("must be > 0");
+        this.capacity = capacity;
+        this.tokensPerNano = refillPerSecond / 1_000_000_000.0;
+        this.ticker = ticker;
+    }
+
+    public boolean tryAcquire(String key) {
+        // computeIfAbsent is atomic: two threads never create two buckets for one key
+        Bucket bucket = buckets.computeIfAbsent(key, k -> new Bucket(capacity, ticker.nanos()));
+        return bucket.tryConsume(ticker.nanos());
+    }
+
+    private final class Bucket {
+        private double tokens;
+        private long lastRefill;
+
+        Bucket(long initialTokens, long now) { tokens = initialTokens; lastRefill = now; }
+
+        // Lock per bucket: users "alice" and "bob" never contend with each other
+        synchronized boolean tryConsume(long now) {
+            if (now > lastRefill) {
+                tokens = Math.min(capacity, tokens + (now - lastRefill) * tokensPerNano);
+                lastRefill = now;
+            }
+            if (tokens >= 1) { tokens -= 1; return true; }
+            return false;
+        }
+    }
+}
+
+/** Sliding-window log: remember the timestamp of every admitted request. Exact, but O(limit) memory per key. */
+final class SlidingWindowLogRateLimiter implements RateLimiter {
+    private final int limit;
+    private final long windowNanos;
+    private final Ticker ticker;
+    private final ConcurrentHashMap<String, Deque<Long>> logs = new ConcurrentHashMap<>();
+
+    SlidingWindowLogRateLimiter(int limit, long windowMillis, Ticker ticker) {
+        if (limit <= 0 || windowMillis <= 0) throw new IllegalArgumentException("must be > 0");
+        this.limit = limit;
+        this.windowNanos = TimeUnit.MILLISECONDS.toNanos(windowMillis);
+        this.ticker = ticker;
+    }
+
+    public boolean tryAcquire(String key) {
+        Deque<Long> log = logs.computeIfAbsent(key, k -> new ArrayDeque<>());
+        synchronized (log) { // ArrayDeque is not thread-safe; lock just this key's log
+            long now = ticker.nanos();
+            while (!log.isEmpty() && now - log.peekFirst() >= windowNanos) log.pollFirst();
+            if (log.size() < limit) { log.addLast(now); return true; }
+            return false;
+        }
+    }
+}
+
+/** Sliding-window counter: two counters per key, weighted estimate. O(1) memory, approximate. */
+final class SlidingWindowCounterRateLimiter implements RateLimiter {
+    private final int limit;
+    private final long windowNanos;
+    private final Ticker ticker;
+    private final ConcurrentHashMap<String, Window> windows = new ConcurrentHashMap<>();
+
+    SlidingWindowCounterRateLimiter(int limit, long windowMillis, Ticker ticker) {
+        if (limit <= 0 || windowMillis <= 0) throw new IllegalArgumentException("must be > 0");
+        this.limit = limit;
+        this.windowNanos = TimeUnit.MILLISECONDS.toNanos(windowMillis);
+        this.ticker = ticker;
+    }
+
+    public boolean tryAcquire(String key) {
+        return windows.computeIfAbsent(key, k -> new Window()).tryAcquire();
+    }
+
+    private final class Window {
+        private long windowIndex = Long.MIN_VALUE; // which fixed window `current` counts
+        private long previous, current;
+
+        synchronized boolean tryAcquire() {
+            long now = ticker.nanos(); // read inside the lock, so windowIndex never moves backwards
+            long idx = Math.floorDiv(now, windowNanos);
+            if (idx != windowIndex) {
+                previous = (idx == windowIndex + 1) ? current : 0; // older than one window -> 0
+                current = 0;
+                windowIndex = idx;
+            }
+            double elapsed = (double) Math.floorMod(now, windowNanos) / windowNanos;
+            double estimate = previous * (1.0 - elapsed) + current;
+            if (estimate < limit) { current++; return true; }
+            return false;
+        }
+    }
+}
+
+public class Main {
+    public static void main(String[] args) throws Exception {
+        System.out.println("== LRU (hand-rolled), capacity 3 ==");
+        LRUCache<String, Integer> lru = new LRUCache<>(3);
+        lru.put("a", 1); lru.put("b", 2); lru.put("c", 3);
+        lru.get("a");                       // a becomes most recent
+        lru.put("d", 4);                    // evicts b (least recent)
+        System.out.println("order LRU->MRU: " + lru.keysLruToMru());
+        System.out.println("get(b) = " + lru.get("b") + ", get(a) = " + lru.get("a"));
+
+        System.out.println("== LRU (LinkedHashMap), capacity 2 ==");
+        Cache<Integer, String> lhm = new LinkedHashMapLRUCache<>(2);
+        lhm.put(1, "one"); lhm.put(2, "two"); lhm.get(1); lhm.put(3, "three");
+        System.out.println("get(2) = " + lhm.get(2) + ", get(1) = " + lhm.get(1) + ", size = " + lhm.size());
+
+        System.out.println("== Token bucket: capacity 3, refill 1/sec ==");
+        FakeTicker clock = new FakeTicker();
+        RateLimiter bucket = new TokenBucketRateLimiter(3, 1, clock);
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < 5; i++) sb.append(bucket.tryAcquire("alice") ? "Y" : "n");
+        clock.advanceMillis(1000);
+        sb.append(" | after 1s: ").append(bucket.tryAcquire("alice") ? "Y" : "n")
+          .append(bucket.tryAcquire("alice") ? "Y" : "n");
+        sb.append(" | bob: ").append(bucket.tryAcquire("bob") ? "Y" : "n");
+        System.out.println(sb);
+
+        System.out.println("== Sliding window log: 2 per 1000 ms ==");
+        FakeTicker clock2 = new FakeTicker();
+        RateLimiter log = new SlidingWindowLogRateLimiter(2, 1000, clock2);
+        System.out.println("t=0    " + log.tryAcquire("k") + " " + log.tryAcquire("k") + " " + log.tryAcquire("k"));
+        clock2.advanceMillis(999);
+        System.out.println("t=999  " + log.tryAcquire("k"));
+        clock2.advanceMillis(1);
+        System.out.println("t=1000 " + log.tryAcquire("k"));
+
+        System.out.println("== 8 threads x 1000 calls on one key, frozen clock, capacity 100 ==");
+        RateLimiter shared = new TokenBucketRateLimiter(100, 10, new FakeTicker());
+        AtomicInteger admitted = new AtomicInteger();
+        try (ExecutorService pool = Executors.newFixedThreadPool(8)) {
+            CountDownLatch start = new CountDownLatch(1);
+            for (int t = 0; t < 8; t++) {
+                pool.submit(() -> {
+                    start.await();
+                    for (int i = 0; i < 1000; i++) if (shared.tryAcquire("hot")) admitted.incrementAndGet();
+                    return null;
+                });
+            }
+            start.countDown();
+        } // Java 21: close() waits for submitted tasks
+        System.out.println("admitted = " + admitted.get());
+    }
+}
+```
+
+## Concurrency and edge cases
+
+- **`get` mutates in an LRU.** Any lock that lets two `get`s run together on the same list is wrong. Use one exclusive lock (or shard).
+- **Map and list must change together.** Evicting removes from both; inserting adds to both, inside the same critical section.
+- **Check-then-act on the per-key map.** Use `computeIfAbsent`, never `get` then `put`.
+- **Read-modify-write on tokens or counters.** Guard with the per-key lock. An `AtomicLong` alone doesn't help for the token bucket because the refill and the consume touch two fields (`tokens` and `lastRefill`) that must stay consistent. A lock-free version needs CAS on one immutable state object (`AtomicReference` to a record).
+- **Calling the clock inside or outside the lock.** We read `ticker.nanos()` just before taking the bucket lock. Two threads can then enter with slightly out-of-order times; the `if (now > lastRefill)` guard stops time from going backwards inside the bucket. The sliding log reads the time inside the lock, so its deque stays sorted. The sliding counter also reads it inside the lock: a stale `now` from the previous window would move `windowIndex` backwards and zero both counters, letting a burst over the limit through.
+- **Unbounded key map.** Every new key adds a bucket forever, which is a memory leak under many unique IPs. Fix: evict idle keys (a periodic sweep of buckets that are full and untouched, or a cache with access-based expiry; our own LRU works too).
+- **Floating-point tokens.** `double` is fine for interview scale. For exactness, store "nanos per token" as a `long` and compute whole tokens with integer division.
+- **Capacity and limit validation.** Zero or negative values throw `IllegalArgumentException` in constructors.
+- **Shutting down the test executor.** In Java 21, `ExecutorService` is `AutoCloseable` (since Java 19); `close()` waits for submitted tasks, which keeps the multithreaded test short. See [Executors and Virtual Threads](/learn/notes/java-executors-virtual-threads/).
+
+## Testing it
+
+The tests are plain Java with a tiny `check` helper (no JUnit needed), but each block maps to one JUnit `@Test`.
+
+```java
+// LRU basics
+LRUCache<String, Integer> c = new LRUCache<>(2);
+c.put("a", 1); c.put("b", 2); c.get("a"); c.put("c", 3);
+check(c.get("b").isEmpty(), "lru evicts least recently used");
+c.put("a", 10);
+check(c.size() == 2 && c.get("a").get() == 10, "lru update does not grow size");
+
+// LRU under contention: 8 threads x 20,000 random get/put on 200 keys, capacity 50
+List<Integer> keys = shared.keysLruToMru();
+check(shared.size() == 50 && keys.size() == 50 && new HashSet<>(keys).size() == 50,
+      "concurrent lru: map and list agree, size == capacity");
+
+// Token bucket with a fake clock: 2 tokens, refill 2/sec
+check(tb.tryAcquire("u") && tb.tryAcquire("u") && !tb.tryAcquire("u"), "bucket burst then reject");
+clk.advanceMillis(499);
+check(!tb.tryAcquire("u"), "no token before 500ms");
+clk.advanceMillis(1);
+check(tb.tryAcquire("u") && !tb.tryAcquire("u"), "one token after 500ms");
+clk.advanceMillis(10_000);
+check(tb.tryAcquire("u") && tb.tryAcquire("u") && !tb.tryAcquire("u"), "refill capped at capacity");
+
+// Sliding-window counter: limit 10 per 1000 ms
+// 15 calls at t=0 -> 10 admitted; at t=1500 (50% into next window) estimate = 10*0.5 -> 5 admitted
+```
+
+**The no-over-admission test.** Freeze the clock so no tokens refill, start 16 threads behind a `CountDownLatch` so they all hit the same key at the same instant, and count admissions. The answer must be **exactly** the limit, every time:
+
+```java
+static int hammer(RateLimiter limiter) throws Exception {
+    AtomicInteger admitted = new AtomicInteger();
+    CountDownLatch start = new CountDownLatch(1);
+    try (ExecutorService pool = Executors.newFixedThreadPool(16)) {
+        for (int t = 0; t < 16; t++) {
+            pool.submit(() -> {
+                start.await();
+                for (int i = 0; i < 2000; i++) if (limiter.tryAcquire("hot")) admitted.incrementAndGet();
+                return null;
+            });
+        }
+        start.countDown();          // release all threads together
+    }                               // close() waits for them
+    return admitted.get();
+}
+// for each of 20 runs, for each of the 3 algorithms with limit 100:
+check(hammer(limiter) == 100, "exact under 16 threads");
+```
+
+32,000 attempts against a limit of 100, repeated 20 times per algorithm, admitted exactly 100 each time. Remove `synchronized` from `Bucket.tryConsume` and this test can admit more than 100, which is the bug it exists to catch. The full harness ran **79 checks, all passing** on JDK 21.
+
+Demo output (`java Main`):
+
+```
+== LRU (hand-rolled), capacity 3 ==
+order LRU->MRU: [c, a, d]
+get(b) = Optional.empty, get(a) = Optional[1]
+== LRU (LinkedHashMap), capacity 2 ==
+get(2) = Optional.empty, get(1) = Optional[one], size = 2
+== Token bucket: capacity 3, refill 1/sec ==
+YYYnn | after 1s: Yn | bob: Y
+== Sliding window log: 2 per 1000 ms ==
+t=0    true true false
+t=999  false
+t=1000 true
+== 8 threads x 1000 calls on one key, frozen clock, capacity 100 ==
+admitted = 100
+```
+
+## Extensions interviewers ask for
+
+| Extension | How the design absorbs it |
+|---|---|
+| TTL per cache entry | Store an expiry time in `Node`; on `get`, treat expired as a miss and unlink it. Inject the same `Ticker` for tests. |
+| Eviction listener / metrics | Add an optional `BiConsumer` called on eviction (Observer). Count hits and misses with `LongAdder`. |
+| LFU instead of LRU | New `Cache` implementation (frequency buckets of linked lists); callers unchanged. |
+| Higher throughput cache | Shard into N `LRUCache`s by `key.hashCode()`; each has its own lock. |
+| Different limits per tier (free/pro) | Pass a `Function` from key to limit config, or keep a `Map` from tier to `RateLimiter`. |
+| New algorithm (leaky bucket, fixed window) | New class implementing `RateLimiter`. Nothing else changes (Open/Closed). |
+| Blocking `acquire()` | Compute the wait until the next token and park the thread; or return the wait time so the caller can schedule a retry. |
+| Distributed limit across servers | Move state to Redis with an atomic Lua script; see [HLD: Distributed Rate Limiter](/learn/notes/hld-rate-limiter/). |
+| Weighted requests (cost N tokens) | `tryAcquire(key, permits)`; the bucket checks `tokens >= permits`. |
+
+## Common mistakes
+
+- Using a plain `HashMap` + `ArrayList` for order: removing from the middle of a list is O(n).
+- Forgetting to store the key in the node, so eviction can't remove it from the map.
+- Making `get` unsynchronized because "it only reads".
+- Using `ReadWriteLock` for an access-ordered LRU.
+- Claiming `ConcurrentHashMap` makes the whole LRU thread-safe.
+- Rate limiter: `get`-then-`put` for new keys, giving one client two buckets.
+- One global `synchronized` on `tryAcquire`: correct, but every client blocks every other client. Say why per-key locking is better.
+- `Thread.sleep` in tests instead of an injected clock.
+- Using `System.currentTimeMillis()` for elapsed time.
+- Never removing idle keys from the limiter map.
+
+## Practice questions
+
+<Practice>
+
+<QA q="How do you build an LRU cache in Java in a few lines?" level="easy">
+
+Subclass `LinkedHashMap` with the constructor `LinkedHashMap(initialCapacity, loadFactor, true)` so it keeps access order, and override `removeEldestEntry` to return `size() > capacity`. The JDK calls `removeEldestEntry` after each `put`, and returning true removes the head of the list, which is the least recently used entry.
+
+</QA>
+
+<QA q="Why is a HashMap plus a doubly linked list O(1) for both get and put?" level="easy">
+
+The HashMap gives direct access to the node for a key. Each node has `prev` and `next` pointers, so unlinking it and re-linking it at the tail is a constant number of pointer updates. Eviction removes `head.next`, also O(1). A singly linked list would need O(n) to find the previous node.
+
+</QA>
+
+<QA q="Why do the nodes store the key as well as the value?" level="easy">
+
+When we evict the least recently used node from the list, we must also remove it from the HashMap. The node is all we have at that moment, so it must carry the key.
+
+</QA>
+
+<QA q="Why use sentinel head and tail nodes?" level="easy">
+
+They make the list never empty, so insert and remove have no special cases for the first or last real node. Every real node always has a non-null `prev` and `next`, which removes a whole class of null-pointer bugs.
+
+</QA>
+
+<QA q="Why must get take an exclusive lock in an LRU cache?" level="medium">
+
+Because `get` moves the entry to the most-recent end, it rewrites list pointers. The `LinkedHashMap` docs state that in access-ordered mode `get` is a structural modification. Two concurrent `get`s could interleave their pointer updates and corrupt the list, so both reads and writes need the same exclusive lock.
+
+</QA>
+
+<QA q="Why isn't ConcurrentHashMap alone enough to make an LRU cache thread-safe?" level="medium">
+
+LRU needs a map **and** an ordering structure, and the invariant spans both (every key in the map is in the list exactly once, size never exceeds capacity). `ConcurrentHashMap` makes single map operations atomic, but a sequence like "find node, move it to tail" or "evict head, remove from map" touches both structures. Another thread can interleave between the steps. You need one lock (or a carefully designed lock-free scheme) covering both.
+
+</QA>
+
+<QA q="Compare token bucket and sliding-window log." level="medium">
+
+Token bucket stores two numbers per key, runs in O(1), and allows bursts up to the bucket capacity while enforcing an average rate. Sliding-window log stores a timestamp per admitted request (up to `limit` per key) and is exact: never more than `limit` requests in any window-length span, no bursts beyond that. Choose the bucket for APIs that should tolerate short bursts and the log when the limit must be strict and limits are small.
+
+</QA>
+
+<QA q="What does computeIfAbsent give you that get-then-put does not?" level="medium">
+
+Atomicity. `ConcurrentHashMap.computeIfAbsent` performs the whole check-and-insert atomically and runs the mapping function at most once for an absent key, so all threads get the same per-key state object. With `get`-then-`put`, two threads can each create a bucket for the same new key; one bucket is lost and the client effectively gets extra quota.
+
+</QA>
+
+<QA q="Why inject a Ticker or Clock instead of calling System.nanoTime directly?" level="medium">
+
+So tests control time. A fake ticker lets you advance time by exactly 499 ms and assert the request is still rejected, then 1 more ms and assert it passes, with no sleeps and no flakiness. It also documents the dependency and lets you choose a monotonic source (`nanoTime`) instead of the wall clock, which can jump.
+
+</QA>
+
+<QA q="Your limiter uses one synchronized tryAcquire method for the whole class. What is wrong and how do you fix it?" level="hard">
+
+It's correct but every request for every client serialises on one lock, so throughput is capped and latency rises under load. Requests for different keys don't share state, so they shouldn't share a lock. Fix: a `ConcurrentHashMap` from key to a state object, and lock only that object. Contention is then limited to requests for the same key, which genuinely must serialise.
+
+</QA>
+
+<QA q="How would you write a test proving the limiter never over-admits?" level="hard">
+
+Freeze a fake clock so nothing refills. Create the limiter with limit N. Start many threads (say 16) that wait on a `CountDownLatch`, release them together, have each call `tryAcquire` on the same key many times, and count successes in an `AtomicInteger`. Assert the count equals N exactly. Repeat the run several times to raise the chance of exposing a race. A version without the per-key lock fails this test.
+
+</QA>
+
+<QA q="Scenario: memory on the rate-limiter service grows steadily over days. What is the likely cause?" level="scenario">
+
+The per-key map never shrinks: every new IP or API key creates a bucket that stays forever. Fix by evicting idle entries, for example a scheduled sweep that removes buckets that are full and haven't been touched for a while, or by storing buckets in a bounded cache with access-based expiry. A full token bucket is equivalent to a brand-new one, so removing it is safe.
+
+</QA>
+
+<QA q="Scenario: the interviewer says the LRU cache is a bottleneck at 64 threads. What do you change?" level="scenario">
+
+Shard it: create N independent LRU caches and route each key by hash to one of them. Each shard has its own lock, so contention drops roughly by N. The trade-off is that eviction is LRU within a shard, not globally. Beyond that, production caches such as Caffeine record reads in buffers and apply them to the order structure in batches, so reads rarely contend.
+
+</QA>
+
+<QA q="Scenario: the wall clock jumped back 2 seconds after an NTP correction and some clients were blocked. Why, and what would you change?" level="scenario">
+
+If elapsed time is computed from the wall clock, a backwards jump makes `now - lastRefill` negative or tiny, so no tokens are added (or a naive implementation subtracts tokens). Use a monotonic source such as `System.nanoTime()` for elapsed-time math, and guard with `if (now > lastRefill)` so time never moves backwards inside a bucket.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="In a LinkedHashMap created with accessOrder = true, what does calling get on an existing key do?" options={["Nothing to the order; it is a pure read", "Moves the entry to the end of the iteration order, which is a structural modification", "Moves the entry to the front of the iteration order", "Throws if the map is wrapped with synchronizedMap"]} answer={1}>
+
+In access order mode, accessing an entry moves it to the end (most recent). The Javadoc calls this a structural modification, which is why get needs exclusive locking.
+
+</MCQ>
+
+<MCQ q="When does LinkedHashMap call removeEldestEntry?" options={["Before every get", "Only when the table resizes", "After put or putAll inserts a new entry", "When the garbage collector runs"]} answer={2}>
+
+It is invoked by put and putAll after inserting a new mapping. Returning true removes the eldest entry.
+
+</MCQ>
+
+<MCQ q="Why does an LRU node store its key?" options={["So eviction can also remove the entry from the HashMap", "To compute hashCode faster", "Because Java generics require it", "To sort the list"]} answer={0}>
+
+Eviction starts from the list. Without the key in the node, you can't delete the matching map entry.
+
+</MCQ>
+
+<MCQ q="Which lock choice is correct for an access-ordered LRU cache?" options={["ReentrantReadWriteLock with get under the read lock", "No lock if the map is a ConcurrentHashMap", "volatile fields on the nodes", "One exclusive lock (synchronized or ReentrantLock) for both get and put"]} answer={3}>
+
+get mutates the recency list, so it can't share a read lock with other gets. volatile gives visibility, not atomicity of multi-step updates.
+
+</MCQ>
+
+<MCQ q="Two threads call tryAcquire for a brand-new key at the same time. Which code guarantees they share one bucket?" options={["buckets.computeIfAbsent(key, k -> new Bucket())", "if (buckets.get(key) == null) buckets.put(key, new Bucket())", "buckets.put(key, new Bucket())", "buckets.getOrDefault(key, new Bucket())"]} answer={0}>
+
+computeIfAbsent is atomic on ConcurrentHashMap. The get-then-put version races; put overwrites; getOrDefault never stores anything.
+
+</MCQ>
+
+<MCQ q="A token bucket has capacity 10 and refills 1 token per second. It has been idle for a minute. How many requests can pass instantly?" options={["1", "60", "10", "0"]} answer={2}>
+
+Refill is capped at capacity, so an idle bucket holds 10 tokens and allows a burst of 10.
+
+</MCQ>
+
+<MCQ q="What is the main weakness of the sliding-window counter compared with the sliding-window log?" options={["It needs O(limit) memory per key", "It is an approximation that assumes the previous window's requests were evenly spread", "It cannot be made thread-safe", "It allows unlimited bursts"]} answer={1}>
+
+It keeps only two counters and weights the previous one, so it is cheap but approximate. The log is exact but stores timestamps.
+
+</MCQ>
+
+<MCQ q="Why prefer System.nanoTime over System.currentTimeMillis for refill math?" options={["nanoTime is always faster", "currentTimeMillis is deprecated", "nanoTime returns the time zone", "nanoTime is for elapsed time and does not jump with wall-clock adjustments"]} answer={3}>
+
+nanoTime measures elapsed time and is unrelated to wall-clock time, so NTP corrections don't move it. Wall-clock time can jump backwards.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **LRU in 5 lines:** `new LinkedHashMap(16, 0.75f, true)` + `removeEldestEntry` returning `size() > capacity`.
+- **LRU by hand:** `HashMap` from key to node + doubly linked list with sentinels; node stores key; evict `head.next`; move to tail on access. O(1) everything.
+- **LRU locking:** `get` mutates order, so one exclusive lock for all ops. `ConcurrentHashMap` alone can't keep map + list consistent. Scale by sharding.
+- **Rate limiter shape:** `RateLimiter` interface (Strategy) + one class per algorithm + injected `Ticker`.
+- **Per-key state:** `ConcurrentHashMap.computeIfAbsent(key, ...)` then lock only that key's object. Different keys never contend.
+- **Token bucket:** lazy refill `min(cap, tokens + elapsed * rate)`; bursts up to cap. **Sliding log:** exact, O(limit) memory. **Sliding counter:** two counters, weighted, approximate.
+- **Tests:** fake clock, `CountDownLatch` start gate, many threads on one key, assert admitted equals limit exactly.
+- **Don't forget:** evict idle keys, monotonic time, validate constructor args.
+- Related: [Rate Limiting](/learn/notes/rate-limiting/), [HLD: Distributed Rate Limiter](/learn/notes/hld-rate-limiter/), [LRU Cache (DSA)](/learn/dsa/lru-cache/), [Java Concurrency and Locks](/learn/notes/java-concurrency-locks/), [Java Collections and HashMap](/learn/notes/java-collections-hashmap/).

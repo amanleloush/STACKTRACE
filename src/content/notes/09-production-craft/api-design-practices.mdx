@@ -1,0 +1,581 @@
+---
+title: "API Design in Practice: Webhooks, Pagination, Versioning, Idempotency"
+phase: "09-production-craft"
+order: 104
+tags: ["api", "http", "webhooks", "pagination", "idempotency", "versioning"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 22
+prerequisites: ["rest-grpc-graphql", "http-versions", "rate-limiting"]
+summary: "The practical rules behind production APIs: when to push with webhooks, how to paginate with cursors, how to version without breaking clients, how idempotency keys make retries safe, and how to report errors and rate limits."
+---
+
+## Definition (interview-ready)
+
+**API design in practice** is the set of conventions that make an API safe to call over an unreliable network and safe to change over years. The big six:
+
+1. **Pick the right style** — REST, gRPC, GraphQL, or webhooks (server pushes events to you).
+2. **Webhooks** — signed, timestamped HTTP callbacks, retried with backoff, handled by idempotent receivers that don't assume order.
+3. **Pagination** — prefer **cursor (keyset) pagination** over `OFFSET`, because offset gets slower with depth and skips or repeats rows when data changes.
+4. **Versioning** — only additive changes inside a version; breaking changes go to a new version (URI, header, media type, or date-based like Stripe).
+5. **Idempotency keys** — the client sends a unique key with a `POST`, and the server stores the first result so retries return it instead of doing the work twice.
+6. **Errors and limits** — a consistent error body (RFC 9457 *problem details*), correct status codes, and rate-limit headers clients can act on.
+
+**One-liner:** A production API is safe to retry and safe to evolve: idempotency keys make POST retries harmless, signed and deduplicated webhooks push events, cursor pagination stays fast and stable, and versioning plus additive-only changes keep old clients working.
+
+## Why it matters
+
+- **Networks fail in the middle.** A client sends "charge ₹500", the connection drops, and it has no idea whether the charge happened. Without idempotency it must choose between "maybe double charge" and "maybe never charge".
+- **APIs live longer than the code behind them.** Once a mobile app version is in users' hands you can't force it to update. A careless rename breaks it.
+- **Lists grow.** A page-1000 query that took 2 ms on day one can take seconds a year later with `OFFSET`.
+- **Interviewers love these.** "Design a payments API", "design a webhook system", and "how do you paginate a feed" all test exactly these ideas.
+
+## Core concepts
+
+### Choosing a style: REST vs gRPC vs GraphQL vs webhooks
+
+The detailed comparison of the first three lives in [REST vs gRPC vs GraphQL](/learn/notes/rest-grpc-graphql/). Webhooks are different: they are not a request style you call, they are the server calling **you** when something happens.
+
+| You need… | Pick | Why |
+|---|---|---|
+| Public API for unknown clients (browsers, curl, partners) | REST + JSON | Universal tooling, HTTP caching, easy to debug |
+| Internal service-to-service, low latency, streaming | gRPC | Typed `.proto` contract, binary encoding, HTTP/2 streams |
+| Many client screens needing different data shapes | GraphQL | Client picks fields; one round trip |
+| Tell another company's system that something happened (payment succeeded, PR merged) | Webhooks | Push instead of the partner polling you every few seconds |
+| Internal "something happened" fan-out between your own services | A message broker, not webhooks | Durable log, replay, consumer groups (see [Kafka deep dive](/learn/notes/kafka-deep/)) |
+
+**How to say it in an interview:** "Webhooks are reverse APIs — the provider calls the consumer. I'd use them for cross-company notifications, and Kafka or a queue for internal events, because webhooks have no replay log of their own unless I build one."
+
+### HTTP method semantics (RFC 9110)
+
+Two words to define first:
+
+- **Safe** — the method is read-only by definition. The client isn't asking for any change. Crawlers and prefetchers may call it freely.
+- **Idempotent** — sending the same request N times has the same *intended effect on the server* as sending it once. The *response* can differ (a second `DELETE` may return `404`), but the server state ends up the same.
+
+| Method | Safe | Idempotent | Cacheable by default | Typical use |
+|---|---|---|---|---|
+| `GET` | Yes | Yes | Yes | Read a resource or list |
+| `HEAD` | Yes | Yes | Yes | Same as GET, headers only |
+| `OPTIONS` | Yes | Yes | No | Capabilities, CORS preflight |
+| `TRACE` | Yes | Yes | No | Diagnostics (usually disabled) |
+| `PUT` | No | Yes | No | Replace a resource at a known URL |
+| `DELETE` | No | Yes | No | Remove a resource |
+| `POST` | No | **No** | Rarely in practice | Create, or "do an action" |
+| `PATCH` | No | **No** (RFC 5789) | No | Partial update |
+
+Why it matters: HTTP clients, proxies and retry libraries may **automatically retry idempotent methods** after a connection failure. They must not blindly retry `POST` or `PATCH`. That gap is exactly what **idempotency keys** fill.
+
+`PATCH` *can* be written to be idempotent (`{"status":"shipped"}` sets a value), but an operation like "append item" or "increment counter" is not, so the spec doesn't promise it.
+
+### Webhook design
+
+A webhook is an HTTP `POST` from the provider to a URL the consumer registered. The trouble is that the consumer's endpoint is on the public internet, so **anyone** can POST to it, and the network between the two can drop, duplicate, or delay requests.
+
+**1. Sign every delivery (HMAC).** An HMAC is a hash computed with a secret key. Only someone who knows the key can produce the right value. The provider computes `HMAC-SHA256(secret, signed_content)` and puts it in a header. The consumer recomputes it over the **raw request bytes** and compares.
+
+- Stripe signs `timestamp + "." + raw_body` and sends it as `Stripe-Signature: t=...,v1=...`.
+- The **Standard Webhooks** spec (an open spec several vendors adopted) signs `webhook-id + "." + webhook-timestamp + "." + body` and sends headers `webhook-id`, `webhook-timestamp`, and `webhook-signature: v1,<base64>`. It also allows `ed25519` asymmetric signatures (`v1a`).
+- Compare signatures with a **constant-time comparison**, otherwise response-time differences can leak how many leading bytes matched.
+- Verify over the **raw body**. If your framework parses and re-serialises JSON first (reordering keys, trimming whitespace), the bytes change and the signature fails.
+
+**2. Timestamp to stop replay.** A *replay attack* is an attacker capturing a valid signed request and sending it again later. Because the timestamp is *inside* the signed content, it can't be changed without breaking the signature. The receiver rejects deliveries whose timestamp is too far from now. Stripe's libraries default to a **5-minute tolerance**. Keep server clocks synced with NTP.
+
+**3. Retry with exponential backoff.** If the receiver doesn't return `2xx` quickly, the provider retries with growing delays plus random jitter. Stripe retries live-mode events for up to **three days**. The Standard Webhooks spec suggests a schedule spanning days (immediately, 5 s, 5 min, 30 min, 2 h, 5 h, 10 h, 14 h, 20 h, 24 h). Give up eventually, mark the endpoint as failing, alert the owner, and let them replay from a dashboard or an events API.
+
+**4. Receivers must be idempotent.** Retries mean the same event *will* arrive more than once (for example, your handler succeeded but the `200` was lost). Store the event ID (`webhook-id` or Stripe's `evt_...`) with a unique constraint and skip duplicates. See [delivery semantics](/learn/notes/delivery-semantics/) — webhooks are **at-least-once**.
+
+**5. Don't rely on order.** Stripe explicitly does not guarantee events arrive in the order they were created. `invoice.paid` can arrive before `invoice.created`. Two good receiver patterns:
+
+- **Treat the event as a hint** ("thin event") and fetch the current state of the object from the API.
+- **Compare versions** — keep a version or `updated_at` on your copy and ignore events older than what you already have.
+
+**6. Acknowledge fast, process async.** Return `2xx` as soon as you've verified and durably stored the event, then process from a queue. Slow handlers cause timeouts, which cause retries, which cause more load.
+
+```
+Provider                                   Consumer
+--------                                   --------
+event happens
+  └─ POST /webhooks                ───►    1. verify HMAC over raw body (constant time)
+     webhook-id: msg_2Lx                   2. reject if timestamp older than tolerance
+     webhook-timestamp: 1730000000         3. INSERT event_id (unique) — duplicate? return 200
+     webhook-signature: v1,K5oZ...         4. enqueue for processing
+                                   ◄───    5. return 200 quickly
+  no 2xx? retry with backoff + jitter      worker: fetch latest object state, apply if newer
+```
+
+### Pagination: offset vs cursor (keyset)
+
+**Offset pagination** — `?page=50&size=20` becomes:
+
+```sql
+SELECT * FROM orders ORDER BY created_at DESC LIMIT 20 OFFSET 980;
+```
+
+Two problems:
+
+1. **It gets slower the deeper you go.** The database still has to produce and throw away the 980 skipped rows. The PostgreSQL docs say this directly: rows skipped by `OFFSET` still have to be computed, so a large offset can be inefficient. Page 50,000 means reading a million rows to return 20.
+2. **It's inconsistent when data changes.** If a new order is inserted at the top while a user is on page 1, every row shifts down by one. Page 2 now starts with the last item the user already saw (duplicate). A delete shifts rows up and the user **skips** one.
+
+**Cursor / keyset pagination** — remember where you stopped and ask for rows *after* that point:
+
+```sql
+-- first page
+SELECT id, created_at, total FROM orders
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+
+-- next page: last row seen was (2026-10-01 10:00:00, 98123)
+SELECT id, created_at, total FROM orders
+WHERE (created_at, id) < ('2026-10-01 10:00:00', 98123)
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+```
+
+- With an index on `(created_at, id)` the database **seeks** straight to the position and reads 20 rows. Page 50,000 costs the same as page 1.
+- Inserts and deletes elsewhere don't shift your position, so no duplicates or skips.
+- The sort key must be **unique** — add `id` as a tie-breaker, otherwise two rows with the same timestamp can be skipped or repeated at a page boundary.
+- Row-value comparison `(a, b) < (x, y)` works in PostgreSQL and MySQL. Where it's not supported, expand it: `a < x OR (a = x AND b < y)`.
+
+**Opaque cursors.** Don't expose `created_at` and `id` as raw query params. Encode them (for example base64 of a small JSON) and return a `next_cursor` string. Clients just pass it back. This lets you change the sort key later without breaking clients. Sign or encrypt it if clients must not tamper with it.
+
+```json
+{
+  "data": [ ... 20 orders ... ],
+  "has_more": true,
+  "next_cursor": "eyJjIjoiMjAyNi0xMC0wMVQxMDowMDowMFoiLCJpIjo5ODEyM30"
+}
+```
+
+**Stripe's flavour:** list endpoints take `limit` (default 10, range 1–100), `starting_after` and `ending_before` (object IDs used as cursors), and return `has_more`.
+
+**Trade-offs of cursors:** no "jump to page 37", and no cheap total count. For admin UIs that need page numbers on small tables, offset is fine. For feeds, infinite scroll, sync jobs and public APIs, use cursors.
+
+| | Offset | Cursor / keyset |
+|---|---|---|
+| Deep page cost | Grows with offset | Constant (index seek) |
+| Concurrent inserts/deletes | Duplicates or skips | Stable |
+| Jump to page N | Yes | No |
+| Total count | Easy (but `COUNT(*)` is itself slow on big tables) | Usually omitted |
+| Needs a unique, indexed sort key | No | Yes |
+
+### API versioning
+
+**Compatibility rules come first.** A version exists so that you can make *breaking* changes without hurting old clients. GitHub's REST docs give a good list:
+
+- **Non-breaking (additive):** add an endpoint, add an optional parameter, add a response field, add a response header, add an enum value.
+- **Breaking:** remove or rename a field or parameter, change a field's type, add a *required* parameter, remove an enum value, change auth requirements.
+
+Clients have a duty too: **ignore unknown fields** (the "tolerant reader" idea). Careful: adding an enum value is "additive" for the server but can crash a client that uses an exhaustive `switch`. Document that new values may appear.
+
+Four ways to carry the version:
+
+| Strategy | Example | Pros | Cons |
+|---|---|---|---|
+| URI path | `/v1/orders`, `/v2/orders` | Obvious, easy to route and cache, easy to test in a browser | Coarse — the whole API bumps at once; same resource has two URLs |
+| Custom header | `X-GitHub-Api-Version: 2022-11-28` | Clean URLs, can version independently of path | Hidden in curl/browser; caches must `Vary` on it |
+| Media type (content negotiation) | `Accept: application/vnd.example.v2+json` | "Most RESTful"; per-representation | Awkward for clients and tooling |
+| Date-based, pinned per account | `Stripe-Version: 2024-09-30.acacia` | Each customer stays on the version they integrated with; server translates | Server must maintain transformation layers for every old version |
+
+**Stripe's model in one paragraph.** A request without a `Stripe-Version` header uses the account's default API version (set in the dashboard). Since `2024-09-30.acacia`, Stripe ships monthly versions with no breaking changes and twice a year a new *major* release whose first version may contain breaking changes. Webhook payloads use the version configured on the endpoint, or the account default. Stripe's engineering blog (2017) describes the mechanism: responses are built in the *current* format, then the API walks back through a list of "version change" modules, applying each one until the response matches the caller's target version.
+
+**GitHub's model:** date-named versions in the `X-GitHub-Api-Version` header; requests without it use `2022-11-28`; the previous version is supported for at least 24 months after a new one ships.
+
+**gRPC and GraphQL** usually avoid versions altogether: protobuf evolves by adding new field numbers and never reusing old ones; GraphQL deprecates fields with `@deprecated` and keeps them. See [schema evolution](/learn/notes/schema-evolution/).
+
+**How to say it:** "Version is a last resort. I evolve additively inside a version, make clients tolerant of unknown fields, and only cut a new version for genuinely breaking changes, with a published deprecation window."
+
+### Idempotency keys
+
+**The idea.** The client generates a unique key (a UUID v4 is typical) **once per logical operation** and sends it with the request. If it has to retry, it sends the **same key**. The server remembers what happened the first time and replays it.
+
+```http
+POST /v1/payments HTTP/1.1
+Idempotency-Key: 8e03978e-40d5-43e8-bc93-6894a57f9324
+Content-Type: application/json
+
+{"amount": 50000, "currency": "INR", "customer": "cus_42"}
+```
+
+The IETF draft *The Idempotency-Key HTTP Header Field* (`draft-ietf-httpapi-idempotency-key-header`, never published as an RFC; the latest revision, -07 from October 2025, has since expired) proposes the header name and suggests these responses:
+
+| Situation | Suggested status |
+|---|---|
+| Key required by the endpoint but missing | `400 Bad Request` |
+| Same key reused with a **different** payload | `422 Unprocessable Content` |
+| Same key while the first request is **still processing** | `409 Conflict` |
+
+**How a server implements it:**
+
+```
+table idempotency_keys
+  (account_id, key)  PRIMARY KEY      -- scope keys per client/tenant
+  request_hash       -- fingerprint: hash of method + path + body
+  status             -- 'in_progress' | 'completed'
+  response_code, response_body
+  created_at         -- for TTL cleanup
+```
+
+1. **Insert-or-get atomically.** `INSERT ... (status='in_progress')`. The unique key is the lock. If the insert fails because the row exists, go to step 2. Using a database unique constraint (or Redis `SET key value NX PX ttl`) is what makes **concurrent duplicates** safe — two requests racing with the same key can't both win.
+2. **Existing row:**
+   - Different `request_hash` → `422` (client bug: one key reused for a different operation).
+   - `in_progress` → `409` and the client retries later. Don't run the work twice in parallel.
+   - `completed` → return the stored status and body **exactly**, without re-executing.
+3. **Do the work**, ideally in the **same database transaction** that marks the key `completed` and stores the response. If the side effect is in another system (a card network), pass the key or a derived ID downstream so *that* call is idempotent too.
+4. **Crash in the middle?** A row stuck `in_progress` needs a recovery rule: either a lease timeout after which the request can be retried, or "recovery points" that record which steps already finished so a retry resumes from there.
+5. **TTL.** Keys aren't kept forever. Stripe (API v1) says keys can be removed once they're at least 24 hours old; reuse after that is treated as a new request. The IETF draft leaves the expiry to the server but says to publish it.
+
+**What does Stripe store?** For API v1, Stripe saves the status code and body of the first request *once endpoint execution has begun* — including `500` errors — and returns them for retries with the same key. Requests that failed validation or collided with a concurrent request aren't saved, so they can be retried. Stripe compares incoming parameters with the original and errors if they differ. Keys can be up to 255 characters. `GET` and `DELETE` don't need keys because they're already idempotent.
+
+**Idempotency key vs natural dedup.** Sometimes you don't need a separate key: `PUT /orders/{client_generated_id}` is idempotent by design, and a unique constraint on `(merchant_id, merchant_order_ref)` stops duplicates. Keys are the general solution for "create" actions without a natural unique field.
+
+### Error format: RFC 9457 problem details
+
+Every team invents an error JSON. **RFC 9457** (July 2023, obsoletes RFC 7807) standardises one, served as `application/problem+json`:
+
+```http
+HTTP/1.1 403 Forbidden
+Content-Type: application/problem+json
+
+{
+  "type": "https://example.com/probs/insufficient-balance",
+  "title": "Insufficient balance",
+  "status": 403,
+  "detail": "Wallet balance is 30.00 but the payment needs 50.00.",
+  "instance": "/payments/abc123",
+  "balance": 3000
+}
+```
+
+| Member | Meaning |
+|---|---|
+| `type` | URI identifying the problem **type**. Primary thing clients branch on. Defaults to `about:blank` (meaning "nothing beyond the status code"). |
+| `title` | Short human summary of the type; same every time. |
+| `status` | The HTTP status, copied for convenience. Advisory only — the real response status must match. |
+| `detail` | Human explanation of *this* occurrence. Help the client fix it; not a stack trace. |
+| `instance` | URI for this specific occurrence (handy for support tickets/log lookups). |
+| extensions | Any extra members (like `balance` or an `errors` array for field validation). Clients must ignore ones they don't recognise. |
+
+Pair it with correct status codes: `400` malformed, `401` not authenticated, `403` authenticated but not allowed, `404` not found, `409` conflict with current state, `422` well-formed but semantically invalid, `429` rate-limited, `5xx` server fault (safe to retry with backoff if the operation is idempotent).
+
+### Rate-limit headers
+
+When you throttle, tell clients how to behave (see [rate limiting](/learn/notes/rate-limiting/) for algorithms):
+
+- **`429 Too Many Requests` + `Retry-After`** (seconds or an HTTP date) — the standard minimum.
+- **Legacy de facto headers:** `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`. Widely used, but the meaning of `Reset` (epoch seconds vs seconds-from-now) differs between vendors.
+- **IETF draft (`draft-ietf-httpapi-ratelimit-headers`, still a draft):** two structured fields:
+
+```http
+RateLimit-Policy: "permin";q=50;w=60,"perhr";q=1000;w=3600
+RateLimit: "permin";r=12;t=27
+```
+
+`RateLimit-Policy` describes the quota (`q` units per `w`-second window). `RateLimit` reports what's left (`r` remaining quota units, and `t` the seconds left in the current window). If both `RateLimit` and `Retry-After` are present, clients should honour `Retry-After`. Because it's still a draft, the field syntax has changed between versions — check the version your gateway implements.
+
+## How it works: designing `POST /payments` end to end
+
+```
+Client (mobile app)                      Payments API                         DB
+-------------------                      ------------                         --
+key = uuid4()  (saved locally with the cart)
+POST /v1/payments  Idempotency-Key: key ─►
+                                         INSERT idem(acct,key,hash,'in_progress')
+                                           conflict? → compare hash → 422 / 409 / replay
+                                         BEGIN
+                                           insert payment row
+                                           call PSP with idempotency = key-derived id
+                                           update idem → completed + response
+                                         COMMIT
+                     ◄── 201 Created  (or application/problem+json on error)
+timeout? retry SAME key with backoff+jitter ─► returns stored 201, no second charge
+
+later, asynchronously:
+Payments API ── POST https://merchant/webhooks (signed, timestamped) ─► merchant
+merchant: verify → dedupe on event id → 200 → process async
+merchant missed some? GET /v1/events?starting_after=evt_... (cursor) to reconcile
+```
+
+Notice how the pieces fit: idempotency makes the *request* safe to retry, webhooks push *results* to the merchant, and cursor pagination over an events list lets the merchant **reconcile** anything the webhooks missed.
+
+## Real-world examples
+
+- **Stripe** — idempotency keys on all v1 `POST` requests (up to 255 chars, pruned after at least 24 hours), cursor pagination with `starting_after`/`ending_before`/`has_more`, date-named API versions via `Stripe-Version`, HMAC-SHA256 signed webhooks with a timestamp and a 5-minute default tolerance, retries for up to three days, and no ordering guarantee.
+- **GitHub REST API** — date-based versions in `X-GitHub-Api-Version` (default `2022-11-28`) with at least 24 months of support for the previous version, and a published list of breaking vs additive changes.
+- **Standard Webhooks** — an open specification for webhook headers (`webhook-id`, `webhook-timestamp`, `webhook-signature`), signing and retries, so receivers can use one verification library across providers.
+
+## Common pitfalls
+
+- **Verifying the webhook signature on parsed JSON** instead of the raw bytes — passes in tests, fails in production when a middleware reformats the body.
+- **Using `==` to compare signatures** instead of a constant-time function.
+- **No timestamp check**, so a captured webhook can be replayed forever.
+- **Doing heavy work before returning `2xx`** — timeouts trigger retries, which multiply load during an incident.
+- **Assuming webhook order** — writing "paid" then receiving the late "created" and overwriting state backwards.
+- **`OFFSET` on large or fast-changing tables** — slow deep pages and duplicate/missing items in infinite scroll.
+- **Cursor on a non-unique column** (`created_at` alone) — rows with equal timestamps fall between pages.
+- **Generating a new idempotency key per retry** — that defeats the whole mechanism. One key per *logical operation*.
+- **Check-then-insert for idempotency keys** (`SELECT` then `INSERT`) — two concurrent retries both see "not found". Use a unique constraint or atomic `SET NX`.
+- **Not scoping keys per client** — two customers using the same UUID library seed (or the same test key) collide.
+- **Returning `200` with `{"error": ...}`** — breaks every HTTP client, retry library, and monitoring dashboard that relies on status codes.
+- **Renaming a field "because it's cleaner"** in v1 — a breaking change. Add the new field, deprecate the old one.
+- **Stack traces in error `detail`** — leaks internals; log them server-side and return an `instance` ID instead.
+
+## Practice questions
+
+<Practice>
+
+<QA q="What is the difference between a safe method and an idempotent method? Give examples." level="easy">
+
+- **Safe**: read-only by definition — the client isn't asking for any state change. `GET`, `HEAD`, `OPTIONS`, `TRACE`.
+- **Idempotent**: repeating the request has the same intended effect on the server as doing it once. All safe methods, plus `PUT` and `DELETE`.
+
+`POST` and `PATCH` are neither. Every safe method is idempotent, but not every idempotent method is safe (`DELETE` changes state, yet deleting twice leaves the same state). The *response* can differ between attempts — a second `DELETE` may return `404` — but the server state doesn't.
+
+</QA>
+
+<QA q="Why is `OFFSET` pagination slow for deep pages?" level="easy">
+
+The database can't jump to row 1,000,000. It has to find and discard every skipped row in sort order, then return the next 20. Cost grows linearly with the offset, even with an index. Keyset pagination instead uses `WHERE (created_at, id) < (last_created_at, last_id)` with an index on those columns, so the database seeks straight to the position and reads only one page — constant cost at any depth.
+
+</QA>
+
+<QA q="Besides speed, what correctness problem does offset pagination have?" level="easy">
+
+Positions shift when rows are inserted or deleted between page requests. A new item at the top pushes everything down, so the next page repeats the last item the user saw. A delete pulls everything up, so the user silently skips an item. A cursor is anchored to a specific row's sort key, not a position, so concurrent changes elsewhere don't shift it.
+
+</QA>
+
+<QA q="What should a webhook receiver do, step by step, when a request arrives?" level="easy">
+
+1. Read the **raw body** bytes.
+2. Recompute the HMAC with the shared secret over the provider's signed content (for example `id.timestamp.body`) and compare with a **constant-time** function.
+3. Reject if the timestamp is outside the tolerance (replay protection).
+4. Insert the event ID into a table with a unique constraint; if it already exists, return `200` and stop (duplicate).
+5. Enqueue the event and return `2xx` quickly.
+6. A worker processes it, without assuming order — fetch the latest object state or compare versions before applying.
+
+</QA>
+
+<QA q="What is an opaque cursor and why not just expose `?after_id=123`?" level="medium">
+
+An opaque cursor is a token (often base64 of the last row's sort key, sometimes signed) that the client passes back without understanding it. Benefits:
+
+- You can change the sort key or add a tie-breaker later without breaking clients.
+- Clients can't build cursors you didn't intend (for example, to jump around or probe IDs).
+- A single field can carry several values (sort column, ID, filter hash, direction).
+
+A plain `after_id` works only when the list is sorted by ID; it breaks as soon as you sort by anything else.
+
+</QA>
+
+<QA q="List three API changes that are backward compatible and three that are breaking." level="medium">
+
+**Compatible (additive):** add a new endpoint; add an optional request parameter; add a new response field or header.
+
+**Breaking:** remove or rename a response field; change a field's type (string to number); make an optional parameter required (or add a required one); remove an enum value; change auth requirements.
+
+Grey area: adding an enum value is additive for the server but can break clients with exhaustive switches — document that new values may appear and that clients must handle unknown ones.
+
+</QA>
+
+<QA q="Compare URI, header, media-type and date-based API versioning." level="medium">
+
+- **URI** (`/v2/orders`): most visible, easy routing and caching; coarse-grained and duplicates URLs.
+- **Header** (`X-GitHub-Api-Version: 2022-11-28`): clean URLs; invisible in a browser, and caches must `Vary` on the header.
+- **Media type** (`Accept: application/vnd.x.v2+json`): versions the representation, very RESTful; awkward for clients.
+- **Date-based, pinned per account** (Stripe): each customer stays on the version they integrated against and upgrades on their own schedule; the provider maintains a transformation layer for each old version.
+
+Whichever you pick, the bigger win is avoiding the need: evolve additively and make clients ignore unknown fields.
+
+</QA>
+
+<QA q="How does a server implement idempotency keys safely under concurrent retries?" level="medium">
+
+Store `(client_id, key)` with a **unique constraint**, plus a request fingerprint, a status and the saved response.
+
+1. Atomically insert the key as `in_progress`. The unique constraint means only one concurrent request wins.
+2. Losers read the row: different fingerprint → `422`; still `in_progress` → `409`; `completed` → replay the stored response.
+3. The winner does the work and marks the key `completed` with the response, ideally in the same DB transaction as the business write.
+4. Expire keys after a published TTL (Stripe: at least 24 hours).
+
+A check-then-insert (`SELECT` then `INSERT`) is a race — both requests see nothing and both execute.
+
+</QA>
+
+<QA q="Should a server store and replay a `500` response for an idempotency key?" level="hard">
+
+It depends on whether the side effect may have happened.
+
+- **Stripe v1 does replay it**: once endpoint execution has begun, the first status and body — including `500` — are saved and returned for retries. That's conservative: the server can't be sure the operation didn't partially happen, so it won't run it again.
+- Requests that never reached execution (validation failure, concurrent-conflict) aren't saved and can be retried.
+
+A more advanced design (Stripe's v2 API, or recovery-point designs) records which steps finished and lets a retry **resume** the operation to completion instead of replaying the failure. The key requirement either way: a retry must never execute a side effect twice.
+
+</QA>
+
+<QA q="Webhooks arrive out of order. How do you keep your local state correct?" level="hard">
+
+Options, often combined:
+
+1. **Fetch on notify** — treat the webhook as a signal and `GET` the current object from the provider's API. Order no longer matters because you always read the latest state.
+2. **Version check** — store the object's version or `updated_at` and ignore events older than what you have (a monotonic guard).
+3. **State machine rules** — only allow valid transitions (`created → paid`), and park events that arrive "early" for a short retry.
+
+Don't use the event's creation timestamp to order — Stripe notes `created` has one-second resolution, so distinct events can share a timestamp.
+
+</QA>
+
+<QA q="Why use RFC 9457 problem details instead of a custom error JSON?" level="medium">
+
+It gives every error the same machine-readable shape with a registered media type (`application/problem+json`): `type` (a URI clients branch on), `title`, `status`, `detail`, `instance`, plus extension members. Generic tooling, gateways and client libraries can parse it, and teams stop inventing incompatible formats. The `status` member is advisory — the real HTTP status must match — and clients must ignore extension members they don't understand.
+
+</QA>
+
+<QA q="How should a well-behaved client react to rate limiting?" level="medium">
+
+On `429` (or `503`), honour `Retry-After` if present. Otherwise use exponential backoff with jitter, capped, and a retry budget so retries can't snowball. Proactively slow down using `RateLimit` / `X-RateLimit-Remaining` before hitting zero. Only auto-retry operations that are idempotent (or carry an idempotency key). See [circuit breakers and retries](/learn/notes/circuit-breakers-retries/).
+
+</QA>
+
+<QA q="Design the retry policy for a webhook delivery system that sends millions of events per day." level="hard">
+
+- Put each delivery attempt on a **durable queue** (or a delay table/timer wheel), not in memory.
+- **Exponential backoff + jitter**, spanning days (for example seconds → minutes → hours, up to about 3 days, as Stripe does).
+- **Short per-attempt timeout** (a few seconds) — receivers should ack fast.
+- **Per-endpoint isolation**: one slow customer must not block others' queues; cap concurrency per endpoint.
+- **Circuit breaker per endpoint**: after sustained failures, pause and notify the owner; disable after a long outage.
+- **Replay tools**: an events list API with cursor pagination and a manual "resend" button.
+- Sign each attempt freshly (new timestamp) and keep the same event ID so receivers can dedupe.
+
+</QA>
+
+<QA q="A partner says some orders got charged twice. Your API has idempotency keys. What do you check?" level="scenario">
+
+1. **Was the same key actually reused?** Many double charges come from the client generating a new key per retry, or per app restart. Check logs for two different keys with identical payloads.
+2. **Key scope** — keys scoped per account? A global table could reject or mix up keys.
+3. **Race** — is the key insert atomic, or a check-then-insert?
+4. **TTL** — did the retry arrive after the key expired?
+5. **Downstream idempotency** — did *our* call to the payment processor retry without its own idempotency ID?
+6. **Different endpoint or payload** — a retry with a changed amount should have returned `422`, not executed.
+
+Fixes: generate and persist the key with the cart before the first attempt, use a unique constraint, pass derived keys downstream, and add a natural unique constraint (merchant order reference) as a second guard.
+
+</QA>
+
+<QA q="An infinite-scroll feed shows duplicate posts and the page-200 query is slow. What do you change?" level="scenario">
+
+Both symptoms point to offset pagination on a hot table. Switch to keyset pagination:
+
+- Sort by `(created_at DESC, id DESC)` and add a composite index on those columns.
+- Return an opaque `next_cursor` encoding the last row's `(created_at, id)`.
+- Next page: `WHERE (created_at, id) < (cursor values) ORDER BY created_at DESC, id DESC LIMIT n`.
+
+New posts no longer shift the user's position, so duplicates disappear, and each page is an index seek. Drop the total count or compute it approximately. If you need "new posts since I loaded", offer a separate `ending_before`-style cursor from the top.
+
+</QA>
+
+<QA q="You must rename `user_name` to `display_name` in a public REST API used by old mobile apps. How?" level="scenario">
+
+Don't rename in place — that's breaking.
+
+1. Add `display_name` alongside `user_name`, both populated (additive, safe for everyone).
+2. Mark `user_name` deprecated in docs/OpenAPI; optionally send the `Deprecation` (RFC 9745) and `Sunset` (RFC 8594) response headers and log which clients still read it.
+3. Ship new app versions that read `display_name`.
+4. Once traffic using the old field is near zero — or in the next API version — remove `user_name`.
+
+With date-based versioning (Stripe style) you'd instead introduce the rename in a new version and keep a transformation that emits `user_name` for accounts pinned to older versions.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="Which HTTP method is idempotent but NOT safe?" options={["GET", "DELETE", "POST", "PATCH"]} answer={1}>
+
+DELETE changes server state (not safe) but deleting the same resource twice leaves the same state (idempotent). GET is both safe and idempotent; POST and PATCH are neither per RFC 9110 and RFC 5789.
+
+</MCQ>
+
+<MCQ q="Why does keyset pagination stay fast at page 10,000?" options={["It caches every page in Redis", "It uses an index seek to the last seen sort key instead of scanning and discarding skipped rows", "It returns fewer columns", "It runs COUNT(*) first to plan the query"]} answer={1}>
+
+A WHERE on the indexed sort key lets the database jump to the position and read only one page. OFFSET has to generate and throw away all skipped rows. Caching and column count are unrelated, and COUNT(*) only adds work.
+
+</MCQ>
+
+<MCQ q="A webhook receiver checks that the signed timestamp is within 5 minutes of now. Which attack does this mainly stop?" options={["Forged payloads from someone without the secret", "Replay of a captured, validly signed request much later", "Timing attacks on signature comparison", "Out-of-order delivery"]} answer={1}>
+
+The HMAC already stops forgery; the timestamp is inside the signed content so it can't be altered, and old timestamps are rejected, blocking later replay. Timing attacks need constant-time comparison, and ordering is a separate concern.
+
+</MCQ>
+
+<MCQ q="Per the IETF Idempotency-Key draft, what should a server return when the same key arrives with a different request body?" options={["200 with the original response", "409 Conflict", "422 Unprocessable Content", "400 Bad Request"]} answer={2}>
+
+Reusing a key for a different payload is a client error the draft maps to 422. 409 is for a duplicate arriving while the first request is still processing, and 400 is for a missing key on an endpoint that requires one.
+
+</MCQ>
+
+<MCQ q="Two retries with the same idempotency key hit two servers at the same instant. What prevents double execution?" options={["Checking with SELECT whether the key exists before inserting it", "A unique constraint or atomic set-if-absent on the key, so only one insert wins", "Making the endpoint use PUT", "A 5-minute TTL on the key"]} answer={1}>
+
+Only an atomic primitive (unique index, SET NX) resolves the race. SELECT-then-INSERT lets both see nothing and both proceed; changing the method or TTL doesn't serialise concurrent requests.
+
+</MCQ>
+
+<MCQ q="Which change is backward compatible for existing REST clients that ignore unknown fields?" options={["Renaming a response field", "Making an optional parameter required", "Adding a new optional response field", "Changing a field from string to integer"]} answer={2}>
+
+Tolerant clients skip fields they don't know, so adding one is safe. Renames, new required inputs and type changes all break existing integrations.
+
+</MCQ>
+
+<MCQ q="In RFC 9457 problem details, what does a missing type member mean?" options={["The response is invalid and must be rejected", "It defaults to about:blank, meaning no semantics beyond the HTTP status code", "The client must use the title to identify the problem", "The server must send status 500"]} answer={1}>
+
+RFC 9457 defines the default type as about:blank. Clients should branch on type, not title, and the HTTP status code is unaffected.
+
+</MCQ>
+
+<MCQ q="Why is cursor pagination on created_at alone risky?" options={["Timestamps cannot be indexed", "Rows sharing the same timestamp can be skipped or duplicated at a page boundary", "Cursors cannot encode dates", "It forces OFFSET internally"]} answer={1}>
+
+The cursor must point to a unique position. Add a tie-breaker like id and compare on the pair. Timestamps index fine, cursors can encode anything, and keyset queries do not use OFFSET.
+
+</MCQ>
+
+<MCQ q="A client gets 429 with RateLimit and Retry-After headers that disagree. What should it do?" options={["Ignore both and retry immediately", "Follow the RateLimit t value", "Follow Retry-After", "Switch to a different API key"]} answer={2}>
+
+The rate-limit headers draft says clients should give Retry-After precedence when both are present. Immediate retries cause storms, and rotating keys to dodge limits is abuse.
+
+</MCQ>
+
+<MCQ q="What is the main reason a webhook handler should return 2xx quickly and process asynchronously?" options={["HTTP forbids long POST handlers", "Slow handlers time out, the provider retries, and duplicates plus load pile up during incidents", "Signatures expire after one second", "Asynchronous processing guarantees ordering"]} answer={1}>
+
+Providers treat timeouts as failures and retry, amplifying load and duplicates. HTTP sets no such limit, signatures don't expire that fast, and async processing does not by itself give ordering.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **Style**: REST public, gRPC internal, GraphQL for flexible client shapes, **webhooks** for cross-company push; internal events go on a broker.
+- **Safe**: GET, HEAD, OPTIONS, TRACE. **Idempotent**: those + PUT, DELETE. **Neither**: POST, PATCH.
+- **Webhooks**: HMAC-SHA256 over raw body + timestamp + id; constant-time compare; reject stale timestamps (Stripe default 5 min); retry with exponential backoff + jitter for days; receivers **dedupe on event id**, **don't assume order**, **ack fast, process async**.
+- **Pagination**: keyset `WHERE (ts, id) < (x, y) ORDER BY ts DESC, id DESC LIMIT n` + composite index + **opaque cursor**. OFFSET only for small admin tables.
+- **Versioning**: evolve additively; clients ignore unknown fields; breaking → new version (URI / header / media type / date-pinned like Stripe); publish deprecation windows.
+- **Idempotency key**: one per logical operation; unique `(client, key)`; fingerprint the request; `422` mismatch, `409` in progress, replay when completed; TTL (Stripe ≥ 24 h); propagate downstream.
+- **Errors**: RFC 9457 `application/problem+json` — `type`, `title`, `status`, `detail`, `instance` + extensions; real status codes.
+- **Rate limits**: `429` + `Retry-After`; `RateLimit-Policy` / `RateLimit` (IETF draft) or legacy `X-RateLimit-*`.
+
+## Go deeper
+
+- **RFC 9110** — [HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110.html) (sections 9.2.1 safe and 9.2.2 idempotent methods).
+- **RFC 5789** — [PATCH Method for HTTP](https://www.rfc-editor.org/rfc/rfc5789.html).
+- **RFC 9457** — [Problem Details for HTTP APIs](https://www.rfc-editor.org/rfc/rfc9457.html).
+- **IETF draft** — [The Idempotency-Key HTTP Header Field](https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/).
+- **IETF draft** — [RateLimit header fields for HTTP](https://datatracker.ietf.org/doc/draft-ietf-httpapi-ratelimit-headers/).
+- **Standard Webhooks** — [spec](https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md) and [site](https://www.standardwebhooks.com/).
+- **Stripe docs** — [Idempotent requests](https://docs.stripe.com/api/idempotent_requests), [Pagination](https://docs.stripe.com/api/pagination), [Versioning](https://docs.stripe.com/api/versioning), [Webhooks](https://docs.stripe.com/webhooks).
+- **GitHub docs** — [REST API versions](https://docs.github.com/en/rest/about-the-rest-api/api-versions).
+- **Markus Winand** — [We need tool support for keyset pagination (no-offset)](https://use-the-index-luke.com/no-offset).
+- **PostgreSQL docs** — [LIMIT and OFFSET](https://www.postgresql.org/docs/current/queries-limit.html).
+- **Google AIP-180** — [Backwards compatibility](https://google.aip.dev/180).

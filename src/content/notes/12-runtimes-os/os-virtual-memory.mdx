@@ -1,0 +1,473 @@
+---
+title: "Virtual Memory, Paging and the Page Cache"
+phase: "12-runtimes-os"
+order: 123
+tags: ["os", "linux", "memory", "paging", "page-cache"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 20
+prerequisites: ["os-processes-threads", "storage-fundamentals"]
+summary: "How the OS gives every process its own private address space using pages, page tables and the TLB, what happens on a page fault, how Linux reclaims memory and caches files, and why databases and Kafka depend on all of it."
+---
+
+## Definition (interview-ready)
+
+**Virtual memory** gives every process the illusion of its own large, private, contiguous memory. The addresses a program uses are **virtual**. The CPU's **MMU** (memory management unit) translates them to **physical** addresses using **page tables** the kernel maintains. Memory is managed in fixed-size chunks: **pages** (virtual, usually 4 KB) map onto **frames** (physical, same size). A **TLB** caches recent translations. If a page isn't in RAM, the access triggers a **page fault** and the kernel loads it (demand paging).
+
+The **page cache** is the kernel using spare RAM to cache file contents. Reads are served from it, and writes land in it as **dirty pages** that are flushed to disk later (or when you call `fsync`).
+
+**One-liner:** Virtual memory is an indirection layer: the MMU maps each process's virtual pages to physical frames through kernel-managed page tables (cached in the TLB), which gives isolation, lazy allocation and overcommit, page sharing such as shared libraries and copy-on-write `fork`, and lets files be cached and memory-mapped through the same machinery.
+
+## Why it matters
+
+- **Performance.** TLB misses, page faults, swapping and THP stalls are real latency sources. "Why is my p99 bad after the box ran for a week?" is often a memory question.
+- **Capacity.** RSS vs virtual size, the page cache "using" all your RAM, and the OOM killer show up in every on-call rotation. Knowing what's reclaimable keeps you from panicking about `free` output.
+- **Data systems.** Postgres, Kafka, Elasticsearch and others deliberately lean on the page cache. Redis forks for snapshots and depends on copy-on-write. See [Storage fundamentals](/learn/notes/storage-fundamentals/) for disks and `fsync`, and [Kafka internals](/learn/notes/kafka-internals/) for how Kafka uses the page cache.
+- **Runtimes.** JVM heaps, Go's heap and container memory limits all sit on top of this. See [Memory management and GC](/learn/notes/memory-gc/) and [JVM memory](/learn/notes/jvm-memory/).
+
+## Core concepts
+
+### Why virtual memory
+
+Without it, every program would use physical addresses directly. Two programs couldn't both be loaded at address `0x400000`, a bug in one could overwrite another, and a program could never use more memory than is physically free and contiguous.
+
+Virtual memory solves four problems at once:
+
+1. **Isolation**: each process has its own page tables, so it simply can't name another process's memory.
+2. **Simple programming model**: every process sees the same clean layout (code, heap, stack) starting from the same addresses.
+3. **Using memory efficiently**: pages are allocated only when touched, can live on disk when idle, and can be shared (one copy of `libc` in RAM for every process).
+4. **Protection bits per page**: read-only code, non-executable stacks, guard pages.
+
+Analogy: virtual addresses are **apartment numbers in a building directory**. The page table is the directory that maps "apartment 4B" to an actual physical location. Each process has its own directory, so two tenants can both live in "4B" of their own buildings.
+
+### Pages, frames and address translation
+
+A virtual address is split into a **page number** and an **offset** inside the page. With 4 KB pages the offset is the low 12 bits (2^12 = 4096).
+
+```
+ virtual address (example, 4 KB pages)
+ ┌───────────────────────────────┬──────────────┐
+ │  virtual page number (VPN)    │ offset (12b) │
+ └───────────────┬───────────────┴──────┬───────┘
+                 │ page table lookup     │ copied unchanged
+                 ▼                       ▼
+ ┌───────────────────────────────┬──────────────┐
+ │  physical frame number (PFN)  │ offset (12b) │   = physical address
+ └───────────────────────────────┴──────────────┘
+```
+
+Each **page table entry (PTE)** stores the frame number plus flag bits:
+
+| Bit | Meaning |
+|---|---|
+| Present | Page is in RAM. If clear, an access causes a page fault |
+| Read/write | Writes allowed? |
+| User/supervisor | Accessible from user mode? |
+| No-execute (NX) | Can't run code from this page |
+| Accessed | Set by hardware when the page is used (used by replacement policies) |
+| Dirty | Set by hardware when the page is written |
+
+### Multi-level page tables
+
+A flat table is too big. On x86-64 with 48-bit virtual addresses and 4 KB pages there are 2^36 virtual pages. At 8 bytes per entry that's 512 GB **per process**, almost all of it describing unused addresses.
+
+The fix is a **tree** of tables. x86-64 uses **4 levels**, each indexed by 9 bits (512 entries of 8 bytes = exactly one 4 KB page):
+
+```
+ 48-bit virtual address:
+ [ 9 bits | 9 bits | 9 bits | 9 bits | 12-bit offset ]
+    L4       L3       L2       L1
+   (PGD)    (PUD)    (PMD)    (PTE)        Linux names in parentheses
+
+ CR3 → L4 table → L3 table → L2 table → L1 table → frame + offset
+```
+
+- Only tables for address ranges that are actually used exist. A sparse address space costs a few pages of tables, not gigabytes.
+- The cost: a TLB miss needs up to **4 memory reads** just to find the translation (the "page walk").
+- 4-level paging allows 256 TiB of virtual address space. CPUs with **5-level paging** extend that to 128 PiB, and Linux supports it on such hardware.
+
+### The TLB
+
+Walking four levels on every memory access would be far too slow. The **TLB (translation lookaside buffer)** is a small, fast cache of recent VPN-to-PFN translations inside the CPU.
+
+- **TLB hit**: translation in about a cycle.
+- **TLB miss**: the hardware walks the page tables (on x86), then caches the result.
+- **TLB reach** = entries × page size. A hypothetical 1,000-entry TLB covers about 4 MB with 4 KB pages, but about 2 GB with 2 MB pages. Programs that jump around a large heap (big hash tables, databases, JVMs with large heaps) miss the TLB a lot. That's the core argument for **huge pages**.
+- On a context switch to another process, the old translations are no longer valid. Tagging entries with an address-space ID (PCID on x86, ASID on ARM) avoids a full flush. See [Processes and threads](/learn/notes/os-processes-threads/).
+- When the kernel changes a mapping that other CPUs might have cached, it must send them an interrupt to invalidate it: a **TLB shootdown**. Frequent `munmap`/`mprotect` in a many-threaded process makes these expensive.
+
+### Page faults: minor vs major
+
+A **page fault** is a CPU exception raised when a translation is missing or an access isn't allowed. The kernel's fault handler decides what it means:
+
+| Type | What happened | Cost |
+|---|---|---|
+| **Minor (soft)** | The data is already in RAM, just not mapped for this process. E.g., first touch of a freshly `malloc`'d page (kernel hands out a zeroed frame), a shared library page already in the page cache, a copy-on-write page | Microseconds, no disk I/O |
+| **Major (hard)** | The data must be read from disk: a file page not in the page cache, or a page that was swapped out | Disk latency: from tens to around a hundred microseconds on NVMe to several milliseconds on HDD |
+| **Invalid** | Address not mapped at all, or writing to a read-only page that isn't copy-on-write | Kernel sends `SIGSEGV` → segfault |
+
+See them with `ps -o min_flt,maj_flt -p PID`, `pidstat -r 1` (minflt/s, majflt/s), or `/usr/bin/time -v cmd`. Major faults on a latency-sensitive service are a red flag.
+
+### Demand paging
+
+The kernel doesn't load a program or allocate memory up front. `malloc(1 GB)` or `mmap` just reserves a range of **virtual** addresses. Physical frames are assigned **on first touch**, through a minor fault. Program code is read from the binary file only as pages are executed.
+
+This is why:
+
+- **Virtual size (VSZ)** can be huge while **resident set size (RSS)**, the RAM actually in use, is small.
+- **Overcommit** is possible. Linux's `vm.overcommit_memory` default (0) uses a heuristic that rejects only obviously impossible requests. Mode 1 always says yes. Mode 2 refuses to commit more than swap plus a configurable share of RAM. With overcommit, `malloc` can succeed and the process can still be killed later when it actually touches the memory.
+
+### Swapping and page replacement
+
+When RAM is full and the kernel needs a frame, it must **evict** a page. What eviction means depends on the page:
+
+- **Clean file-backed page** (e.g., cached file data not modified): just drop it. It can be re-read from the file.
+- **Dirty file-backed page**: write it back to the file first, then drop it.
+- **Anonymous page** (heap, stack: no file behind it): write it to **swap** first. Without swap, anonymous pages can't be evicted at all.
+
+`vm.swappiness` (default 60) biases the kernel between reclaiming file pages and swapping anonymous pages.
+
+**Which page to evict? Replacement policies:**
+
+| Policy | Idea | Notes |
+|---|---|---|
+| **OPT / Belady's MIN** | Evict the page used furthest in the future | Optimal but needs the future. Used as a benchmark |
+| **FIFO** | Evict the oldest loaded page | Simple. Suffers **Belady's anomaly**: more frames can cause more faults |
+| **LRU** | Evict the least recently used page | Good approximation of OPT. Exact LRU needs work on every access, too expensive in hardware |
+| **Clock (second chance)** | Pages in a circle with an accessed bit. The hand sweeps: bit set → clear it and move on; bit clear → evict | Cheap LRU approximation using the hardware accessed bit |
+
+**What Linux does:** it approximates LRU with **active and inactive lists** (separately for anonymous and file pages). New pages start on the inactive list and are promoted to active if they're accessed again. Reclaim takes from the tail of the inactive list. This protects the working set from a one-off big scan (like a backup reading every file once). Linux 6.1 also merged an alternative, **MGLRU** (multi-generational LRU), which is a build and runtime option.
+
+Who reclaims:
+
+- **kswapd**: a background kernel thread that wakes when free memory drops below a watermark and reclaims until it's above a higher one.
+- **Direct reclaim**: if kswapd can't keep up, the allocating thread itself has to reclaim before it gets its page. That's a latency spike inside your application's request.
+
+### Thrashing
+
+**Thrashing** is when the combined **working sets** (the pages processes actively use) don't fit in RAM. Every process keeps faulting in pages that evict pages another process needs right away. CPUs sit idle waiting on disk, and throughput collapses.
+
+Signs: `vmstat` shows sustained `si`/`so` (swap in/out), high `wa`, high major faults, and everything is slow. Fixes: run fewer things, add RAM, cut memory use, set memory limits so one process can't push out everyone else's working set. The OS can't fix it by being clever: the demand is simply larger than the supply.
+
+### Copy-on-write and fork
+
+When a process calls `fork()`, the kernel doesn't copy its memory. It copies the **page tables**, points both parent and child at the same physical frames, and marks the pages **read-only** in both.
+
+```
+ after fork():
+   parent PTE ─┐
+               ├──► frame 42  (read-only, refcount 2)
+   child  PTE ─┘
+
+ child writes to the page → page fault (write to read-only)
+   kernel sees it's a COW page → copies frame 42 to frame 97
+   child PTE ──► frame 97 (writable)
+   parent PTE ──► frame 42 (still read-only; refcount is now 1, so the parent's
+                            next write just flips it writable, no copy)
+```
+
+- `fork` + `exec` stays cheap because the child replaces its memory almost immediately.
+- **Redis** uses this for RDB snapshots and AOF rewrites: it forks, and the child writes a consistent point-in-time view of memory to disk while the parent keeps serving. Memory grows only by the pages the parent modifies during the snapshot. A write-heavy Redis can nearly double its memory during a save.
+- Huge pages make COW much worse: touching one byte copies a whole 2 MB page instead of 4 KB. That's one reason Redis tells you to disable THP.
+
+### mmap
+
+`mmap` maps a file (or anonymous memory) into a process's address space. After that, you read and write the file with plain memory accesses. The page cache and page faults do the I/O.
+
+| Flag combination | Use |
+|---|---|
+| File + `MAP_SHARED` | Writes go to the page cache and eventually to the file. Other processes mapping the file see them. Use `msync` for durability |
+| File + `MAP_PRIVATE` | Copy-on-write private view. Writes never reach the file. How executables and libraries are loaded |
+| Anonymous + `MAP_PRIVATE` | Plain zero-filled memory. glibc's `malloc` uses this for large allocations |
+| Anonymous + `MAP_SHARED` | Memory shared between a parent and its forked children |
+
+Pros: no extra copy from the kernel into a user buffer, the OS handles caching, and random access into big files is easy. Cons: I/O errors arrive as `SIGBUS` instead of return codes, you don't control when pages are evicted or written back, page faults block threads unpredictably, and TLB shootdowns hurt with many threads. Some databases use it (MongoDB's old MMAPv1 engine, LMDB); many others moved away from it to control I/O themselves.
+
+### Huge pages and THP
+
+x86-64 supports **2 MB** and **1 GB** pages besides 4 KB. One huge page needs one TLB entry instead of 512, and the page walk is shorter.
+
+Two ways to get them on Linux:
+
+- **HugeTLB pages** (explicit): reserve a pool ahead of time (`vm.nr_hugepages`), and the application asks for them (`hugetlbfs` or `MAP_HUGETLB`). Predictable; used by some databases and the JVM's `-XX:+UseLargePages` option.
+- **Transparent Huge Pages (THP)**: the kernel tries to back anonymous memory with 2 MB pages automatically. Controlled by `/sys/kernel/mm/transparent_hugepage/enabled`: `always`, `madvise` (only regions that call `madvise(MADV_HUGEPAGE)`), or `never`. The `khugepaged` daemon collapses runs of small pages into huge pages in the background.
+
+THP's trade-offs: latency stalls when the kernel compacts memory to find a free 2 MB block, more memory used (a huge page is allocated even if you touch a little of it), and bigger COW copies after `fork`. That's why latency-sensitive stores like Redis recommend turning it off, while `madvise` mode lets specific applications opt in.
+
+### The page cache in depth
+
+[Storage fundamentals](/learn/notes/storage-fundamentals/) covers the basics (`write` returns before data is durable, `fsync`, `O_DIRECT`). Here's the memory side.
+
+**Read path:**
+
+```
+read(fd, buf, 4096) at offset X
+  → kernel looks up (file, page index) in the file's page cache
+     hit  → copy from the cached page into buf (memory speed)
+     miss → allocate a page, issue disk I/O, block the thread (major cost),
+            usually also read ahead the next pages (sequential readahead)
+  → page now cached; next reader of the same data hits RAM
+```
+
+**Write path and writeback:**
+
+- `write()` copies data into page cache pages and marks them **dirty**, then returns.
+- Background **flusher threads** write dirty pages to disk when they get old enough (`vm.dirty_expire_centisecs`) or when dirty memory passes `vm.dirty_background_ratio` / `dirty_background_bytes`.
+- If dirty memory reaches `vm.dirty_ratio` / `dirty_bytes`, the **writing process itself is throttled** and has to wait for writeback. This is a classic cause of sudden write stalls.
+- `fsync(fd)` forces that file's dirty pages (and metadata) to stable storage and waits.
+
+**`free` output:** the `buff/cache` column is the page cache. It's mostly **reclaimable**, so look at `available`, not `free`, to see how much memory applications can still get. "Linux ate my RAM" is the page cache doing its job.
+
+**When fsync fails.** If writeback fails (a disk error), the kernel may mark the pages clean anyway and report the error once. Retrying `fsync` can then "succeed" while data is lost. PostgreSQL learned this the hard way. Its `data_sync_retry` setting is off by default, so a failed data-file flush makes the server **PANIC** and recover from WAL instead of trusting a retry.
+
+**Why data systems lean on the page cache:**
+
+- **Kafka** keeps a small JVM heap and lets the page cache hold recent log segments, so consumers that keep up read from RAM, and `sendfile` copies from the page cache straight to the socket. Details in [Kafka internals](/learn/notes/kafka-internals/).
+- **PostgreSQL** uses buffered I/O. Its docs suggest `shared_buffers` around 25% of RAM on a dedicated server and note that more than 40% rarely helps, because Postgres also relies on the OS cache. See [Postgres internals](/learn/notes/postgres-internals/).
+- **Elasticsearch / Lucene** read immutable index segments heavily through the OS cache, which is why the usual advice is to leave a big share of RAM outside the JVM heap. See [Elasticsearch](/learn/notes/elasticsearch/).
+- The counterexample: databases that use **O_DIRECT** (InnoDB with `innodb_flush_method=O_DIRECT`, ScyllaDB) skip the page cache and manage their own buffer pool, so RAM isn't cached twice. See [MySQL InnoDB internals](/learn/notes/mysql-innodb-internals/).
+
+### The OOM killer
+
+If the kernel can't reclaim enough memory (nothing left to drop, swap full or absent), it invokes the **OOM (out-of-memory) killer** to free memory by killing a process.
+
+- Each process gets a **badness score** from 0 to 1000, roughly the share of allowed memory it uses (RAM plus swap). You can see it in `/proc/PID/oom_score`.
+- `/proc/PID/oom_score_adj` (-1000 to 1000) shifts the score. **-1000 exempts** a process entirely. Critical daemons (like `sshd`) are often protected this way.
+- In **containers**, the cgroup memory limit has its own OOM: the container's process is killed when the cgroup exceeds its limit, even if the node has free memory. In Kubernetes this shows as `OOMKilled` with exit code 137 (128 + SIGKILL's 9).
+- Find it in `dmesg` / `journalctl -k`: look for "Out of memory: Killed process".
+
+## How it works (one memory access, end to end)
+
+```
+CPU executes: mov rax, [0x7f3a12345678]
+
+1. MMU checks the TLB for page 0x7f3a12345.
+   hit  → physical address = frame + 0x678. Done (fast path).
+   miss → hardware walks L4 → L3 → L2 → L1 tables starting at CR3.
+2. Walk finds the PTE.
+   present + allowed → load into TLB, retry the access. Done.
+   not present / not allowed → PAGE FAULT, trap to the kernel.
+3. Kernel fault handler looks up the address in the process's memory map (VMAs):
+   not mapped             → SIGSEGV
+   anonymous, first touch → grab a zeroed frame, fill PTE          (minor fault)
+   file page in page cache → map the cached frame                  (minor fault)
+   file page not cached    → read from disk into page cache, map   (major fault)
+   swapped out             → read from swap, map                   (major fault)
+   write to COW page       → copy frame, map the copy writable     (minor fault)
+4. If no free frame: kswapd or direct reclaim evicts pages
+   (drop clean, write back dirty, swap anonymous). If that fails → OOM killer.
+5. Return from the fault; the instruction re-runs and now hits.
+```
+
+## Real-world examples
+
+- **Redis** forks for RDB snapshots and AOF rewrites and relies on copy-on-write. Its latency guide tells you to disable Transparent Huge Pages (`echo never > /sys/kernel/mm/transparent_hugepage/enabled`) because THP makes fork-related COW and latency much worse.
+- **PostgreSQL** keeps `shared_buffers` moderate and relies on the OS page cache for the rest. Since `data_sync_retry` defaults to off, it panics on a failed data-file flush rather than risk silent loss.
+- **Kafka** gets its read speed from the page cache plus zero-copy `sendfile`, and recommends small heaps so most RAM is page cache.
+- **Kubernetes** pods that exceed their memory limit are OOM-killed by the kernel's cgroup OOM handling, which is why memory limits should be set with headroom above the JVM or Go heap.
+
+## Common pitfalls
+
+- **Reading `free` wrong.** Low "free" with large "buff/cache" is healthy. Watch `available`, major faults and swap activity instead.
+- **JVM heap = container limit.** The JVM also needs metaspace, thread stacks, code cache and direct buffers. Setting `-Xmx` equal to the container limit gets you OOM-killed. Leave headroom.
+- **Giant JVM heaps on Kafka/Elasticsearch boxes.** It steals RAM from the page cache, which is where their read performance comes from.
+- **THP on latency-sensitive stores** (Redis): compaction stalls and inflated COW. Use `madvise` or `never`.
+- **Assuming `malloc` success means memory exists.** With overcommit, failure shows up later as an OOM kill on first touch.
+- **mmap for writes you need durable** without `msync`, and without handling `SIGBUS` on I/O errors.
+- **Big dirty-page backlogs.** With large RAM, the default ratio-based dirty limits can let gigabytes of dirty data build up, followed by long write stalls. Consider the `_bytes` variants on big-memory write-heavy hosts.
+- **Retrying a failed `fsync`** and assuming the data is now safe.
+- **Disabling swap and being surprised by OOM kills**: without swap, anonymous memory can't be reclaimed at all. Either budget for it or set limits.
+
+## Practice questions
+
+<Practice>
+
+<QA q="Why do operating systems use virtual memory?" level="easy">
+
+Isolation (each process has its own page tables and can't address another's memory), a uniform address layout for every program, efficient use of RAM (lazy allocation, sharing pages such as libraries, swapping idle pages to disk), and per-page protection (read-only code, non-executable stack). It also lets files be cached and memory-mapped through the same mechanism.
+
+</QA>
+
+<QA q="What is the difference between a page and a frame?" level="easy">
+
+A **page** is a fixed-size block of **virtual** address space. A **frame** is a block of the same size in **physical** RAM. The page table maps pages to frames. Pages that aren't in RAM have no frame (they're on disk or not yet touched).
+
+</QA>
+
+<QA q="What is the TLB and why does it matter?" level="easy">
+
+The translation lookaside buffer is a small CPU cache of recent virtual-to-physical translations. A hit avoids the multi-level page table walk (up to 4 memory reads on x86-64). Workloads that touch memory randomly across a big heap miss the TLB often, which costs real time. Huge pages raise TLB reach because one entry covers 2 MB instead of 4 KB.
+
+</QA>
+
+<QA q="Minor vs major page fault?" level="easy">
+
+A **minor** fault is resolved without disk I/O: the data is already in RAM (page cache, COW page) or it's a first touch that just needs a zeroed frame. A **major** fault needs to read from disk (file not cached, or page swapped out), which costs disk latency. Major faults on a hot path are a performance problem.
+
+</QA>
+
+<QA q="Why are page tables multi-level?" level="medium">
+
+A flat table needs one entry for every possible virtual page. On x86-64 with 48-bit addresses and 4 KB pages that's 2^36 entries × 8 bytes = 512 GB per process. A multi-level tree only allocates the tables for address regions that are actually used. The cost is more memory reads per TLB miss (a 4-level walk), which the TLB and page-walk caches hide most of the time.
+
+</QA>
+
+<QA q="Explain copy-on-write in fork()." level="medium">
+
+`fork` copies the page tables, not the memory. Parent and child point at the same frames, which are marked read-only. When either writes to a page, the CPU raises a fault, the kernel sees it's a COW page, copies just that page and maps the copy as writable for the writer. Memory is only duplicated for pages that actually change, which makes `fork` + `exec` cheap and lets Redis snapshot without stopping.
+
+</QA>
+
+<QA q="Compare FIFO, LRU and clock page replacement." level="medium">
+
+**FIFO** evicts the oldest loaded page. It's simple but can evict hot pages and suffers Belady's anomaly (more frames can mean more faults). **LRU** evicts the least recently used page, close to optimal in practice, but exact LRU needs bookkeeping on every access. **Clock** approximates LRU using the hardware accessed bit: a hand sweeps a circular list, clearing set bits (second chance) and evicting the first page whose bit is already clear. Linux uses an LRU approximation with active and inactive lists, and Linux 6.1 added the optional MGLRU.
+
+</QA>
+
+<QA q="What is thrashing and how do you detect it?" level="medium">
+
+Thrashing happens when the active working sets don't fit in RAM, so processes constantly fault pages in that evict pages someone else needs next. The system spends its time on paging, not work. Detect it with `vmstat` (sustained `si`/`so`, high `wa`), high major fault rates (`pidstat -r`), and pressure stall info (`/proc/pressure/memory`). Fix by reducing load or memory use, adding RAM, or isolating workloads with memory limits.
+
+</QA>
+
+<QA q="What happens when you call `write()` on a file, in terms of the page cache?" level="medium">
+
+The kernel copies your data into page cache pages for that file, marks them dirty and returns. The data isn't durable yet. Flusher threads write dirty pages back when they're old enough or when dirty memory passes the background threshold. If dirty memory reaches the hard threshold, your writing thread gets throttled. To make it durable now, call `fsync`/`fdatasync`.
+
+</QA>
+
+<QA q="What are huge pages, and why do some databases recommend disabling Transparent Huge Pages?" level="hard">
+
+Huge pages are 2 MB or 1 GB pages. One TLB entry covers far more memory and page walks are shorter, which helps large-heap workloads. **THP** gives you huge pages automatically, but the kernel may stall allocations to compact memory, may allocate 2 MB when you needed a little, and makes copy-on-write after `fork` copy 2 MB per touched page. Redis, which forks for persistence and cares about tail latency, tells you to set THP to `never`. Explicit HugeTLB pages or `madvise` mode give the benefit without surprising the rest of the system.
+
+</QA>
+
+<QA q="When would you use mmap instead of read and write?" level="hard">
+
+`mmap` fits read-mostly random access into large files (lookup tables, indexes), sharing memory between processes, and avoiding a copy into a user buffer. Downsides: you don't control eviction or writeback, page faults block threads unpredictably, I/O errors come as `SIGBUS`, durability needs `msync`, and with many threads TLB shootdowns from `munmap` get expensive. Databases that need precise control over I/O and durability often prefer explicit `pread`/`pwrite`, sometimes with `O_DIRECT`.
+
+</QA>
+
+<QA q="How does the Linux OOM killer choose a victim, and how do you protect a process?" level="hard">
+
+It computes a badness score per process (0 to 1000), roughly the fraction of allowed memory the process uses, then adds `oom_score_adj` (-1000 to 1000), and kills the highest scorer. Set `oom_score_adj` to -1000 to exempt a process (use sparingly). In a cgroup (container), the limit triggers an OOM inside that cgroup even if the host has free memory. Check `dmesg` for the kill record.
+
+</QA>
+
+<QA q="Why does Kafka recommend a small JVM heap and lots of free RAM?" level="hard">
+
+Kafka doesn't keep its own record cache. It appends to log segment files and lets the OS page cache hold recent data. Consumers that keep up read from RAM, and `sendfile` copies from the page cache to the socket without passing through user space. A huge heap would take RAM away from the page cache, cause long GC pauses, and duplicate data. The page cache also stays warm across a broker process restart.
+
+</QA>
+
+<QA q="A Redis instance with 20 GB of data is OOM-killed during BGSAVE on a 32 GB host. Explain and fix." level="scenario">
+
+BGSAVE forks. Thanks to copy-on-write the child initially shares all pages, but every page the parent modifies while the child is writing the snapshot gets copied. Under heavy writes a large share of the 20 GB is duplicated, and with THP each touch copies 2 MB instead of 4 KB. Total memory exceeds what's available and the OOM killer fires.
+
+Fixes: disable THP, leave headroom for COW (often plan for a big fraction of the dataset), take snapshots from a replica or during low write traffic, check `vm.overcommit_memory` per Redis's guidance so fork doesn't fail, and set `maxmemory` with room to spare.
+
+</QA>
+
+<QA q="A Java service in Kubernetes keeps restarting with exit code 137, but heap usage graphs never pass 70 percent of -Xmx. Why?" level="scenario">
+
+Exit 137 means SIGKILL, here from the cgroup OOM killer. The container limit covers the **whole process RSS**, not just the heap: metaspace, thread stacks (each thread), JIT code cache, direct/NIO buffers, GC data structures, and native libraries. If `-Xmx` is close to the limit, total RSS crosses it while the heap looks fine.
+
+Fix: size `-Xmx` (or `MaxRAMPercentage`) well under the limit, cap direct memory and thread counts, use Native Memory Tracking to see where non-heap memory goes, and confirm the kill in the node's kernel log. See [JVM memory](/learn/notes/jvm-memory/).
+
+</QA>
+
+<QA q="A write-heavy service on a 256 GB host has periodic multi-second write stalls. CPU is idle during the stalls. What do you check?" level="scenario">
+
+Suspect dirty-page writeback. With ratio-based limits on a big-RAM host, many gigabytes of dirty pages can build up. When dirty memory hits `vm.dirty_ratio`, writers are throttled until the disk catches up, and a big `fsync` may have to flush a huge backlog.
+
+Check `grep -E 'Dirty|Writeback' /proc/meminfo` over time, `iostat -x 1` during stalls, and the current `vm.dirty_*` settings. Fixes: switch to `vm.dirty_background_bytes` / `vm.dirty_bytes` with values sized to the disk's throughput so writeback starts earlier and in smaller chunks, fsync more often in smaller batches, or use faster storage.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="With 4 KB pages, how many bits of a virtual address are the page offset?" options={["9", "12", "16", "21"]} answer={1}>
+
+2^12 = 4096, so the low 12 bits are the offset within the page and pass through translation unchanged. 9 bits is the index per page-table level on x86-64; 21 bits is the offset for 2 MB pages.
+
+</MCQ>
+
+<MCQ q="Why does x86-64 use multi-level page tables?" options={["To make TLB hits faster", "To support more than 4 KB pages only", "To avoid allocating table entries for unused parts of the huge virtual address space", "Because hardware cannot read a single table"]} answer={2}>
+
+A flat table for a 48-bit space would be hundreds of GB per process. A tree only allocates tables for regions actually in use. It actually makes TLB misses slower (more memory reads per walk).
+
+</MCQ>
+
+<MCQ q="A process touches a freshly malloc'd page for the first time. What kind of fault is this?" options={["Minor fault, the kernel maps a zeroed frame", "Major fault, it reads from swap", "Segmentation fault", "No fault, malloc already mapped it"]} answer={0}>
+
+Demand paging assigns a frame on first touch. No disk I/O is needed, so it's a minor fault.
+
+</MCQ>
+
+<MCQ q="Which replacement policy can suffer from Belady's anomaly?" options={["LRU", "OPT", "None: more frames always means fewer or equal faults", "FIFO"]} answer={3}>
+
+FIFO can produce more faults with more frames. LRU and OPT are stack algorithms and don't have this anomaly.
+
+</MCQ>
+
+<MCQ q="After fork(), the child writes to a heap page. What happens?" options={["The write goes to the parent's page too", "A page fault occurs, the kernel copies the page and maps the copy writable for the child", "The child is killed with SIGSEGV", "The whole heap is copied"]} answer={1}>
+
+Pages are shared read-only after fork. A write triggers a COW fault and only that page is copied.
+
+</MCQ>
+
+<MCQ q="free shows 1 GB free, 40 GB buff/cache and 45 GB available. What is the right conclusion?" options={["The host is out of memory", "There is a memory leak in the kernel", "Most memory is page cache that can be reclaimed, so applications can still get about 45 GB", "Swap must be added immediately"]} answer={2}>
+
+The page cache uses spare RAM and is mostly reclaimable. `available` is the estimate of memory applications can still allocate.
+
+</MCQ>
+
+<MCQ q="What does setting /proc/PID/oom_score_adj to -1000 do?" options={["Makes the process the first OOM victim", "Exempts the process from the OOM killer", "Limits the process to 1000 MB", "Disables swap for the process"]} answer={1}>
+
+-1000 (OOM_SCORE_ADJ_MIN) is a special value: the kernel skips that process entirely when choosing a victim. +1000 would make it the preferred victim.
+
+</MCQ>
+
+<MCQ q="Why does Redis recommend disabling Transparent Huge Pages?" options={["THP breaks the RESP protocol", "Redis cannot allocate more than 4 KB at a time", "THP disables fork", "THP causes latency spikes and makes copy-on-write after fork copy 2 MB pages"]} answer={3}>
+
+Compaction stalls and much larger copy-on-write copies during snapshot forks hurt latency and memory use.
+
+</MCQ>
+
+<MCQ q="What does PostgreSQL do by default when flushing a modified data file to disk fails?" options={["Retries fsync until it succeeds", "Ignores the error", "Raises a PANIC and recovers from WAL", "Switches to O_DIRECT"]} answer={2}>
+
+With `data_sync_retry` off (the default), Postgres panics, because after a writeback failure the kernel may have dropped the dirty data and a retried fsync could falsely succeed.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- Virtual address = page number + offset (12 bits for 4 KB). MMU translates via **page tables**; **TLB** caches translations.
+- x86-64: **4-level** tables (9 bits per level), 256 TiB virtual; 5-level gives 128 PiB.
+- **Minor fault** = no disk (first touch, page cache hit, COW). **Major fault** = disk read. **Invalid** = SIGSEGV.
+- **Demand paging** + **overcommit**: VSZ is large, RSS is what's real; malloc success isn't a guarantee.
+- Eviction: clean file page → drop; dirty → write back; anonymous → swap. Linux: active/inactive LRU lists (MGLRU optional since 6.1), kswapd vs direct reclaim.
+- Replacement: OPT (ideal), FIFO (Belady's anomaly), LRU, Clock (accessed bit).
+- **Thrashing** = working sets bigger than RAM. Watch `si`/`so`, major faults.
+- **COW fork**: copy page tables, copy pages only on write. Redis snapshots depend on it.
+- **mmap**: file into memory; `MAP_SHARED` vs `MAP_PRIVATE`. Errors arrive as SIGBUS.
+- **Huge pages** 2 MB / 1 GB raise TLB reach. **THP** (`always`/`madvise`/`never`) can stall; Redis says disable.
+- **Page cache**: reads cached, writes dirty then flushed (`dirty_background_*`, `dirty_*` throttle). Check `available`, not `free`.
+- Kafka and Postgres rely on the page cache; InnoDB with O_DIRECT and Scylla bypass it.
+- **OOM killer**: badness 0 to 1000 + `oom_score_adj`; -1000 = exempt; containers get cgroup OOM (exit 137).
+
+## Go deeper
+
+- **OSTEP** (free): [Paging](https://pages.cs.wisc.edu/~remzi/OSTEP/vm-paging.pdf), [TLBs](https://pages.cs.wisc.edu/~remzi/OSTEP/vm-tlbs.pdf), [Smaller tables](https://pages.cs.wisc.edu/~remzi/OSTEP/vm-smalltables.pdf), [Swapping mechanisms](https://pages.cs.wisc.edu/~remzi/OSTEP/vm-beyondphys.pdf), [Swapping policies](https://pages.cs.wisc.edu/~remzi/OSTEP/vm-beyondphys-policy.pdf).
+- **Kernel docs**: [Memory management concepts](https://docs.kernel.org/admin-guide/mm/concepts.html), [Transparent Hugepage support](https://docs.kernel.org/admin-guide/mm/transhuge.html), [HugeTLB pages](https://docs.kernel.org/admin-guide/mm/hugetlbpage.html), [Multi-Gen LRU](https://docs.kernel.org/admin-guide/mm/multigen_lru.html), [/proc/sys/vm sysctls](https://www.kernel.org/doc/html/latest/admin-guide/sysctl/vm.html), [5-level paging](https://docs.kernel.org/arch/x86/x86_64/5level-paging.html).
+- **Man pages**: [mmap(2)](https://man7.org/linux/man-pages/man2/mmap.2.html), [madvise(2)](https://man7.org/linux/man-pages/man2/madvise.2.html), [fsync(2)](https://man7.org/linux/man-pages/man2/fsync.2.html), [oom_score_adj](https://man7.org/linux/man-pages/man5/proc_pid_oom_score_adj.5.html).
+- **Redis**: [Diagnosing latency issues](https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/latency/) (fork, THP, swapping).
+- **PostgreSQL**: [Resource consumption (shared_buffers)](https://www.postgresql.org/docs/current/runtime-config-resource.html) and [Error handling (data_sync_retry)](https://www.postgresql.org/docs/current/runtime-config-error-handling.html).
+- **Kafka**: [Design: persistence and the filesystem](https://kafka.apache.org/documentation/#design_filesystem).
+- **Book**: Silberschatz et al., *Operating System Concepts*, chapters on main memory and virtual memory.

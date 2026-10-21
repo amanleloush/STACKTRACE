@@ -1,0 +1,512 @@
+---
+title: "Kafka Consumers: Poll Loop, Rebalancing, Retries, DLQ"
+phase: "04-messaging-kafka"
+order: 33
+tags: ["messaging"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 16
+prerequisites: ["kafka-deep"]
+summary: "How a Kafka consumer stays alive in its group, what a rebalance really costs, and how to retry, dead-letter, rewind and parallelise without losing or reordering data."
+---
+
+## Definition (interview-ready)
+
+A **Kafka consumer** is a client that repeatedly calls `poll()` to fetch records from the partitions it owns, processes them, and **commits offsets** to record progress. Consumers sharing a `group.id` form a **consumer group**; a broker-side **group coordinator** tracks membership, and whenever membership or subscriptions change it triggers a **rebalance** that redistributes partitions. Everything interesting about consumers — duplicates, stalls, lag spikes, lost messages — comes from three things: *when you commit*, *how long you take between polls*, and *how rebalances move partitions around*.
+
+**One-liner:** A Kafka consumer polls records from the partitions its group assigns it and commits offsets to track progress; when members join or leave, a rebalance moves partitions, so you commit after processing, keep handlers idempotent, and use cooperative rebalancing plus static membership to keep rebalances cheap.
+
+## Why it matters
+
+Producers are mostly configure-once. Consumers are where production incidents live:
+
+- A handler that occasionally takes 6 minutes gets the consumer kicked out of its group, its partitions handed to someone else, and the same batch reprocessed — forever.
+- A rolling deploy of 50 pods triggers 100 stop-the-world rebalances.
+- One malformed record blocks a partition while every other partition is fine, and lag on that one partition climbs to millions.
+- A retry strategy that looks innocent silently breaks per-key ordering.
+
+Interviewers use consumer questions to separate people who have *run* Kafka from people who have read about it.
+
+## Core concepts
+
+### The poll loop and its threads
+
+The Java consumer is **not thread-safe** and is designed around one application thread calling `poll()` in a loop:
+
+```java
+consumer.subscribe(List.of("orders"), rebalanceListener);
+while (running) {
+    ConsumerRecords<String, Order> batch = consumer.poll(Duration.ofMillis(500));
+    for (ConsumerRecord<String, Order> r : batch) {
+        handle(r);                    // your business logic
+    }
+    consumer.commitSync();            // at-least-once: commit AFTER processing
+}
+```
+
+`poll()` does much more than fetch data. It also:
+
+- joins or rejoins the group and runs the rebalance protocol,
+- invokes your `ConsumerRebalanceListener` callbacks,
+- runs auto-commit if enabled,
+- proves to the coordinator that the *processing* thread is still making progress.
+
+Separately, a **background heartbeat thread** (since Kafka 0.10.1) sends heartbeats to the coordinator so that *liveness of the process* is decoupled from *speed of processing*.
+
+### Three timeouts you must not confuse
+
+| Config | Default | What it detects | Who enforces |
+|---|---|---|---|
+| `heartbeat.interval.ms` | 3 s | — (how often the heartbeat thread pings) | client |
+| `session.timeout.ms` | 45 s (was 10 s before Kafka 3.0) | **Dead process**: crash, kill -9, network cut, very long GC | coordinator: no heartbeat within this window → member removed |
+| `max.poll.interval.ms` | 5 min | **Livelock**: process alive but stuck/slow in your handler | client: if `poll()` isn't called again in time, the client proactively leaves the group |
+
+Rule of thumb: `heartbeat.interval.ms` ≈ one third of `session.timeout.ms`.
+
+```
+time ─────────────────────────────────────────────────────────────►
+
+heartbeat thread:  ♥   ♥   ♥   ♥   ♥   ♥   ♥   ♥   ♥   ♥   ♥    (every 3s — process is alive)
+
+app thread:   poll ── handle 500 records ─────────────────────────── … still handling
+              │                                                 │
+              t=0                              t=max.poll.interval.ms (5 min)
+                                                                └─► consumer leaves group,
+                                                                    partitions reassigned,
+                                                                    uncommitted batch reprocessed
+                                                                    by another member
+```
+
+The classic failure: `max.poll.records` (default 500) × slow per-record work (say 1 s each) = 500 s, longer than the 300 s poll interval. The consumer is evicted, the batch is redone by someone else, who is *also* too slow — an endless rebalance loop with zero progress. Fixes, in order of preference: make the handler faster (batch DB writes), lower `max.poll.records`, hand work off asynchronously (with careful offset tracking), and only then raise `max.poll.interval.ms` deliberately.
+
+### What triggers a rebalance
+
+- A member **joins**: new pod, scale-up, restart (a restarted consumer gets a fresh member id unless static membership is used).
+- A member **leaves**: clean `close()`, missed heartbeats past `session.timeout.ms`, or exceeded `max.poll.interval.ms`.
+- **Subscription metadata changes**: partitions added to a subscribed topic, or a regex subscription now matches a new topic.
+- Not a trigger by itself: **coordinator failover** (the broker hosting the group's `__consumer_offsets` partition changes). Members rediscover the new coordinator, which reloads the group state; a rebalance only follows if members time out in the meantime.
+
+### Eager vs cooperative rebalancing
+
+**Eager (classic) protocol**: every member revokes **all** its partitions, everyone rejoins, the elected group leader computes a brand-new assignment, everyone resumes. The whole group stops consuming for the duration — "stop the world".
+
+**Cooperative (incremental) protocol** (KIP-429, Kafka 2.4+): members keep everything that isn't moving. Only partitions that actually change owner are revoked, then handed out in a follow-up round. Unaffected partitions never stop.
+
+```
+3 consumers, 6 partitions; C3 joins a group of C1, C2
+
+EAGER
+  C1: p0 p1 p2  ──revoke all──►  (nothing)  ──assign──► p0 p1
+  C2: p3 p4 p5  ──revoke all──►  (nothing)  ──assign──► p3 p4
+  C3:                                       ──assign──► p2 p5
+  ▲ every partition paused during the rebalance
+
+COOPERATIVE (two rounds)
+  round 1: C1 keeps p0 p1, revokes only p2;  C2 keeps p3 p4, revokes only p5
+  round 2: C3 gets p2 p5
+  ▲ p0 p1 p3 p4 never stopped
+```
+
+Whatever the protocol, the `onPartitionsRevoked` callback is your last chance to **finish in-flight work and commit offsets** for partitions you're losing. Skip it and the new owner reprocesses everything since your last commit.
+
+**KIP-848** (the next-generation consumer group protocol, `group.protocol=consumer`, generally available in Kafka 4.0) moves assignment logic onto the broker-side coordinator and makes rebalances fully incremental without the client-side "leader computes assignment" step. With it, `partition.assignment.strategy`, `session.timeout.ms` and `heartbeat.interval.ms` become broker-side group settings (`group.consumer.*`) rather than client configs; the classic protocol is still the client default. Worth one sentence in an interview; the concepts above still apply.
+
+### Static group membership
+
+Set `group.instance.id` (for example to the Kubernetes StatefulSet pod name). Now the coordinator knows that a consumer coming back with the same instance id is *the same member*:
+
+- A restart within `session.timeout.ms` → it gets its old partitions back with **no rebalance at all**.
+- A static member's `close()` does **not** send a LeaveGroup, so a quick bounce isn't announced as a departure.
+- Trade-off: a member that has *really* died isn't replaced until the session timeout expires, so you trade failover speed for deploy stability. Teams typically pair it with `session.timeout.ms` of 2–5 minutes.
+
+### Partition assignment strategies
+
+| Assignor | How it distributes | Moves on rebalance | Protocol | Use when |
+|---|---|---|---|---|
+| `RangeAssignor` | Per topic: contiguous ranges of partitions to sorted members | Can move a lot | Eager | You need co-partitioning (partition N of topics A and B on the same member for joins). Skews when many topics: member 0 gets the "extra" partition of every topic |
+| `RoundRobinAssignor` | All partitions across all members, one by one | Reshuffles everything | Eager | Even load, no local state |
+| `StickyAssignor` | Balanced, while preserving as much of the previous assignment as possible | Minimal | Eager | Local caches/state, older clients |
+| `CooperativeStickyAssignor` | Same as Sticky | Minimal | **Cooperative** | **Default choice** for new deployments |
+
+Since Kafka 3.0 the default `partition.assignment.strategy` is `[RangeAssignor, CooperativeStickyAssignor]`, which keeps using Range but lets you upgrade a group to cooperative with a single rolling bounce that removes `RangeAssignor` from the list. (Clients that don't already list `CooperativeStickyAssignor` need two bounces: first add it alongside the old assignor, then remove the old one.)
+
+### Delivery semantics from the consumer's side
+
+Where you put the commit decides the guarantee:
+
+| Guarantee | Recipe | Failure behaviour |
+|---|---|---|
+| **At-most-once** | Commit, then process (or auto-commit with very fast handlers) | Crash after commit → record skipped forever |
+| **At-least-once** | Process, then commit (`enable.auto.commit=false` + `commitSync`) | Crash before commit → record redelivered → handler must be idempotent |
+| **Effectively-once (external DB)** | At-least-once + idempotent writes (unique key, upsert, dedup table) — **or** store the consumed offset in the same DB transaction as the result and `seek()` to it on startup | Duplicates become no-ops; or offset and effect commit atomically |
+| **Exactly-once (Kafka → Kafka)** | Transactions with `sendOffsetsToTransaction` | See [Transactions & EOS](/learn/notes/kafka-transactions-eos/) |
+
+The "offsets in the DB" pattern looks like this:
+
+```java
+// on assignment: resume from what the DB says, not from __consumer_offsets
+public void onPartitionsAssigned(Collection<TopicPartition> parts) {
+    for (TopicPartition tp : parts) consumer.seek(tp, offsetStore.nextOffset(tp));
+}
+
+// per record (or batch), one local transaction:
+tx.begin();
+applyBusinessChange(record);
+offsetStore.save(record.topic(), record.partition(), record.offset() + 1);
+tx.commit();
+```
+
+Commit sync vs async: `commitSync()` blocks and retries retriable errors; `commitAsync()` doesn't block and doesn't retry (a retry could overwrite a newer commit). A common pattern is `commitAsync` in the loop and one `commitSync` in `finally` / on revoke. Note that the committed offset is the **next** offset to read (`last processed + 1`).
+
+### Poison pills
+
+A **poison pill** is a record that fails *every* time — corrupt bytes, a schema the deserializer can't read, a value that crashes your business logic. Kafka never deletes a record because you failed on it, and a naive loop retries it forever while that partition's lag grows unboundedly.
+
+Defences:
+
+1. **Fail-safe deserialization**: Spring's `ErrorHandlingDeserializer`, or consume bytes and parse inside a try/catch, so a bad record becomes a handled error instead of an exception thrown out of `poll()`.
+2. **Classify errors**: *transient* (timeout, 503, lock contention) deserve retries; *permanent* (validation failed, unknown enum, schema mismatch) go straight to the DLQ.
+3. **Bounded retries, then DLQ**: after N attempts publish the record (original key/value plus headers such as exception class, message, original topic/partition/offset, attempt count) to a dead-letter topic, then commit past it.
+4. **Operate the DLQ**: alert on DLQ rate/depth, give people a tool to inspect, fix and **replay** DLQ records into the source topic.
+
+### Retry strategies
+
+**Blocking (in-place) retry** — retry inside the handler with backoff before moving on.
+- Keeps strict per-partition order.
+- Stalls the whole partition while retrying; total retry time must stay well under `max.poll.interval.ms` (or use `pause()`/`resume()` on the partition and keep polling).
+
+**Non-blocking retry topics** — on failure, produce the record to a delay tier and move on:
+
+```
+orders ──fail──► orders-retry-5s ──fail──► orders-retry-1m ──fail──► orders-retry-10m ──fail──► orders-dlt
+   ▲                                                                                              │
+   └────────────────────────── manual / tooling replay after fix ◄─────────────────────────────────┘
+```
+
+Each retry consumer waits until `record timestamp + delay` before processing (usually by pausing the partition). The main topic never blocks. The cost: **per-key ordering is gone** — event 2 for order 42 can be processed while event 1 is sitting in `orders-retry-1m`. Use it for independent events; for state-machine streams prefer blocking retries or park the *whole key* until the failed record succeeds. Spring Kafka's `@RetryableTopic` builds this topology for you.
+
+**Backoff**: exponential with **jitter** (e.g. `delay = random(0, base × 2^attempt)` capped at a max). Without jitter, every consumer that failed at the same moment retries at the same moment, and the recovering dependency gets hit by a synchronized wave.
+
+### Rewinding: seek, timestamps and resets
+
+APIs on a live consumer:
+- `seek(tp, offset)` — next poll starts there.
+- `seekToBeginning(tps)` / `seekToEnd(tps)`.
+- `offsetsForTimes(map of tp → timestamp)` — returns the earliest offset whose timestamp is at or after the given time; then `seek` to it.
+
+Offline, for a whole group (all members must be stopped):
+
+```bash
+kafka-consumer-groups.sh --bootstrap-server b:9092 --group billing \
+  --topic orders --reset-offsets --to-datetime 2026-10-20T09:00:00.000 --execute
+# other modes: --to-earliest, --to-latest, --shift-by -500, --to-offset 1200
+```
+
+When you need it: replaying after a bad deploy, surgically skipping a single poison record, bootstrapping a new read model from the beginning, or the "offsets in the DB" pattern.
+
+**`auto.offset.reset` is not a rewind button.** It's only consulted when the group has **no valid committed offset** for a partition — a brand-new group, or a committed offset that retention already deleted. `earliest` = start at the oldest available record, `latest` (default) = only new records, `none` = throw. For critical pipelines, `none` turns "we silently skipped three days of data because retention expired" into a loud failure.
+
+### Parallelism beyond the partition count
+
+Within one group, a partition is owned by at most one consumer, so partitions cap parallelism. When handlers are slow and you can't (or shouldn't) add partitions:
+
+1. **Key-sharded worker pool inside the consumer.** Poll a batch, dispatch each record to `workers[hash(key) % N]`, so the same key always runs on the same thread and stays ordered. `pause()` partitions when queues fill. The hard part: you may only commit offset X when **every** record up to X is done, so you need per-partition watermark tracking.
+2. **Two-stage topology.** A thin first consumer validates/enriches and re-publishes to a second topic with many more partitions; a wider second group does the heavy work.
+3. **Confluent Parallel Consumer** — an open-source library that does key-level (or unordered) concurrency over a single partition and handles the offset bookkeeping for you.
+4. **Make the work cheaper first.** Batch inserts, bulk upserts, async I/O, a bigger connection pool — often a 10× win with no new moving parts.
+
+### Fetch tuning
+
+| Config | Default | Effect |
+|---|---|---|
+| `fetch.min.bytes` | 1 byte | Broker holds the fetch until at least this much data is ready… |
+| `fetch.max.wait.ms` | 500 ms | …or until this long has passed, whichever comes first |
+| `max.partition.fetch.bytes` | 1 MB | Max data returned per partition per fetch |
+| `fetch.max.bytes` | 50 MB | Max data per fetch response overall |
+| `max.poll.records` | 500 | Max records `poll()` hands your code (does not change fetch size) |
+
+Raising `fetch.min.bytes` to e.g. 64 KB–1 MB cuts request rate and CPU on brokers and clients for high-volume pipelines, at the cost of up to `fetch.max.wait.ms` extra latency when traffic is light. Latency-sensitive consumers keep the defaults. Modern consumers return an oversized first record batch anyway so they don't stall, but keep these sizes consistent with the broker's `message.max.bytes`.
+
+## How it works (one record, end to end, at-least-once)
+
+```
+1. Consumer starts → FindCoordinator → JoinGroup → SyncGroup → gets p3, p7
+2. onPartitionsAssigned → (optional) seek to DB-stored offsets
+3. poll(): fetch from leaders of p3, p7 (long-poll: fetch.min.bytes / fetch.max.wait.ms)
+4. for each record:
+      try handle(record)                        ← idempotent: upsert keyed by eventId
+      on transient error → retry with backoff (bounded)
+      on permanent error / retries exhausted → produce to orders-dlt with error headers
+5. commitSync(next offsets for p3, p7)          ← committed to __consumer_offsets
+6. heartbeat thread keeps pinging every 3s throughout
+7. rebalance announced → onPartitionsRevoked → finish in-flight, commitSync → give up partitions
+```
+
+## Real-world examples
+
+- **Spring Kafka** ships most of these patterns as building blocks: `DefaultErrorHandler` with `DeadLetterPublishingRecoverer` (blocking retries then DLT) and `@RetryableTopic` (non-blocking retry tiers).
+- **Kafka Streams and Kafka Connect** use the same group protocol under the hood; Streams adopted cooperative rebalancing and standby replicas to keep stateful apps available during rebalances.
+- **Confluent's Parallel Consumer** exists precisely because "partitions cap parallelism" bites teams with slow, I/O-bound handlers.
+
+## Common pitfalls
+
+- **Heavy work inside the poll loop** with default `max.poll.records` → evicted for exceeding `max.poll.interval.ms` → rebalance storm.
+- **Auto-commit with asynchronous processing**: offsets are committed for records a worker thread hasn't finished → crash loses them.
+- **No `onPartitionsRevoked` handling**: duplicates on every rebalance.
+- **Infinite in-place retry** on a permanent error → one partition stalled forever.
+- **Retry topics on order-sensitive streams** → state transitions applied out of order.
+- **`auto.offset.reset=latest` on a critical consumer** → after retention outruns lag, data is skipped silently.
+- **Eager assignor + no static membership** on a big Kubernetes deployment → every rollout pauses the whole group repeatedly.
+- **Sharing one `KafkaConsumer` across threads** → `ConcurrentModificationException`; use one consumer per thread, or a worker pool behind one poller.
+- **More consumers than partitions** expecting more throughput — extras sit idle.
+
+## Practice questions
+
+<Practice>
+
+<QA q="What does a consumer group give you, and what happens when there are more consumers than partitions?" level="easy">
+
+A group spreads a topic's partitions across members, so each partition is processed by exactly one member at a time. That gives queue semantics *inside* the group, while a different group reads the full stream independently.
+
+Each partition can have only one owner per group, so consumers beyond the partition count get nothing and sit idle. They still act as hot standbys: if an active member dies, they pick up its partitions in the next rebalance. To go wider you need more partitions or more work done per record.
+
+</QA>
+
+<QA q="Auto-commit vs manual commit — what can go wrong with `enable.auto.commit=true`?" level="easy">
+
+Auto-commit commits the offsets returned by previous polls every `auto.commit.interval.ms` (5 s), at the next `poll()`. It doesn't know whether you actually finished processing:
+
+- If you hand records to another thread, offsets can be committed before the work finishes, so a crash **loses** them.
+- If you crash after processing but before the next auto-commit, up to about 5 s of records are **reprocessed**.
+
+Manual commit (`commitSync` after processing) makes the boundary explicit and gives you a clean at-least-once guarantee.
+
+</QA>
+
+<QA q="Explain the poll loop. What is the difference between `session.timeout.ms` and `max.poll.interval.ms`?" level="medium">
+
+One thread calls `poll()` repeatedly. `poll()` fetches records, but it also drives group membership, rebalance callbacks and auto-commit.
+
+- `session.timeout.ms` (default 45 s) is checked by the **coordinator** against heartbeats from a **background thread**. It detects a dead or unreachable process.
+- `max.poll.interval.ms` (default 5 min) is the longest allowed gap between two `poll()` calls. It detects a process that is alive but stuck or too slow. When it's exceeded, the client leaves the group even though heartbeats are still flowing.
+
+The classic bug is `max.poll.records` × per-record time going over the poll interval. That causes eviction, then reprocessing, then eviction again. Fix it with smaller batches, faster or batched processing, or async hand-off. Raise the interval only as a deliberate last step.
+
+</QA>
+
+<QA q="What triggers a rebalance, and what happens during one under the eager vs cooperative protocol?" level="medium">
+
+**Triggers:** a member joins (deploy, scale-up, restart) or leaves (close, missed heartbeats, poll interval exceeded); partitions are added to a subscribed topic or a regex subscription matches a new topic.
+
+**Eager:** everyone revokes everything, rejoins, and the leader computes a fresh assignment. The whole group stops in the meantime.
+
+**Cooperative (CooperativeSticky):** members keep partitions that aren't moving, and only the moved partitions are revoked and then reassigned in a second round. Most partitions never stop, which is a big deal for large groups and rolling deploys.
+
+In both cases, use `onPartitionsRevoked` to finish in-flight work and commit, or the new owner will redo it.
+
+</QA>
+
+<QA q="Compare Range, RoundRobin, Sticky and CooperativeSticky assignors." level="medium">
+
+- **Range:** contiguous partition ranges per topic. It co-locates partition N of several topics on one member, which is useful for joins. With many topics it skews, because the first member gets the extra partition of every topic.
+- **RoundRobin:** even spread across all partitions, but it ignores the previous assignment, so every rebalance reshuffles everything. That's bad for local caches or state.
+- **Sticky:** even spread with minimal movement, but still the eager stop-the-world protocol.
+- **CooperativeSticky:** minimal movement plus the incremental protocol. It's the recommended default. Since 3.0 clients default to `[Range, CooperativeSticky]`, so you can migrate with a single rolling restart that drops Range.
+
+</QA>
+
+<QA q="What is static group membership and what problem does it solve? What is the trade-off?" level="medium">
+
+Setting `group.instance.id` gives each consumer a stable identity. Without it, every restart looks like a new member: a leave and a join, meaning two rebalances per pod per rollout.
+
+With it, an instance that comes back within `session.timeout.ms` reclaims exactly its old partitions with **no rebalance**, and a static member's shutdown doesn't send LeaveGroup.
+
+The trade-off is that a member that has really died is only replaced after the session timeout. With the usual 2–5 minute timeout, failover gets slower.
+
+</QA>
+
+<QA q="As a consumer, how do you get at-most-once, at-least-once and effectively exactly-once processing?" level="medium">
+
+- **At-most-once:** commit before processing. A crash loses the record. Rarely what you want.
+- **At-least-once:** process, then commit. A crash redelivers the record, so the handler must be idempotent.
+- **Effectively-once with an external DB:** at-least-once plus idempotent writes (unique constraint, upsert, dedup table keyed by event id). Alternatively, save the consumed offset **in the same DB transaction** as the state change and `seek()` to it on assignment, so offset and effect are atomic.
+- **True exactly-once between Kafka topics:** a transactional read-process-write with `sendOffsetsToTransaction`.
+
+</QA>
+
+<QA q="What is a poison pill message and how do you handle it?" level="medium">
+
+It's a record that fails deterministically (bad bytes, wrong schema, a business-rule crash). Kafka doesn't skip records on failure, so the consumer retries it forever and that partition's lag grows while the rest of the group is fine.
+
+Handling:
+- Use a fail-safe deserializer (`ErrorHandlingDeserializer`, or parse bytes in try/catch).
+- Classify errors: transient → retry with backoff; permanent → DLQ immediately.
+- Bound the retries, then publish to a dead-letter topic with error metadata headers and commit past the record.
+- Alert on DLQ depth, and have tooling to inspect, fix and replay from it.
+
+</QA>
+
+<QA q="Blocking retries vs non-blocking retry topics — trade-offs?" level="medium">
+
+**Blocking (in place):** simple and **keeps per-partition order**, but it stalls the partition and can blow `max.poll.interval.ms` unless the retry time is bounded or you `pause()` and keep polling.
+
+**Retry topics** (`x-retry-5s` → `x-retry-1m` → … → `x-dlt`): the main partition keeps flowing and delays are cheap, but **per-key ordering breaks**, because later events for the same key can overtake a record that's waiting in a retry tier. Use them for independent events, not state-machine sequences.
+
+Either way, use exponential backoff **with jitter** so recovering dependencies don't get synchronized retry waves.
+
+</QA>
+
+<QA q="How do you rewind a consumer to a specific offset or point in time? When does `auto.offset.reset` apply?" level="medium">
+
+On a live consumer: `seek(tp, offset)`, `seekToBeginning`/`seekToEnd`, or `offsetsForTimes(timestamp)` followed by `seek`.
+
+For a whole group: stop all members, then run `kafka-consumer-groups.sh --reset-offsets --to-datetime …` (or `--to-earliest`, `--shift-by`, `--to-offset`) with `--execute`.
+
+Typical uses: replay after a bug fix, skipping one poison record, bootstrapping a new projection, or resuming from DB-stored offsets.
+
+`auto.offset.reset` only applies when the group has **no valid committed offset** (a new group, or the offset was deleted by retention). It isn't a general rewind. Use `none` on critical consumers so a retention gap fails loudly instead of silently jumping.
+
+</QA>
+
+<QA q="What do `fetch.min.bytes` and `fetch.max.wait.ms` do? How do they trade latency for throughput?" level="medium">
+
+The broker holds a fetch response until at least `fetch.min.bytes` is available (default 1 byte), or until `fetch.max.wait.ms` passes (default 500 ms), whichever comes first. This is long polling.
+
+Raising `fetch.min.bytes` to 64 KB–1 MB gives fewer, fatter responses and less CPU and network overhead, which is ideal for bulk pipelines. Under light traffic it adds up to `fetch.max.wait.ms` of latency, so latency-critical consumers keep the defaults.
+
+Related sizing: `max.partition.fetch.bytes` (1 MB) and `fetch.max.bytes` (50 MB) cap response sizes. `max.poll.records` only caps what one `poll()` hands to your code.
+
+</QA>
+
+<QA q="How do you increase processing parallelism beyond the number of partitions?" level="hard">
+
+1. **Key-sharded worker pool:** one poller dispatches records to `worker[hash(key) % N]`, which keeps per-key order. Pause partitions on backpressure, and commit an offset only when all earlier records in that partition are done (watermark tracking).
+2. **Two-stage topology:** a cheap first consumer re-publishes to a topic with more partitions, and a wider group does the heavy work.
+3. **Confluent Parallel Consumer:** key-level or unordered concurrency within a partition, with correct offset management built in.
+4. **Make each record cheaper** (bulk writes, async I/O). This is often the best fix, with no extra moving parts.
+
+Adding partitions to a keyed topic is the last resort, because it remaps keys and breaks per-key ordering across the change.
+
+</QA>
+
+<QA q="Commit sync vs async — how would you combine them, and why does `commitAsync` not retry?" level="hard">
+
+`commitSync` blocks until the commit succeeds or fails non-retriably, retrying transient errors. That costs latency on every commit.
+
+`commitAsync` returns immediately and does **not** retry. A late retry of commit(100) could land after a successful commit(200) and move the group backwards.
+
+The common pattern: `commitAsync` after each batch for throughput, and a final `commitSync` in `onPartitionsRevoked` and on shutdown, so the last position is durable.
+
+</QA>
+
+<QA q="A 50-instance consumer group stalls for minutes on every rolling deploy. Fix it." level="scenario">
+
+Each pod restart means a leave plus a join, which is two rebalances. With an eager assignor, every one of them stops the entire group: 50 × 2 rebalances is a storm.
+
+Combine these:
+- `CooperativeStickyAssignor`, so unaffected partitions keep consuming.
+- **Static membership** (`group.instance.id` = pod name) plus `session.timeout.ms` of about 2–5 min, so a bounced pod reclaims its partitions with no rebalance.
+- **Graceful shutdown on SIGTERM:** stop polling, finish the in-flight batch, commit, then `close()`.
+- A slower rollout (`maxUnavailable: 1`, readiness gates) so membership changes don't overlap.
+- Warm caches before subscribing, so cold pods don't immediately exceed `max.poll.interval.ms`.
+
+On Kafka 4.x, the KIP-848 protocol (`group.protocol=consumer`) makes rebalances fully incremental on the broker side.
+
+</QA>
+
+<QA q="One partition's lag keeps climbing while all others are near zero. What is going on?" level="scenario">
+
+The skew points at that one partition, not at overall capacity:
+
+- **Poison pill:** the consumer is stuck retrying one record. Check error logs and the committed offset that isn't moving. Fix with DLQ or skip via `seek`.
+- **Hot key:** one key (a big tenant, a `null`/`UNKNOWN` default) dominates that partition. Check bytes-in per partition. Fix with better keys, composite sub-keys, or routing whales to a separate topic.
+- **Slow owner:** the instance that owns it is degraded (GC, noisy neighbour, slow downstream shard). Check per-instance metrics.
+
+Adding consumers doesn't help, because the partition can only have one owner.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="A handler is alive but takes 8 minutes on one batch, with default settings. Which mechanism removes the consumer from the group?" options={["session.timeout.ms, because heartbeats stop", "max.poll.interval.ms, because poll() is not called again within 5 minutes", "heartbeat.interval.ms expiring", "auto.commit.interval.ms"]} answer={1}>
+
+Heartbeats run on a background thread and keep flowing, so the session timeout is not hit; the 5-minute max.poll.interval.ms detects the stuck processing thread and the client leaves the group. The other two are intervals, not failure detectors.
+
+</MCQ>
+
+<MCQ q="What are the default values of session.timeout.ms and heartbeat.interval.ms in Kafka 3.0 and later?" options={["10 s and 3 s", "30 s and 10 s", "45 s and 3 s", "5 min and 45 s"]} answer={2}>
+
+Kafka 3.0 raised session.timeout.ms from 10 s to 45 s; heartbeat.interval.ms stays 3 s. 5 minutes is max.poll.interval.ms.
+
+</MCQ>
+
+<MCQ q="What is the default partition.assignment.strategy since Kafka 3.0?" options={["RangeAssignor plus CooperativeStickyAssignor, using Range until a rolling bounce removes it", "CooperativeStickyAssignor only", "RoundRobinAssignor only", "StickyAssignor plus RangeAssignor"]} answer={0}>
+
+The default list uses RangeAssignor but already includes CooperativeStickyAssignor, so one rolling bounce that removes Range upgrades the group to cooperative rebalancing.
+
+</MCQ>
+
+<MCQ q="During a cooperative (incremental) rebalance, which partitions are revoked?" options={["All partitions of all members", "Only partitions of the leaving member", "None; assignments never change", "Only partitions that actually move to a different owner"]} answer={3}>
+
+Members keep partitions that are not moving and give up only those being reassigned, which are handed out in a follow-up round. Revoking everything is the eager protocol.
+
+</MCQ>
+
+<MCQ q="What is the trade-off of static group membership (group.instance.id)?" options={["Offsets can no longer be committed", "A member that has really died is only replaced after session.timeout.ms expires", "It disables cooperative rebalancing", "It requires one partition per consumer"]} answer={1}>
+
+A bounced pod reclaims its partitions without a rebalance, but a truly dead member's partitions wait for the session timeout. It does not affect commits, assignors or partition counts.
+
+</MCQ>
+
+<MCQ q="When does auto.offset.reset take effect?" options={["On every consumer restart", "Whenever a rebalance happens", "Only when the group has no valid committed offset for a partition", "When max.poll.interval.ms is exceeded"]} answer={2}>
+
+It applies only to a new group or when the committed offset is invalid, for example deleted by retention. It is not a rewind control; use seek or --reset-offsets for that.
+
+</MCQ>
+
+<MCQ q="Why does commitAsync not retry failed commits?" options={["A late retry of an older offset could overwrite a newer successful commit and move the group backwards", "Async commits are always successful", "The broker rejects retried commits", "Retries would trigger a rebalance"]} answer={0}>
+
+Retrying commit(100) after commit(200) succeeded would rewind the group. The usual pattern is commitAsync in the loop plus commitSync on revoke and shutdown.
+
+</MCQ>
+
+<MCQ q="What is the main cost of non-blocking retry topics compared with blocking retries?" options={["The main partition stalls during retries", "Records are lost after the first failure", "They require more partitions on the main topic", "Per-key ordering is lost, because later events can overtake a record waiting in a retry tier"]} answer={3}>
+
+Retry topics keep the main partition flowing, but event 2 for a key can be processed while event 1 waits in a delay tier. Blocking retries are the ones that stall the partition.
+
+</MCQ>
+
+<MCQ q="One partition's lag climbs while all others stay near zero. Which fix is least likely to help?" options={["Routing a hot key to a separate topic", "Sending a poison pill to a DLQ", "Adding more consumers to the group", "Investigating the slow instance that owns the partition"]} answer={2}>
+
+A partition has only one owner per group, so extra consumers cannot share its load. Skew points to a poison pill, a hot key or a degraded owner, which the other options address.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- One thread, one `KafkaConsumer`, a `poll()` loop. Heartbeats run on a background thread.
+- `session.timeout.ms` (45 s) detects a dead process. `max.poll.interval.ms` (5 min) detects a stuck handler.
+- Commit **after** processing, and make handlers idempotent.
+- Rebalance triggers: join, leave, timeout, new partitions / new regex matches. Commit in `onPartitionsRevoked`.
+- Use `CooperativeStickyAssignor` plus static membership (`group.instance.id`) to avoid rebalance storms.
+- Poison pill → safe deserializer, error classification, bounded retries, DLQ with metadata, replay tooling.
+- Blocking retry keeps order. Retry topics keep flowing but break per-key order. Always back off with jitter.
+- `seek` / `offsetsForTimes` / `--reset-offsets` rewind. `auto.offset.reset` applies only when no committed offset exists.
+- Past the partition ceiling: key-sharded workers, two-stage topics, Parallel Consumer, or cheaper work.
+- `fetch.min.bytes` up means more throughput and slightly more latency.
+
+## Go deeper
+
+- **Apache Kafka docs**: [Consumer configs](https://kafka.apache.org/documentation/#consumerconfigs).
+- **KIP-429**: [Kafka Consumer Incremental Rebalance Protocol](https://cwiki.apache.org/confluence/display/KAFKA/KIP-429%3A+Kafka+Consumer+Incremental+Rebalance+Protocol).
+- **KIP-345**: [Static membership](https://cwiki.apache.org/confluence/display/KAFKA/KIP-345%3A+Introduce+static+membership+protocol+to+reduce+consumer+rebalances).
+- **KIP-848**: [The Next Generation of the Consumer Rebalance Protocol](https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol).
+- **Confluent docs**: [Kafka consumer design](https://docs.confluent.io/platform/current/clients/consumer.html).
+- **Book**: *Kafka: The Definitive Guide*, 2nd ed. — chapter 4, "Kafka Consumers".
+- Related notes: [Delivery semantics](/learn/notes/delivery-semantics/) · [Transactions & EOS](/learn/notes/kafka-transactions-eos/) · [Operations & tuning](/learn/notes/kafka-operations-tuning/).

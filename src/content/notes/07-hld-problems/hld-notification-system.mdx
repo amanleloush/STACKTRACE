@@ -1,13 +1,21 @@
 ---
 title: "HLD: Notification System"
 phase: "07-hld-problems"
-order: 39
+order: 62
 tags: []
 premium: false
 previewParagraphs: 4
 estimatedMinutes: 5
 prerequisites: []
 ---
+
+## Definition (interview-ready)
+
+A **notification system** lets any internal service send a message to a user over email, SMS, mobile push or in-app, while respecting the user's preferences, avoiding duplicates and surviving provider failures. Callers hit a **Notify API** that checks an idempotency key and the user's preferences, renders a template and publishes to a **per-channel Kafka topic**, then returns 202 Accepted. **Channel worker pools** consume each topic, rate-limit to each provider's quota, call the provider (SES or SendGrid, Twilio, APNs or FCM), retry with backoff and send poison messages to a dead-letter queue. Provider webhooks and send responses feed delivery status back.
+
+The key decisions are asynchronous, per-channel queues (so a slow SMS provider can't block email, and bursts are absorbed) and idempotency at both the API and the worker. The main trade-off is latency: urgent messages such as OTPs need their own priority lane.
+
+**One-liner:** An idempotent Notify API checks preferences and enqueues to per-channel Kafka topics; rate-limited worker pools deliver through external providers with retries, a DLQ, failover and a separate fast lane for transactional messages.
 
 ## Problem statement
 
@@ -145,7 +153,7 @@ Cached in Redis for fast lookup.
 
 ### Delivery tracking
 
-- Provider webhooks (SendGrid delivery, Twilio status, APNs feedback) consumed via Kafka.
+- Provider webhooks (SendGrid event webhook, Twilio status callbacks) consumed via Kafka; APNs/FCM report dead tokens in the send response itself (APNs `410 Unregistered`, FCM `UNREGISTERED`).
 - Update notification status: queued → sent → delivered → opened/bounced.
 - Surface to product (delivery rates) and users (read receipts on in-app).
 
@@ -181,49 +189,161 @@ Cached in Redis for fast lookup.
 - **Provider mix**: multi-vendor (SendGrid + AWS SES) for failover and price. Complexity vs reliability.
 - **Personalization**: cache user data so worker doesn't query 10 services per notification.
 
-## Interview questions
+## Practice questions
 
-### Q1: How do you guarantee no duplicate notifications?
-Idempotency key from caller; dedupe table at API boundary. Workers also dedupe by notification ID before calling provider. At-least-once delivery + idempotent send = at-most-once visible behavior.
+<Practice>
 
-### Q2: How do you respect user preferences?
-Preferences table indexed by user_id, cached in Redis. API checks before publishing to Kafka. Channel-specific (user may opt out of SMS but keep push). Category-specific (marketing off but transactional on).
+<QA q="Why does the Notify API return 202 Accepted instead of waiting for delivery?" level="easy">
 
-### Q3: A campaign sends 10M notifications in 5 minutes. Design.
-- Producer writes 10M to Kafka topic (fast — millions/sec capacity).
-- Channel workers consume at provider-allowed rate (e.g., SendGrid 100K/min).
-- Spread over hours so we don't violate provider limits.
-- Optionally rate-limit per-category to prevent campaign from starving transactional traffic.
+The API only validates, checks the idempotency key and prefs, renders the template and publishes to Kafka. Delivery to SendGrid, Twilio or APNs/FCM happens later in channel workers, with retries. 202 means accepted for processing, and the returned notification ID lets callers track status. This keeps the API fast and absorbs bursts.
 
-### Q4: How do you ensure transactional OTPs are delivered in seconds?
-- Separate "priority" topic with prioritized consumers and higher rate-limit budget.
-- Or: skip Kafka and call provider sync from the API (with idempotency + retry).
+</QA>
+
+<QA q="How do you respect user preferences?" level="easy">
+
+Preferences table keyed by `(user_id, category, channel)`, cached in Redis. The API checks before publishing to Kafka. Channel-specific (user may opt out of SMS but keep push). Category-specific (marketing off but transactional on).
+
+</QA>
+
+<QA q="Why use a separate Kafka topic and worker pool per channel?" level="easy">
+
+Channels differ in volume, latency needs, provider limits and failure modes. Separate topics let each scale independently, have their own consumer logic and rate limits, and stop a slow provider (say SMS) from backing up email or push. It also gives clearer ownership.
+
+</QA>
+
+<QA q="How do you guarantee no duplicate notifications?" level="medium">
+
+Idempotency key from the caller; dedupe table (`idempotency_key UNIQUE`) at the API boundary, kept for hours to days. Workers also dedupe by notification ID before calling the provider. At-least-once delivery + idempotent send = effectively exactly-once visible behavior in almost all cases. The remaining gap: if a worker crashes after the provider accepted the message but before recording it as sent, the retry sends again. Most SMS and email providers have no idempotency key, so you can narrow that window but not close it fully.
+
+</QA>
+
+<QA q="How do you handle bouncing emails / disabled push tokens?" level="medium">
+
+- Provider webhooks tell us about bounces; APNs/FCM send responses tell us about token failures (APNs `410 Unregistered`, FCM `UNREGISTERED`).
+- Update the user_devices table (mark the token invalid).
+- After N consecutive bounces, mark the email as suppressed.
+- Hard bounces (mailbox doesn't exist) → suppress permanently; soft bounces (mailbox full) → retry later.
+
+</QA>
+
+<QA q="How do you schedule a notification for 9 AM in each user's local time?" level="medium">
+
+Persist it with `scheduled_at` instead of enqueuing it now. Convert the template's local-time rule to each user's time zone, so users get different UTC send times. A scheduler service polls for due notifications and enqueues them into the normal pipeline.
+
+</QA>
+
+<QA q="How do you keep SMS costs under control?" level="medium">
+
+SMS costs roughly $0.01–0.10 per message. Prefer push or email and fall through to SMS only when it's really needed (such as auth codes). Set per-category daily budgets and per-user rate limits, so a bug or campaign can't run up the bill.
+
+</QA>
+
+<QA q="How do you ensure transactional OTPs are delivered in seconds?" level="hard">
+
+- Separate priority topic with dedicated consumers and a higher rate-limit budget.
+- Or: skip Kafka and call the provider synchronously from the API (with idempotency + retry).
 - Multi-provider failover (Twilio + AWS SNS) to handle provider outages.
 - Track p99 explicitly with alerts.
 
-### Q5: A user reports they unsubscribed but still get emails. Investigate.
-- Check pref cache freshness (CDC invalidating Redis on prefs update).
-- Check if the campaign queue snapshot was taken before unsubscribe.
-- Race: notification was already in Kafka when unsubscribe happened — worker should re-check prefs at consume time, not trust the published payload.
-- GDPR: also check that compliance unsubscribe list is honored.
+</QA>
 
-### Q6: How do you handle bouncing emails / disabled push tokens?
-- Provider webhooks tell us bounces / token failures.
-- Update user_devices table (set token to invalid).
-- After N consecutive bounces, mark email as suppressed.
-- Hard bounces (mailbox doesn't exist) → suppress permanently; soft bounces (mailbox full) → retry later.
+<QA q="Design analytics on notification delivery." level="hard">
 
-### Q7: Multi-region notification delivery — design.
-- Notifications by region (user's region determines worker location).
-- Reduce cross-region traffic (provider POPs are global anyway).
-- Failover: if a region's workers down, redirect topics to another region.
-- Compliance: respect data residency (EU users' email content stays in EU workers).
-
-### Q8: Design analytics on notification delivery.
-- Status events to Kafka → ClickHouse/BigQuery.
+- Status events (sent, delivered, opened, bounced) to Kafka → ClickHouse/BigQuery.
 - Dashboards: delivery rate, open rate, conversion, by channel/category/provider.
 - A/B test framework: serve different templates/subjects, measure.
 - Alerting on delivery rate drops by provider.
+
+</QA>
+
+<QA q="A campaign sends 10M notifications in 5 minutes. Design." level="scenario">
+
+- Producer writes 10M to the Kafka topic (fast — Kafka absorbs the burst).
+- Channel workers consume at the provider-allowed rate (your plan's contracted throughput).
+- Spread over hours so we don't violate provider limits.
+- Rate-limit per category to prevent the campaign from starving transactional traffic.
+
+</QA>
+
+<QA q="A user reports they unsubscribed but still get emails. Investigate." level="scenario">
+
+- Check pref cache freshness (CDC invalidating Redis on prefs update).
+- Check if the campaign queue snapshot was taken before the unsubscribe.
+- Race: notification was already in Kafka when the unsubscribe happened — the worker should re-check prefs at consume time, not trust the published payload.
+- GDPR: also check that the compliance unsubscribe list is honored.
+
+</QA>
+
+<QA q="The email provider starts returning 429s and then has an outage. What should the system do?" level="scenario">
+
+On 429s, back off and throttle the send rate; messages wait in Kafka rather than being dropped. For an outage, fail over to a second vendor (for example SendGrid plus AWS SES). Messages that keep failing after N retries go to the DLQ for replay. Idempotency keys stop retries and failover from sending duplicates.
+
+</QA>
+
+<QA q="Multi-region notification delivery — design." level="scenario">
+
+- Route notifications by region (the user's region decides worker location).
+- Reduce cross-region traffic (provider POPs are global anyway).
+- Failover: if a region's workers are down, redirect topics to another region.
+- Compliance: respect data residency (EU users' email content stays in EU workers).
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="A user unsubscribed from marketing after a campaign was already queued in Kafka. Where must the preference be checked to stop the send?" options={["Only at the Notify API", "Again in the channel worker at consume time", "Only in the analytics pipeline", "In the provider's dashboard"]} answer={1}>
+
+The message was already published, so the API check passed before the unsubscribe. Workers must re-check prefs before sending. Analytics and the provider dashboard can't stop a send you already made.
+
+</MCQ>
+
+<MCQ q="What is the role of the idempotency_key in POST /notify?" options={["It lets a retried request return the earlier result instead of sending again", "It encrypts the payload", "It picks the channel", "It sets the message priority"]} answer={0}>
+
+A unique key per logical notification lets the API dedupe caller retries. It doesn't encrypt, route or prioritize.
+
+</MCQ>
+
+<MCQ q="A marketing blast is delaying OTP codes. What is the best fix?" options={["Add more partitions to the shared topic", "Send OTPs by email instead", "Give transactional traffic its own priority topic or sync path with its own rate budget", "Lower the OTP retry count"]} answer={2}>
+
+Isolating transactional traffic stops bulk sends from queueing ahead of it. More partitions on a shared topic still mix the two, email is slower for OTPs, and fewer retries make delivery less reliable.
+
+</MCQ>
+
+<MCQ q="An email hard-bounces because the mailbox doesn't exist. What should happen?" options={["Retry with backoff for 24 hours", "Switch the user to SMS automatically", "Ignore it", "Suppress that address permanently"]} answer={3}>
+
+Hard bounces are permanent, so the address is suppressed to protect sender reputation. Retrying is for soft bounces, switching channels silently ignores preferences, and ignoring keeps hurting deliverability.
+
+</MCQ>
+
+<MCQ q="How do you learn that an APNs or FCM push token is dead?" options={["From the send response, such as APNs 410 Unregistered or FCM UNREGISTERED", "From a nightly email webhook", "Only when the user complains", "By pinging the device over WebSocket"]} answer={0}>
+
+APNs and FCM report dead tokens in the send response itself, and you then mark the token invalid. Email webhooks are for email, and the other options are unreliable.
+
+</MCQ>
+
+<MCQ q="A campaign pushes 10M messages into Kafka in 5 minutes, but the SMS provider allows far less. What happens in a well-designed system?" options={["Workers send everything at once and accept provider errors", "The API rejects the campaign", "Workers drain the topic at the provider-allowed rate, spreading sends over time", "Kafka drops the excess"]} answer={2}>
+
+Kafka buffers the burst and workers rate-limit to the provider's contracted throughput. Ignoring limits gets you throttled, rejecting is unnecessary, and Kafka retains messages rather than dropping them.
+
+</MCQ>
+
+<MCQ q="Why is SMS usually the last channel tried?" options={["It has the lowest delivery rate", "It can't carry links", "It only works on smartphones", "It costs real money per message"]} answer={3}>
+
+SMS costs roughly $0.01–0.10 per message, so systems prefer push or email and keep SMS for cases like auth codes. The other claims aren't the reason.
+
+</MCQ>
+
+<MCQ q="What does at-least-once delivery plus an idempotent send by notification ID give you?" options={["Lower provider costs", "Effectively exactly-once behavior as the user sees it", "Strict global ordering", "No need for retries"]} answer={1}>
+
+Retries may redeliver, but deduping by ID before calling the provider means the user normally gets one message (a crash right after the provider call is the rare exception). It doesn't order messages, cut costs or remove the need for retries.
+
+</MCQ>
+
+</Quiz>
 
 ## TL;DR cheat sheet
 
@@ -238,7 +358,7 @@ Preferences table indexed by user_id, cached in Redis. API checks before publish
 
 ## Go deeper
 
-- **Alex Xu Vol 1**: Chapter 10 (Notification system).
+- **Alex Xu, *System Design Interview Vol 1***: Chapter 10 (Design a notification system).
 - **ByteByteGo**: notification system video.
 - **Twilio + SendGrid docs** for production realities.
 - **AWS SNS / SES architectures**.

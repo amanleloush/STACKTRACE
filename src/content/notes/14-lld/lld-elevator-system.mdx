@@ -1,0 +1,835 @@
+---
+title: "LLD: Elevator System"
+phase: "14-lld"
+order: 142
+tags: ["lld", "machine-coding", "java", "state-pattern", "strategy-pattern", "concurrency"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 35
+prerequisites: ["behavioral-patterns", "machine-coding-strategy", "java-concurrency-locks"]
+summary: "A complete, tested Java 21 elevator system for machine-coding rounds: State pattern for each car, Strategy for dispatching (nearest-car vs LOOK), hall vs car calls, a deterministic tick-based simulation, maintenance mode and a thread-safe request inbox."
+---
+
+## Definition (interview-ready)
+
+An elevator system takes **hall calls** (someone on a floor presses UP or DOWN) and **car calls** (a passenger inside a car presses a floor), decides which car answers each hall call, and moves every car through its stops. The core entities are an `ElevatorController` that owns the cars and a thread-safe request inbox, `ElevatorCar`s that each keep a sorted set of stops, and immutable `Request` records. Two patterns carry the design: **State** for what a car does on each step (idle, moving up, moving down, doors open, maintenance), where each state picks the next one, and **Strategy** for dispatch (nearest car versus a LOOK-aware cost that prefers a car already heading toward the caller in the same direction). Inside a car, stops are served in **LOOK** order: keep going while there are stops ahead, then reverse. Time is simulated with **ticks** driven by one thread, so the system is deterministic and easy to test. The trade-off: one simulation thread is simple and race-free, but all requests are funnelled through a queue instead of being handled in parallel.
+
+**One-liner:** A controller funnels thread-safe button presses into a single tick loop, a swappable dispatch Strategy assigns each hall call to the car that can reach it soonest, and each car is a State machine that serves its stops in LOOK order.
+
+## Problem statement
+
+> Design and implement an elevator system for a building with **N floors** and **M elevator cars**.
+>
+> - People on a floor press **UP** or **DOWN** to call a car. People inside a car press a **floor button**.
+> - The system decides **which car** answers each call, and each car decides **the order** in which it visits its floors.
+> - A car can be put into **maintenance**, after which it takes no new requests.
+> - Show the system working with a short simulation.
+
+This is a favourite because it looks simple but quickly tests whether you can separate **"what a car does right now"** (its state) from **"which car should go"** (a policy that the interviewer will want to swap). It also has a natural concurrency question: many buttons are pressed at the same time.
+
+## Clarifying questions to ask
+
+Ask these in the first five minutes and write the answers at the top of your file. The assumed answers are what the solution below implements.
+
+| Question | Assumed answer |
+|---|---|
+| How many floors and cars? Is the ground floor 0? | Configurable. Floors `minFloor..maxFloor`, here 0 to 9; all cars serve all floors. |
+| Is there a real clock, or can I simulate time? | Simulate with **ticks**. One tick = a car moves one floor, or doors stay open for one tick. Makes the program deterministic and testable. |
+| How long do doors stay open? | A fixed number of ticks (configurable, default 2). |
+| What is the dispatch policy? | Pluggable. Start with nearest car; the main one is **LOOK-aware** (prefer a car already heading toward the caller in the same direction). |
+| Do cars have capacity or weight limits? | Out of scope for the core; mention as an extension. |
+| What happens to a car put into maintenance while it has passengers? | It **finishes its current stops**, then parks in `MAINTENANCE`. It takes no new hall or car calls meanwhile. |
+| What if every car is in maintenance? | Hall calls wait in a queue and are dispatched as soon as a car is available again. |
+| Can buttons be pressed from many threads at once? | Yes. Request submission must be thread-safe. |
+| UI, persistence, fire mode, VIP mode? | Out of scope. Console output only. |
+
+**How to say it in an interview:** "I'll model time as ticks so the simulation is deterministic, put each car's behaviour in State classes, and put the 'which car' decision behind a Strategy so we can swap the algorithm."
+
+## Requirements
+
+**Functional (in scope)**
+
+1. Accept **hall calls** (floor + direction) and **car calls** (car id + floor).
+2. Dispatch each hall call to one available car using a pluggable strategy.
+3. Each car serves its stops in **LOOK** order: keep going in the current direction while there are stops ahead, then reverse.
+4. Car lifecycle: `IDLE`, `MOVING_UP`, `MOVING_DOWN`, `DOORS_OPEN`, `MAINTENANCE`.
+5. Enter and leave maintenance; requests that cannot be served yet are queued.
+6. Reject invalid input (unknown car, floor out of range, UP on the top floor, DOWN on the bottom floor).
+7. A demo that prints an event log, and a status view.
+
+**Non-functional**
+
+- **Deterministic**: the same sequence of inputs gives exactly the same output. This is what makes the system testable.
+- **Thread-safe input**: any number of threads can submit requests.
+- **Extensible**: a new dispatch algorithm or a new car state is a new class.
+
+**Out of scope**: capacity/weight, acceleration and real timing, door obstruction sensors, destination dispatch keypads, fire service mode, persistence.
+
+## Entities and relationships
+
+```
+                         submit(Request)   (any thread)
+   buttons ───────────────────────────────►┌───────────────────────────┐
+                                           │   ElevatorController      │
+                                           │ - inbox: ConcurrentLinked │
+                                           │          Queue<Request>   │
+                                           │ - unassigned: Deque       │
+                                           │ - strategy ───────────────┼──► «interface» DispatchStrategy
+                                           │ + tick()   (one thread)   │        ▲                ▲
+                                           └─────────────┬─────────────┘  NearestCarStrategy  LookDispatchStrategy
+                                                         │ 1..M
+                                                         ▼
+                                           ┌───────────────────────────┐
+  «sealed» Request                         │       ElevatorCar         │  (State context)
+   ├─ HallCall(floor, direction)           │ - floor, direction        │
+   ├─ CarCall(carId, floor)                │ - stops: TreeSet<Integer> │
+   └─ MaintenanceCommand(carId, enter)     │ - state ──────────────────┼──► «interface» ElevatorState
+                                           └───────────────────────────┘     ▲   ▲    ▲     ▲       ▲
+                                                                          Idle  Up  Down DoorsOpen Maintenance
+```
+
+- The **controller** owns all cars, the input queue and the dispatch strategy. It is the only thing the outside world talks to.
+- A **car** holds its position, direction, a sorted set of stops and its current **state object**.
+- A **request** is one of three immutable records. Using a `sealed` interface lets the compiler check that every `switch` handles every kind.
+
+## Design patterns used and why
+
+| Pattern | Where | Why it fits |
+|---|---|---|
+| [State](/learn/notes/behavioral-patterns/) | `ElevatorState` with `IdleState`, `MovingUpState`, `MovingDownState`, `DoorsOpenState`, `MaintenanceState` | What a tick does depends entirely on the phase the car is in. Without State you get one `tick()` with a big `switch` that grows with every new mode. Each state decides its own next state. |
+| [Strategy](/learn/notes/behavioral-patterns/) | `DispatchStrategy` with `NearestCarStrategy` and `LookDispatchStrategy` | "Which car?" is the axis the interviewer will change. The controller is closed for modification, open for new strategies ([Open/Closed](/learn/notes/solid-principles/)). |
+| Command-ish messages | `Request` records in a queue | Button presses become data. They can be queued, logged, replayed in tests, and handled on one thread. |
+| Singleton (stateless) | `IdleState.INSTANCE` etc. | States with no fields can be shared. `DoorsOpenState` has a countdown, so it is created per visit. See [Creational Patterns](/learn/notes/creational-patterns/) for why this is a harmless use of a shared instance. |
+
+The [Strategy vs State](/learn/notes/behavioral-patterns/) difference shows up nicely here: the **controller's owner** picks the dispatch strategy once (from outside), while a car's **states switch themselves** on every tick (from inside).
+
+## Solution walkthrough
+
+### Step 1: model requests as data
+
+```java
+enum Direction { UP, DOWN, NONE }
+
+sealed interface Request permits HallCall, CarCall, MaintenanceCommand {}
+record HallCall(int floor, Direction direction) implements Request {}   // external
+record CarCall(int carId, int floor) implements Request {}             // internal
+record MaintenanceCommand(int carId, boolean enter) implements Request {}
+```
+
+**Internal vs external requests.** A **hall call** (external) says "someone on floor 6 wants to go DOWN" but not which car. The controller must **dispatch** it. A **car call** (internal) says "car 2 must stop at floor 5". It is already tied to a car, so it skips dispatch and becomes a stop on that car. Interviewers often check that you treat these differently.
+
+### Step 2: the car and its stops
+
+Each car keeps its stops in a `TreeSet`. A sorted set gives you, in O(log n):
+
+- `stops.higher(floor)` and `stops.lower(floor)`: is there anything above or below me?
+- `stops.ceiling(floor)` and `stops.floor(floor)`: nearest stop at or above / at or below.
+- `stops.last()` / `stops.first()`: the furthest stop in each direction (where LOOK turns around).
+
+A set also removes duplicates for free: pressing 5 three times is one stop.
+
+### Step 3: the states
+
+Each state implements one method, `tick(car)`:
+
+- **IdleState**: no stops means do nothing (or park in maintenance if it was requested). A stop at the current floor means open the doors. Otherwise pick the direction of the **nearest** stop, switch to a moving state and take the first step in this same tick.
+- **MovingUpState / MovingDownState**: move one floor. If that floor is a stop, `arrive()`: remove the stop and switch to `DoorsOpenState`.
+- **DoorsOpenState**: count down. When it reaches zero, close the doors and call `chooseNextState()`.
+- **MaintenanceState**: do nothing.
+
+`chooseNextState()` is the **LOOK** rule:
+
+```
+if heading UP and there are stops above      -> keep MOVING_UP
+if heading DOWN and there are stops below    -> keep MOVING_DOWN
+else if stops above                          -> turn, MOVING_UP
+else if stops below                          -> turn, MOVING_DOWN
+else                                         -> IDLE (or MAINTENANCE if requested)
+```
+
+**SCAN vs LOOK.** Both come from disk-arm scheduling, where SCAN is literally nicknamed the "elevator algorithm". SCAN sweeps to the **end** of the range before reversing. LOOK is the practical variant: it reverses at the **last pending request** in the current direction, so a car never travels to floor 30 just because floor 30 exists. Both avoid starvation: a request behind the car is served on the return sweep, so it waits at most one round trip. The naive alternative, "always go to the closest stop" (SSTF, shortest seek time first), can starve far floors when nearby requests keep arriving.
+
+### Step 4: dispatch strategies
+
+```java
+interface DispatchStrategy {
+    Optional<ElevatorCar> choose(List<ElevatorCar> cars, HallCall call);
+}
+```
+
+- **NearestCarStrategy** picks the available car with the smallest `|carFloor - callFloor|`. Easy, but it can choose a car that is moving **away** from the caller.
+- **LookDispatchStrategy** estimates how far the car must travel before it can serve the call:
+  - idle car: just the distance;
+  - car moving toward the call floor **in the same direction** the caller wants: just the distance (it will stop on the way);
+  - otherwise: distance to its **turnaround floor** (the furthest stop in its current direction) plus the distance back.
+
+Ties break on the lower car id, so the result is deterministic. Both strategies skip cars in, or heading to, maintenance. Returning `Optional.empty()` means "no car can take this now", and the controller queues the call.
+
+### Step 5: the controller and the tick loop
+
+```
+submit(r)  (any thread):  validate -> inbox.add(r)
+tick()     (one thread):  now++
+                          drain inbox -> dispatch hall calls / add car-call stops / maintenance
+                          retry unassigned hall calls
+                          every car: state.tick(car)
+```
+
+Why ticks instead of `Thread.sleep` and one thread per car?
+
+- **Deterministic**: no timing races, so a test can say "after 4 ticks the car is at floor 4 with doors open".
+- **Fast tests**: a 10,000-tick simulation runs in milliseconds.
+- **Simple concurrency**: only one thread ever mutates car state (the single-writer principle). Producers only touch a thread-safe queue.
+
+In a real deployment a `ScheduledExecutorService` would call `tick()` at a fixed rate; see [Executors and Virtual Threads](/learn/notes/java-executors-virtual-threads/).
+
+## Full solution code
+
+One file, Java 21, compiles with `javac Main.java` and runs with `java Main`.
+
+```java
+import java.util.*;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.function.Consumer;
+
+// ---------- Requests: everything that can happen to the system ----------
+enum Direction { UP, DOWN, NONE }
+
+sealed interface Request permits HallCall, CarCall, MaintenanceCommand {}
+/** External request: a person on a floor presses UP or DOWN. */
+record HallCall(int floor, Direction direction) implements Request {}
+/** Internal request: a passenger inside car carId presses a floor button. */
+record CarCall(int carId, int floor) implements Request {}
+record MaintenanceCommand(int carId, boolean enter) implements Request {}
+
+// ---------- State pattern: what a car does on each tick ----------
+interface ElevatorState {
+    String name();
+    void tick(ElevatorCar car);
+}
+
+final class IdleState implements ElevatorState {
+    static final IdleState INSTANCE = new IdleState();
+    public String name() { return "IDLE"; }
+    public void tick(ElevatorCar car) {
+        if (!car.hasStops()) {
+            if (car.maintenanceRequested()) car.setState(MaintenanceState.INSTANCE);
+            return;
+        }
+        if (car.hasStopAt(car.floor())) { car.arrive(); return; }
+        // Head toward the nearest stop and take the first step in this same tick.
+        car.setDirection(car.nearestStop() > car.floor() ? Direction.UP : Direction.DOWN);
+        car.setState(car.direction() == Direction.UP ? MovingUpState.INSTANCE : MovingDownState.INSTANCE);
+        car.state().tick(car);
+    }
+}
+
+final class MovingUpState implements ElevatorState {
+    static final MovingUpState INSTANCE = new MovingUpState();
+    public String name() { return "MOVING_UP"; }
+    public void tick(ElevatorCar car) {
+        car.moveTo(car.floor() + 1);
+        if (car.hasStopAt(car.floor())) car.arrive();
+    }
+}
+
+final class MovingDownState implements ElevatorState {
+    static final MovingDownState INSTANCE = new MovingDownState();
+    public String name() { return "MOVING_DOWN"; }
+    public void tick(ElevatorCar car) {
+        car.moveTo(car.floor() - 1);
+        if (car.hasStopAt(car.floor())) car.arrive();
+    }
+}
+
+/** Not a singleton: it carries a per-visit countdown. */
+final class DoorsOpenState implements ElevatorState {
+    private int ticksLeft;
+    DoorsOpenState(int ticks) { this.ticksLeft = ticks; }
+    public String name() { return "DOORS_OPEN"; }
+    public void tick(ElevatorCar car) {
+        if (--ticksLeft > 0) return;
+        car.emit("doors close at " + car.floor());
+        car.chooseNextState();
+    }
+}
+
+final class MaintenanceState implements ElevatorState {
+    static final MaintenanceState INSTANCE = new MaintenanceState();
+    public String name() { return "MAINTENANCE"; }
+    public void tick(ElevatorCar car) { /* parked: ignores everything */ }
+}
+
+// ---------- The car (State context). Mutated only by the simulation thread. ----------
+final class ElevatorCar {
+    private final int id, minFloor, maxFloor, doorTicks;
+    private final Consumer<String> events;
+    private final TreeSet<Integer> stops = new TreeSet<>();
+    private int floor;
+    private Direction direction = Direction.NONE;
+    private ElevatorState state = IdleState.INSTANCE;
+    private boolean maintenanceRequested;
+
+    ElevatorCar(int id, int minFloor, int maxFloor, int startFloor, int doorTicks, Consumer<String> events) {
+        this.id = id; this.minFloor = minFloor; this.maxFloor = maxFloor;
+        this.floor = startFloor; this.doorTicks = doorTicks; this.events = events;
+    }
+
+    int id() { return id; }
+    int floor() { return floor; }
+    Direction direction() { return direction; }
+    ElevatorState state() { return state; }
+    boolean maintenanceRequested() { return maintenanceRequested; }
+    boolean isAvailable() { return !maintenanceRequested && !(state instanceof MaintenanceState); }
+    boolean hasStops() { return !stops.isEmpty(); }
+    boolean hasStopAt(int f) { return stops.contains(f); }
+    Set<Integer> stops() { return Collections.unmodifiableSet(stops); }
+
+    void setDirection(Direction d) { this.direction = d; }
+    void setState(ElevatorState s) {
+        if (s != state) emit(state.name() + " -> " + s.name());
+        this.state = s;
+    }
+    void tick() { state.tick(this); }
+    void emit(String msg) { events.accept("car " + id + ": " + msg); }
+
+    void addStop(int f) {
+        if (f < minFloor || f > maxFloor) throw new IllegalArgumentException("bad floor " + f);
+        if (state instanceof DoorsOpenState && f == floor) return; // already here, doors open
+        stops.add(f);
+    }
+
+    void moveTo(int f) {
+        if (f < minFloor || f > maxFloor) throw new IllegalStateException("car " + id + " overran to " + f);
+        floor = f;
+    }
+
+    void arrive() {
+        stops.remove(floor);
+        setState(new DoorsOpenState(doorTicks));
+        emit("doors open at " + floor);
+    }
+
+    int nearestStop() {
+        Integer up = stops.ceiling(floor), down = stops.floor(floor);
+        if (up == null) return down;
+        if (down == null) return up;
+        return (up - floor) <= (floor - down) ? up : down; // tie goes up
+    }
+
+    /** LOOK: keep going while there are stops ahead, otherwise reverse, otherwise idle. */
+    void chooseNextState() {
+        boolean above = stops.higher(floor) != null, below = stops.lower(floor) != null;
+        if (direction == Direction.UP && above) setState(MovingUpState.INSTANCE);
+        else if (direction == Direction.DOWN && below) setState(MovingDownState.INSTANCE);
+        else if (above) { direction = Direction.UP; setState(MovingUpState.INSTANCE); }
+        else if (below) { direction = Direction.DOWN; setState(MovingDownState.INSTANCE); }
+        else {
+            direction = Direction.NONE;
+            setState(maintenanceRequested ? MaintenanceState.INSTANCE : IdleState.INSTANCE);
+        }
+    }
+
+    /** Furthest stop in the current direction: where LOOK will turn around. */
+    int turnaroundFloor() {
+        if (direction == Direction.UP) return stops.isEmpty() ? floor : Math.max(floor, stops.last());
+        if (direction == Direction.DOWN) return stops.isEmpty() ? floor : Math.min(floor, stops.first());
+        return floor;
+    }
+
+    void requestMaintenance() { maintenanceRequested = true; } // finishes current stops first
+    void exitMaintenance() {
+        maintenanceRequested = false;
+        if (state instanceof MaintenanceState) setState(IdleState.INSTANCE);
+    }
+}
+
+// ---------- Strategy pattern: which car answers a hall call ----------
+interface DispatchStrategy {
+    Optional<ElevatorCar> choose(List<ElevatorCar> cars, HallCall call);
+}
+
+/** Closest available car, ignoring direction. Simple, but sends cars the wrong way. */
+final class NearestCarStrategy implements DispatchStrategy {
+    public Optional<ElevatorCar> choose(List<ElevatorCar> cars, HallCall call) {
+        return cars.stream().filter(ElevatorCar::isAvailable)
+                .min(Comparator.comparingInt((ElevatorCar c) -> Math.abs(c.floor() - call.floor()))
+                        .thenComparingInt(ElevatorCar::id));
+    }
+}
+
+/** LOOK-aware cost: cheap if the car will pass the floor in the caller's direction. */
+final class LookDispatchStrategy implements DispatchStrategy {
+    public Optional<ElevatorCar> choose(List<ElevatorCar> cars, HallCall call) {
+        return cars.stream().filter(ElevatorCar::isAvailable)
+                .min(Comparator.comparingInt((ElevatorCar c) -> cost(c, call)).thenComparingInt(ElevatorCar::id));
+    }
+
+    static int cost(ElevatorCar c, HallCall call) {
+        int f = call.floor(), here = c.floor();
+        if (c.direction() == Direction.NONE) return Math.abs(here - f);
+        if (c.state() instanceof DoorsOpenState && here == f && c.direction() == call.direction()) return 0;
+        boolean ahead = c.direction() == Direction.UP ? f > here : f < here;
+        if (ahead && c.direction() == call.direction()) return Math.abs(here - f);
+        int turn = c.turnaroundFloor(); // finish this sweep, then come back
+        return Math.abs(here - turn) + Math.abs(turn - f);
+    }
+}
+
+// ---------- Controller: owns the cars, the inbox and the clock tick ----------
+final class ElevatorController {
+    private final int minFloor, maxFloor;
+    private final List<ElevatorCar> cars = new ArrayList<>();
+    private DispatchStrategy strategy;
+    private final Queue<Request> inbox = new ConcurrentLinkedQueue<>(); // any thread may submit
+    private final Deque<HallCall> unassigned = new ArrayDeque<>();        // tick thread only
+    private final List<String> log = new ArrayList<>();
+    private long now;
+
+    ElevatorController(int minFloor, int maxFloor, int carCount, int doorTicks, DispatchStrategy strategy) {
+        this.minFloor = minFloor; this.maxFloor = maxFloor; this.strategy = strategy;
+        for (int i = 1; i <= carCount; i++)
+            cars.add(new ElevatorCar(i, minFloor, maxFloor, minFloor, doorTicks, msg -> log.add("t=" + now + " " + msg)));
+    }
+
+    /** Thread-safe: validates on the caller's thread, then hands off to the simulation thread. */
+    void submit(Request r) {
+        switch (r) {
+            case HallCall h -> {
+                checkFloor(h.floor());
+                if (h.direction() == Direction.NONE
+                        || (h.direction() == Direction.UP && h.floor() == maxFloor)
+                        || (h.direction() == Direction.DOWN && h.floor() == minFloor))
+                    throw new IllegalArgumentException("invalid hall call " + h);
+            }
+            case CarCall c -> { checkCar(c.carId()); checkFloor(c.floor()); }
+            case MaintenanceCommand m -> checkCar(m.carId());
+        }
+        inbox.add(r);
+    }
+
+    /** Advance the simulation by one time unit. Call from a single thread (or a test). */
+    synchronized void tick() {
+        now++;
+        for (Request r; (r = inbox.poll()) != null; ) handle(r);
+        int pending = unassigned.size();          // retry calls nobody could take earlier
+        for (int i = 0; i < pending; i++) dispatch(unassigned.poll());
+        for (ElevatorCar car : cars) car.tick();
+    }
+
+    private void handle(Request r) {
+        switch (r) {
+            case HallCall h -> dispatch(h);
+            case CarCall c -> {
+                ElevatorCar car = car(c.carId());
+                if (car.isAvailable()) car.addStop(c.floor());
+                else log.add("t=" + now + " car " + car.id() + ": rejected car call (maintenance)");
+            }
+            case MaintenanceCommand m -> {
+                if (m.enter()) car(m.carId()).requestMaintenance(); else car(m.carId()).exitMaintenance();
+            }
+        }
+    }
+
+    private void dispatch(HallCall h) {
+        Optional<ElevatorCar> chosen = strategy.choose(cars, h);
+        if (chosen.isEmpty()) { unassigned.add(h); return; }
+        log.add("t=" + now + " hall call " + h.floor() + " " + h.direction() + " -> car " + chosen.get().id());
+        chosen.get().addStop(h.floor());
+    }
+
+    synchronized void setStrategy(DispatchStrategy s) { this.strategy = s; }
+    synchronized List<String> drainLog() { List<String> out = new ArrayList<>(log); log.clear(); return out; }
+    synchronized String status() {
+        StringBuilder sb = new StringBuilder();
+        for (ElevatorCar c : cars)
+            sb.append(String.format("car %d floor=%d %s stops=%s%n", c.id(), c.floor(), c.state().name(), c.stops()));
+        return sb.toString();
+    }
+    synchronized boolean allIdle() {
+        return inbox.isEmpty() && unassigned.isEmpty() && cars.stream().allMatch(c -> !c.hasStops()
+                && (c.state() instanceof IdleState || c.state() instanceof MaintenanceState));
+    }
+    List<ElevatorCar> carsForTest() { return cars; }
+
+    private ElevatorCar car(int id) { return cars.get(id - 1); }
+    private void checkCar(int id) { if (id < 1 || id > cars.size()) throw new IllegalArgumentException("no car " + id); }
+    private void checkFloor(int f) {
+        if (f < minFloor || f > maxFloor) throw new IllegalArgumentException("floor out of range: " + f);
+    }
+}
+
+public class Main {
+    public static void main(String[] args) {
+        ElevatorController ctl = new ElevatorController(0, 9, 2, 2, new LookDispatchStrategy());
+        // Scripted scenario: tick number -> requests pressed just before that tick.
+        Map<Integer, List<Request>> script = Map.of(
+                1, List.of(new HallCall(6, Direction.DOWN)),
+                2, List.of(new HallCall(2, Direction.UP)),
+                4, List.of(new CarCall(2, 5)),
+                5, List.of(new MaintenanceCommand(1, true)),
+                6, List.of(new HallCall(3, Direction.UP)));
+        for (int t = 1; t <= 16; t++) {
+            script.getOrDefault(t, List.of()).forEach(ctl::submit);
+            ctl.tick();
+        }
+        ctl.drainLog().forEach(System.out::println);
+        System.out.print(ctl.status());
+    }
+}
+```
+
+## Concurrency and edge cases
+
+### Thread-safety of the request queue
+
+- **Producers** (button presses on any thread) call `submit()`. It validates on the caller's thread, so bad input fails fast where it came from, then does `inbox.add(r)`. `ConcurrentLinkedQueue` is a lock-free, thread-safe queue, so no request is ever lost or duplicated.
+- **The consumer** is the single thread calling `tick()`. It drains the inbox with `poll()` until empty. Cars, stops, the `unassigned` deque and the log are only touched on this thread (and inside `synchronized` methods), so they need no locks of their own.
+- `tick()`, `status()`, `drainLog()` and `allIdle()` are `synchronized`. This is a safety net: if someone accidentally calls `tick()` from two threads, the ticks are serialized rather than corrupting state, and a monitoring thread reading `status()` sees a consistent snapshot. See [Java Concurrency and Locks](/learn/notes/java-concurrency-locks/) for why `synchronized` also gives visibility (happens-before) and not just mutual exclusion.
+- A `LinkedBlockingQueue` would also work. Use it if the consumer should **block** waiting for input instead of being driven by a timer.
+
+**Why not lock each car and let threads update cars directly?** Then dispatch (which reads all cars) needs a consistent view of all of them, so you end up taking several locks in a fixed order, and the result is no longer deterministic. Funnelling everything through one queue is simpler and easier to test.
+
+### Edge cases handled
+
+| Case | Behaviour |
+|---|---|
+| Hall call on the car's current floor while it is idle | Doors open in that tick, no movement. |
+| Same floor pressed while doors are already open there | Absorbed; no extra stop. |
+| Same floor pressed many times | One stop (`TreeSet`). |
+| Request for a floor the car just passed | Becomes a stop behind it; LOOK serves it after the turnaround. |
+| UP on the top floor, DOWN on the bottom floor, floor out of range, unknown car | `IllegalArgumentException` from `submit()`. |
+| Maintenance requested mid-trip | Car finishes its current stops, then parks. No new hall calls; car calls are rejected with a log line. |
+| All cars in maintenance | Hall calls wait in `unassigned` and are dispatched once a car returns. |
+| A move outside the building range | `IllegalStateException`: a bug guard, never hit in practice. |
+
+**Known simplification:** a stop is just a floor. A car heading down will open its doors at floor 5 for a person who pressed UP there. Real controllers store `(floor, direction)` and only open for matching hall calls while sweeping. See Extensions.
+
+## Testing it
+
+### Unit tests (JUnit 5 style)
+
+These mirror the plain-Java harness that was actually run (it uses a tiny `check()` helper instead of JUnit so it needs no dependencies).
+
+```java
+class ElevatorControllerTest {
+
+    @Test void idleCarReachesHallCallInFourTicks() {
+        var c = new ElevatorController(0, 9, 1, 2, new LookDispatchStrategy());
+        c.submit(new HallCall(4, Direction.UP));
+        for (int i = 0; i < 4; i++) c.tick();
+        var car = c.carsForTest().get(0);
+        assertEquals(4, car.floor());
+        assertInstanceOf(DoorsOpenState.class, car.state());
+    }
+
+    @Test void lookServesStopsAheadBeforeReversing() {
+        var c = new ElevatorController(0, 9, 1, 1, new LookDispatchStrategy());
+        c.submit(new CarCall(1, 5)); runUntilIdle(c); c.drainLog();
+        c.submit(new CarCall(1, 7)); c.tick();          // now heading up
+        c.submit(new CarCall(1, 2));
+        runUntilIdle(c);
+        var opens = c.drainLog().stream().filter(s -> s.contains("doors open")).toList();
+        assertTrue(opens.get(0).endsWith("at 7"));
+        assertTrue(opens.get(1).endsWith("at 2"));
+    }
+
+    @Test void lookDispatchAvoidsCarMovingAway() {
+        var c = new ElevatorController(0, 20, 2, 1, new LookDispatchStrategy());
+        c.submit(new CarCall(1, 20)); for (int i = 0; i < 6; i++) c.tick(); // car 1 at 6, going up
+        var call = new HallCall(4, Direction.UP);                           // behind car 1
+        assertEquals(1, new NearestCarStrategy().choose(c.carsForTest(), call).get().id());
+        assertEquals(2, new LookDispatchStrategy().choose(c.carsForTest(), call).get().id());
+    }
+
+    @Test void rejectsUpCallOnTopFloor() {
+        var c = new ElevatorController(0, 9, 1, 1, new LookDispatchStrategy());
+        assertThrows(IllegalArgumentException.class, () -> c.submit(new HallCall(9, Direction.UP)));
+    }
+
+    @Test void queuedCallServedWhenCarLeavesMaintenance() {
+        var c = new ElevatorController(0, 9, 1, 1, new LookDispatchStrategy());
+        c.submit(new MaintenanceCommand(1, true)); runUntilIdle(c);
+        c.submit(new HallCall(5, Direction.DOWN));
+        for (int i = 0; i < 5; i++) c.tick();
+        assertFalse(c.allIdle());                        // still waiting
+        c.submit(new MaintenanceCommand(1, false)); runUntilIdle(c);
+        assertEquals(5, c.carsForTest().get(0).floor());
+    }
+
+    @Test void sameInputsGiveIdenticalLog() {
+        assertEquals(runScript(), runScript());          // determinism
+    }
+
+    @Test void concurrentSubmittersLoseNothing() throws Exception {
+        var c = new ElevatorController(0, 30, 4, 1, new LookDispatchStrategy());
+        Set<Integer> requested = ConcurrentHashMap.newKeySet();
+        var pool = Executors.newFixedThreadPool(8);
+        var start = new CountDownLatch(1);
+        List<Future<?>> fs = new ArrayList<>();
+        for (int t = 0; t < 8; t++) {
+            int seed = t;
+            fs.add(pool.submit(() -> {
+                var r = new Random(seed);
+                start.await();
+                for (int i = 0; i < 500; i++) {
+                    int f = 1 + r.nextInt(29);
+                    requested.add(f);
+                    if (r.nextBoolean()) c.submit(new HallCall(f, r.nextBoolean() ? Direction.UP : Direction.DOWN));
+                    else c.submit(new CarCall(1 + r.nextInt(4), f));
+                }
+                return null;
+            }));
+        }
+        List<String> log = new ArrayList<>();
+        start.countDown();
+        while (!fs.stream().allMatch(Future::isDone)) { c.tick(); log.addAll(c.drainLog()); }
+        for (var f : fs) f.get();
+        pool.shutdown();
+        for (int i = 0; i < 10_000 && !c.allIdle(); i++) { c.tick(); log.addAll(c.drainLog()); }
+        assertTrue(c.allIdle());
+        assertTrue(openedFloors(log).containsAll(requested));  // every floor visited
+    }
+}
+```
+
+The concurrent test runs 8 producer threads (4,000 requests in total) while the main thread keeps ticking, then checks two things: the system drains to idle (nothing stuck), and every requested floor had a "doors open" event (nothing lost).
+
+**Harness result** (19 checks, run 10 times in a row with no failures):
+
+```
+PASS idle car reaches hall call in 4 ticks
+PASS car returns to IDLE
+PASS LOOK serves 7 then 2
+PASS same-direction ahead call is cheaper than opposite direction
+PASS nearest picks car moving away
+PASS LOOK picks idle car instead
+PASS UP call on top floor rejected
+PASS unknown car rejected
+PASS out-of-range floor rejected
+PASS car finishes stop then enters MAINTENANCE
+PASS hall call served by the other car
+PASS car call to maintenance car rejected
+PASS hall call waits while every car is in maintenance
+PASS queued call served after maintenance ends
+PASS same inputs give identical event log
+PASS call at current floor opens doors
+PASS press while doors open adds no stop
+PASS all concurrently submitted requests drained, cars idle
+PASS every requested floor was visited
+19 checks passed
+```
+
+### Demo output (real output of `java Main`)
+
+```
+t=1 hall call 6 DOWN -> car 1
+t=1 car 1: IDLE -> MOVING_UP
+t=2 hall call 2 UP -> car 1
+t=2 car 1: MOVING_UP -> DOORS_OPEN
+t=2 car 1: doors open at 2
+t=4 car 1: doors close at 2
+t=4 car 1: DOORS_OPEN -> MOVING_UP
+t=4 car 2: IDLE -> MOVING_UP
+t=6 hall call 3 UP -> car 2
+t=6 car 2: MOVING_UP -> DOORS_OPEN
+t=6 car 2: doors open at 3
+t=8 car 1: MOVING_UP -> DOORS_OPEN
+t=8 car 1: doors open at 6
+t=8 car 2: doors close at 3
+t=8 car 2: DOORS_OPEN -> MOVING_UP
+t=10 car 1: doors close at 6
+t=10 car 1: DOORS_OPEN -> MAINTENANCE
+t=10 car 2: MOVING_UP -> DOORS_OPEN
+t=10 car 2: doors open at 5
+t=12 car 2: doors close at 5
+t=12 car 2: DOORS_OPEN -> IDLE
+car 1 floor=6 MAINTENANCE stops=[]
+car 2 floor=5 IDLE stops=[]
+```
+
+Read it as a story: car 1 is sent up to floor 6. At t=2 a caller on floor 2 wants UP; car 1 is at floor 1 heading up, so LOOK dispatch gives it to car 1 at cost 1, and it stops on the way. At t=4 a passenger in car 2 presses 5. At t=6 the hall call at 3 UP goes to car 2, which is already passing 3 going up. Car 1 was flagged for maintenance at t=5, so it **finishes** its stop at 6 and only then parks.
+
+## Extensions interviewers ask for (and how the design absorbs them)
+
+| Extension | Change |
+|---|---|
+| **Direction-aware stops** (only open for UP callers on the way up) | Store `upStops` and `downStops` (two `TreeSet`s) plus car calls. Moving states check the set for their direction. States and strategies stay the same shape. |
+| **Capacity / weight limit** | Add `load` to the car; strategies filter out full cars; `DoorsOpenState` could refuse boarding. One filter in each strategy, no controller change. |
+| **Destination dispatch** (people enter their destination in the lobby) | New request type `DestinationCall(from, to)` in the sealed interface; the compiler then points you at every `switch` that must handle it. A new strategy groups people going to nearby floors. |
+| **Express / zoned cars** (car 3 serves only floors 20 to 40) | Give each car a `servedFloors` range; strategies filter on it. |
+| **Fire / emergency mode** | A new `EmergencyState` that ignores all calls and goes to the ground floor, plus a `FireAlarm` request. Existing states untouched. |
+| **Peak-hour policy** (morning up-peak) | A new strategy, or a decorator that chooses between strategies by time of day. Swapped with `setStrategy` at runtime. |
+| **Avoid assigning one hall call to two cars** | Keep a map from `HallCall` to car id; skip dispatch if already assigned; clear it on door open at that floor. |
+| **Real time** | Drive `tick()` from a `ScheduledExecutorService` at a fixed rate. Nothing else changes, because time was always external. |
+| **Notifications / display panels** | Replace the `Consumer` log sink with an Observer (`ElevatorListener`) that panels subscribe to. |
+
+## Common mistakes
+
+- **One giant `switch(state)`** in `move()`, `openDoors()` and `addRequest()`. Every new mode touches every method. Use State classes.
+- **One thread per car with `Thread.sleep`.** Non-deterministic, slow to test, and dispatch reads car state that other threads are changing. Prefer a tick loop.
+- **Treating hall calls and car calls the same.** A car call is bound to a car and must never be reassigned to another one.
+- **Shortest-distance-first scheduling inside a car.** Starves far floors. Use SCAN/LOOK.
+- **Dispatch that ignores direction.** The nearest car may be moving away and will not come back for a long time.
+- **Dropping requests when no car is available.** Queue them and retry.
+- **Using an unsynchronized `ArrayList` as the request queue** that button threads write and the simulation thread reads. Lost updates and `ConcurrentModificationException`.
+- **Putting the dispatch rule inside the controller** with `if (mode == ...)`. That is exactly what Strategy is for.
+- **No validation**: an UP button on the top floor, or floor 12 in a 10-floor building, quietly corrupting state.
+
+## Practice questions
+
+<Practice>
+
+<QA q="What is the difference between a hall call and a car call, and why does it matter in the design?" level="easy">
+
+A **hall call** (external request) is made from a floor and has a direction but no car. The controller must **dispatch** it to some car using a strategy. A **car call** (internal request) is made inside a car and is bound to that car, so it becomes a stop on it directly. It matters because only hall calls go through the `DispatchStrategy`, and a car call must never be moved to another car (the passenger is inside that one).
+
+</QA>
+
+<QA q="Why use the State pattern for the elevator car?" level="easy">
+
+The car's behaviour on each tick depends completely on its phase: idle cars look for work, moving cars step a floor and check for a stop, open doors count down, maintenance does nothing. With State each phase is a small class with one `tick()` and it decides the next state. Adding a mode such as fire service is a new class, not a new branch in every method.
+
+</QA>
+
+<QA q="Explain SCAN vs LOOK in one minute." level="easy">
+
+Both come from disk scheduling. **SCAN** moves in one direction serving requests until it hits the **end** of the range, then reverses. **LOOK** reverses as soon as there are **no more requests ahead**, so it never travels to an empty end. Both prevent starvation because any request is served within one round trip (out and back), unlike shortest-distance-first which can keep serving nearby floors forever.
+
+</QA>
+
+<QA q="Why simulate with ticks instead of real time?" level="medium">
+
+Ticks make the system **deterministic**: the same inputs always produce the same log, so tests can assert exact positions after N ticks, and a 10,000-step simulation runs in milliseconds. It also keeps concurrency simple: one thread advances time and mutates cars. In production you'd call `tick()` from a scheduled executor, and nothing in the domain code changes because time was always an input.
+
+</QA>
+
+<QA q="How is the request queue made thread-safe, and why not just lock each car?" level="medium">
+
+Any thread calls `submit()`, which validates and adds to a `ConcurrentLinkedQueue`. Only the simulation thread polls it and touches car state (single writer), so cars need no locks. Locking each car fails because dispatch must read **all** cars consistently, which means taking several locks in a fixed order, and the outcome would depend on thread timing, making tests non-deterministic.
+
+</QA>
+
+<QA q="Walk through what LookDispatchStrategy computes for a car moving up at floor 5 with its furthest stop at 15, for a hall call at 14 DOWN." level="medium">
+
+The car is moving UP and floor 14 is ahead, but the caller wants DOWN, so the car will not pick them up on this sweep. Cost = distance to the turnaround floor plus distance back: `|5 - 15| + |15 - 14| = 11`. For a call at 14 UP the cost would just be `|5 - 14| = 9`, because the car passes 14 going up.
+
+</QA>
+
+<QA q="Why does NearestCarStrategy sometimes make bad choices?" level="medium">
+
+It only looks at distance. A car one floor away that is heading away to floor 20 may need many floors of travel before it can come back, while an idle car five floors away could arrive sooner. In the tests, a car at floor 6 going up to 20 is 'nearest' to a call at 4 UP, but the LOOK strategy correctly picks the idle car at floor 0.
+
+</QA>
+
+<QA q="How does maintenance mode work, and what are the trade-offs of your choice?" level="medium">
+
+A `MaintenanceCommand` sets a flag. The car stops being 'available', so no new hall calls are dispatched to it and new car calls are rejected, but it **finishes the stops it already has**, then `chooseNextState()` parks it in `MAINTENANCE`. The trade-off: it can take a while to park. The alternative (park immediately) strands passengers, and you'd then have to reassign its hall calls. Leaving maintenance moves it back to `IDLE`, and queued hall calls get dispatched on the next tick.
+
+</QA>
+
+<QA q="Why is DoorsOpenState not a singleton when the other states are?" level="hard">
+
+The stateless states have no fields, so one shared instance is safe for all cars. `DoorsOpenState` carries a countdown that is specific to one car's visit to one floor. Sharing it would make two cars decrement the same counter. Creating it per visit is cheap. Alternatively, keep the counter on the car and make the state stateless again.
+
+</QA>
+
+<QA q="A user on floor 5 presses DOWN, but the car serving floor 5 is heading up and opens its doors there anyway. Is that a bug, and how would you fix it?" level="scenario">
+
+It's a known simplification: stops are stored as floors only. Real elevators only stop for a hall call in the current sweep direction (otherwise the passenger boards a car going the wrong way). Fix: keep `upStops` and `downStops` for hall calls plus a set for car calls. The moving-up state stops if the floor is a car call or an up hall call. Down hall calls are served on the way back. The State and Strategy structure doesn't change.
+
+</QA>
+
+<QA q="During the morning rush everyone goes from the lobby up. How would you improve throughput?" level="scenario">
+
+Add an **up-peak strategy**: send idle cars back to the lobby (a parking policy), and split floors into zones so each car serves a band of floors (fewer stops per trip). Swap it in at runtime with `setStrategy`, or wrap strategies in a time-of-day selector. Destination dispatch (people enter their floor in the lobby) helps further by grouping people going to nearby floors.
+
+</QA>
+
+<QA q="The interviewer asks how you would prove the system loses no requests under concurrent load." level="scenario">
+
+Start N producer threads behind a `CountDownLatch` so they all fire at once, each submitting random hall and car calls, while the main thread keeps ticking. After producers finish, tick until `allIdle()`, with an upper bound so a bug fails the test instead of hanging. Assert that the system went idle (nothing stuck in the inbox, the unassigned queue or a car's stops) and that every requested floor got a 'doors open' event. Run it many times, because concurrency bugs are probabilistic.
+
+</QA>
+
+<QA q="How would you prevent two cars from being sent to the same hall call?" level="hard">
+
+Keep a `Map` from `HallCall` to assigned car id in the controller (touched only by the tick thread). On dispatch, skip calls that are already assigned. When a car opens its doors at that floor in the matching direction, remove the entry. If the assigned car goes into maintenance or is badly delayed, remove the entry and re-dispatch, which also gives you a hook for reassignment.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="Which request type must go through the dispatch strategy?" options={["A car call from inside car 2", "A hall call from floor 6", "A maintenance command", "All requests equally"]} answer={1}>
+
+Only hall calls have no car yet. A car call is already bound to its car, and a maintenance command names the car.
+
+</MCQ>
+
+<MCQ q="A car is moving up at floor 4 with stops 7 and 2. In what order does LOOK serve them?" options={["2 then 7, because 2 is closer", "7 then 2", "Whichever was pressed first", "It goes to the top floor first, then 2"]} answer={1}>
+
+LOOK keeps going in its current direction while stops remain ahead (7), then reverses (2). Going to the top floor first would be SCAN, and closest-first is SSTF.
+
+</MCQ>
+
+<MCQ q="What is the main advantage of LOOK/SCAN over always going to the nearest pending stop?" options={["Fewer total floors travelled in every case", "No request waits forever", "It needs no sorted data structure", "It uses less memory"]} answer={1}>
+
+Nearest-first can starve far floors when nearby requests keep arriving. A sweep guarantees every request is reached within one round trip (out and back). It is not always the shortest total travel.
+
+</MCQ>
+
+<MCQ q="Why is the simulation driven by tick() instead of one sleeping thread per car?" options={["Threads cannot call Thread.sleep in Java 21", "It makes behaviour deterministic and testable, with a single writer of car state", "Ticks are faster on multi-core CPUs", "The State pattern requires a single thread"]} answer={1}>
+
+Determinism and single-writer simplicity are the point. Nothing in Java forbids sleeping threads, and the State pattern itself has no threading requirement.
+
+</MCQ>
+
+<MCQ q="Many threads press buttons concurrently. Which structure is safe for submit() to add to while the tick thread polls?" options={["ArrayList", "ArrayDeque", "ConcurrentLinkedQueue", "TreeSet"]} answer={2}>
+
+`ConcurrentLinkedQueue` is a thread-safe non-blocking queue. The other three are not thread-safe without external locking.
+
+</MCQ>
+
+<MCQ q="Strategy and State have the same class diagram. What distinguishes the two uses here?" options={["Strategies switch themselves on every tick; states are picked by the client", "The client picks the dispatch strategy; each state decides the next state itself", "Strategy needs an abstract class; State needs an interface", "There is no difference"]} answer={1}>
+
+Dispatch strategy is chosen from outside and rarely changes; elevator states transition themselves from inside as events occur.
+
+</MCQ>
+
+<MCQ q="A car flagged for maintenance still has two stops. What does this design do?" options={["Drops the stops and parks immediately", "Reassigns the stops to another car", "Finishes the stops, accepts no new requests, then parks", "Ignores the maintenance flag until restarted"]} answer={2}>
+
+Passengers inside are taken to their floors first; the car becomes unavailable to dispatch and rejects new car calls meanwhile.
+
+</MCQ>
+
+<MCQ q="Why do the strategies break ties by car id?" options={["Car ids encode priority", "To keep results deterministic so tests and replays are stable", "Because Comparator requires a tiebreaker", "To balance load evenly"]} answer={1}>
+
+Without a stable tiebreak, the choice could depend on iteration order, and a deterministic simulation is a core requirement here.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **Entities**: `ElevatorController` (owns cars, inbox, strategy), `ElevatorCar` (floor, direction, `TreeSet` stops, state), sealed `Request` = `HallCall` / `CarCall` / `MaintenanceCommand`.
+- **State**: `IDLE`, `MOVING_UP`, `MOVING_DOWN`, `DOORS_OPEN`, `MAINTENANCE`; each has `tick(car)` and picks the next state.
+- **LOOK inside a car**: continue while stops ahead, else reverse, else idle. SCAN goes to the end; nearest-first starves.
+- **Strategy for dispatch**: nearest car (simple, direction-blind) vs LOOK cost (idle = distance; ahead and same direction = distance; else via turnaround floor). Tie-break by id.
+- **Hall vs car calls**: hall calls are dispatched; car calls go straight to their car.
+- **Concurrency**: many producers into `ConcurrentLinkedQueue`; one tick thread mutates everything; `synchronized` read views.
+- **Determinism**: ticks, not sleeps; same inputs, same log; tests assert exact positions.
+- **Edge cases**: invalid floors/directions, duplicate presses, all cars in maintenance (queue), maintenance mid-trip (finish, then park).
+- **Extensions**: direction-aware stop sets, capacity, zones, emergency state, peak-hour strategy, destination dispatch.
+
+## Go deeper
+
+- **OSTEP**: [Hard Disk Drives chapter](https://pages.cs.wisc.edu/~remzi/OSTEP/file-disks.pdf), section on SCAN, the "elevator" algorithm, and why it prevents starvation.
+- **refactoring.guru**: [State pattern](https://refactoring.guru/design-patterns/state).
+- **JDK API**: [ConcurrentLinkedQueue](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ConcurrentLinkedQueue.html).
+- **JEP 441**: [Pattern Matching for switch](https://openjdk.org/jeps/441) (final in Java 21), used for the `switch` over the sealed `Request` type.
+- Related notes: [Behavioral Patterns](/learn/notes/behavioral-patterns/), [Machine Coding Strategy](/learn/notes/machine-coding-strategy/), [Java Concurrency and Locks](/learn/notes/java-concurrency-locks/), [Executors and Virtual Threads](/learn/notes/java-executors-virtual-threads/), [LLD: BookMyShow](/learn/notes/lld-bookmyshow/).

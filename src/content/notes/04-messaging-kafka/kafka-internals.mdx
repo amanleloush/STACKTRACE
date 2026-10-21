@@ -1,0 +1,450 @@
+---
+title: "Kafka Internals: Replication, ISR, KRaft, Storage"
+phase: "04-messaging-kafka"
+order: 31
+tags: ["messaging"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 16
+prerequisites: ["kafka-deep"]
+summary: "What actually happens inside a Kafka cluster — how partitions replicate, when a write counts as committed, how leaders are elected, how bytes hit disk, and how clients find the right broker."
+---
+
+## Definition (interview-ready)
+
+Internally, every Kafka partition is a **replicated, append-only log**. One replica is the **leader** and handles all writes; the **followers** copy from it by fetching, the same way consumers do. The replicas that are fully caught up form the **In-Sync Replica set (ISR)**. A record is **committed** once every ISR member has it, and the **high watermark** marks that boundary: consumers only ever see records below it. Cluster metadata, such as who leads which partition, is owned by a **controller**. That used to be one broker coordinated through ZooKeeper; today it's a Raft quorum built into Kafka itself (**KRaft**). On disk, each partition is a directory of **segment files** that are only ever appended to, served out of the OS page cache, and sent to consumers with zero-copy.
+
+**One-liner:** Each Kafka partition is a replicated append-only log: the leader takes writes, followers fetch from it, a record is committed once every in-sync replica has it (the high watermark), a KRaft controller quorum manages metadata and elections, and speed comes from sequential segment files, the page cache and zero-copy.
+
+## Why it matters
+
+The basic API (topics, partitions, consumer groups) tells you how to *use* Kafka. The internals tell you what Kafka *promises*: when an acknowledged write can still be lost, why a partition can go offline, why consumers sometimes lag a few hundred milliseconds behind producers, and why one broker can push gigabytes per second on ordinary disks. Senior interviews almost always probe this layer. Expect questions like "you set `acks=all`, can you still lose data?" or "what does `min.insync.replicas` actually protect?".
+
+## Core concepts
+
+### Leader, followers, and the ISR
+
+- Each partition has `replication.factor` replicas spread across brokers (RF=3 is the production norm).
+- Exactly one replica is the **leader**. Producers write to it, and consumers read from it by default. Since KIP-392, consumers can read from a nearby follower in the same rack or availability zone.
+- **Followers** send fetch requests to the leader in a loop, just like consumers, and append what they receive to their own copy of the log.
+- A follower is **in sync** if it has caught up with the leader within the last `replica.lag.time.max.ms` (default 30s). If it falls behind for longer, the leader removes it from the ISR. Once it catches up, it's added back.
+- The ISR always includes the leader. The controller persists ISR changes so that a new leader can safely be chosen from them.
+
+Why an ISR instead of a fixed quorum? With a majority quorum (as in Raft), tolerating `f` failures takes `2f+1` replicas. With an ISR, a write only has to reach the replicas that are currently healthy. So RF=3 still accepts writes with 2 brokers down, provided you allow it (see `min.insync.replicas`). The cost: the ISR can shrink to just the leader, and at that point durability depends on a single disk.
+
+### acks and min.insync.replicas
+
+`acks` is set on the **producer**. It decides when the producer is told "done":
+
+| `acks` | The leader responds when… | Can lose acked data? | Typical use |
+|---|---|---|---|
+| `0` | it never waits; the producer doesn't wait for a response | Yes (you never even learn about failures) | Metrics, sampled telemetry |
+| `1` | the leader has appended to its own log | Yes, if the leader dies before followers copy the record | Legacy default, "good enough" logs |
+| `all` / `-1` | every replica currently in the ISR has the record | No, as long as the ISR is at least `min.insync.replicas` | Orders, payments, anything that matters |
+
+`min.insync.replicas` is set on the **broker or topic**. It's the smallest ISR size at which an `acks=all` write is accepted. Below that size, the leader rejects the write with `NotEnoughReplicasException`, choosing consistency over availability.
+
+Note that `acks=all` alone does **not** mean "3 copies". If the ISR has shrunk to just the leader and `min.insync.replicas=1`, then `acks=all` means 1 copy. The two settings only protect you together.
+
+**Failure matrix, RF=3, `acks=all`, `min.insync.replicas=2`:**
+
+| Brokers alive (for this partition) | ISR size | Writes | Reads | Data safety |
+|---|---|---|---|---|
+| 3 | 3 | Accepted | OK | Every acked record is on 3 brokers |
+| 2 (one follower down) | 2 | Accepted | OK | Every acked record is on 2 or more brokers |
+| 2 (leader down) | 2 | Accepted after a new leader is elected from the ISR (milliseconds to seconds) | OK | No committed data lost |
+| 1 | 1 | **Rejected** (`NotEnoughReplicas`) | OK (existing data) | Kafka refuses to take writes that would exist on only one disk |
+| 0 | 0 | Partition offline | Offline | Wait for an ISR replica to return, or allow unclean election (below) |
+
+Compare the same scenario with `min.insync.replicas=1`: with one broker left, writes keep succeeding but each one lives on a single disk. Lose that disk and the data is gone even though every producer got an ack.
+
+### Unclean leader election
+
+If **every** ISR member is gone, only out-of-sync replicas (or none) remain. Kafka has two choices:
+
+- **Wait** (`unclean.leader.election.enable=false`, the default). The partition stays offline until an ISR replica comes back. Consistent but unavailable.
+- **Promote a lagging replica** (`true`). The partition comes back right away, but every record the new leader never received is lost for good. Worse, when the old leader returns it truncates its log to match, so records that consumers may already have read can disappear.
+
+Enable it only for data where uptime beats completeness and loss is tolerable: clickstream sampling, debug logs, metrics. Never enable it for money, orders, ledgers, or anything you reconcile. It's the CAP trade-off made explicit as a per-topic setting.
+
+### ZooKeeper → KRaft
+
+Before KRaft, **ZooKeeper** held the cluster's metadata: which brokers are alive (ephemeral znodes), topic and partition configs, leaders and ISRs, ACLs, and which broker is the controller. Problems with that:
+
+- **Two distributed systems to run**, secure, monitor, and upgrade.
+- **Scalability ceiling.** Metadata lived in znodes, and a new controller had to load all of it from ZooKeeper on failover. Practical limits were around 200k partitions per cluster, and failover on big clusters took tens of seconds or minutes.
+- **Split-brain-ish races** between the controller's in-memory view and ZooKeeper.
+
+**KRaft** (Kafka Raft, KIP-500) moves metadata into Kafka itself:
+
+- A small quorum of **controller nodes** (usually 3 or 5) runs Raft over an internal log, `__cluster_metadata`.
+- Metadata changes are **records in that log**. Brokers replay it to keep a local metadata cache, so metadata spreads using the same log idea as user data.
+- Standby controllers already hold the replicated log, so **controller failover is nearly instant** and clusters can scale to millions of partitions.
+- Timeline: production-ready in Kafka **3.3**; ZooKeeper mode deprecated in 3.5; **Kafka 4.0 removes ZooKeeper** entirely.
+
+See [Consensus: Raft & Paxos](/learn/notes/consensus-raft-paxos/) for how the quorum elects its leader.
+
+### The controller
+
+The controller is the brain of the cluster's control plane. Its jobs:
+
+- Detect broker failures. Under KRaft, brokers send heartbeats to the controller quorum; under ZooKeeper, the controller watched ephemeral nodes.
+- Elect a new leader for every partition the failed broker led, picking from the ISR.
+- Handle topic creation and deletion, partition reassignment, and preferred-leader election.
+- Push metadata changes to every broker.
+
+ZooKeeper mode: whichever broker created the `/controller` ephemeral znode first became the controller, and failover meant re-reading all state. KRaft mode: the **active controller is the Raft leader** of the controller quorum, and the standbys are hot copies.
+
+Only one controller should be active at a time. `ActiveControllerCount` should add up to exactly 1 across the cluster, and it's a standard alert.
+
+### Storage: segments, indexes, and why it's fast
+
+On disk, a partition is a directory such as `orders-3/`:
+
+```
+orders-3/
+  00000000000000000000.log        ← segment: record batches, append-only
+  00000000000000000000.index      ← offset → byte position (sparse)
+  00000000000000000000.timeindex  ← timestamp → offset (sparse)
+  00000000000005242880.log        ← next segment, named by its base offset
+  00000000000005242880.index
+  00000000000005242880.timeindex
+  leader-epoch-checkpoint
+```
+
+- Only the newest (**active**) segment is written to. A segment rolls over at `segment.bytes` (default 1 GiB) or `segment.ms` (default 7 days).
+- Closed segments are **immutable**. Retention deletes whole segments, and compaction rewrites them in the background. Kafka never edits a record in place.
+- The indexes are **sparse**: about one entry every `index.interval.bytes` (4 KiB). To find offset N, Kafka binary-searches the index for the nearest entry at or below N, then scans forward a few KB in the `.log` file. A small index fits in memory and is memory-mapped.
+- The time index powers `offsetsForTimes()`, which lets you rewind a consumer to a point in time, and it drives time-based retention.
+
+**Why it's fast:**
+
+1. **Sequential I/O.** Every write is an append, and spinning disks and SSDs both do sequential writes hundreds of times faster than random ones. Most consumers read the tail, which is also sequential.
+2. **The OS page cache is the cache.** Kafka keeps no record cache on the JVM heap. Recent data sits in the kernel's page cache, so a consumer just behind the producer reads from RAM. The JVM heap stays small (around 6 GB is typical), so garbage-collection pauses stay small too. Give the box lots of RAM that *isn't* heap.
+3. **Zero-copy (`sendfile`).** For a plain-text consumer fetch, the kernel copies bytes from page cache straight to the network card, with no trip through user space and no JVM buffers. (TLS breaks this, because encryption has to happen in user space.)
+4. **One format end to end.** Producers, brokers, and consumers all use the same record-batch binary format. The broker validates a compressed batch and stores it as is, with no decompress-and-recompress cycle, and consumers receive it still compressed.
+5. **Batching everywhere.** Records travel and are stored as batches, so per-record overhead is spread across the whole batch.
+
+### Log End Offset (LEO) vs High Watermark (HW)
+
+- **LEO**: the offset the *next* record will get in a particular replica. Each replica has its own LEO.
+- **High watermark**: the lowest LEO across the ISR. It's the highest point that every in-sync replica is known to have. Everything below the HW is **committed**.
+
+```
+                 offset:  0  1  2  3  4  5  6  7
+Leader   (LEO=8)          ■  ■  ■  ■  ■  ■  ■  ■
+Follower A (LEO=6)        ■  ■  ■  ■  ■  ■
+Follower B (LEO=7)        ■  ■  ■  ■  ■  ■  ■
+                                            ▲
+                     High watermark = min(8, 6, 7) = 6
+       consumers can read offsets 0–5; 6 and 7 are not yet committed
+```
+
+Why hide everything above the HW? If the leader crashes now, the new leader might be Follower A, which never had offsets 6 and 7. A consumer that had already read offset 7 would have seen a record that, from the cluster's point of view, **never existed**. Capping reads at the HW means consumers only ever see data that will survive any ISR-based failover.
+
+The leader learns how far each follower has got from the offsets in that follower's fetch requests, and advances the HW. Followers learn the new HW in fetch responses, so their copy of the HW always lags the leader's by about one fetch round.
+
+### Leader epochs (KIP-101)
+
+Before Kafka 0.11, a follower that restarted **truncated its log to its own high watermark** and then fetched again. Because the HW propagates one round late, this had edge cases. Example: two replicas fail one after the other, both truncate to different stale HWs, and they end up with **different records at the same offset**, or a committed record gets thrown away.
+
+The fix is the **leader epoch**, a number that goes up by one every time the partition gets a new leader. Each replica records which epoch began at which offset (in the `leader-epoch-checkpoint` file). A recovering replica no longer guesses from the HW. Instead it asks the current leader: "my last epoch was 5; where does epoch 5 end in your log?" (`OffsetForLeaderEpoch`). It then truncates exactly at the point where the two logs diverge and fetches from there. Replicas are guaranteed to end up with **byte-identical logs** with no loss of committed data. It's the same idea as Raft terms.
+
+### Large messages
+
+The default limit is about **1 MB** per batch. The relevant settings are `message.max.bytes` (broker and topic), `max.request.size` (producer), and `max.partition.fetch.bytes` / `fetch.max.bytes` (consumer). You can raise all of them, but big records:
+
+- crowd hot data out of the page cache,
+- block other partitions behind them in the same fetch,
+- slow down replication and make the heap usage of each request jump around.
+
+Better options, roughly from most to least preferred:
+
+1. **Claim check.** Upload the blob to object storage (S3 or GCS) and publish a small event carrying its URI, checksum, and metadata. Consumers download the blob only if they need it. Kafka stays a log of *facts*, not a file transfer system.
+2. **Compression** (`zstd` or `lz4`) if the payload compresses well, as JSON and text do.
+3. **Chunking**: split the payload into numbered pieces with the same key and put them back together on the consumer. Messy, because you need ordering, partial-failure handling, and reassembly buffers, and it's rarely worth it.
+
+### How clients find the leader: bootstrap and metadata
+
+1. The client connects to **any** broker listed in `bootstrap.servers`. That list is only a starting point, not the full cluster.
+2. It sends a **Metadata request**. The response lists every broker (host:port) and, for each topic partition, its current leader and replicas.
+3. The client opens connections **straight to the leaders** and sends produce or fetch requests to the right broker. There's no proxy or router layer; the clients themselves know the cluster layout.
+4. If leadership moves, requests fail with `NOT_LEADER_OR_FOLLOWER`. The client refreshes metadata and retries against the new leader. Clients also refresh metadata every `metadata.max.age.ms` (5 min).
+
+**`advertised.listeners`** is the address each broker *tells* clients to use. If it says `localhost:9092` or a private Docker hostname, clients outside the box receive a valid metadata response and then fail to connect to the address it contains. This is the classic "works on the broker host, times out everywhere else" bug in Docker and Kubernetes setups. Use separate listeners for internal (broker-to-broker) and external (client) traffic.
+
+### Quotas
+
+In a shared cluster, one backfill job can starve everyone else. Kafka lets you set quotas per `user`, per `client.id`, or per combination of the two:
+
+- **Produce and fetch byte-rate quotas**, for example 10 MB/s per client.
+- **Request-rate quotas**: the share of broker network and I/O thread time a client may use.
+- **Controller mutation quotas**, which limit how fast clients can create or delete topics and partitions.
+
+When a client goes over a byte-rate or request quota, the broker doesn't return an error. It **delays the response** for a computed throttle time (and mutes the channel), so a well-behaved client simply slows down. (Controller mutation quotas are the exception: an over-quota topic or partition creation is rejected with a `THROTTLING_QUOTA_EXCEEDED` error that tells the client how long to wait.) The client-side metric `produce-throttle-time-avg` / `fetch-throttle-time-avg` greater than 0 tells you it's happening.
+
+## How it works (one `send()` end to end)
+
+```
+Producer app thread
+  1. send(record)
+     → serialize key/value → run interceptors
+     → partitioner picks partition (explicit | hash(key) | sticky)
+  2. append to RecordAccumulator: the open batch for that partition
+     (batch.size / linger.ms decide when it's "ready")
+
+Producer sender (I/O) thread
+  3. drain ready batches, group them by leader broker,
+     send one ProduceRequest per broker
+     (at most max.in.flight.requests.per.connection unacked requests)
+
+Leader broker
+  4. validate (CRC, size, idempotent sequence number, quota)
+     → append the batch to the active segment (page cache)
+  5. acks=all: park the request in "purgatory" until every ISR
+     follower's fetch has gone past the batch's offset
+     → advance the high watermark
+
+  6. respond → producer completes the Future / runs the callback
+     (retriable error? retry within delivery.timeout.ms; with idempotence,
+      sequence numbers make the retry safe)
+
+Consumers
+  7. fetch requests see the record once HW > its offset
+     (read_committed consumers also wait for the transaction to resolve)
+```
+
+The producer side (batching, idempotence, retries) is covered in depth in [Kafka Producer Deep Dive](/learn/notes/kafka-producer/).
+
+## Real-world examples
+
+- **Confluent / Apache Kafka 4.0**: the first release with no ZooKeeper at all. Clusters run on KRaft only.
+- **LinkedIn**: Kafka's birthplace, running it at trillions of messages a day. At that kind of scale the ZooKeeper metadata limits (partition count, controller failover time) became the motivation KIP-500 cites for KRaft.
+- **Managed services** (Amazon MSK, Confluent Cloud): they use RF=3 across three availability zones with `min.insync.replicas=2` by default, the setup recommended in this note.
+
+## Common pitfalls
+
+- **`acks=all` with `min.insync.replicas=1`.** It feels durable but quietly accepts single-copy writes whenever the ISR shrinks.
+- **`min.insync.replicas` equal to RF** (for example 3 of 3). A single broker restart blocks every write. Use RF−1.
+- **Enabling unclean election "for availability"** on business-critical topics.
+- **Huge JVM heap.** It takes RAM away from the page cache, which is where Kafka's read performance actually comes from.
+- **Wrong `advertised.listeners`** in containers or Kubernetes.
+- **Counting only replicas, not racks.** RF=3 with all three copies in one availability zone is gone in one AZ outage. Set `broker.rack` so replicas are spread across zones.
+- **Raising `message.max.bytes` without raising the consumer fetch limits.** Older consumers stall on the oversized batch.
+- **Treating `UnderReplicatedPartitions > 0` as noise.** It's the earliest warning that your durability margin is shrinking.
+
+## Practice questions
+
+<Practice>
+
+<QA q="What are the leader, followers, and the ISR of a partition?" level="easy">
+
+- **Leader**: the one replica that handles all writes (and reads, by default) for the partition.
+- **Followers**: the other replicas. They copy the leader by sending fetch requests in a loop, like consumers.
+- **ISR (In-Sync Replicas)**: the leader plus every follower that has caught up within `replica.lag.time.max.ms` (30s). A record is committed only once every ISR member has it, and a new leader is only ever picked from the ISR, which is how committed data survives a leader failure.
+
+</QA>
+
+<QA q="Explain `acks=0`, `acks=1` and `acks=all`." level="easy">
+
+- `acks=0`: the producer doesn't wait at all. Fastest, but it never even learns about failures. Only for telemetry where losing some data is fine.
+- `acks=1`: the leader acks once the record is in its own log. If the leader dies before a follower copies it, the acked record is lost.
+- `acks=all`: the leader acks only after every current ISR member has the record. Combined with `min.insync.replicas` of 2 or more, an acked write survives the loss of any single broker. Recent clients use this by default (alongside idempotence).
+
+</QA>
+
+<QA q="What is `min.insync.replicas` and why does `acks=all` need it?" level="medium">
+
+It's a broker or topic setting: the minimum ISR size at which an `acks=all` write is accepted. `acks=all` only means "every *current* ISR member", and the ISR can shrink to just the leader. Without a floor, that single replica would satisfy `acks=all`. With RF=3 and `min.insync.replicas=2`, every acked write is on at least 2 brokers, and if the ISR drops to 1 the producer gets `NotEnoughReplicasException`. Kafka chooses consistency over availability. The standard durable setup is **RF=3, min.insync.replicas=2, acks=all**.
+
+</QA>
+
+<QA q="What roles did ZooKeeper play, and what is KRaft?" level="medium">
+
+ZooKeeper stored the cluster metadata (registered brokers, topic configs, partition leaders and ISRs, ACLs) and decided which broker was controller. The downsides: a second system to run, metadata limits of around 200k partitions, and slow controller failover because the new controller had to reload everything.
+
+**KRaft** replaces it with a quorum of controller nodes running Raft over an internal metadata log (`__cluster_metadata`). Brokers replay that log. You get one system to operate, millions of partitions, and near-instant failover because standby controllers already have the log. Production-ready in 3.3; ZooKeeper is removed in 4.0.
+
+</QA>
+
+<QA q="What does the Kafka controller do?" level="medium">
+
+It manages the control plane: detecting broker failures, electing new partition leaders from the ISR, handling topic creation, deletion, and partition reassignment, running preferred-leader election, and pushing metadata to all brokers. In ZooKeeper mode it was whichever broker grabbed an ephemeral znode first. In KRaft mode it's the Raft leader of the controller quorum. Exactly one should be active, so alert if `ActiveControllerCount` summed across the cluster isn't 1.
+
+</QA>
+
+<QA q="What is unclean leader election, and when would you enable it?" level="medium">
+
+When every ISR replica of a partition is down, Kafka can either wait for one to return (partition offline, no data loss) or promote an out-of-sync replica (available again right away, but every record that replica never received is lost, including records consumers may already have read). `unclean.leader.election.enable=false` is the default. Enable it per topic only where uptime beats completeness, such as metrics or sampled clickstream. Never for payments, orders, or ledgers.
+
+</QA>
+
+<QA q="What is the high watermark, and how is it different from the log end offset?" level="medium">
+
+- **LEO**: the offset of the next record to be appended in one particular replica. Every replica has its own.
+- **High watermark**: the lowest LEO across the ISR, meaning the highest offset that every in-sync replica has. Records below it are committed.
+
+Consumers can only read below the HW. If they could read above it, a leader failover to a follower that lacked those records would make data a consumer had already seen disappear. Followers learn the HW through fetch responses, so it reaches them one round late.
+
+</QA>
+
+<QA q="How does Kafka store a partition on disk?" level="medium">
+
+As a directory of **segments**. Each segment is a `.log` file of record batches plus a sparse `.index` (offset → byte position) and a `.timeindex` (timestamp → offset). Only the active segment is appended to; it rolls over at `segment.bytes` (1 GiB) or `segment.ms`. Closed segments are immutable, and retention deletes whole segments. To look up an offset, Kafka binary-searches the memory-mapped index, then scans forward a few KB in the log file.
+
+</QA>
+
+<QA q="Why is Kafka so fast despite writing everything to disk?" level="medium">
+
+1. **Append-only sequential I/O**: no random writes, and consumers reading the tail read sequentially too.
+2. **OS page cache instead of a cache on the heap**: recent data is served from RAM, and the small JVM heap keeps garbage-collection pauses short.
+3. **Zero-copy `sendfile`**: page cache → network card with no copies through user space (only without TLS).
+4. **The same batch format for producer, broker, and consumer**: compressed batches are stored and served as is.
+5. **Batching and compression** everywhere, and **partitions** spread load across brokers and disks.
+
+</QA>
+
+<QA q="What is a leader epoch and what problem did it fix?" level="hard">
+
+A counter that goes up by one each time a partition gets a new leader, recorded together with the offset where that epoch began. Before KIP-101, a recovering follower truncated its log to its own high watermark. Because the HW reaches followers one round late, back-to-back failures could cause data loss or replicas holding different records at the same offset. With epochs, the recovering replica asks the leader "where does my last epoch end in your log?" and truncates exactly where the logs diverge. Replicas are guaranteed to converge to identical logs without losing committed records, the same idea as Raft terms.
+
+</QA>
+
+<QA q="How should you handle very large messages in Kafka?" level="medium">
+
+The default limit is about 1 MB (`message.max.bytes`, `max.request.size`, consumer fetch limits). Raising it hurts the page cache, replication, and memory use. Prefer:
+
+1. **Claim check**: store the blob in S3 or GCS and publish a small event with the URI and checksum.
+2. **Compression** (zstd or lz4) for payloads that compress well.
+3. **Chunking** only as a last resort, because reassembly, ordering, and partial failures are painful.
+
+Kafka is a log of facts, not a blob store.
+
+</QA>
+
+<QA q="How does a client find out which broker leads a partition?" level="medium">
+
+It connects to any broker in `bootstrap.servers` and sends a **Metadata request**. The response lists every broker and every partition's leader. The client then connects straight to the leaders; there's no proxy. When leadership moves it gets `NOT_LEADER_OR_FOLLOWER`, refreshes metadata, and retries. The broker hands out the addresses in `advertised.listeners`, so a wrong value (such as `localhost` inside Docker) causes the classic "connects to bootstrap, then times out" bug.
+
+</QA>
+
+<QA q="What are Kafka quotas and why do multi-tenant clusters need them?" level="medium">
+
+Per-user and per-client-id limits on produce and fetch bytes per second, on the share of broker request-handler time a client may use, and on how fast clients can create or delete topics and partitions. When a client goes over a byte-rate or request quota, the broker **delays responses** instead of returning errors, so clients slow down without any code changes. (Controller mutation quotas instead reject the request with a throttling error.) On a shared, org-wide cluster, quotas keep one team's backfill or a misconfigured client (for example, one flooding the cluster with metadata requests) from starving latency-sensitive production traffic.
+
+</QA>
+
+<QA q="Walk through everything that happens when a producer sends one record." level="hard">
+
+1. `send()` → serialize → interceptors → the partitioner chooses a partition.
+2. The record is appended to that partition's open batch in the `RecordAccumulator`.
+3. The sender thread drains batches that are ready (full, or `linger.ms` has passed), groups them by leader, and sends ProduceRequests, with up to `max.in.flight.requests.per.connection` unacknowledged at once.
+4. The leader validates the batch (CRC, size, idempotent sequence number, quota) and appends it to the active segment.
+5. With `acks=all`, the request waits ("purgatory") until every ISR follower has fetched past it, then the HW advances.
+6. The leader responds, and the producer completes the callback. Retriable errors are retried within `delivery.timeout.ms`, and idempotence makes the retries safe.
+7. Consumers can read the record once the HW has passed its offset.
+
+</QA>
+
+<QA q='RF=3, `acks=all`, `min.insync.replicas=2`. Two brokers die. What happens to producers and consumers?' level="scenario">
+
+The ISR drops to 1, which is below the minimum, so `acks=all` producers get `NotEnoughReplicasException` (and keep retrying until `delivery.timeout.ms` runs out). Consumers can still read everything below the HW from the surviving replica. That's intended: Kafka refuses writes that would exist on only one disk. Recovery means bringing a broker back so the ISR is 2 or more again. Don't fix it by lowering `min.insync.replicas` unless the business accepts single-copy durability for that window.
+
+</QA>
+
+<QA q="Your producers can reach the bootstrap broker but every send times out from outside Kubernetes. What is the likely cause?" level="scenario">
+
+`advertised.listeners`. The bootstrap connection works, but the metadata response gives the client the brokers' *advertised* addresses, which are probably pod-internal hostnames or `localhost`. The client then tries to connect to addresses it can't reach. Fix: set up a dedicated external listener whose advertised host and port can be reached from outside (a LoadBalancer or NodePort per broker), and keep the internal listener for traffic between brokers.
+
+</QA>
+
+<QA q="Why doesn't Kafka cache records in the JVM heap, and what does that mean for sizing a broker?" level="hard">
+
+The OS page cache already caches file data. A second cache on the heap would double memory use, add garbage-collection pressure (pauses of multiple seconds on huge heaps would knock replicas out of the ISR), and be cleared on every restart, whereas the page cache survives a process restart. So: keep the broker heap modest (around 4–8 GB) and leave the rest of the RAM to the kernel. As a rule, size RAM so that the data written in the window your slowest regular consumers lag behind fits in the page cache. Then most reads never touch disk.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="Leader LEO is 8, follower A has LEO 6, follower B has LEO 7, and all three are in the ISR. Up to which offset can consumers read?" options={["Offset 7", "Offset 5 (high watermark is 6)", "Offset 6", "Offset 8"]} answer={1}>
+
+The high watermark is the lowest LEO across the ISR, min(8, 6, 7) = 6, and consumers only see records below it, so offsets 0 to 5. Reading 6 or 7 would expose records that a failover to follower A would erase.
+
+</MCQ>
+
+<MCQ q="RF=3, acks=all, min.insync.replicas=2. Two of the three replicas go down. What happens to writes?" options={["They succeed with a single copy", "They are buffered by the controller", "They are rejected with NotEnoughReplicasException; reads of committed data still work", "Unclean leader election is triggered automatically"]} answer={2}>
+
+The ISR has shrunk to 1, below the minimum of 2, so Kafka refuses acks=all writes and favours consistency. The controller does not buffer data, and unclean election is off by default and only matters when no ISR replica is left.
+
+</MCQ>
+
+<MCQ q="Why can acks=all alone still mean only one durable copy?" options={["acks=all only waits for the current ISR, which can shrink to just the leader if min.insync.replicas is 1", "acks=all is ignored when idempotence is on", "Followers never write to disk", "acks=all only applies to compacted topics"]} answer={0}>
+
+acks=all means every current ISR member; without a min.insync.replicas floor of 2 or more, a leader-only ISR satisfies it. The other options are false.
+
+</MCQ>
+
+<MCQ q="What is the main risk of enabling unclean.leader.election.enable?" options={["Slower producer batching", "Higher JVM heap usage", "Consumers can no longer use offsetsForTimes", "An out-of-sync replica becomes leader and acknowledged records it never received are lost"]} answer={3}>
+
+Promoting a lagging replica restores availability but discards everything it lacked, and the old leader truncates to match when it returns. It has nothing to do with batching, heap size or time lookups.
+
+</MCQ>
+
+<MCQ q="What problem did leader epochs (KIP-101) fix?" options={["Slow consumer rebalances", "Replica divergence or committed-data loss when followers truncated to a stale high watermark during back-to-back failures", "Large-message handling", "ZooKeeper session expiry"]} answer={1}>
+
+Truncating to the lagging high watermark could leave replicas with different records at the same offset or drop committed data. Epochs let a recovering replica ask the leader exactly where its last epoch ends and truncate there.
+
+</MCQ>
+
+<MCQ q="Why does Kafka rely on the OS page cache rather than an in-heap record cache?" options={["The JVM cannot read files", "The page cache is encrypted", "It avoids double caching and GC pressure, and the cache survives a broker process restart", "Heap caches are forbidden by the Kafka license"]} answer={2}>
+
+A heap cache would duplicate data the kernel already caches, cause GC pauses that can drop replicas from the ISR, and be lost on restart. That is why brokers keep a modest heap and leave RAM to the kernel.
+
+</MCQ>
+
+<MCQ q="Clients reach the bootstrap broker but every produce times out from outside Kubernetes. What is the most likely cause?" options={["Wrong advertised.listeners: the metadata response hands out internal hostnames clients cannot reach", "min.insync.replicas is too high", "linger.ms is set to 0", "Segment size is too small"]} answer={0}>
+
+Clients bootstrap, then connect directly to the advertised leader addresses; internal or localhost addresses fail from outside. The other settings would not cause bootstrap-succeeds-then-timeout behaviour.
+
+</MCQ>
+
+<MCQ q="How does a broker enforce client quotas when a client exceeds its byte-rate limit?" options={["It returns a QuotaExceeded error and drops the request", "It disconnects the client permanently", "It silently drops records", "It delays the response by a computed throttle time so the client slows down"]} answer={3}>
+
+Quota violations are handled by throttling: the broker delays responses (and mutes the channel), visible as throttle-time metrics on the client. No data is dropped and no error is returned.
+
+</MCQ>
+
+<MCQ q="How does Kafka locate offset N inside a partition on disk?" options={["A full scan of every segment", "Binary search in the sparse, memory-mapped offset index of the right segment, then a short forward scan in the .log file", "A lookup in ZooKeeper", "A B-tree stored in __consumer_offsets"]} answer={1}>
+
+Each segment has a sparse .index mapping offsets to byte positions, roughly every index.interval.bytes (4 KiB). Kafka finds the nearest entry at or below N and scans forward a little. Metadata stores and the offsets topic are not involved.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- Partition = replicated log; **leader** takes writes, **followers** fetch; **ISR** = caught-up set.
+- Committed = on all ISR members; **HW** = lowest LEO across the ISR; consumers read only below the HW.
+- **RF=3 + `min.insync.replicas=2` + `acks=all`** = survives one broker loss with no acked-data loss.
+- ISR below the minimum → writes rejected (consistency over availability).
+- **Unclean election**: off by default; turning it on trades data loss for uptime.
+- **KRaft**: Raft-replicated `__cluster_metadata`, instant controller failover, ZooKeeper gone in 4.0.
+- **Leader epochs** (KIP-101): truncate exactly where logs diverge, not at the HW.
+- Storage = append-only **segments** + sparse offset and time indexes; speed = sequential I/O + page cache + zero-copy + batches.
+- Large payloads → **claim check**.
+- Clients bootstrap → Metadata request → talk straight to leaders; get **`advertised.listeners`** right.
+- **Byte-rate and request quotas** throttle by delaying responses, not by returning errors.
+
+## Go deeper
+
+- **Apache Kafka docs**: [Design: replication, persistence, efficiency](https://kafka.apache.org/documentation/#design).
+- **KIP-101**: [Alter replication protocol to use leader epoch](https://cwiki.apache.org/confluence/display/KAFKA/KIP-101+-+Alter+Replication+Protocol+to+use+Leader+Epoch+rather+than+High+Watermark+for+Truncation).
+- **KIP-500**: [Replace ZooKeeper with a self-managed metadata quorum](https://cwiki.apache.org/confluence/display/KAFKA/KIP-500%3A+Replace+ZooKeeper+with+a+Self-Managed+Metadata+Quorum).
+- **KIP-392**: [Allow consumers to fetch from the closest replica](https://cwiki.apache.org/confluence/display/KAFKA/KIP-392%3A+Allow+consumers+to+fetch+from+closest+replica).
+- **Book**: *Kafka: The Definitive Guide*, 2nd ed., chapters on reliability and internals.
+- **DDIA** (Kleppmann), Chapters 5 (Replication) and 9 (Consistency and Consensus).

@@ -1,0 +1,329 @@
+---
+title: "Kafka Interview Scenarios: Debug, Design, Defend"
+phase: "04-messaging-kafka"
+order: 41
+tags: ["messaging"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 25
+prerequisites: ["kafka-deep", "kafka-consumer-rebalancing", "kafka-transactions-eos"]
+summary: "The capstone for the messaging phase — production-style Kafka scenarios with a repeatable way to reason through them."
+---
+
+## Definition (interview-ready)
+
+A **scenario question** gives you a symptom ("lag is climbing", "ordering broke", "we lost messages") or a fuzzy requirement ("guaranteed within 5 seconds") and grades **how you reason**, not whether you recall a config name. Strong answers have the same shape every time: clarify, find the failure domain, fix the immediate problem, then prevent it from coming back. This page is a drill set — read the framework, then work through the questions out loud before revealing each answer.
+
+**One-liner:** A Kafka scenario question gives you a symptom or a vague requirement and tests how you reason: clarify the problem, locate the failing stage (producer, broker, consumer or sink) with evidence, fix the immediate issue, then prevent it from recurring with a design change and an alert.
+
+## Why it matters
+
+Senior backend interviews (and real on-call rotations) are dominated by these questions. They test whether you know *where* Kafka can lose, duplicate or reorder data — and whether you can trade off durability, latency and complexity in front of someone who will push back. Every scenario here builds on concepts from earlier notes in this phase: [Kafka core](/learn/notes/kafka-deep/), [internals](/learn/notes/kafka-internals/), [producer](/learn/notes/kafka-producer/), [consumers & rebalancing](/learn/notes/kafka-consumer-rebalancing/), [delivery semantics](/learn/notes/delivery-semantics/), [transactions](/learn/notes/kafka-transactions-eos/) and [operations](/learn/notes/kafka-operations-tuning/).
+
+## Core concepts
+
+### A framework for scenario answers
+
+```
+1. CLARIFY     What exactly is the symptom? Since when? All partitions or some?
+               What changed (deploy, traffic, config, broker)? What's the business impact?
+2. LOCATE      Which failure domain? producer → broker/replication → consumer → downstream sink
+               Use evidence: per-partition lag, URP, error rates, rebalance logs, DLQ depth.
+3. FIX NOW     Stop the bleeding with the smallest safe action (pause, roll back, scale, skip to DLQ).
+4. PREVENT     Config, design or monitoring change so it can't recur silently. Name the alert.
+```
+
+Two habits separate strong candidates: **narrow the scope with data before proposing fixes** ("is it one partition or all?" eliminates half the hypotheses), and **state the trade-off you're making** ("this restores availability at the cost of possible duplicates, which the consumer already dedupes").
+
+### Where messages get lost, duplicated or reordered
+
+| Stage | Lost when… | Duplicated when… | Reordered when… |
+|---|---|---|---|
+| Producer app | Fire-and-forget send with ignored callback; process exits without `flush()`/`close()`; `delivery.timeout.ms` expires and the error is swallowed | App-level resend after an ambiguous timeout; producer restart without transactions | Retries with idempotence off and more than one in-flight request |
+| Replication | `acks=0/1` and leader dies before followers copy; `min.insync.replicas=1`; unclean leader election | — | — |
+| Retention | Consumer lag exceeds retention, and `auto.offset.reset=latest` silently skips ahead | — | — |
+| Partitioning | — | — | Partition count changed on a keyed topic; key choice changed in a deploy |
+| Consumer | Offset committed before processing (auto-commit with async work); swallowed exceptions | Crash or rebalance after processing but before commit; revoked partitions not committed | Parallel processing of a batch without key-sharding; non-blocking retry topics |
+| Sink / side effects | Write errors ignored | Non-idempotent writes or external calls replayed | Out-of-order upserts without version checks |
+
+## How it works (how to drill with this page)
+
+1. Read the question, set a 3-minute timer, and answer **out loud** using the four-step framework.
+2. Reveal the answer and compare: did you clarify, locate with evidence, fix, *and* prevent?
+3. For every gap, jump back to the linked note and re-read that section.
+
+## Common pitfalls
+
+- **Jumping to "add more consumers"** without checking whether you're already at the partition ceiling or whether the sink is the bottleneck.
+- **Fixing duplicates by committing earlier** — that converts duplicates into data loss.
+- **Promising absolutes** ("guaranteed within 5s") instead of SLOs with monitoring and a degradation story.
+- **Forgetting side effects during replays** — reprocessing re-sends emails and re-charges cards unless you guard them.
+- **No prevention step** — an answer without an alert or a design change is half an answer.
+
+## Practice questions
+
+<Practice>
+
+<QA q="After adding partitions to a keyed topic, per-entity ordering broke. Why, and how do you fix it?" level="scenario">
+
+**Why**: the default partitioner computes `murmur2(key) % numPartitions`. Changing N remaps most keys. Older events for key K sit in, say, partition 2 while new ones land in partition 5. Those partitions are consumed independently, so a new event can be processed before an older one — ordering breaks across the change.
+
+**Fix / mitigate**:
+- **Drain then switch**: pause producers, let consumers fully catch up on the old layout, then resume with the new count — a clean boundary for a short pause.
+- **Migrate to a new topic** (`orders-v2`) with the target partition count: replay or dual-write in key order, then cut consumers over at a coordinated point.
+- **Version-aware consumers**: per-entity sequence numbers; buffer or reject out-of-order events briefly.
+
+**Prevent**: over-provision partitions for keyed topics up front and treat their count as immutable; require a migration runbook for changes.
+
+</QA>
+
+<QA q="A consumer processes a message, writes to the DB, then crashes before committing the offset. What happens, and how do you make it safe?" level="scenario">
+
+The committed offset still points at that record, so after restart or rebalance it's **delivered again** and the DB write runs twice — the standard at-least-once duplicate.
+
+Make it safe:
+- **Idempotent write**: upsert keyed by the business/event ID, or `INSERT ... ON CONFLICT DO NOTHING` on a unique constraint.
+- **Dedupe table**: insert the event ID into `processed_events` (unique) **in the same DB transaction** as the effect; a redelivery hits the constraint and is skipped.
+- **Store offsets in the DB**: save `(topic, partition, offset)` in the same transaction as the state change; on startup `seek()` to the stored offsets — offset and effect become atomic.
+
+Never "fix" this by committing before processing — that trades duplicates for data loss.
+
+</QA>
+
+<QA q="One partition carries 10x the traffic of the others. Diagnose and fix the hot partition." level="scenario">
+
+**Diagnose**: per-partition bytes-in, messages-in and consumer lag show the skew. Root cause is nearly always a **hot key** — one huge tenant, a celebrity user, or a degenerate key like `UNKNOWN`, `null`-defaulted IDs, or a low-cardinality field (country, status).
+
+**Fix**:
+- **Fix degenerate keys**: key on the true entity ID, not a low-cardinality attribute.
+- **Salted / composite keys**: `entityId + '-' + (hash(subId) % k)` spreads one entity over k partitions — only if strict per-entity order isn't needed (or can be restored downstream with sequence numbers).
+- **Dedicated lane**: route whale tenants to their own topic and consumers.
+- **Pre-aggregate** at the producer to cut the hot key's message rate.
+- Short term, give the consumer that owns the hot partition more resources — adding group members can't split one partition.
+
+</QA>
+
+<QA q="You fixed a bug in a consumer and need to reprocess the last 7 days of events. How do you do it safely?" level="scenario">
+
+1. **Check retention** covers 7 days (`retention.ms`, and tiered storage if used). If not, replay from an archive (e.g. S3 sink) instead.
+2. **Choose a mechanism**:
+   - *Reset the same group*: stop **all** members (resets fail on active groups), `kafka-consumer-groups.sh --reset-offsets --to-datetime ... --execute`, restart.
+   - *Parallel replay group*: deploy the fixed consumer with a **new `group.id`** starting at the timestamp; the live path keeps running. Usually safer.
+3. **Guard side effects**: replay re-executes everything. Make sure writes are idempotent; disable non-idempotent effects (emails, charges, webhooks) during the replay.
+4. **Throttle and watch**: replay competes for broker I/O and sink capacity — watch other groups' lag and the DB.
+5. **Reconcile**: compare counts/checksums of expected vs produced output before declaring done.
+
+</QA>
+
+<QA q="A rolling deploy of a 50-instance consumer group causes minutes of processing stalls. Fix it." level="scenario">
+
+Each pod restart is a leave + join. With the eager protocol every membership change is stop-the-world for the whole group: 50 pods × 2 rebalances = a storm.
+
+Combine:
+- **CooperativeStickyAssignor** — incremental rebalancing; untouched partitions keep flowing. (On Kafka 4.0+ clients and brokers, the KIP-848 protocol, `group.protocol=consumer`, gives broker-driven incremental rebalances out of the box.)
+- **Static membership**: `group.instance.id` per pod (e.g. StatefulSet ordinal) plus `session.timeout.ms` of a few minutes — a pod that returns in time reclaims its partitions with **no rebalance**.
+- **Graceful shutdown**: on SIGTERM stop polling, finish the in-flight batch, commit, `close()`.
+- **Slower rollout**: `maxUnavailable=1` and readiness gates so membership changes don't overlap.
+- Check `max.poll.interval.ms` isn't ejecting slow cold-starting pods; warm caches before subscribing.
+
+</QA>
+
+<QA q="Product asks for 'guaranteed delivery within 5 seconds' for order events. What do you push back on, and what do you build?" level="scenario">
+
+**Push back**: 'guaranteed' and 'within 5s' are different promises. No loss (durability) can be engineered. A hard latency bound cannot — broker failover, rebalances and downstream outages will occasionally exceed it. Offer a **p99 latency SLO** with monitoring and an explicit plan for late events.
+
+**Build**:
+- **Durability**: outbox at the source, idempotent producer, `acks=all`, RF=3, `min.insync.replicas=2`.
+- **Latency**: small `linger.ms` (0–5), enough partitions and consumers, no blocking calls in the poll loop, cooperative rebalancing + static membership to shrink stalls.
+- **Measure**: histogram of event-time → processed-time; alert on p99 above 5s and on lag in seconds.
+- **Degradation**: agree what happens past 5s — usually late is fine; if not, define a fallback.
+
+</QA>
+
+<QA q="You suspect messages are lost between producer and consumer. List every place loss can happen and the fix." level="scenario">
+
+1. **Fire-and-forget producer** ignoring the future/callback → handle errors, alert on `record-error-rate`.
+2. **`acks=0` or `acks=1`** with leader failure before replication → `acks=all`, `min.insync.replicas=2`, RF=3.
+3. **Unflushed buffer on shutdown** → shutdown hook calling `flush()`/`close()`.
+4. **`delivery.timeout.ms` exhausted** during a long outage, error ignored → fallback persistence plus alerting.
+5. **Unclean leader election** → keep `unclean.leader.election.enable=false`.
+6. **Retention expiry before consumption** with `auto.offset.reset=latest` silently jumping → retention well beyond worst-case lag, lag-vs-retention alert, `auto.offset.reset=none` for critical apps so they fail loudly.
+7. **Commit before processing** (auto-commit + async work) → commit after processing.
+8. **Swallowed exceptions** in the handler → error discipline plus DLQ.
+
+Then **prove it** with end-to-end reconciliation — counts or checksums per hour between source and sink.
+
+</QA>
+
+<QA q="Design the event backbone for an e-commerce order flow: order, payment, inventory, shipping, notification." level="scenario">
+
+- **Topics** per domain, keyed by `orderId`: `orders.events`, `payments.events`, `inventory.events`, `shipping.events`; event type in a header. RF=3, `min.insync.replicas=2`, partitions sized for peak with headroom (e.g. 24–48), 7–30 days retention, Schema Registry with BACKWARD compatibility.
+- **Flow (choreographed saga)**: OrderService writes order + outbox atomically → `OrderCreated`. Payment charges with idempotency key `orderId` → `PaymentCaptured`/`PaymentFailed`. Inventory reserves on capture → `StockReserved`/`OutOfStock`. Failures trigger compensations (refund, release). Shipping and Notification subscribe with their own groups.
+- **Reliability**: every consumer dedupes on event ID; bounded retries → per-consumer DLQ with replay tooling; saga deadlines so nothing sits in PENDING forever.
+- **Cross-cutting**: `orderId` as correlation ID in headers + tracing; lag and DLQ-depth alerts; an order-status CQRS projection for the UI with optimistic UI on placement.
+
+See [Architecture Patterns with Kafka](/learn/notes/kafka-architecture-patterns/).
+
+</QA>
+
+<QA q="After a deploy, a consumer is stuck: lag climbs on every partition and the logs show repeated deserialization errors. What happened and what do you do?" level="scenario">
+
+**Likely cause**: a producer started writing a new format (schema change, JSON → Avro, a missing magic byte) or the consumer was deployed with the wrong deserializer. A record that can't be deserialized throws *before* your handler runs; without handling, the consumer retries the same offset forever — a **poison pill** on every partition that received the new format.
+
+**Now**: roll back whichever side changed. If the bad records must be skipped, route them to a DLQ (or `seek()` past specific offsets) after capturing them for analysis.
+
+**Prevent**:
+- Wrap deserialization (`ErrorHandlingDeserializer` in Spring Kafka, or read bytes and parse in a try/catch) so failures go to a DLQ with error headers.
+- Schema Registry with compatibility enforced at **registration**, so incompatible producers fail at deploy time.
+- Contract tests in CI between producer schemas and consumer readers.
+
+</QA>
+
+<QA q="Under peak load, ISR keeps shrinking and expanding and producers using acks=all see latency spikes and NotEnoughReplicas errors. Diagnose." level="scenario">
+
+Followers are falling more than `replica.lag.time.max.ms` behind, get dropped from the ISR, catch up, and rejoin (flapping). With `acks=all` every write waits on the slowest ISR member; when ISR drops below `min.insync.replicas`, writes are rejected.
+
+Check:
+- **Broker resources**: disk I/O saturation or slow disks on the lagging followers, GC pauses, network saturation (replication shares the NIC with clients).
+- **Replication capacity**: `num.replica.fetchers` too low for the partition count; increase it.
+- **Leader skew**: leadership concentrated on a few brokers after restarts → run preferred leader election / rebalance (Cruise Control).
+- **Noisy neighbours**: a backfill job hammering the cluster → client quotas.
+- **Hot partitions**: one partition's followers can't keep up with its write rate.
+
+Prevent: alert on `UnderReplicatedPartitions` greater than 0 and on ISR shrink rate, capacity-plan with replication traffic included (RF=3 means 2x extra inbound per broker).
+
+</QA>
+
+<QA q="A compacted topic used for latest-state keeps growing on disk even though the key count is stable. Why?" level="scenario">
+
+Compaction isn't instant or complete:
+- The **active segment is never compacted**; with a large `segment.bytes` or low traffic it stays active for a long time. Lower `segment.ms`/`segment.bytes` for state topics.
+- The cleaner only runs when the dirty ratio exceeds `min.cleanable.dirty.ratio` (default 0.5); and `min.compaction.lag.ms` may hold records back.
+- **Tombstones** stay for `delete.retention.ms` before removal; heavy deletes inflate size.
+- The **log cleaner thread may have died** (e.g. an exception or insufficient `log.cleaner.dedupe.buffer.size`) — check broker logs and the cleaner metrics (`max-dirty-percent`, time since last run).
+- Or keys are not as stable as believed (e.g. a timestamp leaked into the key).
+
+</QA>
+
+<QA q="Consumers configured with read_committed stopped making progress on one partition, while read_uncommitted consumers are fine. What's going on?" level="scenario">
+
+`read_committed` consumers can only read up to the **Last Stable Offset** — the first offset of the oldest still-open transaction. A producer has an **open transaction** on that partition (a hung or zombie transactional producer, or a very long transaction), so the LSO is pinned and everything behind it, even committed data from other producers, is invisible.
+
+Fix: find the transactional producer and restart or fence it; for an ordinary open transaction the coordinator aborts it after `transaction.timeout.ms`. A truly *hanging* transaction (one the coordinator has lost track of) never times out — use `kafka-transactions.sh` (KIP-664, Kafka 3.0+) to `find-hanging` and `abort` it. Prevent: keep transactions short, set a sensible `transaction.timeout.ms`, and monitor the LSO lag, not just log-end lag, for `read_committed` groups. See [Kafka Transactions & EOS](/learn/notes/kafka-transactions-eos/).
+
+</QA>
+
+<QA q="The DLQ has been growing quietly for two weeks and nobody noticed. What went wrong, and how should DLQs be run?" level="scenario">
+
+A DLQ without ownership is a black hole: the pipeline looks healthy because the main topic moves, while data is silently diverted.
+
+Run DLQs as a product:
+- **Alert** on DLQ inflow rate and depth, with an owner and a runbook.
+- **Enrich** each DLQ record with headers: original topic/partition/offset, exception class and message, attempt count, timestamp.
+- **Classify**: transient errors should have been retried (fix retry policy); permanent ones need a code or data fix.
+- **Replay tooling**: inspect, fix, and re-publish to the source topic (idempotent consumers make this safe).
+- Track a **DLQ budget** (e.g. under 0.01% of traffic) as an SLO.
+
+</QA>
+
+<QA q="Your primary region's Kafka cluster fails and you fail over to the DR cluster replicated by MirrorMaker 2. What problems do consumers face?" level="scenario">
+
+- **Offsets differ between clusters**: the same record has different offsets in the target. MM2 emits checkpoints and can **translate committed group offsets** (and sync them to the target with `sync.group.offsets.enabled`); consumers must start from translated offsets, not raw ones.
+- **Replication is asynchronous**, so RPO > 0: the last few seconds of data may never have reached DR — expect **some loss and some duplicates** around the cut point. Consumers must be idempotent.
+- **Topic naming**: by default remote topics are prefixed (`primary.orders`); consumers must subscribe to the right names.
+- **Failback** is its own project — data written in DR must flow back.
+
+Prevent surprises with regular DR drills, documented RPO/RTO, and monitoring replication lag.
+
+</QA>
+
+<QA q="Latency on a consumer group jumped from milliseconds to seconds right after enabling producer transactions upstream. Why?" level="scenario">
+
+`read_committed` consumers can only see records once their transaction **commits**. If the producer commits every N records or every few seconds — or Kafka Streams with EOS commits every `commit.interval.ms` — end-to-end latency is now bounded below by that commit interval. Long transactions also pin the LSO.
+
+Fix: commit more frequently (smaller transactions, shorter commit interval — at some throughput cost), or reconsider whether transactions are needed. If the sink is external, at-least-once plus idempotent writes often gives the same correctness without the latency.
+
+</QA>
+
+<QA q="A new consumer group was deployed and processed only new messages, but the team expected it to read the full history. Why?" level="scenario">
+
+`auto.offset.reset` only applies when the group has **no committed offset** — and the default is `latest`. A brand-new group therefore starts at the end of the log. To bootstrap from history, set `auto.offset.reset=earliest` before the first start (or reset the group's offsets with `--to-earliest` while it's stopped), and confirm retention still holds the history you need.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="After partitions were added to a keyed topic, per-entity ordering broke. Why?" options={["New partitions have no leader for the first hour", "The default partitioner hashes the key modulo the partition count, so most keys now map to different partitions", "Consumers reset to `latest` when partitions are added", "Idempotence is disabled when partition counts change"]} answer={1}>
+
+The default partitioner computes murmur2 of the key modulo N. Changing N remaps keys, so older events sit in one partition and newer ones in another, and the two are consumed independently.
+
+</MCQ>
+
+<MCQ q="A consumer writes to the DB, then crashes before committing its offset. What is the right fix for the resulting duplicate?" options={["Commit the offset before processing", "Enable `read_committed` on the consumer", "Make the write idempotent, or store offsets in the DB in the same transaction", "Increase `session.timeout.ms`"]} answer={2}>
+
+Redelivery after a crash is normal at-least-once behaviour. Idempotent upserts, a dedup table, or offsets stored atomically with the state change make it harmless. Committing first converts duplicates into data loss.
+
+</MCQ>
+
+<MCQ q="A brand-new consumer group processed only new messages, but the team expected full history. What is the cause?" options={["`auto.offset.reset` defaults to `latest`, and it applies because the group has no committed offset", "The topic's retention was too short", "Static membership skipped the old records", "`read_committed` hides older records"]} answer={0}>
+
+With no committed offset, the group falls back to `auto.offset.reset`, whose default is `latest`. Set it to `earliest` before the first start, or reset offsets while the group is stopped, and confirm retention still holds the history.
+
+</MCQ>
+
+<MCQ q="`read_committed` consumers are stuck on one partition while `read_uncommitted` consumers are fine. What is the most likely cause?" options={["The partition's leader is offline", "The consumer group is rebalancing", "Log compaction is running on the partition", "An open or hanging transaction is pinning the Last Stable Offset"]} answer={3}>
+
+`read_committed` readers cannot pass the first offset of the oldest open transaction. An ordinary open transaction is aborted after `transaction.timeout.ms`; a hanging one needs `kafka-transactions.sh` (Kafka 3.0+) to find and abort it.
+
+</MCQ>
+
+<MCQ q="A rolling deploy of 50 consumer pods causes minutes of stalls. Which combination helps most?" options={["Raise `max.poll.records` and lower `session.timeout.ms`", "Cooperative rebalancing plus static membership with `group.instance.id` and graceful shutdown", "Add more partitions and restart all pods at once", "Switch to `acks=0` during deploys"]} answer={1}>
+
+Incremental rebalancing keeps untouched partitions flowing, static membership lets a returning pod reclaim its partitions without a rebalance, and graceful shutdown commits before leaving. On Kafka 4.0+ the KIP-848 consumer protocol also gives incremental, broker-driven rebalances.
+
+</MCQ>
+
+<MCQ q="ISR flaps under peak load and `acks=all` producers see `NotEnoughReplicas`. What does that error mean?" options={["The topic's replication factor is below 3", "The producer's idempotence sequence is out of order", "The in-sync replica count dropped below `min.insync.replicas`, so the broker refuses the write", "The consumer group has fewer members than partitions"]} answer={2}>
+
+Followers fall behind by more than `replica.lag.time.max.ms`, leave the ISR, then rejoin. When the ISR shrinks below `min.insync.replicas`, writes with `acks=all` are rejected by design. Fix the slow brokers or disks; don't lower the floor.
+
+</MCQ>
+
+<MCQ q="A compacted latest-state topic keeps growing although the key count is stable. Which is a valid explanation?" options={["The active segment is never compacted, and a large segment with low traffic stays active for a long time", "Compaction deletes all records older than `retention.ms`", "Tombstones are removed immediately, which adds new segments", "Compaction only runs when consumers are idle"]} answer={0}>
+
+The log cleaner never touches the active segment, only runs once the dirty ratio passes `min.cleanable.dirty.ratio` (default 0.5), and keeps tombstones for `delete.retention.ms`. A dead cleaner thread or unstable keys can also explain the growth.
+
+</MCQ>
+
+<MCQ q="Product asks for 'guaranteed delivery within 5 seconds'. What is the best response?" options={["Accept it and set `linger.ms` to 0", "Refuse; Kafka cannot deliver in under 5 seconds", "Promise it, as long as `acks=all` is set", "Separate durability, which can be engineered, from a p99 latency SLO with monitoring and a plan for late events"]} answer={3}>
+
+No-loss delivery can be built with outbox, idempotent producer, `acks=all`, RF=3 and min ISR 2. A hard latency bound cannot be guaranteed through failovers and rebalances, so offer a p99 SLO, alerts on it, and an agreed degradation path.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- Answer shape: **clarify → locate (with evidence) → fix now → prevent (with an alert)**.
+- First question for any lag/throughput issue: **one partition or all?**
+- Ordering breaks: partition-count changes, key changes, unkeyed parallelism, retry topics.
+- Loss: fire-and-forget, weak acks, unflushed buffers, unclean election, retention vs lag, early commits, swallowed errors.
+- Duplicates: retries, rebalances, crashes before commit, replays — cure with idempotency, never by committing earlier.
+- Deploy pain: cooperative assignor + static membership + graceful shutdown.
+- `read_committed` stalls = an open transaction pinning the LSO.
+- DR: async replication means RPO > 0 and translated offsets.
+- Never promise absolutes; offer SLOs, monitoring and a degradation plan.
+
+## Go deeper
+
+- **Kafka docs**: [kafka.apache.org/documentation](https://kafka.apache.org/documentation/) — operations, replication, and consumer configuration sections.
+- **Confluent docs**: [docs.confluent.io](https://docs.confluent.io/) — monitoring, MirrorMaker 2 / Cluster Linking, transactions.
+- **Kafka: The Definitive Guide** (2nd ed.) — chapters on reliable delivery, administration and monitoring.
+- **KIP-345** — [Static membership](https://cwiki.apache.org/confluence/display/KAFKA/KIP-345%3A+Introduce+static+membership+protocol+to+reduce+consumer+rebalances).
+- **KIP-429** — [Incremental cooperative rebalancing](https://cwiki.apache.org/confluence/display/KAFKA/KIP-429%3A+Kafka+Consumer+Incremental+Rebalance+Protocol).
+- **DDIA** (Kleppmann), Chapter 11 — Stream Processing.

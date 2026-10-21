@@ -1,7 +1,7 @@
 ---
 title: "Sharding Strategies: Range, Hash, Geo, Directory"
 phase: "06-hld-patterns"
-order: 31
+order: 54
 tags: ["hashing", "sharding"]
 premium: false
 previewParagraphs: 4
@@ -12,6 +12,8 @@ prerequisites: []
 ## Definition (interview-ready)
 
 **Sharding** splits a dataset across N nodes so each holds a subset, enabling horizontal scaling of writes and storage. The **shard key** + **strategy** determines placement: **range** (keys in adjacent ranges live together), **hash** (hash(key) % N), **geo** (by user/data location), or **directory** (a lookup service maps key → shard).
+
+**One-liner:** Sharding splits data across nodes by a shard key so writes and storage scale horizontally; range keeps neighbours together for scans but risks hot spots, hash spreads load evenly but loses range scans, and the shard key should be high-cardinality and present in most queries.
 
 ## Why it matters
 
@@ -42,7 +44,7 @@ Cons:
 - **Hot shards** when load is uneven by range. The classic killer: monotonic IDs → "latest" shard takes all writes.
 - Split heuristics matter — bad split = unbalanced shards.
 
-Used by: HBase, MongoDB (default ranged sharding), CockroachDB (per-range Raft), DynamoDB (in some cases).
+Used by: HBase, MongoDB (default ranged sharding), CockroachDB (per-range Raft), DynamoDB only inside one partition key (its items are stored sorted by sort key; the partition key itself is hashed).
 
 ### Hash partitioning
 
@@ -66,7 +68,7 @@ Used by: Cassandra (Murmur3), DynamoDB (default), Riak.
 
 Special hash strategy that minimizes remapping on shard add/remove. Place both keys and nodes on a ring; key goes to next node clockwise. Adding a node only moves ~1/N keys.
 
-Combined with **virtual nodes** (vnodes), gives even distribution. See Topic 3.
+Combined with **virtual nodes** (vnodes), gives even distribution. See [DNS & Load Balancing](/learn/notes/dns-load-balancing/).
 
 ### Geo partitioning
 
@@ -88,7 +90,7 @@ Cons:
 - Skew: if 80% of users are in one region, you haven't really sharded.
 - Migration as users move (less common, but a real edge case).
 
-Used by: Uber (S2 cells for geographic indexing), DoorDash (zone-based), Spanner (geo-replicated with locality hints).
+Used by: Uber (S2, later its own H3 hexagon grid, for geographic indexing), Spanner (geo-partitioning / placement of rows in chosen regions).
 
 ### Directory-based partitioning
 
@@ -107,7 +109,7 @@ Cons:
 - Latency hit on every operation (cache the directory).
 - Cache invalidation on remap.
 
-Used by: HDFS NameNode, some custom DB layers, kubernetes-style schedulers.
+Used by: MongoDB config servers (store which chunk lives on which shard), Vitess lookup vindexes, HDFS NameNode (block → DataNode map), many custom tenant-routing layers.
 
 ### Composite / hybrid
 
@@ -145,7 +147,7 @@ Adding a shard:
 - **Range**: split a range; only that range moves.
 - **Directory**: arbitrary; the lookup is rewired.
 
-Online rebalancing tools: Vitess (MySQL), MongoDB balancer, Cassandra `nodetool rebalance` (with care).
+Online rebalancing tools: Vitess (MySQL), MongoDB balancer, Cassandra (new node bootstraps and streams its token ranges, then `nodetool cleanup` on the old owners).
 
 ### Cross-shard operations
 
@@ -172,11 +174,10 @@ Client: GET /user/42
 ## Real-world examples
 
 - **Discord**: messages sharded by channel ID over Cassandra/Scylla. Range-by-time within channel.
-- **Uber**: trips sharded by trip ID (hash). Geo indexing (S2 cells) for dispatch.
+- **Uber**: trip data lived in Schemaless, which hashes each row key (a UUID) into a fixed number of shards. Geo indexing (S2, later H3 cells) is used for dispatch.
 - **Shopify**: tenants sharded across MySQL pods; each merchant has a home shard.
-- **Slack**: workspaces sharded; messages within a workspace live together.
-- **Stripe**: heavy multi-tenant; merchant-based sharding.
-- **YouTube → Vitess**: MySQL sharded by video ID + user ID, transparent routing.
+- **Slack**: originally sharded by workspace; moved to Vitess, re-sharding big tables (e.g., messages by channel ID) to fix hot workspaces.
+- **YouTube → Vitess**: Vitess was built at YouTube to shard MySQL with transparent query routing.
 
 ## Common pitfalls
 
@@ -185,25 +186,52 @@ Client: GET /user/42
 - **Huge tenant skew**: one customer = 30% of data on one shard.
 - **Cross-shard joins frequent**: rethink schema; denormalize.
 - **`% N` hash with growth**: ouch on the rebalance.
-- **Re-sharding underestimated**: 10TB to re-shard is a 6-week project, not a weekend.
+- **Re-sharding underestimated**: re-sharding 10 TB is typically a multi-week project, not a weekend.
 - **No global secondary index**: queries that don't include the shard key are slow.
 - **Cross-shard transactions**: not just slow — fragile. Avoid via design.
 
-## Interview questions
+## Practice questions
 
-### Q1 — Easy: Why hash partitioning over range partitioning?
-Hash distributes keys evenly regardless of key distribution — no hot ranges. Range partitioning's locality is great for scans but causes hot shards under monotonic / time-based writes. Hash trades scan locality for write balance.
+<Practice>
 
-### Q2 — Easy: What's a good shard key?
-High cardinality, balanced access (no celebrity dominating), present in most queries (to avoid scatter-gather), and enables localized transactions (related data colocated).
+<QA q="Why choose hash partitioning over range partitioning?" level="easy">
 
-### Q3 — Medium: How does consistent hashing minimize data movement?
-Place nodes and keys on a hash ring. Each key goes to the next node clockwise. Adding a node steals only the keys closer to it than to its successor — about 1/N of total. With virtual nodes (~256 vnodes per physical node), distribution stays even and rebalancing is incremental.
+Hash spreads keys evenly regardless of how they're distributed — no hot ranges. Range partitioning's locality is great for scans but creates hot shards under monotonic or time-based writes. Hash trades scan locality for write balance.
 
-### Q4 — Medium: Why is sharding by time (e.g., `created_at`) usually bad?
-All writes hit "today's" shard, creating a write hotspot. Reads of "recent data" also hit one shard. The cluster is statistically idle except for one node. Time can be a *secondary* partition (range by time within a tenant or user), but rarely the primary.
+</QA>
 
-### Q5 — Medium: Compare range, hash, geo, and directory partitioning.
+<QA q="What's a good shard key?" level="easy">
+
+High cardinality (millions of distinct values, not 5), balanced access (no celebrity dominating traffic), present in most queries (to avoid scatter-gather), and enables localized transactions (related data colocated on one shard).
+
+</QA>
+
+<QA q="Why is tenant ID often the natural shard key in a multi-tenant system, and what are the caveats?" level="easy">
+
+All of a tenant's data lives together, so transactions and per-tenant analytics stay on one shard. Caveats: **huge tenants** create skew (cap tenant size or split big tenants across shards), and **cross-tenant queries** like admin views become scatter-gather.
+
+</QA>
+
+<QA q="How does consistent hashing minimize data movement?" level="medium">
+
+Nodes and keys are placed on a hash ring; each key goes to the next node clockwise. Adding a node takes over only the keys between it and its predecessor — about 1/N of the total. With virtual nodes (Cassandra defaulted to 256 per node; 4.0+ defaults to 16 with a smarter token allocator), distribution stays even and rebalancing is incremental.
+
+</QA>
+
+<QA q="Why is plain `hash(key) % N` painful when the cluster grows?" level="medium">
+
+Changing N changes the result of the modulo for almost every key, so adding a shard remaps nearly the whole dataset — a huge data movement. Consistent hashing moves only about 1/N of keys; range partitioning moves only the split range; a directory just rewires the lookup.
+
+</QA>
+
+<QA q="Why is sharding by time (e.g., `created_at`) usually bad?" level="medium">
+
+All writes land on today's shard, creating a write hotspot, and recent-data reads also hit that one shard — the rest of the cluster sits mostly idle. Time works as a **secondary** partition (range by time within a tenant or user), but rarely as the primary key.
+
+</QA>
+
+<QA q="Compare range, hash, geo, and directory partitioning." level="medium">
+
 | | Range | Hash | Geo | Directory |
 |---|---|---|---|---|
 | Locality (scans) | great | none | regional | flexible |
@@ -212,29 +240,124 @@ All writes hit "today's" shard, creating a write hotspot. Reads of "recent data"
 | Cross-shard query | OK | scatter | mostly local | depends |
 | Use case | OLAP, time-series | KV, transactional | latency, compliance | dynamic placement |
 
-### Q6 — Hard: Design sharding for a chat app with billions of messages.
-- **Partition key**: channel ID (hash). All messages in a channel colocated; reads localized.
-- **Clustering**: timestamp (sorted within channel) for tail reads.
-- **Bucket**: channel ID + day → bound partition size; avoid mega-partitions for huge channels.
-- **For per-user search across channels**: denormalize into a secondary table keyed by user ID.
-- **For analytics**: CDC into a warehouse (Trino over Parquet).
-- **Hot channels** (e.g., a big public chat): split via sub-channels or chat-shard.
+</QA>
 
-### Q7 — Hard: You have a multi-tenant SaaS with 10K customers; one customer is 5× larger than others. Sharding strategy?
+<QA q="What are the trade-offs of directory-based partitioning?" level="medium">
+
+**Pros**: maximum flexibility — any placement policy, dynamic remapping, asymmetric capacity, and moving shards without changing client logic. **Cons**: the lookup service is a new SPOF unless replicated, every operation pays a lookup (so clients cache the directory), and caches must be invalidated on remap.
+
+</QA>
+
+<QA q="How do you handle joins, transactions and aggregations that span shards?" level="hard">
+
+- **Joins**: scatter-gather is slow — denormalize at write time, or use a query layer (Trino/Presto).
+- **Transactions**: 2PC or sagas; sagas are usually preferred, and the best answer is a design that keeps them on one shard.
+- **Aggregations**: each shard computes locally and a coordinator merges.
+- **Queries without the shard key**: global secondary indexes (DynamoDB GSIs, Vitess vindexes).
+
+</QA>
+
+<QA q="How do you re-shard a live system from 8 to 16 shards with zero downtime?" level="hard">
+
+1. **Dual writes** to both the old (8) and new (16) layouts.
+2. **Backfill** historical data into the new shards and verify consistency.
+3. **Cut over reads** gradually (a small percentage first).
+4. **Verify** with shadow comparisons and error budgets.
+5. **Stop dual writes** once confident; write only to the new layout.
+6. **Decommission** the old shards.
+
+Tooling: Vitess Reshard, application-layer routing behind a feature flag, CDC. Budget for it — re-sharding 10 TB is a multi-week project, not a weekend.
+
+</QA>
+
+<QA q="Design sharding for a chat app with billions of messages." level="scenario">
+
+- **Partition key**: channel ID (hashed), so a channel's messages are colocated and reads stay local.
+- **Clustering**: timestamp, sorted within the channel, for tail reads.
+- **Bucketing**: channel ID + day to bound partition size and avoid mega-partitions for huge channels.
+- **Per-user search across channels**: denormalize into a secondary table keyed by user ID.
+- **Analytics**: CDC into a warehouse (Trino over Parquet).
+- **Hot channels**: split via sub-channels or a dedicated shard.
+
+</QA>
+
+<QA q="You have a multi-tenant SaaS with 10K customers; one customer is 5x larger than the others. Sharding strategy?" level="scenario">
+
 - Default: shard by tenant ID — tenants colocated, transactions cheap.
-- Handle the giant: **dedicated shard** for that tenant. Directory partitioning lets you carve out giants without disrupting other tenants.
-- Small tenants share shards (multi-tenancy within a shard is fine).
-- Plan capacity per shard with headroom for tenant growth; monitor.
-- For analytics across tenants: CDC into warehouse.
+- Give the giant a **dedicated shard**; directory partitioning lets you carve out big tenants without disturbing others.
+- Small tenants share shards.
+- Plan per-shard capacity with headroom for tenant growth, and monitor it.
+- Cross-tenant analytics: CDC into a warehouse.
 
-### Q8 — Hard: How do you re-shard a live system from 8 to 16 shards with zero downtime?
-- **Dual writes**: writes go to both old (8) and new (16) shards.
-- **Backfill**: copy historical data to new shards; verify consistency.
-- **Cut over reads**: gradually shift reads to new shards (small % first).
-- **Verify**: shadow comparison, error budgets.
-- **Stop dual writes**: when confident, write only to new.
-- **Decommission**: drop old shards.
-- Tooling: Vitess Reshard, application-layer routing with feature flag, CDC.
+</QA>
+
+<QA q="After launch, 90% of queries on your sharded DB are scatter-gather and p99 is terrible. What happened and what do you do?" level="scenario">
+
+The shard key was chosen without studying access patterns, so most queries don't include it. Options: add **global secondary indexes** or a denormalized lookup table keyed by the commonly queried attribute; denormalize so hot queries become single-shard; route analytical queries to a separate query layer or warehouse. If the dominant access pattern truly differs from the key, plan a re-shard onto a better key — expensive, which is why the key is a near-permanent decision.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="A users table is range-partitioned on an auto-increment ID. What problem appears as the system grows?" options={["Range scans become impossible", "All new writes hit the last shard, creating a hot tail", "Every query becomes scatter-gather", "Keys are spread too evenly"]} answer={1}>
+
+Monotonic IDs mean every new row falls in the newest range, so one shard takes all writes. Range scans are actually range partitioning's strength, single-key lookups still route to one shard, and even spread is the opposite of the problem.
+
+</MCQ>
+
+<MCQ q="What is the main thing you give up with hash partitioning?" options={["Even distribution", "Single-key lookups", "Range-scan locality", "The ability to add shards"]} answer={2}>
+
+Hashing scatters adjacent keys, so range queries become scatter-gather. Even distribution is hash's strength, point lookups remain single-shard, and shards can still be added (ideally with consistent hashing).
+
+</MCQ>
+
+<MCQ q="With consistent hashing and N nodes, roughly how many keys move when one node is added?" options={["About 1/N of the keys", "About half of the keys", "Almost all keys", "None"]} answer={0}>
+
+The new node takes over only the keys between it and its predecessor on the ring, about 1/N. Almost all keys moving is what happens with hash mod N; none is impossible since the new node must take some keys.
+
+</MCQ>
+
+<MCQ q="Which is the worst shard key for a large orders table?" options={["customer_id", "order_id hashed", "tenant_id in a B2B SaaS", "country, with 5 possible values"]} answer={3}>
+
+Five values means at most five useful shards forever, and likely skew too. Customer ID, a hashed order ID and tenant ID all have high cardinality and can work depending on access patterns.
+
+</MCQ>
+
+<MCQ q="What new risk does directory-based partitioning introduce?" options={["Range scans become impossible", "The lookup service becomes a SPOF and adds a hop unless replicated and cached", "Keys can never be moved", "It forces hash mod N"]} answer={1}>
+
+The directory gives full placement flexibility but every request depends on it, so it must be replicated and cached. It doesn't prevent range scans, it makes moving keys easy, and it isn't tied to modulo hashing.
+
+</MCQ>
+
+<MCQ q="A chat app partitions messages by channel ID. One public channel is huge and its partition keeps growing. What is the common fix?" options={["Shard by message timestamp only", "Move all channels to one shard", "Bucket the partition key by channel ID plus a time bucket such as day", "Disable writes to that channel"]} answer={2}>
+
+Adding a time bucket bounds partition size while keeping a channel's recent messages together. Timestamp-only sharding creates a hot today shard, one shard for everything defeats sharding, and blocking writes isn't a design.
+
+</MCQ>
+
+<MCQ q="Which approach is usually preferred for a business operation that spans two shards?" options={["A saga, or better, a design that keeps the operation on one shard", "A distributed lock held across all shards", "A cross-shard join inside a transaction", "Writing to whichever shard responds first"]} answer={0}>
+
+Sagas are generally preferred over 2PC, and the best fix is choosing a key that colocates related data. Global locks are slow and fragile, cross-shard transactional joins are what you're trying to avoid, and racing writes loses data.
+
+</MCQ>
+
+<MCQ q="During a live re-shard, which step comes right after starting dual writes?" options={["Drop the old shards", "Stop writing to the old shards", "Switch all reads to the new shards at once", "Backfill historical data into the new shards and verify it"]} answer={3}>
+
+New shards only have new writes until historical data is copied and checked. Dropping or stopping writes to old shards that early loses data, and an all-at-once read cutover skips the gradual, verified shift.
+
+</MCQ>
+
+<MCQ q="Why does geo partitioning not always solve scaling?" options={["It cannot meet GDPR", "If most users are in one region, that region's shard still carries most of the load", "It forbids local reads", "It requires hash mod N"]} answer={1}>
+
+Geo partitioning follows the user distribution, so 80% of users in one region means one shard does 80% of the work. It helps with compliance, enables local reads, and has nothing to do with modulo hashing.
+
+</MCQ>
+
+</Quiz>
 
 ## TL;DR cheat sheet
 
@@ -252,8 +375,8 @@ All writes hit "today's" shard, creating a write hotspot. Reads of "recent data"
 ## Go deeper
 
 - **DDIA Chapter 6** — the canonical chapter.
-- **System Design Primer**: [sharding section](https://github.com/donnemartin/system-design-primer#partitioning).
-- **Vitess docs**: [vitess.io/docs/concepts/sharding](https://vitess.io/docs/concepts/shard/) — sharded MySQL in practice.
+- **System Design Primer**: [sharding section](https://github.com/donnemartin/system-design-primer#sharding).
+- **Vitess docs**: [vitess.io/docs/concepts/shard](https://vitess.io/docs/concepts/shard/) — sharded MySQL in practice.
 - **MongoDB sharding docs**.
 - **Discord engineering**: storing billions of messages.
 - **Uber engineering**: H3 / S2 cells for geo partitioning.

@@ -261,7 +261,7 @@
   // ===================================================================
   register("word-search-ii", {
     title: "Word Search II — grid DFS pruned by trie",
-    caption: "Trie of {oath, oat, eat}. DFS the grid; each step requires the cell's char to be a trie child. Collect end-flag nodes as found words.",
+    caption: "Trie of {oath, oat, eat}. DFS the grid; each step requires the cell's char to be a trie child. Collect end-flag nodes as found words — here oat and oath (eat is in the dictionary but not on the grid).",
     code: [
       "for each (r,c) start cell:",
       "  dfs(r, c, root)",

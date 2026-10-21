@@ -1,0 +1,577 @@
+---
+title: "Docker: Images, Layers, Multi-Stage Builds"
+phase: "09-production-craft"
+order: 103
+tags: ["docker", "containers", "devops"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 18
+prerequisites: ["os-processes-threads"]
+summary: "How containers really work (namespaces and cgroups), how images are built from cached layers, and how to write small, secure, fast-building Dockerfiles with multi-stage builds and correct signal handling."
+---
+
+## Definition (interview-ready)
+
+A **container** is an ordinary Linux process that the kernel isolates with **namespaces** (what it can *see*: its own process IDs, network, filesystem mounts, hostname) and limits with **cgroups** (what it can *use*: CPU, memory, number of processes). It shares the host's kernel — there is no guest operating system.
+
+A **Docker image** is a read-only template for a container: an ordered stack of **filesystem layers** plus a **config** (entrypoint, environment, user, ports), described by a **manifest**. The format is standardized by the **OCI** (Open Container Initiative) image spec, so images built by Docker run on containerd, CRI-O, Podman and Kubernetes. A **container** is a running instance of an image with a thin writable layer on top.
+
+A **multi-stage build** uses several `FROM` stages in one Dockerfile: compile in a big "builder" image, then copy only the finished artifact into a small runtime image.
+
+**One-liner:** A container is just a Linux process that namespaces isolate and cgroups limit, sharing the host kernel; a Docker image is a stack of read-only, content-addressed layers plus a config, and the container adds a thin writable layer on top.
+
+## Why it matters
+
+- Nearly every service you deploy today ships as a container image, usually to [Kubernetes](/learn/notes/kubernetes/). The image is the immutable artifact your [CI/CD pipeline](/learn/notes/cicd-pipeline-design/) builds once and promotes through environments.
+- A badly written Dockerfile means **slow builds** (cache busted on every commit), **huge images** (slow pulls, slow autoscaling), **security holes** (running as root, shells and compilers in production, secrets baked into layers), and **broken shutdowns** (the app never sees SIGTERM and gets SIGKILLed mid-request).
+- Interviewers use Docker questions to test Linux basics: processes, signals, filesystems.
+
+## Core concepts
+
+### Containers vs virtual machines
+
+Analogy: a VM is a separate house with its own foundation (kernel). A container is an apartment in a shared building — own front door and walls, shared foundation.
+
+```
+        Virtual machines                          Containers
+ ┌────────┐ ┌────────┐ ┌────────┐       ┌────────┐ ┌────────┐ ┌────────┐
+ │ app A  │ │ app B  │ │ app C  │       │ app A  │ │ app B  │ │ app C  │
+ │ libs   │ │ libs   │ │ libs   │       │ libs   │ │ libs   │ │ libs   │
+ │guest OS│ │guest OS│ │guest OS│       └────────┘ └────────┘ └────────┘
+ └────────┘ └────────┘ └────────┘        container runtime (containerd, runc)
+          hypervisor                     ONE shared host kernel
+          host hardware                  host hardware
+```
+
+| | VM | Container |
+|---|---|---|
+| Isolation boundary | Hypervisor + separate kernel | Kernel features (namespaces, cgroups, seccomp, capabilities) |
+| Boot time | Seconds to minutes (boots an OS) | Usually well under a second (starts a process) |
+| Size | GBs (full OS) | MBs to hundreds of MBs |
+| Kernel | Its own; can be a different OS | The host's; a Linux container needs a Linux kernel |
+| Security isolation | Stronger | Weaker — a kernel bug can be a container escape |
+
+On macOS and Windows, Docker Desktop runs Linux containers inside a small Linux VM, because containers need a Linux kernel.
+
+When you need container convenience with VM-grade isolation (multi-tenant platforms), people use sandboxed runtimes like gVisor or micro-VMs like Firecracker or Kata Containers.
+
+### Namespaces: what a container can see
+
+Linux namespaces (see `man 7 namespaces`) give a process its own view of a global resource:
+
+| Namespace | Isolates | Effect in a container |
+|---|---|---|
+| **PID** | process IDs | your app is PID 1 and can't see host processes |
+| **Network** | interfaces, IPs, ports, routing tables | own `eth0` and `localhost`; port 8080 doesn't clash with the host |
+| **Mount** | mount points | own root filesystem (the image) |
+| **UTS** | hostname, domain name | own hostname |
+| **IPC** | System V IPC, POSIX message queues | no shared memory with other containers |
+| **User** | user and group IDs | root inside can map to an unprivileged user outside (rootless mode) |
+| **Cgroup** | view of the cgroup tree | can't see the host's cgroup hierarchy |
+| **Time** (Linux 5.6+) | boot and monotonic clocks | rarely used by Docker |
+
+### Cgroups: what a container can use
+
+**Control groups** limit and account for resources: CPU, memory, block I/O, number of processes (pids). Modern distributions use **cgroup v2** (one unified hierarchy).
+
+- `docker run --memory=512m` → if the container goes over, the kernel's OOM killer kills a process in it (exit code 137 = 128 + SIGKILL's 9).
+- `--cpus=1.5` → CPU is **throttled** (slowed), not killed.
+- `--pids-limit` → protects against fork bombs.
+- Kubernetes `resources.limits` become the same cgroup settings.
+
+Namespaces + cgroups + a root filesystem from an image = a container. Docker adds extra hardening on top: dropped Linux **capabilities**, a default **seccomp** profile that blocks risky syscalls, and AppArmor/SELinux profiles.
+
+### Image vs container
+
+| Image | Container |
+|---|---|
+| Read-only template | Running (or stopped) instance |
+| Layers + config + manifest | Image layers + one writable layer + runtime state (process, network) |
+| Built with `docker build` | Created with `docker run` / `docker create` |
+| Shared by many containers | Each has its own writable layer |
+
+Like a class and an object: one image, many containers.
+
+### Layers and the union filesystem (overlay2)
+
+Each filesystem-changing Dockerfile instruction (`RUN`, `COPY`, `ADD`) produces a **layer** — a tarball of the files it added, changed or deleted. Other instructions (`ENV`, `EXPOSE`, `CMD`, `USER`, `WORKDIR`, `LABEL`) only change image metadata.
+
+At runtime, a **union filesystem** stacks the layers into one view. On Linux the classic Docker storage driver is **overlay2** (built on the kernel's OverlayFS):
+
+```
+ merged/     ← what the container sees (union of everything below)
+ upperdir/   ← container's writable layer (thin, per-container)
+ lowerdir/   ← image layers, read-only, shared by every container of this image
+   layer 3: COPY app.jar
+   layer 2: RUN apt-get install ...
+   layer 1: base image (debian)
+```
+
+- **Reads**: the topmost layer that has the file wins.
+- **First write to an image file**: **copy-up** — the whole file is copied from `lowerdir` into `upperdir`, then modified. Copy-up works per file, so writing one byte of a 1 GB file copies the whole file once.
+- **Deleting an image file**: a **whiteout** file is created in `upperdir` that hides it. The bytes still exist in the lower layer.
+- Consequences:
+  - `RUN rm big.tar` in a later layer **does not shrink the image** — the earlier layer still contains it. Delete in the **same** `RUN` that created it, or use multi-stage builds.
+  - Write-heavy data (databases, logs, uploads) belongs in **volumes**, which bypass the storage driver.
+  - Layers are **content-addressed** (named by a SHA-256 digest), so identical layers are stored and pulled only once and shared between images.
+
+Newer setups use **containerd's image store and snapshotters** instead of Docker's classic storage drivers: Docker Engine 29.0+ uses the containerd image store by default on fresh installs. The ideas — read-only layers, a writable top layer, copy-on-write — are the same.
+
+### Layer caching and Dockerfile ordering
+
+The builder walks the Dockerfile top to bottom. For each instruction it looks for a cached layer built from the same parent with the same instruction:
+
+- **`RUN`**: only the **command string** is compared. `RUN apt-get update` is a cache hit forever, even if new packages were published.
+- **`COPY` / `ADD`**: a checksum of the copied files (contents and metadata, but not modification time) is compared. Change one file → miss.
+- **Once one instruction misses, every instruction after it is rebuilt.**
+
+So: **put things that change rarely first, and things that change often last.**
+
+```dockerfile
+# BAD: any source change re-downloads every dependency
+COPY . .
+RUN mvn -q package
+
+# GOOD: dependencies are cached until pom.xml changes
+COPY pom.xml .
+RUN mvn -q dependency:go-offline
+COPY src ./src
+RUN mvn -q package -DskipTests
+```
+
+Same idea in every ecosystem: copy `go.mod`/`go.sum` then `go mod download`; copy `package.json` + lockfile then `npm ci`; copy `requirements.txt` then `pip install`.
+
+Other caching rules:
+
+- Combine `apt-get update && apt-get install -y ... && rm -rf /var/lib/apt/lists/*` in **one** `RUN`, so the update is never cached separately from the install and the package lists don't bloat the layer.
+- Pin versions (base image tags or digests, package versions) so a cache miss doesn't silently pull something new.
+- In CI, the cache is empty on fresh runners unless you export and import it (`docker buildx build --cache-to / --cache-from`, for example to a registry).
+
+### .dockerignore
+
+`docker build .` sends the **build context** (the directory) to the builder. A `.dockerignore` file excludes paths, just like `.gitignore`:
+
+```
+.git
+**/node_modules
+target/
+*.log
+.env
+**/*.pem
+```
+
+It keeps builds fast, stops `COPY . .` from busting the cache on irrelevant changes, and **keeps secrets out of the image**.
+
+### Multi-stage builds
+
+Idea: build tools (JDK, Maven, Go compiler, gcc) are needed to **build**, not to **run**. Use one stage to build and copy only the result into the final stage. Only the last stage (or the one you pick with `--target`) becomes the image.
+
+**Go example** — static binary on distroless:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM golang:1.23 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY . .
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/app ./cmd/app
+
+FROM gcr.io/distroless/static-debian13:nonroot
+COPY --from=build /out/app /app
+USER nonroot:nonroot
+EXPOSE 8080
+ENTRYPOINT ["/app"]
+```
+
+- `CGO_ENABLED=0` produces a statically linked binary with no libc dependency, so it can run on `static` distroless (or even `scratch`).
+- The final image is the binary plus CA certificates, timezone data and `/etc/passwd` — typically a few MB plus your binary — versus the Go toolchain image, which is hundreds of MB.
+
+**Java example** — Maven build, JRE-only runtime:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM maven:3.9-eclipse-temurin-21 AS build
+WORKDIR /src
+COPY pom.xml .
+RUN --mount=type=cache,target=/root/.m2 mvn -q dependency:go-offline
+COPY src ./src
+RUN --mount=type=cache,target=/root/.m2 mvn -q package -DskipTests
+
+FROM gcr.io/distroless/java21-debian13:nonroot
+WORKDIR /app
+COPY --from=build /src/target/app.jar /app/app.jar
+EXPOSE 8080
+ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75", "-jar", "/app/app.jar"]
+```
+
+- The runtime has a JRE but no Maven, no JDK compiler, no shell.
+- Spring Boot can split the fat jar into layers (dependencies, then application classes) so a code change only rebuilds and pushes a small layer.
+- The JVM reads the cgroup memory limit (container support is on by default since JDK 10 and was backported to 8u191). By default the max heap is 25% of that limit (for anything but very small limits) — `-XX:MaxRAMPercentage` raises it.
+
+Multi-stage also helps with: a `test` stage you build in CI with `--target test`, a `debug` stage with tools, and stages that run in parallel under BuildKit.
+
+### Small and secure images
+
+| Base | Contents | Pros | Cons |
+|---|---|---|---|
+| `ubuntu` / `debian` | full distro, shell, package manager | familiar, glibc, easy debugging | larger, more packages = more CVEs |
+| `debian:*-slim` | trimmed Debian | glibc, still has apt | still has a shell and package manager |
+| `alpine` | musl libc + BusyBox, ~5 MB | tiny, has `apk` | **musl caveats** (below) |
+| **distroless** | just your runtime deps: CA certs, tzdata, libc (or nothing for `static`), a runtime like a JRE | very small attack surface: **no shell, no package manager** | harder to debug (use `:debug` tags with a BusyBox shell, or ephemeral debug containers) |
+| `scratch` | literally empty | smallest possible | you must add CA certs, users, tzdata yourself |
+
+**Alpine and musl caveats:**
+
+- Alpine uses **musl** libc, not glibc. Binaries compiled against glibc won't run without recompiling. Python wheels, Node native modules and some JDK builds need musl-specific builds or must compile from source, which can make images **bigger and builds slower**, not smaller.
+- musl's DNS resolver historically behaved differently: before **musl 1.2.4** (shipped in Alpine 3.18, 2023) it had no TCP fallback, so large DNS responses could fail. musl's memory allocator and threading defaults also differ, which can change performance.
+- Rule of thumb: Alpine is great for static Go binaries and simple tools; for JVM, Python or Node services, prefer `-slim` or distroless unless you've tested.
+
+**Run as non-root.** By default a container runs as root (UID 0). If an attacker escapes the app, root in the container is much more dangerous — especially with a kernel bug or a mounted host path.
+
+```dockerfile
+RUN groupadd --system app && useradd --system --gid app app   # Debian-based
+USER app
+# distroless: use the :nonroot tag or USER 65532
+```
+
+Also: `COPY --chown=app:app`, a read-only root filesystem at runtime (`--read-only`, Kubernetes `readOnlyRootFilesystem`), drop capabilities, and never use `--privileged` for application containers.
+
+**Never bake secrets into layers.** `COPY .npmrc` followed by `RUN rm .npmrc` leaves the secret in an earlier layer, readable by anyone who can pull the image. Same for `ARG`/`ENV` with tokens (they show up in `docker history`). Use **BuildKit secret mounts**:
+
+```dockerfile
+RUN --mount=type=secret,id=npmrc,target=/root/.npmrc npm ci
+```
+
+```
+docker build --secret id=npmrc,src=$HOME/.npmrc .
+```
+
+The secret is available only during that `RUN` and never written to a layer. Runtime secrets come from the orchestrator — see [Secrets management](/learn/notes/secrets-management/).
+
+### ENTRYPOINT vs CMD
+
+- **ENTRYPOINT** = the executable that always runs.
+- **CMD** = default arguments (or a default command if there's no ENTRYPOINT). Anything after the image name in `docker run IMAGE ...` **replaces CMD**. `--entrypoint` replaces ENTRYPOINT.
+
+```dockerfile
+ENTRYPOINT ["java", "-jar", "/app/app.jar"]
+CMD ["--server.port=8080"]
+# docker run img                     → java -jar /app/app.jar --server.port=8080
+# docker run img --server.port=9090  → java -jar /app/app.jar --server.port=9090
+```
+
+**Exec form vs shell form** — this is where shutdown bugs come from:
+
+| Form | Example | What runs as PID 1 |
+|---|---|---|
+| **Exec form** (JSON array) | `ENTRYPOINT ["java", "-jar", "app.jar"]` | `java` itself |
+| **Shell form** | `ENTRYPOINT java -jar app.jar` | `/bin/sh -c "java -jar app.jar"` — the **shell** is PID 1 |
+
+With shell form, `/bin/sh` is PID 1 and **doesn't forward signals**, so `docker stop` sends SIGTERM to the shell, your app never sees it, and after the timeout it gets SIGKILLed. Use exec form. If you need a wrapper shell script, end it with `exec "$@"` (or `exec java ...`) so the app replaces the shell and becomes PID 1.
+
+### PID 1 and signal handling
+
+PID 1 in a PID namespace is special:
+
+1. **Signals**: the kernel only delivers a signal to PID 1 if PID 1 **has installed a handler** for it. The default action ("terminate on SIGTERM") doesn't apply. A program that never registered a SIGTERM handler (a naive script, some C programs) simply **ignores** `docker stop`. (SIGKILL from the host always works.)
+2. **Zombie reaping**: orphaned child processes get re-parented to PID 1, which must `wait()` on them. If your app spawns children and never reaps them, zombies pile up.
+3. If PID 1 exits, the kernel **kills every other process** in the container.
+
+The stop sequence:
+
+```
+docker stop  → SIGTERM (or the image's STOPSIGNAL) to PID 1
+             → wait grace period (10 s default for Linux containers; --stop-timeout / -t)
+             → SIGKILL
+Kubernetes   → preStop hook, then SIGTERM, wait terminationGracePeriodSeconds (30 s default), then SIGKILL
+```
+
+Fixes:
+
+- **Exec-form** ENTRYPOINT so your app is PID 1.
+- Make the app **handle SIGTERM**: stop accepting new work, finish in-flight requests, flush buffers (e.g. Kafka producer `flush()`), close connections, exit. Spring Boot has `server.shutdown=graceful`; Go uses `signal.NotifyContext` + `http.Server.Shutdown`.
+- Use a tiny **init process** when the app can't do PID 1 duties: `docker run --init` (Docker ships `docker-init`, based on **tini**), or `ENTRYPOINT ["tini", "--", "app"]`. It forwards signals and reaps zombies.
+- Keep the grace period longer than your slowest request.
+
+### Registries, tags and digests
+
+- A **registry** stores images: Docker Hub, Amazon ECR, Google Artifact Registry, GitHub Container Registry, Harbor, Artifactory.
+- Image reference: `registry/namespace/repo:tag@sha256:digest`, e.g. `ghcr.io/acme/api:1.4.2`.
+- A **tag** is a **mutable** pointer — `latest` and even `1.4.2` can be re-pushed to point at a different image.
+- A **digest** (`sha256:...`) is the hash of the image manifest — **immutable**. Same digest = byte-for-byte the same image.
+- **Multi-arch images**: an **image index** (OCI) lists one manifest per platform (linux/amd64, linux/arm64). The client pulls the one matching its CPU.
+- Good practice:
+  - Tag with the git commit SHA (plus semver for releases), never deploy `latest`.
+  - Deploy or pin by **digest** for reproducibility, e.g. `FROM eclipse-temurin:21-jre@sha256:...`.
+  - Build once, promote the **same digest** from staging to production (see [CI/CD](/learn/notes/cicd-pipeline-design/)).
+  - Sign images (Sigstore cosign) and verify signatures at deploy time.
+
+### BuildKit
+
+**BuildKit** is Docker's build engine and the default builder since Docker Engine 23.0 (`docker build` now goes through `docker buildx build`). Features:
+
+- Builds **independent stages in parallel** and **skips stages** the target doesn't need.
+- Transfers only changed files in the build context.
+- `RUN --mount=type=cache` — persistent package caches (Maven `.m2`, Go module cache, apt) across builds without putting them in layers.
+- `RUN --mount=type=secret` and `--mount=type=ssh` — use secrets or SSH agent forwarding without baking them in.
+- **Multi-platform builds** (`docker buildx build --platform linux/amd64,linux/arm64`).
+- Exporting and importing **remote build cache** (`--cache-to` / `--cache-from`) for CI.
+- The `# syntax=docker/dockerfile:1` line pins the Dockerfile frontend so new syntax works.
+
+### Image scanning and supply chain
+
+- **Scanners** compare the packages in each layer against vulnerability databases (CVEs): Trivy, Grype, Docker Scout, plus registry-built-in scanning (ECR, Artifact Registry).
+- **SBOM** (software bill of materials) — a list of every package in the image; BuildKit can generate one with `--sbom=true`, and tools like Syft too.
+- Run scans **in CI** and fail the build on critical, fixable CVEs; re-scan images already in the registry because new CVEs appear daily.
+- Fewer packages = fewer CVEs — distroless and slim images help more than anything else.
+- Rebuild regularly so you pick up patched base images.
+
+## How it works (from Dockerfile to running process)
+
+```
+docker build
+  1. CLI sends build context (minus .dockerignore) to BuildKit
+  2. BuildKit parses Dockerfile → graph of stages; skips unused ones; runs independent ones in parallel
+  3. each RUN runs in a temporary container; each RUN/COPY/ADD result → a layer tarball (sha256)
+  4. writes image config (env, user, entrypoint, layer order) + manifest → stored locally
+
+docker push
+  5. uploads layers the registry doesn't already have, then the manifest; tag → digest
+
+docker run (or kubelet via containerd)
+  6. pull manifest for the right platform; download missing layers
+  7. snapshotter / overlay2 stacks layers read-only + adds a writable layer
+  8. runc creates namespaces + cgroups, applies seccomp/capabilities, sets USER
+  9. execs ENTRYPOINT + CMD as PID 1 inside the new namespaces
+ 10. on stop: SIGTERM → grace period → SIGKILL
+```
+
+## Real-world examples
+
+- **Docker Engine 23.0** made BuildKit the default builder on Linux, and **Docker Engine 29.0** made the containerd image store the default for fresh installs.
+- **Google's distroless images** (GoogleContainerTools/distroless) are based on Debian 13 at the time of writing, ship `static`, `base`, `cc`, `java` and others, with `:nonroot` and `:debug` variants.
+- **Kubernetes** pulls OCI images through containerd or CRI-O — Docker-built images work unchanged because they follow the OCI image spec.
+- **musl 1.2.4** (2023) added DNS TCP fallback, fixing a long-standing Alpine DNS issue with large responses.
+
+## Common pitfalls
+
+- **`COPY . .` before installing dependencies** — every code change re-downloads everything.
+- **Shell-form ENTRYPOINT** — the app never sees SIGTERM; every deploy kills requests mid-flight after the timeout.
+- **Deleting files in a later layer** expecting a smaller image. Delete in the same `RUN`, or use multi-stage.
+- **Secrets in `COPY`, `ARG` or `ENV`** — they live forever in layers and `docker history`.
+- **Running as root** by default.
+- **Using `latest`** in production or as a base — builds aren't reproducible and rollbacks are guesswork.
+- **Alpine for everything** — musl incompatibilities and slow native-module builds.
+- **No `.dockerignore`** — `.git`, `node_modules` and `.env` end up in the context or the image.
+- **Writing heavy data to the container layer** — slow copy-up and lost on container removal; use volumes.
+- **JVM without container-aware heap settings** — default 25% heap wastes memory, or a too-large `-Xmx` gets OOM-killed (exit 137).
+- **`apt-get update` in its own `RUN`** — cached forever, so later installs use stale package lists.
+
+## Practice questions
+
+<Practice>
+
+<QA q="What is the difference between a container and a virtual machine?" level="easy">
+
+A **VM** virtualizes hardware: a hypervisor runs full guest operating systems, each with its own kernel. A **container** is a process on the host kernel, isolated with **namespaces** (its own view of PIDs, network, mounts, hostname) and limited with **cgroups** (CPU, memory, pids). Containers start in well under a second and are MBs, VMs take seconds to minutes and are GBs. VMs give stronger isolation because they don't share a kernel; containers trade some isolation for density and speed.
+
+</QA>
+
+<QA q="What is the difference between an image and a container?" level="easy">
+
+An **image** is a read-only template: ordered filesystem layers plus a config (entrypoint, env, user) and a manifest, identified by a digest. A **container** is a running (or stopped) instance of an image: the image's layers plus its own thin writable layer, a process, and namespaces/cgroups. One image can back many containers, like one class and many objects.
+
+</QA>
+
+<QA q="What is the difference between ENTRYPOINT and CMD?" level="easy">
+
+**ENTRYPOINT** is the executable that always runs. **CMD** provides default arguments to it (or a default command if there's no ENTRYPOINT). Arguments after the image name in `docker run` replace CMD; `--entrypoint` replaces ENTRYPOINT. Typical pattern: ENTRYPOINT is the binary, CMD is overridable default flags. Always use the **exec form** (JSON array) so the app is PID 1 and receives signals.
+
+</QA>
+
+<QA q="What does .dockerignore do and why does it matter?" level="easy">
+
+It excludes files from the **build context** sent to the builder. Benefits: faster builds (no `.git` or `node_modules` upload), better caching (irrelevant files don't change the `COPY . .` checksum), smaller images, and **security** — `.env` files, keys and credentials don't end up in a layer.
+
+</QA>
+
+<QA q="How do image layers and overlay2 work?" level="medium">
+
+Each `RUN`, `COPY` or `ADD` produces a layer — a content-addressed tarball of filesystem changes. At runtime overlay2 stacks the read-only layers (`lowerdir`) under a per-container writable layer (`upperdir`) and presents a merged view. Reads come from the topmost layer that has the file. The first write to an image file does a **copy-up** of the whole file into the writable layer. Deletes create a **whiteout** that hides the file. Identical layers are shared between images and containers, saving disk and pull time.
+
+</QA>
+
+<QA q="Why doesn't RUN rm in a later instruction reduce image size?" level="medium">
+
+Layers are additive. The file is still stored in the earlier layer; the later layer only adds a whiteout that hides it. The image still carries the bytes and anyone can extract them — which is also why secrets deleted this way are still leaked. Fix: create and delete in the **same** `RUN`, or build in a separate stage and copy only what you need.
+
+</QA>
+
+<QA q="How does Docker's build cache work, and how should you order a Dockerfile?" level="medium">
+
+The builder checks each instruction in order. `RUN` is matched by its command string only; `COPY`/`ADD` by a checksum of the copied files. The first miss invalidates **every later instruction**. So order from least to most frequently changing: base image → system packages → dependency manifest (`pom.xml`, `go.mod`, `package.json` + lockfile) → dependency download → source code → build. Combine `apt-get update` and `install` in one `RUN`. In CI, export/import the cache (`--cache-to`, `--cache-from`) because fresh runners start empty.
+
+</QA>
+
+<QA q="What are multi-stage builds and why use them?" level="medium">
+
+Several `FROM` stages in one Dockerfile. Early stages have compilers and build tools; the final stage starts from a small runtime base and uses `COPY --from=build` to take only the artifact (a Go binary, a jar). Benefits: much smaller images, fewer CVEs, no build tools or source in production, one Dockerfile for build and runtime. With BuildKit, independent stages run in parallel and unused stages are skipped; `--target` builds a specific stage (for tests or debugging).
+
+</QA>
+
+<QA q="Distroless vs Alpine vs slim — how do you choose a base image?" level="medium">
+
+- **Distroless**: only runtime dependencies, no shell or package manager — smallest attack surface; great for Go (`static`) and Java (`java21`). Debug with `:debug` tags or ephemeral debug containers.
+- **Alpine**: tiny, has a shell and `apk`, but uses **musl** libc — glibc binaries don't run, native Python/Node modules may need compiling, and older musl had DNS quirks (no TCP fallback before 1.2.4).
+- **Debian/Ubuntu slim**: glibc, familiar tooling, medium size — safe default when you need a shell or OS packages.
+
+Pick distroless when possible, slim when you need OS tools, Alpine mainly for static binaries or when you've tested musl compatibility.
+
+</QA>
+
+<QA q="Why should containers run as non-root, and how do you do it?" level="medium">
+
+UID 0 in a container is root on the shared kernel (unless user namespaces remap it). If the app is compromised, root makes container escape, writing to mounted host paths, and privilege escalation much easier. Do it with `USER` in the Dockerfile (create a system user, or use distroless `:nonroot` / UID 65532), `COPY --chown`, and enforce it in Kubernetes with `runAsNonRoot: true`, plus a read-only root filesystem and dropped capabilities.
+
+</QA>
+
+<QA q="Explain the PID 1 problem in containers." level="hard">
+
+The first process in a PID namespace is treated like `init`:
+
+1. The kernel delivers signals to PID 1 **only if it installed a handler** — default actions don't apply, so an app without a SIGTERM handler ignores `docker stop` and gets SIGKILLed after the grace period (10 s in Docker, 30 s default in Kubernetes).
+2. Orphaned processes are re-parented to PID 1, which must reap them or zombies accumulate.
+3. When PID 1 exits, everything else in the container is killed.
+
+With a **shell-form** ENTRYPOINT, `/bin/sh` is PID 1 and doesn't forward signals. Fixes: exec form, `exec` in wrapper scripts, handle SIGTERM in the app (graceful shutdown), or use a tiny init like **tini** (`docker run --init`).
+
+</QA>
+
+<QA q="What is the difference between a tag and a digest? Which should you deploy?" level="medium">
+
+A **tag** (`api:1.4.2`, `latest`) is a mutable name that can be moved to a different image. A **digest** (`sha256:...`) is the hash of the manifest — immutable and content-addressed. Deploy by digest (or a unique, never-reused tag like the git SHA that you resolve to a digest) so what you tested is exactly what runs, and rollbacks are precise. Pin base images by digest for reproducible builds.
+
+</QA>
+
+<QA q="How do you use a private token during a build without leaking it into the image?" level="hard">
+
+Use a **BuildKit secret mount**: `RUN --mount=type=secret,id=npmrc,target=/root/.npmrc npm ci` and build with `docker build --secret id=npmrc,src=...`. The secret is mounted only for that `RUN` and never written to a layer. Don't use `COPY` + `rm` (the earlier layer keeps it) or `ARG`/`ENV` (visible in `docker history` and image config). For SSH access to private repos, use `--mount=type=ssh`. If a secret was ever baked in, **rotate it** — deleting the tag doesn't remove copies already pulled.
+
+</QA>
+
+<QA q="A container is killed with exit code 137. What does that mean and how do you debug it?" level="hard">
+
+137 = 128 + 9, so the process got **SIGKILL**. Two common causes:
+
+1. **OOM kill** — memory went over the cgroup limit. Check `docker inspect` (`OOMKilled: true`) or Kubernetes `Last State: OOMKilled`. For JVMs, check heap settings vs the container limit (heap is not the only memory: metaspace, thread stacks, direct buffers).
+2. **Stop timeout** — the app ignored or didn't finish handling SIGTERM within the grace period, so it was force-killed. Check for shell-form ENTRYPOINT, missing signal handling, or shutdown slower than the grace period.
+
+</QA>
+
+<QA q="Your CI builds take 15 minutes and every build re-downloads all dependencies. How do you fix it?" level="scenario">
+
+1. Reorder the Dockerfile: copy dependency manifests and download dependencies **before** copying source.
+2. Add a `.dockerignore` so unrelated files don't bust `COPY` caches.
+3. Use BuildKit **cache mounts** (`--mount=type=cache` for `.m2`, Go module cache, npm cache).
+4. CI runners start with an empty cache, so **export and import** build cache (`--cache-to type=registry` / `--cache-from`).
+5. Use multi-stage so test and build stages run in parallel, and skip unused stages.
+6. Pin base images so they don't change under you.
+
+</QA>
+
+<QA q="During every deploy, a few hundred requests fail with connection resets. The app is a Spring Boot service on Kubernetes. What do you check in the image and app?" level="scenario">
+
+- **ENTRYPOINT form**: shell form (or a wrapper script without `exec`) means the JVM never gets SIGTERM and is SIGKILLed after the grace period. Switch to exec form.
+- **Graceful shutdown**: enable `server.shutdown=graceful` and a shutdown timeout shorter than `terminationGracePeriodSeconds`.
+- **Endpoint removal race**: the pod can receive traffic briefly after SIGTERM while endpoints update — add a short `preStop` sleep and fail readiness on shutdown.
+- **Grace period** longer than your slowest request.
+- Make sure the app flushes producers and closes pools on shutdown.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="Which kernel feature limits how much memory a container can use?" options={["PID namespace", "Mount namespace", "cgroups", "seccomp"]} answer={2}>
+
+cgroups limit and account for resources like memory and CPU. Namespaces control what a process can see, and seccomp filters syscalls.
+
+</MCQ>
+
+<MCQ q="A Dockerfile has COPY . . followed by RUN mvn package. You change one Java file. What happens on rebuild?" options={["Only the changed class is recompiled from cache", "The COPY layer misses, so it and every later instruction rebuild, including dependency downloads in that RUN", "Nothing rebuilds because RUN is matched by command string", "Docker rebuilds from the base image"]} answer={1}>
+
+The COPY checksum changes, so its layer misses and all later instructions rebuild. The RUN string is unchanged, but caching stops after the first miss. Layers before the COPY, including the base, are still cached.
+
+</MCQ>
+
+<MCQ q="With overlay2, a container modifies one line of a 2 GB file that came from the image. What happens?" options={["Only the changed block is written to the writable layer", "The whole file is copied up into the writable layer first", "The image layer is modified in place", "The write fails because image layers are read-only"]} answer={1}>
+
+OverlayFS copy-up works per file, so the whole file is copied to upperdir once and then modified. Image layers are never changed, and the write succeeds.
+
+</MCQ>
+
+<MCQ q="ENTRYPOINT is written as ENTRYPOINT java -jar app.jar. What runs as PID 1?" options={["java", "/bin/sh", "tini", "dockerd"]} answer={1}>
+
+Shell form runs the command via /bin/sh -c, so the shell is PID 1 and does not forward SIGTERM to java. Exec form makes java PID 1; tini only runs if you add it or use --init.
+
+</MCQ>
+
+<MCQ q="By default, how long does docker stop wait after SIGTERM before sending SIGKILL to a Linux container?" options={["10 seconds", "30 seconds", "60 seconds", "It waits forever"]} answer={0}>
+
+The Docker default for Linux containers is 10 seconds, changeable with -t or --stop-timeout. 30 seconds is the Kubernetes default terminationGracePeriodSeconds.
+
+</MCQ>
+
+<MCQ q="Why can a statically built Go binary run on gcr.io/distroless/static but a glibc-linked binary may fail on Alpine?" options={["Alpine has no kernel", "Alpine uses musl libc instead of glibc", "distroless includes the Go toolchain", "Static binaries require a shell"]} answer={1}>
+
+Alpine is built on musl, so dynamically linked glibc binaries fail to load. A CGO_ENABLED=0 binary needs no libc at all. distroless static has no toolchain and no shell.
+
+</MCQ>
+
+<MCQ q="Which reference guarantees you always pull exactly the same image bytes?" options={["myapp:latest", "myapp:1.4.2", "myapp@sha256:...", "myapp:stable"]} answer={2}>
+
+A digest is the hash of the manifest and cannot change. Tags, including version-looking ones, are mutable pointers.
+
+</MCQ>
+
+<MCQ q="What is the safest way to use an npm token during docker build?" options={["ARG NPM_TOKEN then use it in RUN", "COPY .npmrc, run npm ci, then RUN rm .npmrc", "RUN --mount=type=secret with docker build --secret", "ENV NPM_TOKEN in the Dockerfile"]} answer={2}>
+
+Secret mounts exist only for that RUN and are never stored in a layer. ARG and ENV values show up in history or config, and a deleted COPY still lives in an earlier layer.
+
+</MCQ>
+
+<MCQ q="Which is NOT a BuildKit feature?" options={["Skipping stages the target does not depend on", "Building independent stages in parallel", "Persistent cache mounts for package managers", "Automatically running containers as non-root"]} answer={3}>
+
+BuildKit skips unused stages, parallelizes, and supports cache and secret mounts. The runtime user comes from the USER instruction or the orchestrator, not from BuildKit.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **Container** = process + namespaces (see) + cgroups (use), sharing the host kernel. **VM** = own kernel on a hypervisor.
+- **Image** = read-only layers + config + manifest (OCI). **Container** = image + writable layer + process.
+- **overlay2**: lowerdir (read-only) + upperdir (writable) → merged. Copy-up per file; deletes are whiteouts; deleting later never shrinks the image.
+- **Cache**: first miss rebuilds everything after it. Copy dependency manifests → install → copy source → build. Use `.dockerignore`.
+- **Multi-stage**: build in a fat image, `COPY --from=build` into distroless/slim. Go: `CGO_ENABLED=0` + `static`. Java: JRE-only distroless + `MaxRAMPercentage`.
+- **Secure**: non-root `USER`, minimal base, no secrets in layers (`--mount=type=secret`), scan in CI, pin by digest, sign images.
+- **Alpine** = musl; watch glibc binaries, native modules, older DNS quirks.
+- **ENTRYPOINT** = binary, **CMD** = default args. Always **exec form**.
+- **PID 1**: signals only delivered if handled; must reap zombies. Handle SIGTERM gracefully, or use `--init`/tini. Docker waits 10 s, Kubernetes 30 s, then SIGKILL (exit 137).
+- **BuildKit** (default since Engine 23.0): parallel stages, cache/secret/ssh mounts, multi-platform, remote cache.
+
+## Go deeper
+
+- **Docker docs**: [Dockerfile reference](https://docs.docker.com/reference/dockerfile/), [Build cache invalidation](https://docs.docker.com/build/cache/invalidation/), [Multi-stage builds](https://docs.docker.com/build/building/multi-stage/), [BuildKit](https://docs.docker.com/build/buildkit/), [OverlayFS storage driver](https://docs.docker.com/engine/storage/drivers/overlayfs-driver/), [Building best practices](https://docs.docker.com/build/building/best-practices/), [docker container stop](https://docs.docker.com/reference/cli/docker/container/stop/).
+- **OCI**: [Image spec](https://github.com/opencontainers/image-spec/blob/main/spec.md), [Runtime spec](https://github.com/opencontainers/runtime-spec).
+- **Linux man pages**: [namespaces(7)](https://man7.org/linux/man-pages/man7/namespaces.7.html), [pid_namespaces(7)](https://man7.org/linux/man-pages/man7/pid_namespaces.7.html), [cgroups(7)](https://man7.org/linux/man-pages/man7/cgroups.7.html).
+- **Distroless**: [GoogleContainerTools/distroless](https://github.com/GoogleContainerTools/distroless).
+- **tini**: [krallin/tini](https://github.com/krallin/tini).
+- **Scanning**: [Trivy](https://trivy.dev/), [Grype](https://github.com/anchore/grype).

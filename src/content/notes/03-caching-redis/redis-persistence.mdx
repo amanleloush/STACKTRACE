@@ -1,0 +1,514 @@
+---
+title: "Redis Persistence & Durability: RDB, AOF, Backups"
+phase: "03-caching-redis"
+order: 24
+tags: ["caching"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 16
+prerequisites: ["redis-deep"]
+summary: "How Redis gets data from RAM onto disk with RDB snapshots and the append-only file, how much you can lose under each setting, and how to back up, restore, and recover an instance."
+---
+
+## Definition (interview-ready)
+
+**Redis persistence** is how an in-memory Redis server writes its dataset to disk so it survives a restart. There are two mechanisms. **RDB** takes point-in-time binary snapshots: the server forks, and the child writes the whole dataset to `dump.rdb`. **AOF** (append-only file) logs every write command and replays the log on startup. You can run neither (pure cache), either one, or both. Since Redis 4.0 the AOF can also start with an RDB-format snapshot (the "RDB preamble"), which gives you a compact base plus a log of recent writes. How much data you can lose is set by how often you snapshot (RDB) or how often you `fsync` the log (AOF, default once per second). Replication, `WAIT`, and `WAITAOF` lower the risk further, but Redis never becomes a strongly consistent store.
+
+**One-liner:** Redis persists its in-memory data with RDB snapshots (fork and dump the whole dataset) and/or an append-only log of writes fsynced every second by default, so you can lose minutes of data with RDB alone or about one second with AOF.
+
+## Why it matters
+
+- "Is Redis durable?" is a classic interview trap. The honest answer is "it depends on the config, and here is the exact loss window for each config."
+- Persistence choices change **latency** (`fork` pauses, `fsync` stalls), **memory headroom** (copy-on-write during a snapshot), and **restart time** (loading an RDB is much faster than replaying a long log).
+- People lose data in the gaps between settings: a master with persistence off that auto-restarts empty and wipes its replicas, AOF switched on by editing the config and restarting (which loads an empty AOF), or backups nobody has ever restored.
+- When Redis is the source of truth for anything (sessions, queues, counters, rate limiters), you need a backup and restore story, not just a cache-miss story.
+
+## Core concepts
+
+### The four persistence modes
+
+| Mode | Config | What survives a crash | Typical use |
+|---|---|---|---|
+| None | `save ""` and `appendonly no` | Nothing | Pure cache, rebuildable data |
+| RDB only | `save` rules, `appendonly no` | State as of the last successful snapshot | Caches that should warm-start; you can accept minutes of loss |
+| AOF only | `appendonly yes`, `save ""` | Everything up to the last `fsync` (about 1s by default) | Rare. The docs discourage it, because periodic RDBs are what you use for backups |
+| RDB + AOF | both on | AOF is used on restart, because it is the most complete | Data you actually care about |
+
+When both are enabled, Redis loads the **AOF** at startup and ignores `dump.rdb`, because the AOF is guaranteed to be the more complete of the two.
+
+### RDB: snapshots via fork + copy-on-write
+
+```text
+            BGSAVE (or a save rule fires)
+                    │
+        parent ─────┼──── fork() ────▶ child
+   keeps serving    │                   │ walks the whole dataset
+   clients, writes  │                   │ writes temp-<pid>.rdb
+   touch pages ──▶  │ kernel copies     │ fsyncs, then rename(2)
+   (copy-on-write)  │ only the pages    │ over dump.rdb atomically
+                    │ that change       ▼
+                    │               exits; parent logs result
+```
+
+- **`fork()`** gives the child a frozen view of memory. Parent and child **share pages**, and the kernel copies a page only when one side writes to it. That is copy-on-write (COW).
+- **Memory overhead** depends on how much you write during the save. A read-heavy instance barely grows. A write-heavy instance can, in the worst case, touch almost every page and need close to **2x RAM**. `INFO persistence` reports `rdb_last_cow_size` so you can measure it.
+- **Fork latency** is real. The parent must copy its **page table** before returning. The docs work through an example: a 24 GB instance with 4 kB pages needs about 48 MB of page table. `INFO stats` → `latest_fork_usec` shows how long the last fork took.
+- **Transparent Huge Pages** make COW much worse: one write copies a 2 MB page instead of a 4 kB one. The docs say to disable THP (`echo never > /sys/kernel/mm/transparent_hugepage/enabled`).
+- **`vm.overcommit_memory = 1`**: with the default (0), Linux may refuse the fork unless enough free RAM exists to copy *all* pages. The FAQ's example is a 3 GB dataset with 2 GB free. Redis recommends setting it to 1.
+- **The snapshot is consistent.** The fork always happens between commands, so anything atomic in RAM is atomic in the snapshot.
+- **Copying is safe.** The child writes to a temp file and `rename(2)`s it into place, so `dump.rdb` is never half-written. You can copy it while the server is running.
+
+#### Save points
+
+```conf
+# redis.conf — the defaults (Redis 7.0+) when no save line is given:
+#   (before 7.0 the defaults were 900 1, 300 10, 60 10000)
+#   after 3600s if >= 1 change, after 300s if >= 100 changes, after 60s if >= 10000 changes
+save 3600 1 300 100 60 10000
+
+dbfilename dump.rdb
+dir /var/lib/redis
+stop-writes-on-bgsave-error yes   # refuse writes if the last BGSAVE failed (default yes)
+```
+
+The rules are OR-ed: a snapshot runs as soon as any one of them is met. `save ""` turns RDB off.
+
+#### SAVE vs BGSAVE
+
+| | `SAVE` | `BGSAVE` |
+|---|---|---|
+| Who writes | The main thread | A forked child |
+| Blocks clients | **Yes, for the whole dump** | Only for the `fork()` itself |
+| Complexity | O(N) in keys | Returns immediately (O(1)); the child does the O(N) work |
+| When to use | Last resort, e.g. when `fork()` keeps failing | Normal manual snapshot |
+
+```bash
+redis-cli BGSAVE              # "Background saving started"
+redis-cli BGSAVE SCHEDULE     # if an AOF rewrite is running, queue it instead of erroring (3.2.2+)
+redis-cli LASTSAVE            # unix time of last successful save
+redis-cli INFO persistence | grep -E 'rdb_bgsave_in_progress|rdb_last_bgsave_status|rdb_changes_since_last_save'
+```
+
+### AOF: the write log
+
+```conf
+appendonly yes
+appendfilename "appendonly.aof"
+appenddirname "appendonlydir"      # Redis 7+: all AOF parts live in this directory
+appendfsync everysec               # always | everysec (default) | no
+auto-aof-rewrite-percentage 100    # rewrite when the AOF is 2x its post-rewrite size...
+auto-aof-rewrite-min-size 64mb     # ...and at least this large
+aof-load-truncated yes             # if the tail is cut off, load what's there (default)
+aof-use-rdb-preamble yes           # base file is written in RDB format (default yes)
+```
+
+Every write command is appended in RESP format, the same wire format clients use. On restart, Redis replays it.
+
+#### `appendfsync`: the durability dial
+
+| Setting | What happens | Loss window on power failure or kernel crash | Cost |
+|---|---|---|---|
+| `always` | `fsync` after each batch of writes, **before replying** | About zero for acknowledged writes | Very slow. Group commit helps when there are many parallel clients |
+| `everysec` (default) | A background thread runs `fsync` once a second | About **1 second** (up to about 2s if the disk stalls) | Close to RDB speed |
+| `no` | Redis calls `write(2)` and the kernel decides when to flush | Whatever the OS hasn't flushed. On Linux that's often about 30 seconds, depending on tuning | Fastest |
+
+Two details interviewers like:
+
+- **A process crash is not a power failure.** If only `redis-server` dies (OOM-killed, `kill -9`), data already handed to the kernel with `write(2)` is still in the page cache and reaches disk. `appendfsync` matters when the **machine** dies.
+- With `everysec`, if the previous `fsync` is still running, Redis holds back the next `write(2)` for up to 2 seconds. After that it writes anyway, which can show up as latency spikes on a slow disk. `no-appendfsync-on-rewrite yes` skips `fsync` while a rewrite or BGSAVE is running. That cuts disk contention but widens the loss window.
+
+#### AOF rewrite (compaction)
+
+Incrementing a counter 100 times leaves 100 log entries for one key. A **rewrite** writes a new file with the minimal commands needed to rebuild the current state.
+
+```bash
+redis-cli BGREWRITEAOF       # manual
+# automatic: when size >= auto-aof-rewrite-min-size AND growth >= auto-aof-rewrite-percentage
+```
+
+A rewrite forks, just like BGSAVE. Redis won't run a rewrite and a BGSAVE at the same time. If you ask for one while the other is running, it is scheduled for later.
+
+#### Redis 7 multi-part AOF
+
+Before 7.0, a rewrite buffered every new write in memory while the child worked, appended that buffer at the end, and wrote each of those commands to disk twice. Redis 7.0 replaced this with a **multi-part AOF**:
+
+```text
+appendonlydir/
+├── appendonly.aof.1.base.rdb     ← base: snapshot at last rewrite (RDB format if preamble on)
+├── appendonly.aof.1.incr.aof     ← incremental writes since that base
+├── appendonly.aof.2.incr.aof     ← (another incr file opened at the next rewrite)
+└── appendonly.aof.manifest       ← lists which files make up the current dataset
+```
+
+Rewrite in 7.x:
+
+1. Fork. The child writes a new **base** file.
+2. At the same moment, the parent opens a **new incr file** and keeps appending to it. If the rewrite fails, the old base, the old incr files, and the new incr file still hold everything.
+3. When the child finishes, the parent writes a **temporary manifest** listing the new base and the new incr file, then atomically swaps it in.
+4. Old files are deleted. Failed rewrites are retried at a slower and slower rate, so you don't pile up incr files.
+
+The result: no big rewrite buffer in memory, and no writing every command twice.
+
+### Hybrid: RDB preamble
+
+`aof-use-rdb-preamble yes` (added in 4.0, default `yes` since 5.0) writes the AOF **base** as an RDB snapshot. Restart then loads a fast binary base and replays only the short incremental log. You get RDB's restart speed with AOF's loss window. This is what "RDB + AOF hybrid" means in practice.
+
+### RDB vs AOF
+
+| | RDB | AOF |
+|---|---|---|
+| Format | Compact binary, one file | RESP command log (plus RDB base with preamble) |
+| Loss window | Since the last snapshot (often minutes) | About 1s with `everysec`, about 0 with `always` |
+| Restart speed | Fast: load binary | Slower: replay commands (much better with preamble) |
+| File size | Small | Bigger, so it needs rewrites |
+| Runtime cost | Periodic fork + full dump | Constant `write`/`fsync`, plus occasional rewrite forks |
+| Backups / DR | Ideal: one file you can ship | Possible (copy the dir), but you must avoid rewrites during the copy |
+| Human-readable | No | Yes, so you can fix an accidental `FLUSHALL` by deleting it from the log before a rewrite runs |
+| Corruption tolerance | Checksummed; validate with `redis-check-rdb` | Truncated tail auto-handled; `redis-check-aof --fix` for worse |
+
+The official advice is to use both if you want safety close to PostgreSQL. Use RDB alone if a few minutes of loss is fine. Avoid AOF alone, because you lose the easy backups.
+
+### Durability beyond one disk: replication, WAIT, WAITAOF
+
+Disk persistence protects against a **restart**, not against losing the **machine**. For that you need replicas, and replication is **asynchronous** by default.
+
+| Tool | What it guarantees | What it doesn't |
+|---|---|---|
+| Replicas | A copy on another box, usually milliseconds behind | Writes acknowledged by the master but not yet replicated are lost on failover |
+| `WAIT numreplicas timeout` (3.0+) | Blocks until N replicas have **received** your earlier writes | Not that they're on disk. Not that failover will choose one of them |
+| `WAITAOF numlocal numreplicas timeout` (**7.2+**) | Blocks until your writes are **fsynced to the AOF** locally (`numlocal` = 0 or 1) and/or on N replicas | Still not strong consistency. Needs AOF enabled for `numlocal 1`. Can't be run on a replica |
+| `min-replicas-to-write N` + `min-replicas-max-lag S` | Master **refuses writes** unless at least N replicas lagged no more than S seconds | Only puts a bound on the loss window; it doesn't close it |
+
+```bash
+SET order:991 paid
+WAITAOF 1 1 100     # fsynced locally + on 1 replica, or give up after 100 ms
+# → 1) (integer) 1   local fsync done
+#   2) (integer) 1   one replica fsynced
+```
+
+Both `WAIT` and `WAITAOF` **return counts even on timeout**. The client must check the numbers. Sentinel and Cluster promote the "best" replica on a best-effort basis, so a write that reached a replica can still be lost if a different replica wins.
+
+### What Redis can and can't promise
+
+- **Can:** survive a clean restart with zero loss (`SHUTDOWN` saves first). Survive a process crash with about 1s of loss or less (`everysec`). Survive a single machine loss with replicas, losing at most the replication lag. Produce consistent, atomic snapshots for backup.
+- **Can't:** promise that an acknowledged write survives a failover. It isn't a CP system even with `WAIT`/`WAITAOF`. Cluster uses "last failover wins", and the cluster spec lists ways acknowledged writes can be lost. It also can't protect you from a bad command (`FLUSHALL`) being faithfully persisted and replicated. That's what backups are for.
+
+## How it works
+
+### A sensible production config for data you care about
+
+```conf
+save 3600 1 300 100 60 10000      # keep RDBs for backups and fast restarts
+appendonly yes
+appendfsync everysec
+aof-use-rdb-preamble yes
+stop-writes-on-bgsave-error yes
+# OS: vm.overcommit_memory=1, THP disabled, leave RAM headroom for COW
+```
+
+### Backup strategy
+
+1. **Snapshot**: rely on save rules or trigger `BGSAVE`. Wait until `rdb_bgsave_in_progress:0` and `rdb_last_bgsave_status:ok`.
+2. **Copy `dump.rdb` off the box.** It's safe to copy while running, thanks to the atomic rename. The docs suggest hourly snapshots kept for about 48 hours and daily ones kept for a month or two, named with timestamps, and at least one copy a day **outside the data center** (for example S3, encrypted).
+3. **Verify** the size and checksum after transfer. Alert when fresh backups stop arriving.
+4. **AOF-only instances (7.x):** set `auto-aof-rewrite-percentage 0`, wait until `aof_rewrite_in_progress:0`, then copy or hard-link everything in `appenddirname`, then restore the setting. A copy taken mid-rewrite can be inconsistent.
+5. **Newer option:** Redis 8.10 added a `BACKUP` command family (`BACKUP START`, `SEAL`, `LIST`, `CLEANUP`). It produces a base + incr + manifest set without stopping writes. You restore it with the startup-only `preload-file` setting.
+
+```bash
+# Simple cron-style backup
+set -e
+before=$(redis-cli LASTSAVE)              # unix time of the last successful save
+redis-cli BGSAVE SCHEDULE                 # queued if an AOF rewrite is running
+for i in $(seq 600); do                   # wait up to 10 min for a new successful save
+  [ "$(redis-cli LASTSAVE)" != "$before" ] && break
+  sleep 1
+done
+[ "$(redis-cli LASTSAVE)" != "$before" ] || { echo "BGSAVE did not finish" >&2; exit 1; }
+f=/backups/redis-$(date +%F-%H%M).rdb      # compute the name once
+cp /var/lib/redis/dump.rdb "$f"
+aws s3 cp "$f" s3://my-bucket/redis/ --sse
+```
+
+### Restore procedure (RDB)
+
+1. Stop Redis (`SHUTDOWN NOSAVE` if the in-memory data is bad, so it doesn't overwrite your file).
+2. **If AOF is enabled, Redis will load the AOF, not your RDB.** Either set `appendonly no` for the restore, or move the AOF directory aside.
+3. Put the backup at `dir/dbfilename` with the right owner and permissions.
+4. Start Redis and check `DBSIZE` and a few keys.
+5. To turn AOF back on, use `CONFIG SET appendonly yes` **on the live server**. That builds the AOF from memory. Then persist the setting with `CONFIG REWRITE`. If you edit `redis.conf` and restart instead, Redis starts from an empty AOF and you lose the data.
+
+### Recovering from failures
+
+| Symptom | What to do |
+|---|---|
+| Crash mid-write, AOF tail truncated | Default `aof-load-truncated yes`: Redis drops the half-written last command and starts, logging "AOF loaded anyway". |
+| AOF corrupted mid-file ("Bad file format") | Back up the file. Run `redis-check-aof` **without** `--fix` first to find the offset. Repair by hand if you can. `--fix` throws away everything from the bad point to the end. |
+| Suspect RDB file | `redis-check-rdb dump.rdb` checks it. Fall back to an older backup if it fails. |
+| `BGSAVE` failing (fork error) | Writes are refused while `stop-writes-on-bgsave-error yes`. Fix `overcommit_memory` or free RAM. `SAVE` is the last resort. |
+| Master died | With replicas, Sentinel or Cluster promotes one. Without them, restore from AOF/RDB on a new box. |
+| Accidental `FLUSHALL` with AOF | Stop the server **before a rewrite**, delete the trailing `FLUSHALL` from the AOF, and restart. |
+
+## Real-world examples
+
+- **The docs' own DR recipe**: ship hourly and daily RDB snapshots, encrypted (for example `gpg -c`), to S3 or to small VPSes at two different providers. Check size and SHA1 after transfer, and alert on its own channel if fresh backups stop arriving. It's cheap and dull, and it works.
+- **The persistence-off master trap** is documented in the replication docs. Master A has persistence off and auto-restarts empty. Replicas B and C sync from the now-empty A and wipe their own copies. Either enable persistence on the master or disable auto-restart.
+
+## Common pitfalls
+
+- **Turning on AOF by editing `redis.conf` and restarting.** Redis loads an empty AOF, and the data is gone. Use `CONFIG SET appendonly yes` and then `CONFIG REWRITE`.
+- **No memory headroom for COW.** A write-heavy 20 GB instance on a 24 GB box can get OOM-killed during `BGSAVE`.
+- **THP enabled.** Fork latency and COW memory both get much worse.
+- **`everysec` sold as "no data loss".** It's up to about 1s, and more when the disk is slow.
+- **Treating `WAIT` as synchronous replication.** It confirms delivery to replicas, not fsync to disk, and not which replica failover picks.
+- **Persistence off on a master with auto-restart**, which wipes the replicas.
+- **Backups on the same disk** as the data, or backups that have never been test-restored.
+- **Running `SAVE` in production**, which blocks every client for the whole dump.
+- **Huge single instances.** Fork time grows with RAM. Shard before fork pauses hurt.
+
+## Practice questions
+
+<Practice>
+
+<QA q="How does Redis persist data if it is an in-memory database?" level="easy">
+
+All reads and writes are served from RAM. Disk is only for recovery. There are two mechanisms:
+
+- **RDB**: periodic point-in-time snapshots (`dump.rdb`), written by a forked child using copy-on-write.
+- **AOF**: an append-only log of every write command, replayed on startup. How often it is `fsync`ed controls the loss window.
+
+You can disable both (pure cache), use one, or combine them. With the default `aof-use-rdb-preamble yes`, the AOF's base file is itself an RDB snapshot.
+
+</QA>
+
+<QA q="What is the difference between RDB and AOF?" level="easy">
+
+**RDB** is a compact binary snapshot of the whole dataset at one moment. It is fast to load and ideal for backups, but you lose everything since the last snapshot, which is often minutes.
+
+**AOF** records every write as it happens. You lose at most what wasn't fsynced: about 1s with the default `everysec`, about 0 with `always`. The trade-offs are larger files, the need for periodic rewrites, and slower restarts if there's no RDB preamble.
+
+If both are on, Redis loads the AOF on restart because it is the more complete of the two.
+
+</QA>
+
+<QA q="How do you force Redis to write a snapshot to disk right now?" level="easy">
+
+- `BGSAVE` forks a child and returns immediately. Clients keep being served. Check `LASTSAVE` or `INFO persistence` (`rdb_bgsave_in_progress`, `rdb_last_bgsave_status`) to see when it finishes.
+- `SAVE` does the dump on the main thread and **blocks every client** until it's done. It's only for emergencies, such as when `fork()` keeps failing.
+- `BGSAVE SCHEDULE` queues the save if an AOF rewrite is in progress, instead of returning an error.
+- `SHUTDOWN` (without `NOSAVE`) also saves before exiting when persistence is configured.
+
+</QA>
+
+<QA q="How do you control when Redis writes data to disk?" level="medium">
+
+- **RDB**: `save seconds changes` rules, OR-ed together. The default is `3600 1 300 100 60 10000`. `save ""` disables RDB. You can also trigger it manually with `BGSAVE`.
+- **AOF**: `appendonly yes` turns it on, and `appendfsync` sets how often data is forced to disk: `always`, `everysec`, or `no`.
+- **AOF size**: `auto-aof-rewrite-percentage` and `auto-aof-rewrite-min-size` (defaults 100% and 64mb) trigger compaction, or run `BGREWRITEAOF` by hand.
+- **Disk contention**: `no-appendfsync-on-rewrite` skips fsync while a child is writing. It's faster, but the loss window gets wider.
+- **Per write**: `WAITAOF 1 0 timeout` (7.2+) blocks your client until its writes are fsynced to the local AOF.
+
+</QA>
+
+<QA q="Compare the pros and cons of RDB and AOF, and say what you would run in production." level="medium">
+
+RDB pros: a single compact file, fast restarts, perfect for off-site backups, and little runtime cost apart from periodic forks. RDB cons: minutes of potential loss, and a fork that can pause a big instance and needs copy-on-write memory headroom.
+
+AOF pros: about 1s loss window (or about 0), a human-readable log (you can undo an accidental `FLUSHALL` before a rewrite), and truncation is handled automatically. AOF cons: bigger files, rewrite forks, `fsync` latency, and slower replay without the preamble.
+
+In production, if the data matters, I'd run both: RDB save rules for backups, plus AOF `everysec` with the RDB preamble. For a pure cache I'd turn persistence off, or keep RDB only for warm restarts.
+
+</QA>
+
+<QA q="Explain how BGSAVE uses fork and copy-on-write, and what it costs." level="medium">
+
+`fork()` creates a child that shares every memory page with the parent. The child walks the dataset and writes a temp RDB file, then atomically renames it to `dump.rdb`. When the parent changes a key, the kernel copies just that page, so the child keeps seeing the frozen snapshot.
+
+The costs:
+
+1. **Fork pause.** The page table has to be copied (about 48 MB for 24 GB with 4 kB pages). See `latest_fork_usec`.
+2. **COW memory.** It grows with the write rate during the save. Worst case is close to 2x. See `rdb_last_cow_size`.
+3. **CPU and disk I/O** in the child.
+
+The mitigations: `vm.overcommit_memory=1`, THP disabled, RAM headroom, and smaller shards.
+
+</QA>
+
+<QA q="What changed about AOF in Redis 7?" level="medium">
+
+Redis 7.0 introduced the **multi-part AOF**. Instead of one file, `appenddirname` (default `appendonlydir`) holds:
+
+- one **base** file (RDB or AOF format)
+- one or more **incr** files
+- a **manifest** that lists them
+
+During a rewrite, the parent opens a fresh incr file while the child writes a new base. A temp manifest is then atomically swapped in.
+
+This removed the old rewrite buffer, which used extra memory, wrote each command to disk twice, and could freeze the server at the end of a rewrite. One side effect: to back up the AOF you now copy the whole directory, with rewrites paused.
+
+</QA>
+
+<QA q="How does Redis handle backups, and how would you set them up?" level="medium">
+
+Redis is backup-friendly because a finished RDB is never modified. It is written to a temp name and renamed atomically, so copying `dump.rdb` while the server runs is safe.
+
+My setup:
+
+1. Snapshots come from save rules or `BGSAVE`.
+2. A cron job copies them with timestamps: hourly for about 48h, daily for a month or two, and prunes old ones.
+3. At least one copy a day goes off the machine and out of the data center, for example encrypted to S3.
+4. Verify size and checksum after transfer, and alert when backups go stale.
+5. Run a test restore regularly.
+
+For AOF-only, pause rewrites (`auto-aof-rewrite-percentage 0`) while copying `appendonlydir`. On Redis 8.10+, the `BACKUP` command family can produce sealed base + incr + manifest sets without pausing writes.
+
+</QA>
+
+<QA q="What mechanisms does Redis provide for durability, and what can it not guarantee?" level="hard">
+
+There are layers:
+
+1. **Local disk**: RDB snapshots and AOF with `appendfsync`.
+2. **Copies on other machines**: asynchronous replicas.
+3. **Per-write confirmation**: `WAIT N timeout` means N replicas *received* the write. `WAITAOF local N timeout` (7.2+) means it was *fsynced* locally and/or on N replicas.
+4. **Write fencing**: `min-replicas-to-write` and `min-replicas-max-lag` refuse writes when too few replicas are fresh, which bounds the loss window.
+5. **Backups**: off-site RDB copies protect against logical mistakes and disasters.
+
+What it can't guarantee: an acknowledged write surviving a failover. Replication is async. Sentinel and Cluster pick the best replica only on a best-effort basis. Cluster uses "last failover wins". The docs say plainly that neither `WAIT` nor `WAITAOF` makes Redis strongly consistent. For ledger-grade data, use a consensus-backed database.
+
+</QA>
+
+<QA q="What strategies would you combine to make a Redis-backed session store as durable as reasonably possible?" level="hard">
+
+- AOF `everysec` with the RDB preamble, plus RDB save rules for backups.
+- At least one replica in a different AZ, managed by Sentinel or Cluster for failover.
+- `min-replicas-to-write 1` and `min-replicas-max-lag 10`, so an isolated master stops accepting writes instead of collecting writes that will be lost.
+- For critical writes only (login, checkout), `WAITAOF 1 1 50`, and check the returned counts.
+- OS tuning: `overcommit_memory=1`, THP off, COW headroom.
+- Off-site RDB backups with tested restores.
+- Never run a master with persistence off and auto-restart on.
+
+Even then, say clearly that the remaining risk is a failover losing very recent writes.
+
+</QA>
+
+<QA q="A Redis node crashed and will not start, logging Bad file format reading the append only file. How do you recover?" level="scenario">
+
+1. **Copy the whole `appendonlydir` aside first.** Never repair your only copy.
+2. Run `redis-check-aof` on the AOF **without `--fix`** to find where the corruption starts.
+3. If it's near the end, `redis-check-aof --fix` truncates from that point. Compare with `diff -u` to see what was lost.
+4. If it's early in the file, `--fix` would discard most of the data. Try a manual repair (it's just RESP text), or restore the latest RDB backup. Start with `appendonly no`, then `CONFIG SET appendonly yes` and `CONFIG REWRITE` live.
+5. If a healthy replica exists, promoting it is often faster than repairing.
+6. Afterwards, find the root cause: disk full, a hardware fault, or a kill during write.
+
+A plain truncated tail usually needs nothing. The default `aof-load-truncated yes` loads everything up to the last full command.
+
+</QA>
+
+<QA q="You enabled AOF on a running RDB-only production instance by editing redis.conf and restarting. Keys dropped to zero. What happened, and what is the right procedure?" level="scenario">
+
+With `appendonly yes` set, Redis loads the AOF at startup and ignores `dump.rdb`. The AOF didn't exist yet, so Redis started empty.
+
+To recover: stop the server and restore from the previous `dump.rdb`. Make sure the empty instance didn't overwrite it with a new snapshot. Start with `appendonly no`.
+
+The right procedure:
+
+1. Back up `dump.rdb`.
+2. `CONFIG SET appendonly yes` on the live server. It writes an AOF from memory.
+3. Wait until `aof_rewrite_in_progress:0` and `aof_last_bgrewrite_status:ok`.
+4. `CONFIG REWRITE` so the change survives a restart.
+5. Restart later and confirm `DBSIZE` matches.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="Redis runs with appendonly yes, appendfsync everysec. The whole machine loses power. Roughly how much acknowledged data can be lost?" options={["None, because AOF is synchronous", "About one second of writes, sometimes a bit more if the disk was stalling", "Everything since the last RDB snapshot", "Everything since the last AOF rewrite"]} answer={1}>
+
+With `everysec`, a background thread fsyncs once a second, so about the last second of writes may still be in the page cache when the power goes. A slow disk can stretch this a little, because the write can be delayed up to about 2s. Only `always` gets close to zero. The RDB snapshot and the rewrite timing don't matter here, because the AOF is what gets loaded on restart.
+
+</MCQ>
+
+<MCQ q="Only the redis-server process is killed with kill -9. The box stays up, and appendfsync is no. What happens to writes that were already passed to write(2)?" options={["They are lost, because there was no fsync", "They are lost only if the AOF was being rewritten", "They are still in the kernel page cache and normally reach disk, because the OS did not crash", "Redis replays them from the replication backlog on restart"]} answer={2}>
+
+`fsync` protects against an **OS or power** failure. Once data is handed to the kernel with `write(2)`, the kernel owns it, and a process crash doesn't drop it. The fsync policy matters when the machine itself dies.
+
+</MCQ>
+
+<MCQ q="Why can a BGSAVE on a write-heavy 20 GB instance get the server OOM-killed on a 24 GB host?" options={["BGSAVE loads the old RDB into memory first", "Copy-on-write duplicates every page the parent modifies during the save, so memory can approach 2x in the worst case", "The child process allocates a full second copy of the dataset up front", "RDB compression buffers the whole file in RAM"]} answer={1}>
+
+Parent and child share pages after `fork()`, and the kernel copies a page only when it's written. Heavy writes during a long save mean many copied pages. The child doesn't copy everything up front, which is why read-heavy instances barely grow. `rdb_last_cow_size` shows the real overhead.
+
+</MCQ>
+
+<MCQ q="Both RDB and AOF are enabled. Redis restarts. Which file does it load?" options={["The AOF, because it is guaranteed to be the most complete", "dump.rdb, because it loads faster", "Whichever file is newer", "Both: the RDB first, then the AOF on top"]} answer={0}>
+
+When AOF is enabled, Redis rebuilds from the AOF and ignores `dump.rdb`. The 'RDB first, then log' idea is close to what the **RDB preamble** does, but there the RDB is the AOF's own base file, not `dump.rdb`.
+
+</MCQ>
+
+<MCQ q="What problem did the Redis 7 multi-part AOF solve?" options={["AOF files could not be read by humans", "During a rewrite, new writes were buffered in memory and written to disk twice, and the end of a rewrite could stall", "AOF could not be combined with RDB", "AOF rewrites required stopping all writes"]} answer={1}>
+
+Before 7.0, the parent kept a rewrite buffer and appended it to the child's file at the end. That cost extra memory, doubled the disk writes, and could freeze the server. In 7.x, the parent just opens a new incr file, and a manifest swap makes the new base and incr files live. Rewrites never required stopping writes, and RDB+AOF already worked through the preamble.
+
+</MCQ>
+
+<MCQ q="A client runs SET then WAIT 1 100 and gets back 1. What is now guaranteed?" options={["The write is fsynced on one replica", "The write will survive any failover", "At least one replica has received the write. Durability on that replica's disk and failover choice are not guaranteed", "The write is fsynced on the master's AOF"]} answer={2}>
+
+`WAIT` counts replicas that acknowledged *receiving* the write. For fsync confirmation you need `WAITAOF` (7.2+). Even then, failover is best-effort, and the docs say neither command makes Redis strongly consistent.
+
+</MCQ>
+
+<MCQ q="Which statement about SAVE vs BGSAVE is correct?" options={["SAVE is preferred in production because it produces a more consistent snapshot", "BGSAVE blocks clients for the whole dump but uses less memory", "Both fork a child process; SAVE just waits for it", "SAVE runs on the main thread and blocks all clients; BGSAVE forks and only pauses for the fork itself"]} answer={3}>
+
+`SAVE` is synchronous on the main thread, so every client waits. It is only a last resort when `fork()` fails. Both produce equally consistent snapshots. `BGSAVE` pauses only while forking.
+
+</MCQ>
+
+<MCQ q="A master runs with persistence disabled and is supervised by systemd with auto-restart. Two replicas have full copies. The master crashes and restarts in 2 seconds. What is the risk?" options={["None, the replicas will push their data back to the master", "The replicas resync from the now-empty master and wipe their own data", "The master refuses to start without an RDB file", "Sentinel always promotes a replica first, so the old master's state doesn't matter"]} answer={1}>
+
+Replication flows from master to replica. The restarted master is empty with a new history, so the replicas full-sync from it and lose everything. Sentinel may not notice a restart that fast. The replication docs call this out: enable persistence on the master, or disable auto-restart.
+
+</MCQ>
+
+<MCQ q="Where does aof-use-rdb-preamble yes put the RDB data?" options={["In dump.rdb, alongside the AOF", "In memory only, to speed up rewrites", "In a separate backup directory", "As the base of the AOF itself, followed by incremental commands"]} answer={3}>
+
+The preamble makes the AOF base file (for example `appendonly.aof.1.base.rdb` in 7.x) RDB-encoded, with incr files of plain commands after it. Restarts load the compact base fast and then replay only a short tail.
+
+</MCQ>
+
+<MCQ q="Why is it safe to cp dump.rdb while Redis is running?" options={["Redis locks the file during writes", "The child writes a temp file and atomically renames it over dump.rdb when complete, so the visible file is always a finished snapshot", "Redis pauses writes during the copy", "The RDB format is append-only, so partial copies are valid"]} answer={1}>
+
+A finished RDB file is never modified in place. A new snapshot replaces it via `rename(2)`, so any copy you take is a complete, consistent file. No locks or pauses are involved.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **RDB** = fork + COW snapshot to `dump.rdb`. Default save rules: `3600 1 300 100 60 10000`. Loss = since last snapshot.
+- **`BGSAVE`** forks (pauses only for the fork). **`SAVE`** blocks everything (last resort). Check `LASTSAVE`, `INFO persistence`.
+- **AOF** = RESP command log. `appendfsync everysec` (default) means about 1s loss, `always` about 0 (slow), `no` leaves it to the OS.
+- **Rewrite** (`BGREWRITEAOF`, auto at 100% growth and 64mb) compacts the log. **Redis 7 multi-part AOF** = base + incr files + manifest in `appendonlydir`.
+- **`aof-use-rdb-preamble yes`** (default) = RDB base + command tail, giving fast restart and small loss.
+- Both on, so **AOF is loaded** on restart.
+- Fork costs: page-table copy (`latest_fork_usec`), COW memory (`rdb_last_cow_size`). Set `overcommit_memory=1`, disable THP.
+- **Durability across machines**: replicas (async), `WAIT` (received), `WAITAOF` 7.2+ (fsynced), `min-replicas-to-write`. Still **not** strongly consistent.
+- **Backups**: copy `dump.rdb` (safe, atomic rename), hourly and daily, off-site, verify, test restores.
+- **Recovery**: truncated AOF auto-loads; corrupt AOF → `redis-check-aof` (back up first, `--fix` last); RDB → `redis-check-rdb`.
+- To enable AOF on a live RDB box: **`CONFIG SET appendonly yes`**, then `CONFIG REWRITE`. Never edit the config and restart.
+
+## Go deeper
+
+- **Redis docs**: [Redis persistence](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/), the canonical page on RDB, AOF, multi-part AOF, backups, and DR.
+- **Redis docs**: [`WAITAOF`](https://redis.io/docs/latest/commands/waitaof/), [`WAIT`](https://redis.io/docs/latest/commands/wait/), [`BGSAVE`](https://redis.io/docs/latest/commands/bgsave/), [`SAVE`](https://redis.io/docs/latest/commands/save/).
+- **Redis docs**: [Replication](https://redis.io/docs/latest/operate/oss_and_stack/management/replication/), including the persistence-off master failure mode.
+- **Redis docs**: [Diagnosing latency](https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/latency/), covering fork cost, THP, and AOF fsync latency.
+- **Redis docs**: [FAQ](https://redis.io/docs/latest/develop/get-started/faq/), on why `overcommit_memory=1` matters.
+- **antirez**: ["Redis persistence demystified"](http://oldblog.antirez.com/post/redis-persistence-demystified.html), the original author on fsync, write, and what each layer guarantees.
+- **Book**: *Redis in Action* (Josiah Carlson), whose persistence and replication chapter predates Redis 7 but still explains the trade-offs well.
+- Related notes: [Redis deep dive](/learn/notes/redis-deep/), [Replication & Cluster](/learn/notes/redis-replication-cluster/), [Redis operations](/learn/notes/redis-operations/), [Atomicity & scripting](/learn/notes/redis-transactions-scripting/).

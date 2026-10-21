@@ -1,0 +1,650 @@
+---
+title: "Creational Patterns: Factory, Abstract Factory, Singleton, Builder"
+phase: "14-lld"
+order: 134
+tags: ["lld", "design-patterns", "java", "gof", "singleton", "builder"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 28
+prerequisites: ["solid-principles"]
+summary: "How and why to use Factory Method, Abstract Factory, Singleton (five thread-safe variants), Builder and Prototype in Java, with JDK and Spring examples and the trade-offs interviewers ask about."
+---
+
+## Definition (interview-ready)
+
+**Creational patterns** control *how objects get created*, so the rest of the code doesn't depend on concrete classes or on messy construction steps. The 1994 "Gang of Four" (GoF) book *Design Patterns* lists five:
+
+| Pattern | Problem it solves | One-liner |
+|---|---|---|
+| **Factory Method** | Callers shouldn't know which concrete class to instantiate. | Let a method (often overridden in a subclass) decide which class to create. |
+| **Abstract Factory** | You need *families* of related objects that must match. | One factory interface creates a whole matching set of products. |
+| **Builder** | An object has many optional parts or must be assembled step by step. | Collect parameters with named, chained calls, then `build()` once. |
+| **Singleton** | Exactly one instance must exist, with a global access point. | Hide the constructor; hand out the one instance. |
+| **Prototype** | Creating from scratch is expensive or the class is only known at runtime. | Create new objects by copying an existing one. |
+
+Separately, *Effective Java* Item 1 recommends **static factory methods** (`Integer.valueOf`, `List.of`). That's not one of the GoF patterns, and interviewers love checking that you know the difference.
+
+How to say it in an interview: *"Creational patterns decouple 'what I need' from 'how it's built'. I reach for a static factory or simple factory first, Builder when a constructor has many optional parameters, Abstract Factory when products come in matching families, and I avoid hand-rolled singletons in favour of a DI container's singleton scope."*
+
+**One-liner:** Creational patterns (Factory Method, Abstract Factory, Builder, Singleton, Prototype) hide how objects are built, so callers depend on interfaces instead of concrete classes and complex construction happens in one place.
+
+## Why it matters
+
+- **LLD rounds**: Parking lot, payment system, notification service — each needs "create the right handler for this type" logic. A clean factory keeps `new` out of business code (DIP, OCP).
+- **Singleton is the most-asked pattern question in Java interviews**, mostly because of thread safety: double-checked locking, `volatile`, the holder idiom, the enum singleton.
+- **Builder** shows up in every modern Java codebase (Lombok `@Builder`, `HttpClient.newBuilder()`), and in questions about immutability.
+- Knowing **real JDK/Spring examples** proves you've seen the patterns in practice, not just in a textbook.
+
+## Core concepts
+
+### Simple factory vs static factory method vs GoF Factory Method
+
+These three are often mixed up.
+
+| | What it is | Example |
+|---|---|---|
+| **Simple factory** | A class with a method that picks a concrete class (often with a `switch`). Not a GoF pattern, but the most common in practice. | `PaymentProcessorFactory.forType("UPI")` |
+| **Static factory method** (*Effective Java* Item 1) | A static method that returns an instance instead of a public constructor. | `Integer.valueOf(42)`, `List.of(a, b)`, `Calendar.getInstance()` |
+| **Factory Method** (GoF) | A method in a base class that **subclasses override** to decide which product to create. | `Creator.createTransport()` overridden by `RoadLogistics`, `SeaLogistics` |
+
+**Static factory methods** — why *Effective Java* prefers them to constructors in many cases:
+- **They have names.** `BigInteger.probablePrime(...)` says more than a constructor overload.
+- **They don't have to create a new object.** `Integer.valueOf` always caches values from -128 to 127 (documented in the Javadoc), and `Boolean.valueOf` returns one of two constants.
+- **They can return any subtype.** In OpenJDK, `EnumSet.noneOf` returns a small bit-vector implementation for enums with up to 64 constants and a larger one otherwise; callers only see `EnumSet`.
+- **The returned class can vary per call or per release**, and can even be loaded later (service-provider frameworks like JDBC's `DriverManager.getConnection`).
+- Downsides: classes with only private constructors can't be subclassed, and static factories are harder to spot in Javadoc. Naming conventions help: `from`, `of`, `valueOf`, `getInstance`, `newInstance`, `getType`, `newType`.
+
+### Factory Method (GoF)
+
+**Intent.** Define an interface for creating an object, but let subclasses decide which class to instantiate.
+
+**Problem.** A framework or base class has a workflow (create a notifier, send, record the result) but can't know which concrete product a particular variant needs.
+
+```
+     ┌────────────────────────┐                ┌──────────────────┐
+     │ OrderNotifier          │   creates      │ «interface»      │
+     │ (abstract creator)     │ ─────────────► │ Channel          │
+     │ + notify(order)        │                │ + send(msg)      │
+     │ # createChannel()      │◄─ factory      └────────▲─────────┘
+     └──────────▲─────────────┘   method                │
+                │                              ┌────────┴────────┐
+     ┌──────────┴──────────┐                   │                 │
+ ┌───┴────────────┐ ┌──────┴────────┐   ┌──────┴─────┐   ┌───────┴─────┐
+ │ SmsNotifier    │ │ EmailNotifier │   │ SmsChannel │   │ EmailChannel│
+ │ createChannel()│ │ createChannel()│  └────────────┘   └─────────────┘
+ └────────────────┘ └───────────────┘
+```
+
+```java
+public abstract class OrderNotifier {
+    // template workflow, same for all subclasses
+    public final void notify(Order order) {
+        Channel channel = createChannel();             // the factory method
+        channel.send(Message.orderShipped(order));
+    }
+    protected abstract Channel createChannel();
+}
+
+public class SmsNotifier extends OrderNotifier {
+    @Override protected Channel createChannel() { return new SmsChannel(smsProvider); }
+}
+public class EmailNotifier extends OrderNotifier {
+    @Override protected Channel createChannel() { return new EmailChannel(smtpConfig); }
+}
+```
+
+In everyday Java you more often see a **simple factory keyed by type**, which is fine and easier to read:
+
+```java
+public class PaymentProcessorFactory {
+    private final Map<PaymentType, PaymentProcessor> byType;
+
+    public PaymentProcessorFactory(List<PaymentProcessor> processors) {   // Spring injects all beans
+        this.byType = processors.stream()
+            .collect(Collectors.toMap(PaymentProcessor::type, p -> p));
+    }
+
+    public PaymentProcessor get(PaymentType type) {
+        PaymentProcessor p = byType.get(type);
+        if (p == null) throw new IllegalArgumentException("Unsupported: " + type);
+        return p;
+    }
+}
+```
+
+Adding net banking is a new `PaymentProcessor` bean; the factory doesn't change (OCP).
+
+**Real examples.**
+- `java.util.Calendar.getInstance()`, `java.text.NumberFormat.getInstance()`, `java.nio.charset.Charset.forName(...)` — usually listed as "factory method" examples (refactoring.guru lists them), though strictly they are **static factory methods**, not the subclass-override GoF form.
+- `java.util.Collection.iterator()` *is* the GoF form: each collection subclass overrides it to create its own `Iterator` implementation.
+- Spring: `@Bean` methods in a `@Configuration` class are factory methods the container calls; `FactoryBean` lets a bean act as a factory for another object.
+
+**Use when** the creation decision varies by subclass or by a runtime key, and you want callers to depend only on the product interface. **Avoid when** there is one concrete class and no reason to vary it — just call the constructor.
+
+### Abstract Factory
+
+**Intent.** Provide an interface for creating **families of related objects** without naming their concrete classes, and guarantee the products in a family match.
+
+**Problem.** A marketplace supports several payment providers. For each provider you need a matching *payment client*, *refund client*, and *webhook verifier*. Mixing Razorpay's webhook verifier with another provider's payment client is a bug the compiler should prevent.
+
+```
+             ┌─────────────────────────────────┐
+             │ «interface» PaymentProviderKit  │
+             │ + paymentClient()               │
+             │ + refundClient()                │
+             │ + webhookVerifier()             │
+             └───────────▲───────────▲─────────┘
+                         │           │
+        ┌────────────────┴──┐   ┌────┴──────────────────┐
+        │ RazorpayKit       │   │ StripeKit             │
+        │ → RazorpayPayment │   │ → StripePayment       │
+        │ → RazorpayRefund  │   │ → StripeRefund        │
+        │ → RazorpayWebhook │   │ → StripeWebhook       │
+        └───────────────────┘   └───────────────────────┘
+  Client code: CheckoutService uses only PaymentProviderKit and the product interfaces.
+```
+
+```java
+public interface PaymentProviderKit {
+    PaymentClient paymentClient();
+    RefundClient refundClient();
+    WebhookVerifier webhookVerifier();
+}
+
+public class RazorpayKit implements PaymentProviderKit {
+    private final RazorpayConfig cfg;
+    public RazorpayKit(RazorpayConfig cfg) { this.cfg = cfg; }
+
+    public PaymentClient paymentClient()     { return new RazorpayPaymentClient(cfg); }
+    public RefundClient refundClient()       { return new RazorpayRefundClient(cfg); }
+    public WebhookVerifier webhookVerifier() { return new RazorpayWebhookVerifier(cfg.webhookSecret()); }
+}
+
+// Chosen once, e.g. per merchant or per region
+PaymentProviderKit kit = merchant.usesStripe() ? stripeKit : razorpayKit;
+kit.paymentClient().charge(order);
+```
+
+**Factory Method vs Abstract Factory.** Factory Method creates **one** product and relies on inheritance (subclass overrides). Abstract Factory creates a **family** of products and relies on composition (you hold a factory object). Abstract factories are often implemented as a set of factory methods. The trade-off: adding a new *product* (say, `payoutClient()`) means changing the interface and every factory.
+
+**Real examples.** `javax.xml.parsers.DocumentBuilderFactory.newInstance()`, `javax.xml.transform.TransformerFactory.newInstance()` and `javax.xml.xpath.XPathFactory.newInstance()` return a provider-specific factory that then creates matching parser/transformer objects. Classic UI toolkits (a "Windows" factory vs a "Mac" factory for buttons and checkboxes) are the textbook case.
+
+**Use when** you have real product families that must be consistent, and the family is chosen in one place. **Avoid when** there's only one family, or the "family" members don't actually need to match.
+
+### Singleton
+
+**Intent.** Ensure a class has exactly one instance and provide a global access point to it.
+
+```
+ ┌────────────────────────────────┐
+ │ Singleton                      │
+ │ - static instance : Singleton  │
+ │ - Singleton()       (private)  │
+ │ + static getInstance()         │
+ └────────────────────────────────┘
+```
+
+Valid uses: a process-wide resource where two instances would be wrong or wasteful — a configuration snapshot, a metrics registry, a connection pool, a local cache. `java.lang.Runtime.getRuntime()` is the JDK's textbook example: every Java application has a single `Runtime` instance.
+
+#### 1. Eager initialization
+
+```java
+public final class AppConfig {
+    private static final AppConfig INSTANCE = new AppConfig();
+    private AppConfig() { /* load config */ }
+    public static AppConfig getInstance() { return INSTANCE; }
+}
+```
+
+Thread-safe for free: the JVM initialises static fields during class initialization, which the JLS guarantees happens once, under a lock. The cost: created when the class is initialised, even if it's never used, and constructor exceptions surface as `ExceptionInInitializerError`. Since class initialization is already lazy (it happens on first active use), this is fine for most cases.
+
+#### 2. Lazy, synchronized method
+
+```java
+public final class AppConfig {
+    private static AppConfig instance;
+    private AppConfig() {}
+    public static synchronized AppConfig getInstance() {
+        if (instance == null) instance = new AppConfig();
+        return instance;
+    }
+}
+```
+
+Correct, but every call takes a lock, even after initialization. Usually acceptable unless it's on a very hot path; simple beats clever.
+
+The **broken** version is the same code without `synchronized`: two threads can both see `null` and create two instances.
+
+#### 3. Double-checked locking (DCL) with `volatile`
+
+```java
+public final class AppConfig {
+    private static volatile AppConfig instance;      // volatile is essential
+    private AppConfig() {}
+
+    public static AppConfig getInstance() {
+        AppConfig local = instance;                   // one volatile read on the fast path
+        if (local == null) {
+            synchronized (AppConfig.class) {
+                local = instance;
+                if (local == null) {
+                    instance = local = new AppConfig();
+                }
+            }
+        }
+        return local;
+    }
+}
+```
+
+**Why `volatile`?** `instance = new AppConfig()` is not one step. It allocates memory, runs the constructor, and publishes the reference. Without `volatile`, the compiler or CPU may reorder these, so another thread can see a **non-null reference to a not-yet-constructed object** and skip the lock. `volatile` creates a happens-before edge: everything the constructor wrote is visible to any thread that reads the non-null reference. DCL was famously **broken before Java 5**; the revised Java Memory Model (JSR-133, Java 5) made it correct *only* with `volatile`. The local variable is an optimisation that avoids reading the volatile field twice.
+
+#### 4. Initialization-on-demand holder (Bill Pugh idiom)
+
+```java
+public final class AppConfig {
+    private AppConfig() {}
+
+    private static class Holder {
+        static final AppConfig INSTANCE = new AppConfig();
+    }
+
+    public static AppConfig getInstance() { return Holder.INSTANCE; }
+}
+```
+
+`Holder` is not initialised until `getInstance()` first touches `Holder.INSTANCE`. The JVM's class-initialization procedure (JLS 12.4.2) guarantees it runs once and is safely visible to all threads. You get lazy loading and thread safety with no `volatile` and no explicit locks. This is usually the best choice for a lazy static singleton.
+
+#### 5. Enum singleton (*Effective Java* Item 3)
+
+```java
+public enum IdGenerator {
+    INSTANCE;
+
+    private final AtomicLong counter = new AtomicLong();
+    public long next() { return counter.incrementAndGet(); }
+}
+
+long id = IdGenerator.INSTANCE.next();
+```
+
+Bloch calls a single-element enum often the best way to implement a singleton. The Java language guarantees it for you:
+- **Reflection-proof.** The JLS prohibits reflective instantiation of enum classes; `Constructor.newInstance` throws `IllegalArgumentException` for enums. A normal private constructor can be called through `setAccessible(true)`.
+- **Serialization-proof.** Enum constants get special treatment in serialization, so deserializing never creates a second instance. A normal `Serializable` singleton needs a `readResolve()` method returning `INSTANCE` (and non-transient fields can still be attacked).
+- **Clone-proof.** `Enum.clone()` is final and throws.
+
+Limits: an enum can't extend another class (it implicitly extends `java.lang.Enum`), though it can implement interfaces. It is always eagerly created on first use of the enum, and it feels unusual to some teams.
+
+#### Comparison
+
+| Variant | Lazy? | Thread-safe? | Reflection/serialization safe? | Notes |
+|---|---|---|---|---|
+| Eager static field | On class init | Yes | No (needs guards and `readResolve`) | Simplest |
+| Synchronized `getInstance` | Yes | Yes | No | Lock on every call |
+| DCL + `volatile` | Yes | Yes (Java 5+) | No | Easy to get wrong |
+| Holder idiom | Yes | Yes | No | Best lazy option |
+| Enum | On enum init | Yes | **Yes** | Can't extend a class |
+
+#### Why singletons hurt testability
+
+- **Hidden dependencies.** `PricingService` calls `TaxConfig.getInstance()` internally; nothing in its constructor tells you it needs tax config.
+- **Global mutable state** leaks between tests and makes test order matter.
+- **Hard to substitute.** You can't pass a fake in, because callers fetch the instance themselves. Static methods are awkward to mock.
+- **Lifetime is per class loader**, so in app servers or test runners with multiple class loaders you can get more than one "singleton".
+
+The fix is to **separate "only one instance" from "global access"**: create one instance and **inject** it. That's exactly what a DI container does.
+
+#### Spring singleton scope vs GoF Singleton
+
+| | GoF Singleton | Spring `singleton` scope |
+|---|---|---|
+| How many | One per **class loader** | One per **bean definition, per container** |
+| Who enforces it | The class itself (private constructor) | The container |
+| Access | Static `getInstance()` | Injected into dependents |
+| Class can still be `new`-ed? | No | Yes (e.g. in tests) |
+| Default? | — | Yes, singleton is Spring's default scope |
+
+So two `@Bean` definitions of the same class give you two instances, and two application contexts give you two each. Spring singletons are shared across threads, so they must be **stateless or thread-safe**. Spring's **prototype** scope creates a new instance on each request to the container; note that Spring does not call destruction callbacks for prototype beans.
+
+**Use a hand-written Singleton when** you have no container and the resource is truly process-wide. **Otherwise** let the container manage a singleton-scoped bean and inject it.
+
+### Builder
+
+**Intent.** Separate the construction of a complex object from its representation, so the same construction process can create different representations (GoF). In modern Java, the more common meaning is *Effective Java* Item 2: **use a builder when a constructor or static factory would have many parameters**, especially optional ones.
+
+**The telescoping constructor problem.**
+
+```java
+public Order(String id, String customerId) { ... }
+public Order(String id, String customerId, Address shipTo) { ... }
+public Order(String id, String customerId, Address shipTo, String couponCode) { ... }
+public Order(String id, String customerId, Address shipTo, String couponCode,
+             boolean giftWrap, String giftMessage, PaymentMode mode) { ... }
+
+new Order("o1", "c9", addr, null, true, null, PaymentMode.UPI);   // which null is which?
+```
+
+Adjacent parameters of the same type are easy to swap silently. The **JavaBeans alternative** (no-arg constructor plus setters) is readable but leaves the object **mutable and possibly inconsistent** halfway through construction, and it can't be immutable.
+
+**Builder solution.**
+
+```
+ ┌─────────────────────────┐        builds        ┌────────────────────────┐
+ │ Order.Builder           │ ───────────────────► │ Order (immutable)      │
+ │ - id, customerId (req.) │                      │ - final fields         │
+ │ - shipTo, coupon, ...   │                      │ - private Order(Builder)│
+ │ + shipTo(a) : Builder   │                      └────────────────────────┘
+ │ + coupon(c) : Builder   │
+ │ + build() : Order       │
+ └─────────────────────────┘
+```
+
+```java
+public final class Order {
+    private final String id;
+    private final String customerId;
+    private final Address shipTo;
+    private final String couponCode;
+    private final boolean giftWrap;
+    private final List<LineItem> items;
+
+    private Order(Builder b) {
+        this.id = b.id;
+        this.customerId = b.customerId;
+        this.shipTo = b.shipTo;
+        this.couponCode = b.couponCode;
+        this.giftWrap = b.giftWrap;
+        this.items = List.copyOf(b.items);          // defensive, immutable copy
+    }
+
+    public static Builder builder(String id, String customerId) {   // required params up front
+        return new Builder(id, customerId);
+    }
+
+    public static final class Builder {
+        private final String id;
+        private final String customerId;
+        private Address shipTo;
+        private String couponCode;
+        private boolean giftWrap;
+        private final List<LineItem> items = new ArrayList<>();
+
+        private Builder(String id, String customerId) {
+            this.id = Objects.requireNonNull(id);
+            this.customerId = Objects.requireNonNull(customerId);
+        }
+        public Builder shipTo(Address a)     { this.shipTo = a; return this; }
+        public Builder coupon(String code)   { this.couponCode = code; return this; }
+        public Builder giftWrap(boolean g)   { this.giftWrap = g; return this; }
+        public Builder addItem(LineItem i)   { this.items.add(i); return this; }
+
+        public Order build() {
+            if (items.isEmpty()) throw new IllegalStateException("order has no items");
+            if (shipTo == null) throw new IllegalStateException("shipping address required");
+            return new Order(this);                 // validate invariants once, here
+        }
+    }
+}
+
+Order order = Order.builder("o1", "c9")
+    .shipTo(addr)
+    .addItem(new LineItem("SKU-1", 2))
+    .giftWrap(true)
+    .build();
+```
+
+Key points:
+- **Required parameters** go in the builder's constructor (or are checked in `build()`); optional ones are named methods.
+- **Validation happens in `build()`**, so an invalid `Order` never exists.
+- The product's fields are `final` and collections are copied, so the result is **immutable** and safe to share across threads.
+- A builder object itself is mutable and not thread-safe; don't share one across threads.
+
+**Lombok `@Builder`.** Annotating a class with Lombok's `@Builder` generates a static `builder()` method, an inner `OrderBuilder` class with one chained method per field, and `build()`. Extras: `@Builder.Default` for default values, `@Singular` for add-one-at-a-time collection methods (the built collection is immutable), and `toBuilder = true` to copy an existing object into a pre-filled builder. Lombok's builder does **not** validate required fields for you; put checks in a constructor or a custom `build()`.
+
+**Real examples.**
+- `java.net.http.HttpClient.newBuilder()` and `HttpRequest.newBuilder()` (Java 11+) — textbook builders producing immutable objects.
+- `java.util.stream.Stream.builder()`, `Locale.Builder`.
+- `StringBuilder` is often cited, and it does build a `String` step by step, but it's really a mutable string buffer rather than the "named optional parameters → validated immutable object" builder. Say this nuance if asked.
+- Spring: `UriComponentsBuilder`, `ResponseEntity.ok().header(...).body(...)`, `WebClient.builder()`.
+- Records (Java 16+) reduce boilerplate for the immutable product but don't solve many-optional-parameters; builders are still used with them.
+
+**Use when** there are roughly four or more parameters, many optional, or you need validation across fields before the object exists. **Avoid when** there are two or three required parameters — a constructor or static factory is clearer.
+
+### Prototype (briefly)
+
+**Intent.** Create new objects by **copying** an existing instance (the prototype) instead of building from scratch.
+
+```java
+public final class ProductTemplate {
+    private final String category;
+    private final Map<String, String> attributes;
+    // expensive to assemble: loaded from catalog rules, tax slabs, etc.
+
+    public ProductTemplate(ProductTemplate other) {          // copy constructor
+        this.category = other.category;
+        this.attributes = new HashMap<>(other.attributes);   // deep enough copy
+    }
+}
+
+ProductTemplate kurtaTemplate = registry.get("apparel/kurta");
+ProductTemplate draft = new ProductTemplate(kurtaTemplate);   // seller edits the copy
+```
+
+Java's built-in mechanism is `Object.clone()` with the `Cloneable` marker interface, which makes a **shallow, field-for-field copy**. It's widely considered awkward: `Cloneable` has no `clone` method, `clone()` bypasses constructors, it fights with `final` fields, and shallow copies share mutable internals. *Effective Java* advises overriding `clone` only with great care and prefers **copy constructors or copy factories**. Spring's **prototype scope** is named after the idea but simply creates a new bean each time it's requested.
+
+## How it works (choosing a creational pattern)
+
+```
+Need to create an object?
+│
+├─ Simple, few params, one class ............... constructor
+├─ Want a name, caching, or to return a subtype  static factory (valueOf, of, from)
+├─ Pick one implementation by a runtime key .... simple factory / map of strategies
+├─ Subclasses decide what to create ............ Factory Method
+├─ Several products that must match ............ Abstract Factory
+├─ Many optional params / validate before exist  Builder
+├─ Copying is cheaper than building ............ Prototype (copy constructor)
+└─ Exactly one shared instance ................. DI singleton scope;
+                                                 hand-written: holder idiom or enum
+```
+
+## Real-world examples
+
+- **JDK**: `Runtime.getRuntime()` (singleton); `Calendar.getInstance()`, `NumberFormat.getInstance()`, `Integer.valueOf`, `EnumSet.of` (static factories); `Collection.iterator()` (GoF factory method); `DocumentBuilderFactory.newInstance()` (abstract factory); `HttpClient.newBuilder()` (builder); `Object.clone()` (prototype).
+- **Spring**: `BeanFactory` is the root interface of the Spring container — a general-purpose factory that creates and hands out beans by name or type. `FactoryBean` lets one bean produce another (Spring uses it widely internally). Beans are singleton-scoped by default; prototype scope gives a new instance per request.
+- **Lombok** `@Builder` is the most common way builders appear in Spring Boot codebases.
+
+## Common pitfalls
+
+- **DCL without `volatile`**: a thread may see a partially constructed object. Works by luck on some hardware, fails on others.
+- **Mutable state in a Spring singleton bean** (an instance field that holds per-request data) → race conditions under load.
+- **Singletons as global variables**: hidden dependencies, test pollution, impossible to fake.
+- **Serializable singleton without `readResolve`** → deserialization creates a second instance. Use an enum.
+- **Builder without validation**: `build()` happily returns an `Order` with no items.
+- **Leaking mutable collections** from the builder into the "immutable" product. Copy them.
+- **Factories for the sake of factories**: an `OrderFactory` whose only method calls `new Order(...)`.
+- **Abstract Factory for one family**: an interface plus one implementation, extra indirection, nothing gained.
+- **Shallow `clone()`** of an object holding lists or maps: the copy and original share and mutate the same collection.
+- **Calling `Calendar.getInstance()` a "GoF Factory Method"** without the nuance; it's a static factory method.
+
+## Practice questions
+
+<Practice>
+
+<QA q="What is the difference between a static factory method and the GoF Factory Method pattern?" level="easy">
+
+A **static factory method** (*Effective Java* Item 1) is a static method like `Integer.valueOf` or `List.of` that returns an instance instead of a public constructor; it can have a name, cache instances, and return subtypes. The **GoF Factory Method** is an overridable (usually abstract) instance method in a base class, and **subclasses** decide which concrete product to create, for example `Collection.iterator()`. One is about replacing constructors; the other is about deferring the choice of class to subclasses.
+
+</QA>
+
+<QA q="Why use a Builder instead of a constructor with many parameters?" level="easy">
+
+Long constructors (the telescoping constructor problem) are hard to read, and adjacent parameters of the same type can be swapped silently. The setter-based JavaBeans approach allows inconsistent, mutable objects. A builder gives **named, chained** calls for optional parameters, puts **validation in `build()`**, and produces an **immutable** object with `final` fields.
+
+</QA>
+
+<QA q="Give three JDK examples of creational patterns." level="easy">
+
+- **Singleton**: `Runtime.getRuntime()`.
+- **Static factory**: `Integer.valueOf`, `List.of`, `Calendar.getInstance()`.
+- **Builder**: `HttpClient.newBuilder()` / `HttpRequest.newBuilder()` (Java 11+).
+- **Abstract factory**: `DocumentBuilderFactory.newInstance()`.
+- **Prototype**: `Object.clone()` with `Cloneable`.
+
+</QA>
+
+<QA q="Why is the volatile keyword required in double-checked locking?" level="medium">
+
+`instance = new X()` involves allocating memory, running the constructor, and assigning the reference, and these can be reordered. Without `volatile`, another thread can read a non-null reference **before** the constructor's writes are visible, skip the lock, and use a half-built object. Under the Java Memory Model since Java 5 (JSR-133), a `volatile` write/read creates a happens-before edge, so the fully constructed object is visible to anyone who sees the reference. Before Java 5, DCL was broken even with `volatile`.
+
+</QA>
+
+<QA q="How does the initialization-on-demand holder idiom achieve lazy, thread-safe initialization without locks in your code?" level="medium">
+
+The instance lives in a static field of a private nested `Holder` class. The JVM initialises a class only on its first active use, so `Holder` is initialised the first time `getInstance()` reads `Holder.INSTANCE`. The class-initialization procedure in the JLS runs exactly once, under a JVM-internal lock, and makes its writes visible to all threads that use the class afterwards. So you get laziness and safe publication for free.
+
+</QA>
+
+<QA q="Why does Effective Java recommend an enum for singletons?" level="medium">
+
+A single-element enum is concise and the language itself guarantees one instance: the JLS forbids reflective instantiation of enums (`Constructor.newInstance` throws), serialization has special handling that never creates a new constant, and `Enum.clone()` is final. A class-based singleton needs extra work for all three (a constructor guard, `readResolve`, no `Cloneable`). The limitation is that an enum can't extend another class, though it can implement interfaces.
+
+</QA>
+
+<QA q="How is Spring's singleton scope different from the GoF Singleton?" level="medium">
+
+The GoF Singleton enforces one instance **per class loader**, inside the class, via a private constructor and a static accessor. Spring's singleton scope means one instance **per bean definition per container**, enforced by the container; the class itself is ordinary, can be `new`-ed in tests, and is **injected** rather than fetched globally. Two bean definitions of the same class yield two instances. Singleton is Spring's default scope, so such beans must be stateless or thread-safe.
+
+</QA>
+
+<QA q="Factory Method vs Abstract Factory — when would you choose each?" level="medium">
+
+**Factory Method**: one product, and the choice is made by a subclass or a single key (which `Channel` this notifier uses). **Abstract Factory**: a **family** of products that must be consistent (a payment client, refund client and webhook verifier for the same provider), chosen once and passed around as an object. Abstract Factory uses composition and is often built from several factory methods. Its cost is that adding a new product type changes the interface and every concrete factory.
+
+</QA>
+
+<QA q="Why can singletons hurt testability, and what's the alternative?" level="medium">
+
+Callers fetch them through a static `getInstance()`, so the dependency is hidden from constructors and can't easily be replaced with a fake. They carry global mutable state between tests, making test order matter, and static access is awkward to mock. The alternative is to keep "one instance" but drop "global access": create one instance at startup (or let a DI container manage a singleton-scoped bean) and **inject** it through constructors.
+
+</QA>
+
+<QA q="How can reflection or serialization break a class-based singleton, and how do you defend?" level="hard">
+
+**Reflection**: `getDeclaredConstructor().setAccessible(true).newInstance()` calls the private constructor. Defence: throw from the constructor if an instance already exists (imperfect), or use an enum, for which reflective instantiation is prohibited. **Serialization**: `readObject` creates a fresh object. Defence: implement `readResolve()` returning `INSTANCE` and make instance fields `transient`, or use an enum, which serialization handles specially. Cloning is avoided by not implementing `Cloneable`.
+
+</QA>
+
+<QA q="What are the drawbacks of Object.clone() for the Prototype pattern?" level="hard">
+
+`Cloneable` is a marker interface with no `clone` method, so the contract is weak. `Object.clone()` makes a **shallow** field-for-field copy, so mutable fields (lists, maps, arrays) are shared unless you deep-copy them by hand. It bypasses constructors (so constructor invariants aren't enforced) and conflicts with `final` fields that need new values. It also throws a checked `CloneNotSupportedException`. *Effective Java* recommends copy constructors or copy factories instead.
+
+</QA>
+
+<QA q="How would you make a builder-produced object truly immutable?" level="hard">
+
+Make the class `final` (or the constructor private), make all fields `private final`, set them only in a private constructor that takes the builder, **copy** mutable inputs (`List.copyOf`, `Map.copyOf`, or defensive copies of dates and arrays), don't expose setters, and return unmodifiable views or copies from getters. Validate invariants in `build()` or the private constructor. The builder itself stays mutable and shouldn't be shared across threads.
+
+</QA>
+
+<QA q="In a payment service, you need to pick a processor (Card, UPI, Wallet) per request. Design the creation logic." level="scenario">
+
+Define a `PaymentProcessor` interface with `type()` and `charge(order)`. Each implementation is a Spring bean. A `PaymentProcessorFactory` takes `List<PaymentProcessor>` in its constructor and builds an `EnumMap` from type to processor; `get(type)` returns it or throws a clear `UnsupportedPaymentTypeException`. Adding net banking is a new bean, with no edits to checkout or the factory (OCP). Processors are singleton-scoped, so they must hold no per-request state. Add a startup check that every enum value has a processor.
+
+</QA>
+
+<QA q="A teammate's lazy singleton holds a Redis client and is created with plain if-null-then-new. Production occasionally has two clients. What happened and what's the fix?" level="scenario">
+
+A race: two threads both saw `null` and each constructed an instance (and one may have been published half-built). Fixes, in order of preference: let the DI container create one singleton-scoped bean and inject it; or use the **holder idiom**; or an eager `static final` field; or DCL with `volatile` if lazy loading matters and you need a constructor argument. Also make sure the old extra client is closed — leaking connections is often how this gets noticed.
+
+</QA>
+
+<QA q="Your Order class has 12 fields, 8 optional, and is built in 30 places. Bugs keep appearing from swapped constructor args. What do you do?" level="scenario">
+
+Introduce a **builder** (hand-written or Lombok `@Builder`), with required fields in `builder(...)` or checked in `build()`, and cross-field validation (for example, gift message requires gift wrap). Make `Order` immutable. Migrate call sites incrementally, then deprecate and remove the long constructor. Consider grouping related fields into value objects (`Address`, `GiftOptions`, `Money`) so the builder itself gets smaller.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="Which of these is the GoF Factory Method form rather than a static factory method?" options={["Integer.valueOf(42)", "List.of(a, b)", "Collection.iterator(), overridden by each collection class", "Calendar.getInstance()"]} answer={2}>
+
+GoF Factory Method relies on subclasses overriding a creation method; each collection overrides iterator() to create its own Iterator. The others are static factory methods.
+
+</MCQ>
+
+<MCQ q="In double-checked locking, what goes wrong if the instance field is not volatile?" options={["Two threads might both acquire the lock at once", "Another thread may see a non-null reference to a partially constructed object", "The JVM throws IllegalMonitorStateException", "The singleton is garbage collected"]} answer={1}>
+
+Without volatile, writes inside the constructor and the reference assignment can be reordered, so a thread skipping the lock may see an incompletely initialised object. Locking itself still works correctly.
+
+</MCQ>
+
+<MCQ q="What makes the initialization-on-demand holder idiom thread-safe?" options={["A synchronized block in getInstance", "The volatile keyword on the holder field", "The JVM's class-initialization guarantees, which run the static initializer once and publish it safely", "An AtomicReference compareAndSet loop"]} answer={2}>
+
+The JLS class-initialization procedure runs once under a JVM-internal lock and makes the results visible to later users of the class. No explicit synchronization or volatile is needed.
+
+</MCQ>
+
+<MCQ q="Which advantage is unique to the enum singleton among the common variants?" options={["Lazy loading", "Built-in protection against reflective instantiation and serialization creating a second instance", "Ability to extend another class", "Lower memory usage"]} answer={1}>
+
+The JLS prohibits reflective instantiation of enums and serialization handles enum constants specially. Enums cannot extend another class, and laziness or memory are not their distinguishing features.
+
+</MCQ>
+
+<MCQ q="Two @Bean methods in the same Spring context both return new PaymentClient(). With default scope, how many PaymentClient instances exist?" options={["One, because singleton is the default", "Two, one per bean definition", "Zero until each is injected", "One per thread"]} answer={1}>
+
+Spring singleton scope is per bean definition per container, not per class. Two definitions yield two instances. This is the key difference from the GoF Singleton.
+
+</MCQ>
+
+<MCQ q="You need a payment client, refund client and webhook verifier that always come from the same provider. Which pattern fits best?" options={["Singleton", "Prototype", "Abstract Factory", "Builder"]} answer={2}>
+
+Abstract Factory creates families of related products that must match. Builder assembles one object; Prototype copies; Singleton limits instance count.
+
+</MCQ>
+
+<MCQ q="Where should cross-field validation live in a hand-written builder?" options={["In each setter-style method of the builder", "In build() or the product's private constructor", "In the caller after build() returns", "Nowhere; builders should not validate"]} answer={1}>
+
+Validating once in build() (or the private constructor it calls) guarantees an invalid object never exists. Per-method checks can't see the full set of fields, and caller-side checks get forgotten.
+
+</MCQ>
+
+<MCQ q="What kind of copy does Object.clone() perform by default?" options={["Deep copy of the whole object graph", "Shallow field-for-field copy", "Serialization-based copy", "No copy; it returns this"]} answer={1}>
+
+The default clone copies each field value, so references to mutable objects are shared between original and clone. Deep copying must be done by hand.
+
+</MCQ>
+
+<MCQ q="Which statement about Lombok @Builder is correct?" options={["It validates that required fields are set", "It generates a static builder() method and an inner builder class with a build() method", "It makes the class a Spring singleton", "It only works on records"]} answer={1}>
+
+@Builder generates builder(), a nested ClassNameBuilder with chained methods, and build(). It does not validate required fields or affect Spring scope.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **Static factory** (Item 1): named, can cache, can return subtypes — `valueOf`, `of`, `getInstance`. Not the GoF pattern.
+- **Factory Method**: subclass overrides a create method (`Collection.iterator()`). In practice: a map from type to strategy bean.
+- **Abstract Factory**: one interface, many matching products (`DocumentBuilderFactory`). Adding a product type touches every factory.
+- **Singleton variants**: eager `static final` → synchronized method → DCL + **`volatile`** (Java 5+) → **holder idiom** (best lazy) → **enum** (Item 3; reflection- and serialization-proof).
+- Singletons hurt tests via hidden global state; **inject** one instance instead.
+- **Spring singleton** = one per bean definition per container (default scope); GoF = one per class loader. Keep Spring singletons stateless.
+- **Builder** (Item 2): fixes telescoping constructors; validate in `build()`; produce immutable objects; Lombok `@Builder`, `HttpClient.newBuilder()`.
+- **Prototype**: copy instead of build; prefer copy constructors over `clone()`.
+
+## Go deeper
+
+- **Refactoring Guru**: [Creational patterns catalog](https://refactoring.guru/design-patterns/creational-patterns) and the [Factory Method in Java](https://refactoring.guru/design-patterns/factory-method/java/example) page with JDK usages.
+- **Book**: *Design Patterns: Elements of Reusable Object-Oriented Software* (Gamma, Helm, Johnson, Vlissides), Chapter 3 (Creational Patterns).
+- **Book**: *Effective Java*, 3rd ed., Joshua Bloch, Chapter 2, Items 1–3.
+- **Bill Pugh et al.**: [The "Double-Checked Locking is Broken" Declaration](https://www.cs.umd.edu/~pugh/java/memoryModel/DoubleCheckedLocking.html).
+- **JLS**: [8.9 Enum Classes](https://docs.oracle.com/javase/specs/jls/se21/html/jls-8.html#jls-8.9) and [12.4 Initialization of Classes and Interfaces](https://docs.oracle.com/javase/specs/jls/se21/html/jls-12.html#jls-12.4).
+- **Spring docs**: [Bean Scopes](https://docs.spring.io/spring-framework/reference/core/beans/factory-scopes.html).
+- **Lombok**: [@Builder](https://projectlombok.org/features/Builder).
+- Related notes: [SOLID principles](/learn/notes/solid-principles/), [Spring core and IoC](/learn/notes/spring-core-ioc/), [Java concurrency and locks](/learn/notes/java-concurrency-locks/).

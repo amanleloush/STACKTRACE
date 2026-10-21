@@ -1,0 +1,698 @@
+---
+title: "LLD: In-Memory Pub-Sub Message Queue"
+phase: "14-lld"
+order: 145
+tags: ["lld", "machine-coding", "java", "concurrency", "messaging", "design-patterns"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 45
+prerequisites: ["machine-coding-strategy", "behavioral-patterns", "java-concurrency-locks", "java-executors-virtual-threads", "kafka-deep"]
+summary: "Build a Kafka-like in-memory message queue in Java 21: topics with partitions, keyed ordering, consumer groups with per-group committed offsets, one thread per consumer on an ExecutorService, at-least-once delivery with retries and a dead-letter list, producer backpressure, graceful shutdown, and a multi-threaded test that proves nothing is lost or reordered."
+---
+
+## Definition (interview-ready)
+
+An in-memory pub-sub message queue lets producers publish to named topics and delivers every message to every subscribing consumer group, while the members inside one group share the load. It is a small Kafka. Each `Topic` has `Partition`s. A partition is an append-only log where a message's offset is its index, and each group keeps its own committed offset (the next offset to read) instead of removing messages. The same key always maps to the same partition, and one worker thread per partition per group keeps per-key order. A `ReentrantLock` with `notEmpty` and `notFull` conditions lets idle consumers wait and slows producers down (backpressure). Committing only after the subscriber succeeds gives at-least-once delivery, with retries and a dead-letter list for poison messages, and shutdown drains published messages before stopping threads.
+
+**One-liner:** Topics split into append-only partition logs, a committed offset per consumer group, key-to-partition hashing with one worker per partition for ordering, and commit-after-processing for at-least-once delivery.
+
+## Problem statement
+
+*"Design an in-memory message queue that supports publish–subscribe. Producers publish messages to named topics. Subscribers register for a topic and receive every message published after (or before) they subscribed. Several independent subscribers must each get every message; multiple instances of the same subscriber should share the load. Messages for the same key must be processed in order. A subscriber that fails should get the message again. The system is multi-threaded — make it thread-safe and shut it down cleanly."*
+
+This is a favourite because it tests three things at once: modelling (topic, partition, group, offset), concurrency (locks, conditions, executors, shutdown), and distributed-systems vocabulary (delivery guarantees, backpressure, ordering). You are expected to know the Kafka model — see [Kafka: Topics, Partitions, Consumer Groups](/learn/notes/kafka-deep/) and [Async Messaging Fundamentals](/learn/notes/async-messaging-fundamentals/) — and to build a small version of it, not to re-explain Kafka.
+
+## Clarifying questions to ask
+
+| Question | Sensible assumed answer |
+|---|---|
+| Is it one process, in memory? | Yes. No persistence, no network. Messages live as long as the queue object. |
+| Queue semantics (one consumer gets each message) or pub-sub (everyone gets it)? | Both, Kafka-style: **every consumer group** gets every message; **within a group** each message goes to one member. |
+| Ordering guarantee? | Per **key** (via partition), not global. Global order would need a single partition and kills parallelism. |
+| Delivery guarantee? | **At-least-once**: a message is committed only after the subscriber returns successfully. Duplicates are possible; subscribers should be idempotent. |
+| What if a subscriber keeps failing? | Retry a few times with backoff, then move the message to a **dead-letter** list and continue. |
+| Push or pull? | Subscribers register a callback (push-style API), but internally each consumer thread **pulls** from the partition at its own pace. |
+| Does a new group start from the beginning or from now? | Configurable: `fromBeginning` (earliest) or latest. |
+| What if producers are much faster than consumers? | **Backpressure**: a producer blocks when the slowest group is more than `maxLag` messages behind on that partition. |
+| Retention / deletion of old messages? | Out of scope (keep everything); mention as an extension. |
+| Rebalancing when members join or leave dynamically? | Out of scope; fixed assignment at subscribe time. Discuss as an extension. |
+
+## Requirements
+
+**Functional**
+- `createTopic(name, partitions, maxLag)`.
+- `publish(topic, key, value)` returns the offset. Same key → same partition; null key → round-robin.
+- `subscribe(topic, group, members, fromBeginning, subscriber)`.
+- Each group receives every message; inside a group, each partition is owned by exactly one member.
+- Subscriber returns normally = ack; throws = nack → retry; after max retries → dead-letter.
+- `shutdown(grace)`: stop accepting publishes, let consumers drain, then stop threads (force after the grace period).
+
+**Non-functional**
+- Thread-safe for any number of producer threads.
+- Order preserved per partition (therefore per key) within each group.
+- No message lost; duplicates allowed only after a failure (at-least-once).
+- Bounded lag via backpressure.
+- No busy-spinning: idle consumers wait on a condition.
+
+**Out of scope:** persistence, replication, network protocol, dynamic rebalancing, retention, exactly-once.
+
+## Entities and relationships
+
+```
+ MessageQueue (facade)
+   ├── topics: Map<name, Topic>                ExecutorService consumers (one task per member)
+   ├── deadLetters: List<Message>              workers: List<ConsumerWorker>
+   │
+   ▼ 1..*
+ Topic(name) ── partitionFor(key) ──► Partition 1..*
+                                       - log: List<Message>          (offset = index)
+                                       - committed: Map<group, nextOffset>
+                                       - lock + notEmpty + notFull    (ReentrantLock, Conditions)
+                                       + append / poll / commit / register / close
+
+ ConsumerWorker (Runnable)  ── owns ──► 1..* Partition   (exclusive within its group)
+   - group, subscriber, maxRetries
+   loop: poll → deliver (retry / DLQ) → commit(offset + 1)
+
+ «interface» Subscriber  void onMessage(Message) throws Exception     ◄── user code (Observer)
+ Message(topic, partition, offset, key, value) — immutable record
+```
+
+**How a group maps onto partitions** (topic with 4 partitions):
+
+```
+             P0      P1      P2      P3
+ group g1:   m0      m1      m0      m1        2 members → 2 partitions each
+ group g2:   m0      m1      m2      m0        3 members → uneven but every partition owned once
+ group g3:   m0      m1      m2      m3   m4 idle (more members than partitions)
+```
+
+## Design patterns used and why
+
+| Pattern | Where | Why |
+|---|---|---|
+| **Observer** | `Subscriber` callbacks registered per topic/group | Publishers don't know who listens; new groups subscribe without touching producers. See [Behavioral Patterns](/learn/notes/behavioral-patterns/). |
+| **Producer–consumer with a monitor** | `Partition` with `ReentrantLock` + two `Condition`s | Classic bounded-buffer shape: producers wait on `notFull`, consumers on `notEmpty`. See [Java Concurrency and Locks](/learn/notes/java-concurrency-locks/). |
+| **Facade** | `MessageQueue` | One small API hides topics, partitions, workers and the executor. |
+| **Strategy (implicit)** | `partitionFor` (hash vs round-robin) | Easy to replace with a pluggable `Partitioner` interface if asked. |
+| **Thread-per-consumer on an executor** | `ConsumerWorker` tasks | Each member processes its partitions sequentially → ordering for free. See [Executors and Virtual Threads](/learn/notes/java-executors-virtual-threads/). |
+
+## Solution walkthrough
+
+### Step 1 — the log is the data structure
+
+The core idea, borrowed from Kafka: a partition is an **append-only list**, and a message's **offset** is just its index. Consumers don't remove messages — each group remembers **how far it has read**. This one decision gives you:
+
+- **Fan-out for free:** ten groups read the same list; nothing is copied.
+- **Replay:** a group can start from offset 0.
+- **Simple at-least-once:** don't advance the committed offset until processing succeeds.
+
+Compare with the naive design — one `BlockingQueue` per subscriber, with the publisher copying every message into each queue. That works for "push to N listeners" but makes replay, consumer groups and per-group lag much harder. Mention it as the simpler alternative and say why you didn't choose it.
+
+### Step 2 — committed offsets live in the partition
+
+```java
+private final Map<String, Long> committed = new HashMap<>(); // group -> next offset to read
+```
+
+Kafka stores the committed position per (group, topic, partition) in an internal topic. We store it in the partition, guarded by the same lock as the log. Two reasons:
+
+1. `poll`, `commit` and `append` all need consistent views of "how far is each group" and "how long is the log".
+2. **Backpressure** needs the slowest group's position, which is now a cheap local computation.
+
+The committed value is the **next** offset to read (Kafka uses the same convention), so after processing offset 41 we commit 42. `commit` uses `Math::max` so a late or duplicate commit can never move a group backwards.
+
+### Step 3 — one lock, two conditions
+
+```java
+long append(String key, String value) throws InterruptedException {
+    lock.lock();
+    try {
+        while (!closed && maxLag > 0 && lagOfSlowestGroup() >= maxLag) notFull.await();
+        if (closed) throw new QueueClosedException(...);
+        long offset = log.size();
+        log.add(new Message(topic, id, offset, key, value));
+        notEmpty.signalAll();
+        return offset;
+    } finally { lock.unlock(); }
+}
+```
+
+- Producers wait on `notFull` while the slowest group lags by `maxLag` or more; `commit` signals it.
+- Consumers wait on `notEmpty` (with a timeout) when caught up; `append` signals it.
+- Always `await` inside a `while` loop — spurious wake-ups are allowed by the `Condition` contract, and another thread may have changed the state between signal and wake-up.
+- `close()` signals both conditions so nobody sleeps forever during shutdown.
+
+Why not `synchronized` + `wait/notifyAll`? It works, but an intrinsic monitor has a single wait set, so producers and consumers would wake each other needlessly. Two `Condition`s keep them apart.
+
+### Step 4 — choosing a partition
+
+```java
+int idx = key == null ? Math.floorMod(roundRobin.getAndIncrement(), n)
+                      : Math.floorMod(key.hashCode(), n);
+```
+
+`Math.floorMod` — not `Math.abs(hash) % n` — because `Math.abs(Integer.MIN_VALUE)` is still negative. Same key → same partition → ordered. Kafka's default partitioner hashes the key bytes with murmur2; any stable hash gives the same guarantee.
+
+### Step 5 — the consumer worker (pull inside, push outside)
+
+Each group member is one `ConsumerWorker` task on the executor. It owns a fixed set of partitions and loops:
+
+```
+while not (stopped or all my partitions drained):
+    for each owned partition:
+        batch = poll(group, max 50, wait up to 100 ms)
+        for each message: deliver (with retries) → commit(offset + 1)
+```
+
+- **Pull** gives natural flow control: a slow consumer simply polls less often; the broker never overwhelms it. Kafka consumers pull for the same reason.
+- **Push-style API** for the user: they implement `Subscriber.onMessage`; the worker calls it.
+- Because exactly one thread handles a given partition for a given group, and it handles messages one at a time in offset order, **per-partition order is guaranteed** without extra locking.
+- A worker that owns several partitions uses a short poll timeout (10 ms) so one quiet partition doesn't delay the others much. That's a known trade-off of the simple loop; a topic-level "data available" condition is the refinement.
+
+### Step 6 — delivery, retries and the dead-letter list
+
+```java
+for (int attempt = 1; ; attempt++) {
+    try { subscriber.onMessage(m); return; }
+    catch (InterruptedException e) { throw e; }      // shutdown, not a processing failure
+    catch (Exception e) {
+        if (attempt > maxRetries) { deadLetters.add(m); return; }
+        Thread.sleep(attempt);
+    }
+}
+```
+
+- **At-least-once:** commit happens *after* `deliver` returns. If the subscriber did its side effect and then failed (or the process died) before the commit, the message is delivered again → duplicates. The test proves duplicates equal the number of failed attempts, and no message is missed.
+- **At-most-once** would be "commit first, then process" — no duplicates, but a crash loses messages. **Exactly-once** needs idempotent processing or transactional offsets; see [Async Messaging Fundamentals](/learn/notes/async-messaging-fundamentals/).
+- **Poison message:** a message that always fails would block its partition forever (head-of-line blocking). After `maxRetries` we park it in a dead-letter list and move on — the same idea as a DLQ topic.
+- The `InterruptedException` line matters: without it, a forced shutdown's interrupt is treated as "processing failed", retried, and the worker blocks again — the shutdown hangs. Our test caught exactly this bug.
+
+### Step 7 — graceful shutdown
+
+```java
+boolean shutdown(Duration grace) throws InterruptedException {
+    closed = true;                                         // 1. reject new publishes
+    topics.values().forEach(t -> t.partitions.forEach(Partition::close)); // 2. wake everyone
+    consumers.shutdown();                                  // 3. no new tasks; running ones continue
+    if (consumers.awaitTermination(grace...)) return true; // 4. workers drain and exit
+    workers.forEach(ConsumerWorker::stopNow);              // 5. too slow: flag + interrupt
+    consumers.shutdownNow();
+    consumers.awaitTermination(1, TimeUnit.SECONDS);
+    return false;
+}
+```
+
+A worker exits normally when every partition it owns is **closed and fully committed** by its group — so a graceful shutdown delivers everything already published. Producers blocked by backpressure get a `QueueClosedException` instead of hanging. If a subscriber is stuck, `shutdownNow` interrupts it; its uncommitted message would be redelivered on restart (at-least-once again).
+
+## Full solution code
+
+One file, Java 21. `javac Main.java && java Main`.
+
+```java
+import java.time.Duration;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.*;
+
+record Message(String topic, int partition, long offset, String key, String value) {}
+
+/** The callback a consumer-group member registers (Observer). Returning normally = ack; throwing = nack. */
+@FunctionalInterface
+interface Subscriber { void onMessage(Message m) throws Exception; }
+
+class QueueClosedException extends RuntimeException {
+    QueueClosedException(String msg) { super(msg); }
+}
+
+/**
+ * An append-only log. Offsets are list indexes. Committed offsets live here too, keyed by group,
+ * so the partition can apply backpressure against the slowest group.
+ */
+class Partition {
+    private final String topic;
+    private final int id;
+    private final int maxLag;                                 // 0 = unbounded
+    private final List<Message> log = new ArrayList<>();
+    private final Map<String, Long> committed = new HashMap<>(); // group -> next offset to read
+    private final ReentrantLock lock = new ReentrantLock();
+    private final Condition notEmpty = lock.newCondition();  // consumers wait here
+    private final Condition notFull = lock.newCondition();   // producers wait here
+    private boolean closed;
+
+    Partition(String topic, int id, int maxLag) { this.topic = topic; this.id = id; this.maxLag = maxLag; }
+
+    long append(String key, String value) throws InterruptedException {
+        lock.lock();
+        try {
+            while (!closed && maxLag > 0 && lagOfSlowestGroup() >= maxLag) notFull.await();
+            if (closed) throw new QueueClosedException("partition closed: " + topic + "-" + id);
+            long offset = log.size();
+            log.add(new Message(topic, id, offset, key, value));
+            notEmpty.signalAll();
+            return offset;
+        } finally { lock.unlock(); }
+    }
+
+    /** Pull up to max messages from the group's committed offset. Waits up to timeout if none. Does NOT advance. */
+    List<Message> poll(String group, int max, long timeoutMs) throws InterruptedException {
+        lock.lock();
+        try {
+            long nanos = TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+            int from = (int) (long) committed.get(group);
+            while (from >= log.size() && !closed && nanos > 0) nanos = notEmpty.awaitNanos(nanos);
+            int to = Math.min(log.size(), from + max);
+            return from < to ? List.copyOf(log.subList(from, to)) : List.of();
+        } finally { lock.unlock(); }
+    }
+
+    void commit(String group, long nextOffset) {
+        lock.lock();
+        try {
+            committed.merge(group, nextOffset, Math::max);   // never move backwards
+            notFull.signalAll();
+        } finally { lock.unlock(); }
+    }
+
+    void register(String group, boolean fromBeginning) {
+        lock.lock();
+        try { committed.putIfAbsent(group, fromBeginning ? 0L : (long) log.size()); } finally { lock.unlock(); }
+    }
+
+    /** True when the group has consumed everything and no more can arrive. */
+    boolean drained(String group) {
+        lock.lock();
+        try { return closed && committed.get(group) >= log.size(); } finally { lock.unlock(); }
+    }
+
+    void close() {
+        lock.lock();
+        try { closed = true; notEmpty.signalAll(); notFull.signalAll(); } finally { lock.unlock(); }
+    }
+
+    private long lagOfSlowestGroup() {
+        long min = committed.values().stream().mapToLong(Long::longValue).min().orElse(log.size());
+        return log.size() - min;
+    }
+    int id() { return id; }
+}
+
+class Topic {
+    final String name;
+    final List<Partition> partitions = new ArrayList<>();
+    private final AtomicInteger roundRobin = new AtomicInteger();
+
+    Topic(String name, int partitionCount, int maxLag) {
+        this.name = name;
+        for (int i = 0; i < partitionCount; i++) partitions.add(new Partition(name, i, maxLag));
+    }
+    /** Same key -> same partition -> ordered. No key -> spread round-robin. */
+    Partition partitionFor(String key) {
+        int n = partitions.size();
+        int idx = key == null ? Math.floorMod(roundRobin.getAndIncrement(), n) : Math.floorMod(key.hashCode(), n);
+        return partitions.get(idx);
+    }
+}
+
+/** One thread per member. A member owns some partitions exclusively, so per-partition order is kept. */
+class ConsumerWorker implements Runnable {
+    private final String group;
+    private final List<Partition> owned;
+    private final Subscriber subscriber;
+    private final int maxRetries;
+    private final List<Message> deadLetters;
+    private volatile boolean stopNow;
+
+    ConsumerWorker(String group, List<Partition> owned, Subscriber s, int maxRetries, List<Message> dlq) {
+        this.group = group; this.owned = owned; this.subscriber = s; this.maxRetries = maxRetries; this.deadLetters = dlq;
+    }
+
+    public void run() {
+        try {
+            while (!stopNow && !owned.stream().allMatch(p -> p.drained(group))) {
+                long wait = owned.size() == 1 ? 100 : 10;          // short waits when juggling several partitions
+                for (Partition p : owned) {
+                    for (Message m : p.poll(group, 50, wait)) {
+                        if (stopNow) return;
+                        deliver(m);
+                        p.commit(group, m.offset() + 1);          // commit AFTER processing = at-least-once
+                    }
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();                     // forced shutdown: uncommitted work is redelivered later
+        }
+    }
+
+    private void deliver(Message m) throws InterruptedException {
+        for (int attempt = 1; ; attempt++) {
+            try { subscriber.onMessage(m); return; }
+            catch (InterruptedException e) { throw e; }                  // shutdown, not a processing failure
+            catch (Exception e) {
+                if (attempt > maxRetries) { deadLetters.add(m); return; } // park it, keep the partition moving
+                Thread.sleep(attempt);                               // tiny linear backoff
+            }
+        }
+    }
+
+    void stopNow() { stopNow = true; }
+}
+
+class MessageQueue {
+    private final Map<String, Topic> topics = new ConcurrentHashMap<>();
+    private final ExecutorService consumers = Executors.newCachedThreadPool();
+    private final List<ConsumerWorker> workers = new CopyOnWriteArrayList<>();
+    final List<Message> deadLetters = new CopyOnWriteArrayList<>();
+    private volatile boolean closed;
+
+    void createTopic(String name, int partitions, int maxLag) {
+        if (topics.putIfAbsent(name, new Topic(name, partitions, maxLag)) != null)
+            throw new IllegalArgumentException("topic exists: " + name);
+    }
+
+    long publish(String topic, String key, String value) throws InterruptedException {
+        if (closed) throw new QueueClosedException("queue is shut down");
+        return topic(topic).partitionFor(key).append(key, value);
+    }
+
+    /**
+     * Join a consumer group with N members. Every group gets every message (fan-out);
+     * inside a group each partition goes to exactly one member (load sharing).
+     */
+    void subscribe(String topic, String group, int members, boolean fromBeginning, Subscriber s) {
+        Topic t = topic(topic);
+        t.partitions.forEach(p -> p.register(group, fromBeginning));
+        List<List<Partition>> assignment = new ArrayList<>();
+        for (int i = 0; i < members; i++) assignment.add(new ArrayList<>());
+        for (Partition p : t.partitions) assignment.get(p.id() % members).add(p);
+        for (List<Partition> owned : assignment) {
+            if (owned.isEmpty()) continue;                          // more members than partitions: extras idle
+            ConsumerWorker w = new ConsumerWorker(group, owned, s, 3, deadLetters);
+            workers.add(w);
+            consumers.submit(w);
+        }
+    }
+
+    /** Stop intake, let consumers drain what is already published, then stop threads. */
+    boolean shutdown(Duration grace) throws InterruptedException {
+        closed = true;
+        topics.values().forEach(t -> t.partitions.forEach(Partition::close));
+        consumers.shutdown();
+        if (consumers.awaitTermination(grace.toMillis(), TimeUnit.MILLISECONDS)) return true;
+        workers.forEach(ConsumerWorker::stopNow);
+        consumers.shutdownNow();                                    // interrupts blocked polls
+        consumers.awaitTermination(1, TimeUnit.SECONDS);
+        return false;                                               // had to force it
+    }
+
+    private Topic topic(String name) {
+        Topic t = topics.get(name);
+        if (t == null) throw new IllegalArgumentException("no topic " + name);
+        return t;
+    }
+}
+
+public class Main {
+    public static void main(String[] args) throws Exception {
+        MessageQueue mq = new MessageQueue();
+        mq.createTopic("orders", 3, 0);
+
+        Map<String, List<String>> billing = new ConcurrentHashMap<>();
+        AtomicInteger failOnce = new AtomicInteger();
+        mq.subscribe("orders", "billing", 2, true, m -> {
+            if (m.value().equals("o2-paid") && failOnce.getAndIncrement() == 0)
+                throw new IllegalStateException("db timeout");     // first attempt fails -> retried
+            billing.computeIfAbsent(m.key(), k -> Collections.synchronizedList(new ArrayList<>())).add(m.value());
+        });
+        List<String> audit = Collections.synchronizedList(new ArrayList<>());
+        mq.subscribe("orders", "audit", 1, true, m -> audit.add(m.partition() + "@" + m.offset() + ":" + m.value()));
+
+        for (String order : List.of("o1", "o2", "o3"))
+            for (String step : List.of("created", "paid", "shipped"))
+                mq.publish("orders", order, order + "-" + step);
+
+        boolean clean = mq.shutdown(Duration.ofSeconds(5));
+        System.out.println("clean shutdown: " + clean);
+        new TreeMap<>(billing).forEach((k, v) -> System.out.println("billing " + k + " -> " + v));
+        System.out.println("audit saw " + audit.size() + " messages, retries on o2-paid: " + (failOnce.get() - 1));
+        try { mq.publish("orders", "o4", "late"); }
+        catch (QueueClosedException e) { System.out.println("after shutdown: " + e.getMessage()); }
+    }
+}
+```
+
+## Concurrency and edge cases
+
+- **Many producers, one partition.** `append` runs under the partition lock, so offsets are unique and gap-free, and messages from one producer thread keep their relative order.
+- **Readers see a consistent snapshot.** `poll` returns `List.copyOf(subList)` built under the lock, so the consumer never iterates the live `ArrayList` while a producer appends.
+- **Lock is held only briefly.** The subscriber callback runs **outside** the partition lock. Calling user code while holding a lock is a recipe for deadlocks and stalls.
+- **Visibility.** Everything shared lives under the partition lock (happens-before via lock/unlock). `closed` on the facade and `stopNow` on workers are `volatile`.
+- **More members than partitions.** Extra members get no partitions and aren't started — like Kafka, where consumers beyond the partition count sit idle.
+- **Backpressure with no groups.** If no group is registered, lag is treated as zero, so producers are never blocked by nobody.
+- **A dead group blocks producers.** A group that registered but stopped consuming holds back its partitions forever. Real systems avoid this by using retention instead of blocking (Kafka never blocks producers on consumer lag). Say so if asked.
+- **Late subscriber.** `register` uses `putIfAbsent`, so re-subscribing an existing group keeps its offset instead of resetting it.
+- **Unbounded memory.** The log is never trimmed. Backpressure bounds *lag*, not total size. Trimming below the minimum committed offset is the first extension.
+- **Thread type.** `newCachedThreadPool` gives one platform thread per member. With many members, Java 21 virtual threads (`Executors.newVirtualThreadPerTaskExecutor()`) fit well because workers mostly block in `await`.
+
+## Testing it
+
+A plain-Java harness ran **22 checks, all passing**, repeated several times to catch flakiness. The key ones, written JUnit-style:
+
+```java
+@Test void everyMessageDeliveredOncePerGroupAndOrderedPerPartition() throws Exception {
+    MessageQueue mq = new MessageQueue();
+    mq.createTopic("events", 4, 0);
+    // three groups: g1 (2 members), g2 (3 members), g3 (5 members, one idle);
+    // each subscriber appends Seen(group, partition, offset, value) to a ConcurrentLinkedQueue
+    // 6 producer threads, released together by a CountDownLatch,
+    // each publishing 5,000 messages "producerId:key:seq" over 16 keys
+    ...
+    assertTrue(mq.shutdown(Duration.ofSeconds(30)));        // graceful: drains everything
+    for (String g : List.of("g1", "g2", "g3")) {
+        assertEquals(30_000, seen(g).size());               // nothing lost...
+        assertEquals(30_000, distinctValues(g).size());     // ...nothing duplicated (no failures here)
+        assertOffsetsConsecutivePerPartition(g);            // 0, 1, 2, ... per partition, no gaps
+        assertSeqIncreasingPerProducerAndKey(g);            // keyed order preserved end to end
+    }
+}
+
+@Test void atLeastOnceRedeliversAfterFailure() {
+    // subscriber records a side effect, then throws on the first attempt for every 7th offset
+    // 1000 messages over 2 partitions
+    assertEquals(1000, distinct(effects).size());           // every message processed
+    assertEquals(1000 + failedOnce.size(), effects.size()); // duplicates == failed attempts (e.g. 144)
+}
+
+@Test void backpressureBlocksProducerAtMaxLag() {
+    // maxLag = 5, consumer blocked on a latch while processing offset 0
+    assertEquals(5, published.get());
+    assertEquals(Thread.State.WAITING, producer.getState());
+    release.countDown();                                    // consumer resumes
+    producer.join();
+    assertEquals(50, published.get());
+}
+```
+
+Other checks: a poison message is attempted 1 + 3 times, dead-lettered, and later messages still arrive; while it was running, published never ran more than `maxLag` ahead of the consumer's offset; a stuck consumer makes `shutdown` report a forced stop, and the producer blocked on backpressure gets `QueueClosedException`; a group subscribed "from latest" sees only new messages; null keys spread evenly round-robin; publishing after shutdown is rejected.
+
+**What makes this a good concurrency test:** a `CountDownLatch` releases all producers together to maximise interleaving; assertions check **invariants** (counts, consecutive offsets, per-key sequence), not timings; and the run is repeated.
+
+**Demo output (real run):**
+
+```
+clean shutdown: true
+billing o1 -> [o1-created, o1-paid, o1-shipped]
+billing o2 -> [o2-created, o2-paid, o2-shipped]
+billing o3 -> [o3-created, o3-paid, o3-shipped]
+audit saw 9 messages, retries on o2-paid: 1
+after shutdown: queue is shut down
+```
+
+`o2-paid` failed once and was retried in place, so `o2-shipped` still came after it — ordering survived the failure.
+
+## Extensions interviewers ask for
+
+| Extension | How the design absorbs it |
+|---|---|
+| **Retention / trimming** | Keep a `baseOffset`; drop messages below the minimum committed offset (or older than a time limit) and translate offsets by subtracting `baseOffset`. |
+| **Dynamic rebalancing** | A group coordinator reassigns partitions when a member joins or leaves: pause workers, commit, recompute assignment, restart. Same idea as Kafka's rebalance protocol. |
+| **Seek / replay** | `seek(group, partition, offset)` sets the committed offset (allow moving backwards only here). |
+| **Batch processing** | Pass the whole polled list to the subscriber and commit the last offset + 1 once. Fewer commits, bigger redelivery window. |
+| **Exactly-once effect** | Subscriber stores processed message ids (or offset per partition) in the same transaction as its side effect — idempotent consumer. |
+| **Message filtering / wildcard topics** | Subscribe with a predicate or a topic pattern; the worker skips non-matching messages but still commits them. |
+| **Delayed messages / TTL** | Store a `deliverAt` time; `poll` returns only due messages, or route to a delay queue. |
+| **Priority** | One topic per priority, workers poll high first. Don't mix priority into a single ordered log. |
+| **Persistence** | Append each message to a segment file before acknowledging the publish; rebuild offsets on startup. |
+| **Metrics** | Lag per group per partition = log size − committed; expose published/consumed/retried/dead-lettered counters. |
+
+## Common mistakes
+
+- **Removing messages on read** — breaks fan-out and replay. Keep a log plus offsets.
+- **Committing before processing** while claiming at-least-once — that is at-most-once.
+- **Global ordering promised** — only per-partition order is cheap.
+- **Two threads consuming one partition in the same group** — destroys ordering.
+- **Calling subscriber code while holding the partition lock.**
+- **`if` instead of `while` around `await`.**
+- **`Math.abs(hash) % n`** — negative for `Integer.MIN_VALUE`.
+- **Busy-waiting** (`while (log.isEmpty()) {}`) instead of a condition with a timeout.
+- **Swallowing `InterruptedException`** in the retry loop — shutdown hangs.
+- **Unbounded everything** — no backpressure, no DLQ, no retention.
+- **Shutdown that just calls `shutdownNow()`** — in-flight and queued messages are abandoned.
+
+## Practice questions
+
+<Practice>
+
+<QA q="Why model a partition as an append-only log with offsets instead of a queue that removes messages?" level="easy">
+
+Because many groups must each receive every message. With a log, every group just keeps its own position; nothing is copied and nothing is removed. It also gives replay (reset the offset) and makes at-least-once trivial (don't advance until processed). A removing queue gives competing-consumer semantics only; for pub-sub you'd have to copy every message into a queue per subscriber.
+
+</QA>
+
+<QA q="How do you guarantee ordering, and what exactly is ordered?" level="easy">
+
+Messages with the same key hash to the same partition; the partition appends under a lock, so offsets reflect arrival order; and within a group exactly one worker thread processes a partition, sequentially, committing in offset order. So order is guaranteed **per partition (hence per key) per group** — not across partitions and not across groups.
+
+</QA>
+
+<QA q="What is the difference between a consumer group and a subscriber in your design?" level="easy">
+
+A group is a logical subscriber: it gets every message once (fan-out happens **across** groups). Members inside a group split the partitions (load sharing happens **within** a group). Two different services use two groups; three instances of the same service use one group with three members.
+
+</QA>
+
+<QA q="Explain at-most-once, at-least-once and exactly-once in terms of where you commit." level="medium">
+
+At-most-once: commit, then process — a crash after the commit loses the message. At-least-once: process, then commit — a crash before the commit redelivers it, so duplicates are possible. Exactly-once *effect*: at-least-once delivery plus idempotent processing (dedupe by id) or committing the offset in the same transaction as the side effect. My queue is at-least-once; subscribers should be idempotent.
+
+</QA>
+
+<QA q="Push or pull — which did you build and why?" level="medium">
+
+Internally pull: each worker polls its partitions at its own pace and waits on a condition when caught up. Pull gives natural flow control (a slow consumer can't be flooded) and makes batching easy. Externally the API looks like push — users implement `onMessage`. Pure push from the broker would need per-subscriber buffers and flow control to avoid overwhelming slow subscribers. Kafka consumers pull for the same reasons.
+
+</QA>
+
+<QA q="How does backpressure work in your queue, and what are its downsides?" level="medium">
+
+Each partition knows every group's committed offset. `append` waits on a `notFull` condition while (log size − slowest committed offset) is at least `maxLag`; every `commit` signals it. Downsides: one slow or dead group slows every producer of that topic, and producers can block indefinitely (we release them on shutdown). Kafka instead never blocks on consumer lag — it relies on retention, so slow consumers can fall behind (and eventually lose data past retention).
+
+</QA>
+
+<QA q="Why use ReentrantLock with two Conditions instead of synchronized?" level="medium">
+
+An intrinsic monitor has one wait set, so `notifyAll` from a commit would also wake waiting consumers and vice versa — wasted wake-ups. With `notEmpty` and `notFull`, appends wake only consumers and commits wake only producers. `awaitNanos` also makes timed waits easy. Either way, waits must be in a `while` loop.
+
+</QA>
+
+<QA q="Walk me through a graceful shutdown." level="medium">
+
+1) Set `closed` so new publishes fail. 2) Close every partition, which signals both conditions so blocked producers throw and waiting consumers wake. 3) `executor.shutdown()` — running workers continue. 4) Workers exit once all their partitions are closed and fully committed, so everything published is delivered. 5) `awaitTermination(grace)`; if it times out, set stop flags and `shutdownNow()` to interrupt stuck subscribers. Their uncommitted messages would be redelivered on restart.
+
+</QA>
+
+<QA q="A subscriber throws on one message forever. What happens to the rest of the partition?" level="medium">
+
+Without protection it blocks the partition forever (head-of-line blocking) because ordering forbids skipping. We retry `maxRetries` times with backoff, then move the message to the dead-letter list and commit past it, so later messages flow. The DLQ is monitored and replayed after a fix. If strict ordering per key matters more than progress, you could instead pause just that key.
+
+</QA>
+
+<QA q="How would you test that no message is lost or reordered under concurrency?" level="hard">
+
+Use invariants, not sleeps. Start many producer threads behind a `CountDownLatch` so they collide; each publishes values like producerId:key:seq. After a graceful shutdown, assert per group: total count equals published count; distinct values equals published count; per partition offsets are 0, 1, 2… with no gaps; per (producer, key) the seq numbers increase. Repeat the run several times. Add a failing-subscriber test to prove redelivery, a backpressure test checking a blocked producer's thread state, and a forced-shutdown test.
+
+</QA>
+
+<QA q="Scenario: you have 4 partitions and scale a group to 8 instances, but throughput doesn't improve. Why?" level="scenario">
+
+Within a group each partition is owned by one member, so at most 4 members do work; the other 4 are idle. Parallelism is capped by the partition count. Increase partitions (accepting that existing key-to-partition mapping changes), or parallelise inside a member while keeping per-key order (e.g. a per-key executor).
+
+</QA>
+
+<QA q="Scenario: shutdown hangs in production even though you call shutdownNow. What might be wrong?" level="scenario">
+
+`shutdownNow` only **interrupts**. If code catches `InterruptedException` (or a generic `Exception`) and keeps going — for example a retry loop treating it as a failure — the thread never exits. Fix: rethrow or restore the interrupt flag, check a stop flag in loops, and make blocking calls interruptible or time-limited. That was a real bug in the first version of this design, found by the forced-shutdown test.
+
+</QA>
+
+<QA q="Scenario: the interviewer asks for exactly-once processing for a payments subscriber. What do you change?" level="scenario">
+
+Keep at-least-once delivery and make the effect idempotent: the subscriber stores the message id (or partition + offset) in the same database transaction as the payment write, and skips ids already seen. Alternatively store the consumed offset in that same database and start from it on restart, instead of the queue's committed offset. True exactly-once across systems without such coordination isn't possible.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="Group A has 3 members and the topic has 2 partitions. How many members of A receive messages?" options={["3", "2", "1", "It depends on message keys"]} answer={1}>
+
+Each partition is owned by exactly one member of a group, so only 2 members get work; the third is idle. Keys decide the partition, not the member count.
+
+</MCQ>
+
+<MCQ q="Where must the offset commit happen for at-least-once delivery?" options={["Before calling the subscriber", "After the subscriber returns successfully", "When the message is published", "It doesn't matter as long as it's inside the lock"]} answer={1}>
+
+Committing after successful processing means a failure before the commit causes redelivery. Committing first is at-most-once.
+
+</MCQ>
+
+<MCQ q="Why does the code use Math.floorMod(key.hashCode(), n) instead of Math.abs(key.hashCode()) % n?" options={["floorMod is faster", "Math.abs(Integer.MIN_VALUE) is negative, giving a negative index", "hashCode can be null", "abs changes the hash distribution"]} answer={1}>
+
+`Integer.MIN_VALUE` has no positive counterpart in `int`, so `Math.abs` returns it unchanged (negative). `floorMod` always returns a value in 0..n-1 for positive n.
+
+</MCQ>
+
+<MCQ q="What ordering does this design guarantee?" options={["Global order across the topic", "Per partition (therefore per key) within each group", "Per producer across all partitions", "No ordering at all"]} answer={1}>
+
+One worker per partition per group processes in offset order. Different partitions are processed in parallel, so there's no global order.
+
+</MCQ>
+
+<MCQ q="Why is awaiting on a Condition wrapped in a while loop?" options={["To make the code compile", "Spurious wake-ups are allowed and the state may change again before the thread reacquires the lock", "To avoid needing signalAll", "Because await releases the lock permanently"]} answer={1}>
+
+The `Condition` contract permits spurious wake-ups, and another thread can grab the lock first. Re-checking the predicate in a loop is the standard idiom.
+
+</MCQ>
+
+<MCQ q="A poison message keeps failing. Without a dead-letter mechanism, what happens?" options={["It is skipped automatically", "Its partition stops making progress for that group (head-of-line blocking)", "All partitions stop", "The message is duplicated forever into other groups"]} answer={1}>
+
+Ordering forbids processing later messages in that partition, so the group's partition is stuck. Other partitions and other groups continue.
+
+</MCQ>
+
+<MCQ q="With backpressure maxLag = 5 and a consumer stuck on offset 0 (not committed), how many messages can a producer publish to that partition before blocking?" options={["0", "1", "5", "Unlimited"]} answer={2}>
+
+The producer may append while log size minus the slowest committed offset (0) is below 5, so offsets 0..4 succeed and the sixth publish blocks. The test asserts exactly this.
+
+</MCQ>
+
+<MCQ q="Which is the most important reason the subscriber callback runs outside the partition lock?" options={["Locks cannot be held across method calls", "User code may be slow or block; holding the lock would stall producers and other groups and risk deadlock", "Java forbids calling interfaces under a lock", "It makes delivery exactly-once"]} answer={1}>
+
+Never call unknown code while holding a lock. Producers and other groups' workers need that lock constantly.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **Model:** Topic → Partitions (append-only log, offset = index) → committed offset per **group** per partition (next offset to read).
+- **Semantics:** fan-out across groups; load sharing within a group; members beyond partition count are idle.
+- **Ordering:** key → `floorMod(hash, n)` → same partition; one worker per partition per group → in order.
+- **Concurrency:** `ReentrantLock` + `notEmpty` (consumers) + `notFull` (producers); `await` in `while`; callbacks outside the lock; `poll` returns a copy.
+- **Delivery:** process then commit = at-least-once; retries with backoff; DLQ after max retries; subscribers idempotent.
+- **Pull inside, push API outside**; pull = natural flow control.
+- **Backpressure:** block producers while slowest group lag ≥ `maxLag`; Kafka uses retention instead.
+- **Shutdown:** reject publishes → close partitions (signal all) → `shutdown()` → workers drain → `awaitTermination` → `shutdownNow()`; never swallow `InterruptedException`.
+- **Test with invariants:** counts, consecutive offsets, per-key sequence; latch-started producers; repeat runs.
+
+## Go deeper
+
+- [Apache Kafka documentation — design (consumer position, pull model, delivery semantics)](https://kafka.apache.org/documentation/#design)
+- [Java 21 `Condition` API](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/locks/Condition.html)
+- [Java 21 `ExecutorService` API (shutdown and awaitTermination)](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ExecutorService.html)
+- Related notes: [Kafka: Topics, Partitions, Consumer Groups](/learn/notes/kafka-deep/) · [Async Messaging Fundamentals](/learn/notes/async-messaging-fundamentals/) · [Java Concurrency and Locks](/learn/notes/java-concurrency-locks/) · [Executors and Virtual Threads](/learn/notes/java-executors-virtual-threads/)

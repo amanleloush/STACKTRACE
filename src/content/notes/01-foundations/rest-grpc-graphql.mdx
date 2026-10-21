@@ -13,6 +13,8 @@ prerequisites: []
 
 **REST** is an architectural style over HTTP using resource-oriented URLs and standard verbs, typically with JSON payloads. **gRPC** is an RPC framework using Protocol Buffers over HTTP/2 with strongly typed contracts and code generation. **GraphQL** is a query language and runtime where clients describe exactly the data shape they want, executed against a single endpoint.
 
+**One-liner:** REST exposes resources at URLs with standard HTTP verbs and is the default for public APIs, gRPC is typed Protobuf RPC over HTTP/2 suited to fast internal service calls and streaming, and GraphQL lets each client ask one endpoint for exactly the fields it needs.
+
 ## Why it matters
 
 The choice between these shapes API ergonomics, mobile bandwidth, internal-service performance, and team coupling for years. "Use REST" is rarely the full answer — most modern systems mix all three (REST/GraphQL at the edge, gRPC internally).
@@ -51,14 +53,14 @@ flowchart TB
 
 - Schema-first: define services and messages in **`.proto`** files.
 - Code generation: client + server stubs in many languages.
-- **Protocol Buffers**: compact binary encoding (much smaller than JSON).
-- Runs over **HTTP/2**: multiplexed streams, header compression, server push.
+- **Protocol Buffers**: compact binary encoding (typically smaller and faster to parse than JSON).
+- Runs over **HTTP/2**: multiplexed streams, header compression, trailers (gRPC doesn't use server push).
 - Four call types: unary, server streaming, client streaming, bidirectional streaming.
 - Built-in: deadlines, cancellation, metadata (headers), interceptors, mTLS.
 
 ### GraphQL
 
-- One endpoint (`/graphql`), POST queries.
+- One endpoint (`/graphql`), queries usually sent as POST (GET is also allowed for queries).
 - Client specifies the exact fields it needs:
   ```graphql
   query { user(id: 42) { name orders(last: 5) { total } } }
@@ -111,9 +113,9 @@ Content-Type: application/json
 - **gRPC through HTTP/1.1 proxies**: silent failure. Confirm every hop supports h2.
 - **GraphQL N+1 on the resolver side**: naive resolvers fetch one row at a time. Use **DataLoader** to batch.
 - **Versioning**: REST often uses `/v1/`. gRPC uses field numbers (additive evolution) — never reuse a field number. GraphQL is supposed to be additive forever (deprecate, don't remove).
-- **Caching**: REST GETs cache trivially (URL is the key). GraphQL is POST → custom caching layer (persisted queries, Apollo client cache).
+- **Caching**: REST GETs cache trivially (URL is the key). GraphQL usually uses POST → custom caching layer (persisted queries, Apollo client cache).
 - **Authorization**: GraphQL exposes broad surface area — easy to leak data through field traversal. Authorize per field, not just per endpoint.
-- **gRPC errors**: use `grpc-status` codes (NOT_FOUND, INVALID_ARGUMENT, ...) — there are only 16, and they map well to HTTP if you ever need to bridge.
+- **gRPC errors**: use `grpc-status` codes (NOT_FOUND, INVALID_ARGUMENT, ...) — there are only 17 (OK plus 16 error codes), and they map well to HTTP if you ever need to bridge.
 
 ## When to pick each
 
@@ -127,31 +129,148 @@ Content-Type: application/json
 | Heavy mobile + bandwidth constrained + diverse client needs | GraphQL |
 | Need HTTP caching, CDNs | REST |
 
-## Interview questions
+## Practice questions
 
-### Q1 — Easy: When is gRPC better than REST?
-For internal services where both sides are under your control, you need strong typing, low latency, small payloads, and streaming. gRPC wins on schema enforcement, protobuf compactness, and HTTP/2 multiplexing.
+<Practice>
 
-### Q2 — Easy: What problem does GraphQL solve?
-Over-fetching (REST endpoint returns more than the client needs) and under-fetching (client needs many REST calls to build one screen). GraphQL lets the client describe exactly the data shape required in one request.
+<QA q="When is gRPC better than REST?" level="easy">
 
-### Q3 — Medium: How do you version a gRPC API?
-Add fields with new field numbers (additive only). Never reuse or change a field number. For breaking changes: new service or new package (`v2`). Use proto3 conventions: optional/required have specific semantics, field deletions should `reserved` the number to prevent reuse.
+For internal services where you control both sides and need strong typing, low latency, small payloads, or streaming. gRPC wins on schema enforcement (`.proto` + codegen), Protobuf's compact binary encoding, and HTTP/2 multiplexing. REST stays better for public, browser-facing APIs that benefit from HTTP caching.
 
-### Q4 — Medium: GraphQL N+1 — what is it and how do you fix it?
-A query like `users { posts { title } }` triggers one DB query for users and then one query per user for posts (N+1 total). Fix with batching: **DataLoader** collects keys requested within a tick and issues a single `IN (...)` query, returning results indexed by key.
+</QA>
 
-### Q5 — Medium: Why is GraphQL hard to cache?
-REST caches on URL (GET). GraphQL uses POST + body, so HTTP caching doesn't apply. Solutions: **persisted queries** (hash the query, GET it like a URL), client-side normalized caches (Apollo, Relay), or whole-response caching with cache tags.
+<QA q="What problem does GraphQL solve?" level="easy">
 
-### Q6 — Hard: How would you migrate a REST API to gRPC without breaking clients?
-Run both. Use **grpc-gateway** to expose REST→gRPC reverse proxy from your `.proto` definitions — single source of truth, two transports. Gradually shift internal clients to gRPC; keep REST for external clients until you can sunset.
+**Over-fetching** (a REST endpoint returns more than the client needs) and **under-fetching** (the client needs many REST calls to build one screen). In GraphQL the client describes exactly the data shape it needs and gets it from one endpoint in one request.
 
-### Q7 — Hard: A team built a GraphQL API for mobile, but p99 latency is bad. What investigations?
-(1) Resolver N+1 → audit with query tracing, add DataLoader. (2) Query complexity attacks → add max depth, query cost limits. (3) Joins behind multiple resolvers fanning out to many services → consider stitching, federation, or pre-computed views. (4) Cold persisted-query cache → preload. (5) Expensive fields on every query → mark them as deferrable or move to a separate query.
+</QA>
 
-### Q8 — Hard: Compare gRPC and GraphQL streaming.
-gRPC streaming is at the transport level (HTTP/2 streams) — strict typing, bi-directional, persistent connection, well-suited for server-to-server and bidi RPC. GraphQL subscriptions are typically WebSockets — designed for client (often browser) subscribing to server-pushed events. Different audiences: gRPC for internal control planes, GraphQL subscriptions for UI live updates.
+<QA q="What are gRPC's four call types?" level="easy">
+
+1. **Unary**: one request, one response.
+2. **Server streaming**: one request, a stream of responses.
+3. **Client streaming**: a stream of requests, one response.
+4. **Bidirectional streaming**: both sides stream independently over the same HTTP/2 stream.
+
+</QA>
+
+<QA q="What are the core constraints of REST?" level="easy">
+
+Resources are identified by URLs (`/users/42/orders/7`), standard verbs map to actions (GET, POST, PUT, PATCH, DELETE), the server keeps no per-client session state in the protocol, and messages are self-descriptive through standard HTTP semantics (status codes, caching headers, content negotiation). HATEOAS (hypermedia links in responses) is part of pure REST but rarely implemented.
+
+</QA>
+
+<QA q="How do you version a gRPC API?" level="medium">
+
+Evolve additively: add fields with new field numbers, and never reuse or change a field number. When you delete a field, mark its number (and name) `reserved` so nobody reuses it. Proto3 has no `required` (`optional` returned in protobuf 3.15 for explicit field presence). For truly breaking changes, create a new service or package (`v2`) and run both.
+
+</QA>
+
+<QA q="What is the GraphQL N+1 problem and how do you fix it?" level="medium">
+
+A query like `users { posts { title } }` runs one DB query for users and then one per user for posts: N+1 in total. Fix with batching: **DataLoader** collects the keys requested within one tick and issues a single `IN (...)` query, then hands each resolver its results by key.
+
+</QA>
+
+<QA q="Why is GraphQL hard to cache?" level="medium">
+
+REST GETs cache on the URL. GraphQL normally sends a POST with the query in the body, so HTTP and CDN caching don't apply. Options: **persisted queries** (clients send a hash of a registered query, which can be a cacheable GET), normalized client caches (Apollo, Relay), or server-side response caching with cache tags.
+
+</QA>
+
+<QA q="Why is authorization trickier in GraphQL than in REST?" level="medium">
+
+REST exposes a fixed set of endpoints, so you can authorize per route. GraphQL exposes one endpoint over a whole graph that clients can traverse, e.g. `order → customer → paymentMethods`, so a check at the entry point doesn't protect fields reachable through relationships. Authorize **per field/type** in resolvers or the business layer, and limit query depth and cost.
+
+</QA>
+
+<QA q="Compare gRPC streaming with GraphQL subscriptions." level="hard">
+
+gRPC streaming lives at the transport level (HTTP/2 streams): strictly typed, bidirectional, on a persistent connection, a good fit for server-to-server and control-plane traffic. GraphQL subscriptions usually run over WebSockets and let a client (often a browser) subscribe to events the server pushes. Different audiences: gRPC for internal services, subscriptions for live UI updates.
+
+</QA>
+
+<QA q="How would you migrate a REST API to gRPC without breaking clients?" level="scenario">
+
+Run both. Use **grpc-gateway** to generate a REST→gRPC reverse proxy from the `.proto` definitions, so there's a single source of truth and two transports. Move internal clients to gRPC gradually and keep REST for external clients until it can be sunset. Remember every hop must support HTTP/2, since gRPC through an HTTP/1.1 proxy fails silently.
+
+</QA>
+
+<QA q="A team built a GraphQL API for mobile, but p99 latency is bad. What do you investigate?" level="scenario">
+
+1. Resolver N+1: audit with query tracing and add DataLoader.
+2. Expensive or abusive queries: enforce max depth and query cost limits.
+3. Fan-out across many services behind nested resolvers: consider federation, stitching, or precomputed views.
+4. A cold persisted-query cache: preload it.
+5. Expensive fields fetched on every query: make them deferrable or move them to a separate query.
+
+</QA>
+
+<QA q="You're designing APIs for a product with a public developer API, a bandwidth-constrained mobile app with many screens, and 40 internal microservices. What do you pick for each?" level="scenario">
+
+- **Public developer API → REST**: browser- and curl-friendly, cacheable GETs, familiar to unknown clients.
+- **Mobile app → GraphQL** at the edge: each screen fetches exactly its shape in one round trip, which saves bandwidth. Budget for DataLoader, field-level auth and query-cost limits.
+- **Internal services → gRPC**: typed contracts, compact Protobuf, deadlines, cancellation, and streaming.
+
+Mixing all three is normal. The edge and the internal mesh have different needs.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="A mobile screen needs a user, their last 5 orders, and each order's shipment status. Which problem does GraphQL address here compared with plain REST?" options={["Under-fetching, since REST would need several round trips to assemble the screen", "Lack of encryption in REST", "REST's inability to return JSON", "HTTP/2 multiplexing being unavailable to REST"]} answer={0}>
+
+Building the screen from REST resources takes multiple requests (under-fetching), and each may return unneeded fields (over-fetching). GraphQL fetches the exact shape in one request. Encryption and JSON support aren't differences between them.
+
+</MCQ>
+
+<MCQ q="You removed field 4 from a protobuf message. What should you do?" options={["Reuse field number 4 for the next new field", "Renumber the remaining fields to close the gap", "Mark 4 (and the old name) as reserved", "Change the message name"]} answer={2}>
+
+Old clients still interpret number 4 with its old type, so reusing it corrupts data. reserved stops anyone from reusing it. Renumbering breaks wire compatibility for every field.
+
+</MCQ>
+
+<MCQ q="A GraphQL query for 100 users and their posts issues 101 SQL queries. What is the standard fix?" options={["Switch the endpoint from POST to GET", "Add an HTTP cache in front of the server", "Increase the database connection pool", "Batch the per-user lookups with DataLoader into one IN query"]} answer={3}>
+
+This is resolver-side N+1, and DataLoader collapses the per-key lookups into a batched query. A cache or bigger pool only hides the symptom, and the HTTP method has nothing to do with resolver execution.
+
+</MCQ>
+
+<MCQ q="Why don't GraphQL responses benefit from CDN caching by default?" options={["GraphQL responses are binary", "Queries are typically sent as POST bodies, so the URL is not a usable cache key", "GraphQL forbids cache headers", "GraphQL only runs over WebSockets"]} answer={1}>
+
+HTTP caches key on the method and URL, and POST bodies aren't cached. Persisted queries turn a query into a hash that can be sent as a cacheable GET. GraphQL responses are JSON, and subscriptions are only one part of GraphQL.
+
+</MCQ>
+
+<MCQ q="Which gRPC call type best fits a client that uploads a large stream of sensor readings and receives one summary at the end?" options={["Unary", "Server streaming", "Client streaming", "Bidirectional streaming"]} answer={2}>
+
+The client sends many messages and the server replies once, which is client streaming. Bidirectional would also work but is unnecessary when the server only answers once.
+
+</MCQ>
+
+<MCQ q="An internal service checks auth only at the GraphQL entry query, yet users can read other customers' payment data through nested fields. What is the right fix?" options={["Authorize at the field or type level as the graph is traversed", "Move to a single REST endpoint", "Disable introspection", "Rate-limit the endpoint"]} answer={0}>
+
+GraphQL lets clients reach data through relationships, so each field or type must enforce access. Disabling introspection hides the schema but doesn't stop a crafted query, and rate limiting doesn't address authorization.
+
+</MCQ>
+
+<MCQ q="You want to offer both REST and gRPC from one set of definitions during a migration. Which approach fits?" options={["Hand-write a REST server and a gRPC server separately", "Use GraphQL federation", "Expose gRPC directly to browsers without a proxy", "Use grpc-gateway to generate a REST reverse proxy from the .proto files"]} answer={3}>
+
+grpc-gateway translates REST/JSON to gRPC from the same .proto, keeping one source of truth. Browsers can't speak native gRPC without gRPC-Web and a proxy, and federation is a GraphQL composition technique.
+
+</MCQ>
+
+<MCQ q="Which statement about the three API styles is correct?" options={["gRPC can run over HTTP/1.1 if trailers are disabled", "gRPC requires HTTP/2, uses Protobuf, and needs gRPC-Web plus a proxy to be called from browsers", "GraphQL requires Protobuf schemas", "REST requires a typed contract such as OpenAPI"]} answer={1}>
+
+gRPC depends on HTTP/2 features, including trailers that carry grpc-status, and browsers need gRPC-Web. GraphQL uses its own SDL, and OpenAPI is optional for REST.
+
+</MCQ>
+
+</Quiz>
 
 ## TL;DR cheat sheet
 

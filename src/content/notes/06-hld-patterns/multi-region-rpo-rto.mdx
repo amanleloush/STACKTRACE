@@ -1,7 +1,7 @@
 ---
 title: "Multi-Region, Multi-AZ, RPO/RTO"
 phase: "06-hld-patterns"
-order: 32
+order: 55
 tags: []
 premium: false
 previewParagraphs: 4
@@ -11,7 +11,9 @@ prerequisites: []
 
 ## Definition (interview-ready)
 
-**Availability Zones (AZs)** are physically isolated data centers within a single cloud region (separate power, cooling, network). **Multi-AZ** = redundant within a region; **multi-region** = redundant across geographically separated regions. **RPO (Recovery Point Objective)** = how much data you can afford to lose (e.g., 5 minutes). **RTO (Recovery Time Objective)** = how long you can be down (e.g., 30 minutes).
+**Availability Zones (AZs)** are physically separate groups of one or more data centers within a single cloud region, each with its own power, cooling and networking. **Multi-AZ** = redundant within a region; **multi-region** = redundant across geographically separated regions. **RPO (Recovery Point Objective)** = how much data you can afford to lose (e.g., 5 minutes). **RTO (Recovery Time Objective)** = how long you can be down (e.g., 30 minutes).
+
+**One-liner:** Multi-AZ protects against losing one data center and multi-region against losing a whole region; RPO is how much data I can afford to lose and RTO is how long I can afford to be down, and those two numbers decide between backups, warm or hot standby, and active-active.
 
 ## Why it matters
 
@@ -37,8 +39,8 @@ flowchart LR
 
 ### Region vs AZ vs edge
 
-- **Region** = geographically distinct location (us-east-1 = N. Virginia, eu-west-1 = Ireland). 100+ms RTT between regions.
-- **AZ** = physically separated DCs in one region. Sub-millisecond to ~2ms RTT between AZs.
+- **Region** = geographically distinct location (us-east-1 = N. Virginia, eu-west-1 = Ireland). Tens of ms RTT between nearby regions, 100+ms across continents.
+- **AZ** = one or more physically separate DCs in a region (AWS keeps AZs within about 100 km of each other). Round trips between AZs are typically about 1–2 ms (AWS quotes single-digit milliseconds), low enough for synchronous replication.
 - **Edge** (CDN PoP) = globally distributed cache, much smaller than a full region.
 
 ### Multi-AZ baseline
@@ -70,7 +72,7 @@ Both regions serve traffic concurrently.
 
 **Read replication**: one region is the write leader; other reads from a replicated copy. Common (RDS read replica in another region).
 
-**Multi-leader / writes in any region**: requires conflict resolution. CRDTs, vector clocks, or app-level merge. Used by DynamoDB global tables, Cosmos DB, Spanner.
+**Multi-leader / writes in any region**: requires conflict resolution. CRDTs, vector clocks, or app-level merge. Used by DynamoDB global tables (last-writer-wins in their default, eventually consistent mode), Cosmos DB multi-region writes.
 
 **Strong consistency multi-region**: extremely hard. Spanner does it with TrueTime. Generally trades latency (cross-region quorum for every write).
 
@@ -109,8 +111,8 @@ Issues:
 ### Cross-region challenges
 
 - **Latency**: every cross-region write adds 50–200ms. Quorum across regions = expensive.
-- **Bandwidth cost**: AWS charges $0.02/GB for inter-region — at scale, this dominates.
-- **Compliance**: data may not legally cross borders (GDPR, India's DPDP).
+- **Bandwidth cost**: AWS charges per GB for inter-region transfer (about $0.02/GB between most US and EU regions, more from some regions) — at scale, this dominates.
+- **Compliance**: data-protection laws can restrict where personal data goes — GDPR only allows transfers out of the EU under conditions (adequacy decisions, SCCs), and India's DPDP Act lets the government block transfers to specific countries. Check before replicating PII to another region.
 - **Time skew**: NTP across regions has more drift; HLC/TrueTime increasingly relevant.
 - **Distributed transactions**: cross-region 2PC is unusable. Use single-region scopes + sagas.
 
@@ -136,10 +138,9 @@ RTO ~1-2 minutes.
 
 ## Real-world examples
 
-- **AWS us-east-1 outages**: every few years; takes down half the internet. Drives multi-region for serious infra.
+- **AWS us-east-1 outages**: major incidents (the S3 outage of Feb 2017, Dec 2021, Oct 2025) each took down many widely used services that ran in that one region. They drive multi-region for serious infra.
 - **Cloudflare**: multi-region active-active by design.
-- **Netflix**: multi-region active-active across us-east, us-west, eu-west. Chaos Monkey simulating outages.
-- **Stripe**: heavy multi-region; payment processing in multiple regions with eventual reconciliation.
+- **Netflix**: multi-region active-active across us-east, us-west, eu-west. Chaos Kong simulates losing a whole region (Chaos Monkey kills individual instances).
 - **Spanner-backed services (Google Photos, Ad systems)**: global strong consistency.
 
 ## Common pitfalls
@@ -153,42 +154,176 @@ RTO ~1-2 minutes.
 - **Latency-tail in active-active**: every write waits for cross-region quorum.
 - **Asymmetric DR region**: cheaper instances → can't actually handle prod load on failover.
 
-## Interview questions
+## Practice questions
 
-### Q1 — Easy: Difference between multi-AZ and multi-region?
-Multi-AZ = redundancy across data centers within one region (sub-ms RTT, single regional power/network). Multi-region = redundancy across geographically separated regions (100+ms RTT, separate infrastructure). Multi-AZ is table stakes; multi-region is for true disaster recovery and global users.
+<Practice>
 
-### Q2 — Easy: Define RPO and RTO.
-RPO (Recovery Point Objective) = how much data you can afford to lose, in time units. RTO (Recovery Time Objective) = how long you can be down. They're business decisions that drive architecture.
+<QA q="What's the difference between multi-AZ and multi-region?" level="easy">
 
-### Q3 — Medium: Compare active-passive and active-active multi-region setups.
-Active-passive: one region serves traffic, the other is standby. Simpler, but pays for idle capacity and failover is rarely tested. Active-active: both regions serve concurrently. Better cost utilization, faster failover, but requires conflict resolution and complex replication topology.
+**Multi-AZ** = redundancy across physically separate data centers within one region (round trips of about 1–2 ms). **Multi-region** = redundancy across geographically separated regions (tens of ms between nearby regions, 100+ ms across continents; separate infrastructure). Multi-AZ is table stakes for production; multi-region is for true disaster recovery and global users.
 
-### Q4 — Medium: How do you choose between sync and async cross-region replication?
-Sync: zero data loss (RPO=0), but write latency = max(local commit, cross-region RTT) → 100–200ms penalty. Async: low latency, but RPO = replication lag (usually seconds). Choose based on what the business can tolerate: payments often sync within region, async cross-region; analytics async.
+</QA>
 
-### Q5 — Medium: What's "split brain" and how do you prevent it?
-Split brain = a network partition where two sides each believe they're the primary, both accept writes, diverge. Prevent with:
-- **Quorum-based decisions** (majority needed to act as primary).
-- **External coordinator** (Zookeeper/etcd) holds the lease.
+<QA q="Define RPO and RTO." level="easy">
+
+**RPO** (Recovery Point Objective) = how much data you can afford to lose, measured in time. **RTO** (Recovery Time Objective) = how long you can afford to be down. They're business decisions that drive the architecture — replication choices set RPO, topology and runbook quality set RTO.
+
+</QA>
+
+<QA q="What are the active-passive DR tiers, and how do they trade cost against RTO?" level="easy">
+
+From cheapest/slowest to most expensive/fastest:
+
+- **Backup-only**: data copied to another region; long RTO (restore from scratch).
+- **Pilot light**: minimal infra running in the DR region; scale up on failover.
+- **Warm standby**: a scaled-down full stack that takes traffic on failover (minutes to hours).
+- **Hot standby**: a fully sized DR region, ready instantly (seconds to minutes).
+
+</QA>
+
+<QA q="Compare active-passive and active-active multi-region setups." level="medium">
+
+**Active-passive**: one region serves, the other stands by. Simpler, but you pay for idle capacity and failover is rarely tested. **Active-active**: both regions serve concurrently. Better utilization and faster failover, but writes in multiple regions need conflict resolution (LWW, CRDTs, app-level merge) and a more complex replication topology.
+
+</QA>
+
+<QA q="How do you choose between sync and async cross-region replication?" level="medium">
+
+**Sync**: zero data loss (RPO = 0), but every write waits for a cross-region round trip — a 100–200 ms penalty. **Async**: low write latency, but RPO = replication lag (usually seconds, more under load). Choose by what the business tolerates: payments often replicate sync within a region and async across regions; analytics is async.
+
+</QA>
+
+<QA q="What's split brain and how do you prevent it?" level="medium">
+
+Split brain = during a partition, two sides each believe they're the primary, both accept writes, and the data diverges. Prevent it with:
+
+- **Quorum-based decisions** — a majority is needed to act as primary.
+- **An external coordinator** (ZooKeeper/etcd) holding the leader lease.
 - **STONITH** (Shoot The Other Node In The Head) — fence the suspected old primary at the network or hardware level.
-- Don't ever **manually** promote without fencing.
+- Never manually promote without fencing.
 
-### Q6 — Hard: Design a multi-region setup for a global SaaS with low-latency reads everywhere and strong consistency for writes.
+</QA>
+
+<QA q="What are the options for shifting traffic during a regional failover, and their limits?" level="medium">
+
+- **DNS-based**: point records at the DR region. Bound by TTLs (10 s to 5 min), and clients/browsers cache aggressively.
+- **Anycast IP**: BGP-driven; faster than DNS, but expensive and mostly a cloud-provider capability.
+- **Application-level**: client SDKs know multiple endpoints and fail over themselves.
+- **Database failover**: promote a replica; drivers reconnect.
+
+Failback is often harder than failover — plan and test both.
+
+</QA>
+
+<QA q="Besides latency, what makes cross-region architectures hard?" level="medium">
+
+- **Bandwidth cost**: inter-region transfer is billed per GB and dominates at scale.
+- **Compliance**: data-protection laws can restrict cross-border transfers (GDPR needs an adequacy decision or safeguards such as SCCs; India's DPDP Act allows transfers except to countries the government restricts) — replicating EU PII to the US for 'DR' without a valid transfer mechanism can be a violation.
+- **Clock skew**: more drift across regions, so HLC/TrueTime matter.
+- **Transactions**: cross-region 2PC is unusable; keep transactions within a region and use sagas across.
+
+</QA>
+
+<QA q="A team claims RPO=0 with async cross-region replication. Critique." level="hard">
+
+Async means writes are acknowledged locally before they replicate. If the region fails, anything not yet replicated is lost — so RPO is greater than zero, roughly the peak replication lag, which can spike to minutes under load. They probably mean 'small', not zero. True RPO = 0 needs synchronous replication (or a quorum that spans regions).
+
+</QA>
+
+<QA q="How would you reduce the blast radius of a regional outage to fewer customers?" level="hard">
+
+- **Cell-based architecture**: split the system into independent cells, each serving a subset of customers, so a failure affects only that cell.
+- **Multi-region per cell**: each cell has its own redundancy, so a cell-level outage doesn't propagate.
+- **Tenant pinning**: each tenant is assigned to a cell.
+
+AWS documents this approach (cell-based architecture), and companies like Salesforce and Slack have written about it.
+
+</QA>
+
+<QA q="Design a multi-region setup for a global SaaS with low-latency reads everywhere and strong consistency for writes." level="scenario">
+
 Two main approaches:
-1. **Spanner-style**: globally distributed DB with TrueTime — sync writes with global quorum. Low ms penalty for global strong consistency.
-2. **Geo-partitioned with home regions**: each tenant has a home region. Writes within home region (fast). Reads served locally from replicas (eventual consistency) or via the home region (slower but consistent).
 
-Practical hybrid: use #2 with optional read-from-home for strong consistency. Keep tenant migrations rare.
+1. **Spanner-style**: a globally distributed DB with TrueTime and sync cross-region quorum writes. Writes pay cross-region RTT (tens to 100+ ms) for global strong consistency; reads can be served locally.
+2. **Geo-partitioned with home regions**: each tenant has a home region where its writes happen (fast). Reads come from local replicas (eventually consistent) or from the home region (slower but consistent).
 
-### Q7 — Hard: A team claims RPO=0 with async cross-region replication. Critique.
-Async replication means writes are acked locally before cross-region replication. On regional failure, anything not yet replicated is lost — RPO > 0 (typically equal to peak replication lag, which can spike to minutes under load). They likely mean RPO is "small" but it's not zero. True RPO=0 requires sync replication (or quorum across regions).
+Practical hybrid: approach 2 with optional read-from-home when strong consistency is required. Keep tenant migrations rare.
 
-### Q8 — Hard: How would you reduce the blast radius of a regional outage to fewer customers?
-- **Cell-based architecture (cells/shards)**: split the system into independent cells, each handling a subset of customers. A failure in one cell affects only that cell's customers.
-- **Multi-region per cell**: each cell has its own multi-region setup; a cell-level outage doesn't propagate.
-- **Tenant pinning**: tenant assigned to a cell; cell failures isolated.
-- AWS uses this internally (Cell-Based Architectures). Salesforce, Slack, others have written about it.
+</QA>
+
+<QA q="Your first real regional failover took 3 hours instead of the planned 15 minutes. What likely went wrong, and how do you prevent it next time?" level="scenario">
+
+Likely causes: the runbook was **never tested**; the DR region was **undersized** (cheaper instances that can't take prod load); **DNS TTLs** and client caches kept traffic on the dead region; replicas needed manual promotion and fencing; config or secrets had drifted in the DR region. Prevention: regular **game days** that actually fail over, a DR region sized for full load, low TTLs or anycast/app-level failover, and automated, fenced promotion.
+
+</QA>
+
+<QA q="The business asks for RPO under 1 second and RTO under 5 minutes for payments. What does that imply for the architecture?" level="scenario">
+
+RPO under 1 s rules out backups and leaves little room for async lag — it needs synchronous replication (at least across AZs, and across regions or quorum-based for regional loss), the Spanner-class end of the spectrum. RTO under 5 min requires a **hot standby or active-active** setup with automated failover and fencing; warm standby or restoring from backups won't make it. Expect higher write latency and cost, and test failover regularly.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="A database replicates asynchronously to another region with typical lag of 2 s that spikes to 90 s under load. What is the realistic worst-case RPO?" options={["0 seconds", "2 seconds", "About 90 seconds", "Equal to the RTO"]} answer={2}>
+
+With async replication, the data at risk is whatever hasn't replicated yet, so the worst case tracks peak lag, about 90 s. Zero needs sync replication, 2 s is only the typical case, and RPO and RTO are independent.
+
+</MCQ>
+
+<MCQ q="Which DR strategy gives the lowest RTO?" options={["Backup-only", "Pilot light", "Warm standby", "Hot standby"]} answer={3}>
+
+A hot standby is fully sized and ready, so failover takes seconds to minutes. Warm standby needs scaling, pilot light needs most infra brought up, and backup-only means a full restore.
+
+</MCQ>
+
+<MCQ q="What does synchronous cross-region replication cost you?" options={["Higher write latency because each write waits for a cross-region round trip", "Possible data loss on failover", "It prevents reads in the secondary region", "Higher RTO"]} answer={0}>
+
+Sync replication gives RPO 0 but adds the cross-region RTT to every write. Data loss is the async trade-off, reads in the replica region still work, and RTO is driven by topology and runbooks, not the replication mode.
+
+</MCQ>
+
+<MCQ q="During a partition, the old primary keeps accepting writes after a replica was promoted. What prevents this?" options={["Lowering DNS TTL", "Fencing the old primary, for example with a quorum lease or STONITH", "Adding more read replicas", "Switching to async replication"]} answer={1}>
+
+Split brain is prevented by fencing: only the quorum lease holder may act as primary, or the old node is cut off. TTLs only affect traffic routing, extra replicas don't stop writes, and async replication makes divergence worse.
+
+</MCQ>
+
+<MCQ q="Why is DNS-based failover often slower than planned?" options={["DNS servers refuse updates during outages", "DNS can't point to another region", "TTLs and aggressive client caching keep traffic going to the old endpoint", "DNS failover requires BGP"]} answer={2}>
+
+Resolvers and clients cache records for the TTL or longer, so some traffic keeps hitting the dead region. DNS updates work and can point anywhere; BGP is how anycast works, not DNS.
+
+</MCQ>
+
+<MCQ q="What is the main purpose of a cell-based architecture?" options={["To lower inter-region bandwidth costs", "To provide RPO 0 without sync replication", "To make every write globally consistent", "To limit how many customers a single failure affects"]} answer={3}>
+
+Cells are independent slices of the system, each serving a subset of customers, so a failure is confined to one cell. They don't change bandwidth pricing, replication guarantees or global consistency.
+
+</MCQ>
+
+<MCQ q="In a geo-partitioned design, a European user's writes go to their home region in Europe. What is the main downside?" options={["Global views need scatter-gather and travelling users pay cross-region latency", "Writes from European users are slow", "There is constant write-write conflict between regions", "It requires TrueTime"]} answer={0}>
+
+Home-region writes are fast and conflict-free; the costs are scatter-gather for global queries and latency when users are far from home. Local writes are fast, conflicts are avoided by design, and TrueTime isn't needed.
+
+</MCQ>
+
+<MCQ q="A team replicates EU customer PII to a US region purely for DR. What is the primary concern?" options={["Replication lag", "It may violate data residency rules such as GDPR", "Higher RTO", "Split brain"]} answer={1}>
+
+Moving personal data across borders can breach residency and privacy laws regardless of the technical motive. Lag, RTO and split brain are engineering concerns that don't capture the legal risk.
+
+</MCQ>
+
+<MCQ q="In the RDS Multi-AZ setup, the primary's AZ fails. What happens?" options={["Data written in the last minute is lost because replication is async", "The application must be redeployed to the other AZ", "AWS promotes the synchronous standby and updates DNS, with RTO of about 1 to 2 minutes and RPO 0", "Nothing; both AZs were already accepting writes"]} answer={2}>
+
+The standby is synchronously replicated, so RPO is 0, and AWS promotes it and repoints the endpoint's DNS in roughly 1 to 2 minutes. Replication is sync, not async; stateless apps don't need a redeploy; and Multi-AZ RDS is single-writer.
+
+</MCQ>
+
+</Quiz>
 
 ## TL;DR cheat sheet
 
@@ -207,8 +342,8 @@ Async replication means writes are acked locally before cross-region replication
 - **AWS Builders Library**: ["Static stability using Availability Zones"](https://aws.amazon.com/builders-library/static-stability-using-availability-zones/) and other resilience articles.
 - **AWS Well-Architected Reliability Pillar**: [docs](https://aws.amazon.com/architecture/well-architected/).
 - **Google Cloud Architecture Center**: multi-region patterns.
-- **Google SRE Book**, Chapter 7 on managing disasters; Chapter 26 on data integrity.
+- **Google SRE Book**, Chapter 14 on managing incidents; Chapter 26 on data integrity.
 - **DDIA Chapter 5** — replication topologies.
-- **Cell-based architecture**: AWS re:Invent talks (ARC305, ARC303 series).
+- **Cell-based architecture**: AWS whitepaper ["Reducing the Scope of Impact with Cell-Based Architecture"](https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/reducing-scope-of-impact-with-cell-based-architecture.html).
 - **Netflix tech blog**: regional failover, Chaos Engineering.
 - **AWS Architecture Blog**: ["Disaster Recovery Strategies"](https://aws.amazon.com/blogs/architecture/disaster-recovery-dr-architecture-on-aws-part-i-strategies-for-recovery-in-the-cloud/).

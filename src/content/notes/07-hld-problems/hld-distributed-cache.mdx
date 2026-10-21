@@ -1,7 +1,7 @@
 ---
 title: "HLD: Distributed Cache (Redis Cluster)"
 phase: "07-hld-problems"
-order: 41
+order: 64
 tags: ["caching"]
 premium: false
 previewParagraphs: 4
@@ -9,9 +9,19 @@ estimatedMinutes: 6
 prerequisites: []
 ---
 
+## Definition (interview-ready)
+
+A **distributed cache** keeps hot key-value data in memory across many machines so reads take about a millisecond instead of hitting a database, and it scales by adding nodes.
+
+The design in one breath (Redis Cluster model): the key space is split into **16,384 hash slots** (`CRC16(key) mod 16384`), and each slot is owned by one **primary**, so adding nodes means moving slots, not rehashing everything. Each primary has one or more **replicas** fed by **asynchronous replication**; nodes watch each other over a **gossip cluster bus** and promote a replica when a majority of primaries agree its primary has failed. **Smart clients** cache the slot map and go straight to the right node, following `MOVED`/`ASK` redirects during resharding. Each node caps memory with `maxmemory` and evicts with an LRU-style policy; TTLs expire keys lazily plus by sampling.
+
+The main trade-off is **speed vs durability**: async replication keeps writes fast but can lose recently acknowledged writes on failover, which is fine for a cache, not for a source of truth. Hot keys and big keys need special handling because one key always lives on one shard.
+
+**One-liner:** Shard keys into 16,384 hash slots spread across primaries, give each primary async replicas with gossip-based failover, let smart clients route directly using a cached slot map, and treat it as a cache because async replication can lose recent writes.
+
 ## Problem statement
 
-Design a distributed cache cluster (Redis-style) for sub-ms reads of hot keyed data, horizontally scalable, with replication for HA and consistent hashing for sharding.
+Design a distributed cache cluster (Redis-style) for sub-ms reads of hot keyed data, horizontally scalable, with replication for HA and hash-slot sharding (a fixed-partition cousin of consistent hashing).
 
 <Anim id="consistent-hash" />
 
@@ -33,14 +43,14 @@ Design a distributed cache cluster (Redis-style) for sub-ms reads of hot keyed d
 ## Scale estimation
 
 - 1B keys at 500 bytes each = ~500 GB hot data.
-- Cluster of 20 nodes × 32 GB each = 640 GB raw, with RF=2 = 320 GB usable.
-- Throughput: 1M ops/sec aggregate → ~50K ops/sec per node.
+- 20 primaries × 32 GB = 640 GB usable (40 nodes / 1.28 TB raw with 1 replica each) — fits ~500 GB of data plus Redis per-key overhead, with little headroom.
+- Throughput: 1M ops/sec aggregate → ~50K ops/sec per primary.
 
 ## High-level architecture
 
 ```
                         ┌────────────┐
-   Client SDK ───────►  │ Proxy /    │ ── consistent hash → shard
+   Client SDK ───────►  │ Proxy /    │ ── CRC16(key) → slot → shard
                         │ Cluster    │
                         │ Client     │
                         └─────┬──────┘
@@ -74,7 +84,7 @@ Design a distributed cache cluster (Redis-style) for sub-ms reads of hot keyed d
 
 ### Client topology awareness
 
-- Smart clients (e.g., redis-py-cluster, lettuce, redisson) cache the slot map.
+- Smart clients (e.g., redis-py's `RedisCluster`, lettuce, redisson) cache the slot map.
 - On `MOVED` / `ASK` response, refresh slot map.
 - One round trip in the steady state.
 
@@ -107,7 +117,7 @@ Design a distributed cache cluster (Redis-style) for sub-ms reads of hot keyed d
 If one key (`celebrity_user`) takes 100K QPS, one shard saturates.
 
 Solutions:
-- **Read replicas** for that key: clients can hit any replica.
+- **Read replicas** for that key: clients can read from any replica (in Redis Cluster the client must send `READONLY` on replica connections, and replica reads may be slightly stale).
 - **Local hot-key cache** at the application server: short-TTL Caffeine/Guava cache.
 - **Key splitting**: store under N keys (`key:0`, `key:1`, ..., `key:N-1`), clients pick one at random.
 
@@ -117,6 +127,7 @@ A single key with 1 GB value (huge sorted set) — single-thread Redis blocks on
 
 Solutions:
 - Split into smaller keys.
+- Delete big keys with `UNLINK` (frees memory in a background thread) instead of `DEL`.
 - Use SCAN-based operations instead of full reads.
 - Move to a different store (sometimes the data shouldn't be in Redis).
 
@@ -125,49 +136,168 @@ Solutions:
 - **Pipelining**: batch many commands per round trip → enormous throughput gain.
 - **Tail-latency**: occasional fork-related stalls during BGSAVE/AOF rewrite — tune or disable persistence on pure caches.
 - **Cross-slot operations**: forbidden. Restructure with hash tags if you need multi-key transactions.
-- **Cluster bus**: gossip cost grows with N; ~100-200 nodes per cluster is the practical ceiling. Beyond that, multi-cluster.
+- **Cluster bus**: gossip cost grows with N; the cluster spec targets up to ~1000 nodes, and in practice gossip overhead gets noticeable well before that. Beyond that, multi-cluster.
 
 ## Trade-offs
 
 - **Cluster mode vs single-node + Sentinel**: cluster scales writes (sharding); Sentinel is HA without sharding. Pick cluster only when single-node memory/throughput insufficient.
-- **Async vs sync replication**: Redis Cluster uses async (default) — fast, but writes can be lost on primary failure within the replication window. WAIT command can force sync-like ack.
+- **Async vs sync replication**: Redis Cluster uses async (default) — fast, but writes can be lost on primary failure within the replication window. The `WAIT` command makes the client wait for replica acks, which narrows the window, but the Redis docs are clear that even `WAIT` doesn't make Redis Cluster strongly consistent.
 - **Pure cache vs durable**: pure cache loses data on full cluster failure. Acceptable for caches; not for source-of-truth.
 
-## Interview questions
+## Practice questions
 
-### Q1: How does Redis Cluster partition data?
-By 16,384 hash slots. Key → CRC16(key) % 16384 → slot owner. Hash tags `{tag}` force keys to the same slot for multi-key operations.
+<Practice>
 
-### Q2: How does failover work?
-Each primary has a replica. Replicas monitor primary via gossip pings. On loss, replicas vote (cluster-bus consensus); winner is promoted. Other nodes update their topology. Clients receive MOVED responses for affected keys until they refresh slot map.
+<QA q="How does Redis Cluster partition data?" level="easy">
 
-### Q3: Can you do multi-key operations across shards?
+By 16,384 hash slots. Key → `CRC16(key) % 16384` → slot owner. Hash tags `{tag}` force keys to the same slot for multi-key operations.
+
+</QA>
+
+<QA q="How do TTL expirations work, and are expired keys removed instantly?" level="easy">
+
+TTLs are stored per key. Expiry is **lazy** (a key is checked and deleted when it is accessed) plus a **periodic sampled sweep** that removes a batch of expired keys in the background. So removal is not instant but close. Use TTLs to cap how long data can be stale.
+
+</QA>
+
+<QA q="Which eviction policy fits a general-purpose cache, and how exact is it?" level="easy">
+
+Set `maxmemory` per node and use `allkeys-lru`, so any key can be evicted when memory is full. Redis approximates LRU by sampling a few keys and evicting the best candidate, not by keeping a perfect LRU list. That is cheap and close enough in practice.
+
+</QA>
+
+<QA q="How does failover work?" level="medium">
+
+Each primary has a replica. Nodes monitor each other via gossip pings; once a majority of primaries flag the primary as FAIL, its replica requests votes and the other primaries vote — a replica that wins a majority of primaries is promoted. Other nodes update their topology. Clients receive MOVED responses for affected keys until they refresh the slot map.
+
+</QA>
+
+<QA q="Can you do multi-key operations across shards?" level="medium">
+
 Not by default — Redis Cluster rejects cross-slot commands. Use hash tags `{user42}:profile` and `{user42}:cart` to ensure colocation. For larger transactions, restructure the data model or use external coordination.
 
-### Q4: How would you handle a hot key receiving 1M QPS?
+</QA>
+
+<QA q="What is the difference between a MOVED and an ASK redirect?" level="medium">
+
+- **MOVED**: the slot now lives on another node permanently. The client retries there and updates its cached slot map.
+- **ASK**: the slot is being migrated. The client sends only that one query to the target node, prefixed with `ASKING`, and does not update its slot map yet. Once migration finishes, the old node starts returning MOVED.
+
+</QA>
+
+<QA q="Compare consistent hashing vs Redis Cluster's hash slots." level="medium">
+
+Both partition keys across nodes. Consistent hashing uses a ring; adding a node moves only about 1/N of the keys. Hash slots are 16,384 fixed slots reassigned to nodes; rebalancing moves a small fraction of slots between nodes. Functionally similar; hash slots are simpler to reason about (you can list which slots N1 owns) and easier for online migration.
+
+</QA>
+
+<QA q="When would you pick Redis Cluster over a single node with Sentinel?" level="medium">
+
+Sentinel gives HA (automatic failover) but no sharding, so all data and writes still fit on one primary. Cluster shards data across primaries, which scales memory and write throughput. Pick cluster only when a single node's memory or throughput isn't enough; it adds cross-slot restrictions and client complexity.
+
+</QA>
+
+<QA q="Can Redis Cluster lose writes that were acknowledged? How do you reduce that?" level="hard">
+
+Yes. Replication is asynchronous: the primary acks the client before replicas have the write. If the primary dies inside that replication window, the promoted replica doesn't have it. `WAIT` makes the client wait for replica acks, at a latency cost; it narrows the window but still doesn't make the cluster strongly consistent. For a cache this is usually acceptable; for source-of-truth data it is not.
+
+</QA>
+
+<QA q="What is the big-key problem and how do you fix it?" level="hard">
+
+A single huge value (for example a 1 GB sorted set) makes single-threaded Redis block on operations that touch it, stalling every other request on that shard. Fixes: split it into smaller keys, use SCAN-style incremental operations instead of full reads, or move that data to a store better suited for it.
+
+</QA>
+
+<QA q="How would you handle a hot key receiving 1M QPS?" level="scenario">
+
 - Read replicas (clients hit any).
 - Local in-process cache with short TTL.
 - Key splitting (N copies under different keys; client picks one).
 - CDN if the data is static enough to push there.
 
-### Q5: How would you online-reshard from 10 to 20 nodes?
-- Add 10 new nodes.
-- Initiate slot migration: each existing node moves ~N/2 of its slots to a new node.
-- Clients see ASK redirects during transition; complete migration; topology stabilizes.
-- Run during low-traffic; monitor latency.
+</QA>
 
-### Q6: What if the entire cluster restarts (no persistence)?
+<QA q="How would you online-reshard from 10 to 20 nodes?" level="scenario">
+
+- Add 10 new nodes.
+- Initiate slot migration: each existing node moves about half of its slots to a new node.
+- Clients see ASK redirects during transition; complete migration; topology stabilizes.
+- Run during low traffic; monitor latency.
+
+</QA>
+
+<QA q="What if the entire cluster restarts (no persistence)?" level="scenario">
+
 - All data lost; cache is cold.
 - Cold cache means all reads hit the backing store → potential overload.
 - Mitigations: persist with AOF (slower writes), or have a warm-up procedure (replay top N keys), or run the cluster in HA mode so a full restart is rare.
 
-### Q7: Compare consistent hashing vs Redis Cluster's hash slots.
-Both partition keys across nodes. Consistent hashing uses a ring; resharding moves only ~1/N keys per node added. Hash slots are 16384 fixed slots reassigned to nodes; rebalancing moves a small fraction of slots between nodes. Functionally similar; hash slots are simpler to reason about (you can list "which slots does N1 own?") and easier for online migration.
+</QA>
 
-### Q8: What if Redis Cluster isn't enough — too many nodes, gossip overhead?
+<QA q="What if Redis Cluster isn't enough — too many nodes, gossip overhead?" level="scenario">
+
 - **Federated clusters**: multiple smaller clusters, app routes by namespace.
 - **Different cache product**: Cassandra (not as fast for KV), Memcached cluster (simpler, no replication), or specialized (Apache Ignite, Hazelcast).
 - **Cell-based architecture**: each cell has its own Redis cluster; tenant pinning to cell.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="In Redis Cluster, why would you wrap user42 in a hash tag (curly braces) in both the profile key and the cart key?" options={["To give them the same TTL", "So both hash to the same slot and multi-key commands work", "To store them on different shards for balance", "To make them eligible for eviction first"]} answer={1}>
+
+Only the text inside the braces is hashed, so both keys land in the same slot and can be used together in multi-key commands. Hash tags have nothing to do with TTL or eviction, and they colocate keys rather than spread them.
+
+</MCQ>
+
+<MCQ q="A client gets an ASK redirect for a key. What should it do?" options={["Send that one query to the target node with ASKING and keep its slot map unchanged", "Update its slot map and send all future queries for that slot to the target", "Retry the same node after a backoff", "Fall back to the backing database"]} answer={0}>
+
+ASK means the slot is mid-migration, so it's a one-off redirect: prefix the query with ASKING and don't remap yet. Updating the map is what you do on MOVED. Retrying the same node or skipping the cache ignores the redirect.
+
+</MCQ>
+
+<MCQ q="One key receives 100K QPS and saturates its shard. Which fix does NOT help?" options={["A short-TTL in-process cache on app servers", "Splitting the value across key:0 ... key:N-1 and picking one at random", "Adding more primaries to the cluster", "Serving reads for it from replicas"]} answer={2}>
+
+A single key always maps to one slot on one primary, so adding primaries doesn't spread its load. Local caches, key splitting and replica reads all spread or absorb the traffic for that one key.
+
+</MCQ>
+
+<MCQ q="Why can Redis Cluster lose a write it already acknowledged?" options={["Eviction removes recently written keys first", "Gossip messages overwrite values", "Hash slots are recalculated on every write", "Replication is asynchronous, so a primary can fail before replicas receive the write"]} answer={3}>
+
+The primary acks before replicating; if it dies in that window, the promoted replica lacks the write. Eviction under allkeys-lru removes least-recently-used keys, gossip carries cluster state not values, and slots are fixed per key.
+
+</MCQ>
+
+<MCQ q="A team needs automatic failover for a 10 GB dataset that easily fits one node's memory and write load. What fits best?" options={["Redis Cluster with 20 primaries", "A single primary with replicas and Sentinel", "Consistent hashing across several standalone nodes", "No replication, persistence only"]} answer={1}>
+
+Sentinel gives HA without sharding, which is all that's needed when one node handles the data and writes. Cluster or client-side sharding adds complexity for no gain, and no replication gives no failover.
+
+</MCQ>
+
+<MCQ q="Which statement about Redis TTL expiry is correct?" options={["Expired keys are deleted exactly at their expiry time", "Expired keys stay until memory is full", "Expiry is lazy on access plus a periodic sampled sweep", "TTLs only apply when persistence is enabled"]} answer={2}>
+
+Redis deletes expired keys when they are accessed and also runs a sampled background sweep, so removal is close to but not exactly on time. Expiry doesn't wait for memory pressure and is unrelated to persistence.
+
+</MCQ>
+
+<MCQ q="A pure cache cluster shows periodic p99 latency spikes that line up with BGSAVE. What is the most direct fix?" options={["Switch eviction to allkeys-lru", "Add hash tags to hot keys", "Increase the number of hash slots", "Tune or disable persistence, since the fork for snapshots causes stalls"]} answer={3}>
+
+BGSAVE and AOF rewrite fork the process, which can stall the server. A pure cache can often run without persistence. Eviction policy and hash tags don't affect fork stalls, and the slot count is fixed at 16,384.
+
+</MCQ>
+
+<MCQ q="A whole cache cluster with no persistence restarts. What is the main risk?" options={["The cold cache sends all reads to the backing store and can overload it", "Clients get stuck in a MOVED loop", "Hash slots must be reassigned by hand", "Replicas serve stale data forever"]} answer={0}>
+
+All data is gone, so every read misses and hits the database at once. Warm-up procedures or persistence reduce this. The other options are not consequences of a cold restart.
+
+</MCQ>
+
+</Quiz>
 
 ## TL;DR cheat sheet
 
@@ -182,9 +312,9 @@ Both partition keys across nodes. Consistent hashing uses a ring; resharding mov
 
 ## Go deeper
 
-- **Redis docs**: [scaling/cluster](https://redis.io/docs/management/scaling/) and [cluster spec](https://redis.io/docs/reference/cluster-spec/).
+- **Redis docs**: [scaling/cluster](https://redis.io/docs/latest/operate/oss_and_stack/management/scaling/) and [cluster spec](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/).
 - **ByteByteGo**: Redis cluster videos.
 - **Hussein Nasser**: Redis internals + cluster deep dives.
 - **Antirez blog** (Salvatore Sanfilippo): history of Redis Cluster decisions.
-- **Topic 15** in this collection (Redis deep).
+- [Redis deep dive](/learn/notes/redis-deep/) in this collection.
 - **Memcached docs**: alternative architecture for comparison.

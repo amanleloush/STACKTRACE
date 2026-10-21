@@ -1,0 +1,470 @@
+---
+title: "Async Messaging Fundamentals: Queues, Pub-Sub, EDA, Idempotency"
+phase: "04-messaging-kafka"
+order: 29
+tags: ["messaging"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 14
+prerequisites: []
+summary: "The vocabulary underneath every Kafka conversation — why services talk asynchronously, what a broker actually buys you, and the discipline (idempotency, correlation, backpressure) it demands."
+---
+
+## Definition (interview-ready)
+
+**Asynchronous messaging** is a communication style where a sender hands a message to an intermediary (a queue or log) and moves on without waiting for the receiver to process it. The receiver picks the message up when it is ready. The intermediary — a **message broker** or **event streaming platform** — decouples the two sides in **time** (receiver can be down), **location** (neither needs the other's address), and **rate** (the broker absorbs bursts).
+
+The price of that decoupling is a set of obligations the application must take on: **idempotent consumers**, **correlation IDs** for traceability, **backpressure** handling, and acceptance of **eventual consistency**.
+
+**One-liner:** Asynchronous messaging means a producer drops a message on a broker or log and carries on without waiting, which decouples services in time, location, and rate, at the cost of eventual consistency and consumers that must handle duplicates idempotently.
+
+## Why it matters
+
+Almost every Kafka interview question quietly assumes you know these fundamentals. "Why would you put Kafka here?" is really "what does async buy you, and what does it cost?". Candidates who can name the trade-offs — duplicates, ordering, debugging, eventual consistency — sound like people who have operated these systems rather than read about them.
+
+This note covers the messaging-level concepts. For the architecture-level view (choreography vs orchestration, hybrid sync/async designs) see [Sync, Async & Event-Driven](/learn/notes/sync-async-event-driven/).
+
+## Core concepts
+
+### Synchronous vs asynchronous
+
+```
+Synchronous (REST / gRPC)
+
+  Caller ──request──▶ Callee
+     │   (thread blocked, timeout ticking)
+  Caller ◀─response── Callee
+
+Asynchronous (broker in the middle)
+
+  Producer ──msg──▶ [ Broker ] ──msg──▶ Consumer
+     │ returns immediately         (whenever it's ready)
+```
+
+| | Synchronous | Asynchronous |
+|---|---|---|
+| Caller waits? | Yes — holds a thread/connection | No — fire and continue |
+| Availability coupling | Caller fails if callee is down | Caller succeeds; message waits |
+| Latency of result | Immediate answer | Result arrives later (or never, visibly) |
+| Error handling | Exception / status code right away | Retries, DLQs, monitoring |
+| Load on callee | Callee must handle peak rate | Broker smooths the peak |
+| Debugging | One stack trace / one trace span | Spans across services and time |
+
+A useful mental model: synchronous calls multiply availability. If an order request synchronously calls payment (99.9%), inventory (99.9%), and notification (99.9%), the request succeeds at best 99.7% of the time. Moving notification to an async event removes it from the critical path entirely.
+
+**Example:** "Place order" writes the order, publishes `OrderPlaced`, returns `201 Created`. Invoice generation, email, inventory reservation, and analytics all happen downstream, each at its own pace.
+
+### What async messaging buys you
+
+1. **Temporal decoupling** — the consumer can be deploying, crashing, or paused; messages wait in the broker.
+2. **Load levelling** — a 10× flash-sale spike lands on the broker, not on the downstream database. Consumers drain at a sustainable rate.
+3. **Independent scaling** — add consumer instances to raise throughput without touching producers.
+4. **Failure isolation** — a broken email service doesn't fail checkout.
+5. **Fan-out** — one event, many independent reactions (search indexing, analytics, notifications), and new reactions can be added without changing the producer.
+6. **Replay** (log-based brokers only) — re-read history to rebuild state, backfill a new service, or recover from a consumer bug.
+
+### What it costs you
+
+1. **Eventual consistency** — the order exists, but the "My Orders" read model may not show it for a few hundred ms. Read-your-own-writes across services is not free.
+2. **Harder error handling** — there is no caller to return an error to. Failures become retries, dead-letter queues, alerts, and runbooks.
+3. **Harder debugging** — one business flow spans many services and seconds or minutes. Without correlation IDs and distributed tracing you are grepping blind.
+4. **Duplicates** — almost every real system gives at-least-once delivery, so consumers must be idempotent.
+5. **Ordering is limited** — usually only per key / per partition, never global at scale.
+6. **Operational weight** — the broker is now a tier-0 dependency you must run, monitor, secure, and upgrade.
+
+### Point-to-point queue vs publish-subscribe
+
+**Queue (point-to-point / competing consumers):** each message is handled by exactly **one** consumer out of a pool. Consumers compete; once a message is acknowledged it is gone. Ideal for distributing work: thumbnail generation, PDF rendering, sending one email. *Examples: RabbitMQ queues, SQS.*
+
+**Publish-subscribe:** each message is delivered to **every** subscriber. Ideal for broadcasting facts: "order placed" interests billing, search, analytics, and notifications alike. *Examples: SNS topics, RabbitMQ fanout exchanges, Redis Pub/Sub.*
+
+**How Kafka gets both from one primitive — the consumer group:**
+
+```
+Topic "orders" (4 partitions)
+
+Group "billing"  (2 instances)  → P0,P1 → B1   P2,P3 → B2    ← queue semantics inside a group
+Group "search"   (1 instance)   → P0..P3 → S1                ← every group sees every record
+Group "analytics"(4 instances)  → one partition each          ← pub-sub semantics across groups
+```
+
+Inside a group, partitions are divided among members — competing consumers. Across groups, each group reads the full stream independently with its own offsets. You choose the semantics by choosing the `group.id`, not by choosing a different kind of topic.
+
+### Message broker vs event streaming platform
+
+| | Message broker (RabbitMQ, ActiveMQ, SQS) | Event streaming platform (Kafka, Pulsar, Kinesis) |
+|---|---|---|
+| Storage model | Queue; message removed after ack | Append-only log; kept for a retention period |
+| Who tracks progress | Broker tracks per-message ack state | Consumer tracks its own offset |
+| Replay | Not really (once acked, gone) | Yes — rewind the offset |
+| Many independent readers | Copy the message per queue | Free — each reader has its own offset |
+| Strength | Rich routing, per-message TTL/priority/delay | Throughput, durability, replay, stream processing |
+| Mental model | "Deliver this task, then forget it" | "Record what happened; anyone can read it, now or later" |
+
+The distinction matters in design discussions: if you need a task queue with per-message retries and delays, a broker is simpler. If you need many consumers, replay, or a durable history, you want a log. Detailed comparison in [Pulsar vs RabbitMQ vs SQS](/learn/notes/pulsar-rabbitmq-sqs/).
+
+### Commands, events, and queries
+
+| | Command | Event | Query |
+|---|---|---|---|
+| Meaning | "Please do X" | "X happened" | "Tell me X" |
+| Naming | Imperative: `ReserveInventory` | Past tense: `InventoryReserved` | `GetOrderStatus` |
+| Addressed to | One owning handler | Anyone interested (broadcast) | One owner |
+| Can be rejected? | Yes | No — it's already a fact | n/a |
+| Side effects | Yes | Consumers decide | None |
+
+In Kafka designs, **commands** typically go to a request topic owned by a single service (`inventory.commands`), while **events** go to a domain topic many services subscribe to (`orders.events`). Confusing the two is a classic smell: an "event" called `SendWelcomeEmail` is really a command, and it couples the producer to one specific consumer.
+
+### Event-driven architecture patterns (quick map)
+
+1. **Event notification** — a thin event ("order 42 changed"); consumers call back to fetch details. Small payloads, but consumers are coupled to the producer's API at read time.
+2. **Event-carried state transfer** — the event carries the data consumers need. No callbacks, better autonomy, bigger payloads and schema responsibility.
+3. **Event sourcing** — the event log *is* the system of record; state is a fold over events.
+4. **CQRS** — separate write model and read models; read models are projections built from events.
+
+These are covered in depth in [Sync, Async & Event-Driven](/learn/notes/sync-async-event-driven/) and [Kafka Architecture Patterns](/learn/notes/kafka-architecture-patterns/).
+
+### Delivery guarantees (overview)
+
+| Guarantee | What can go wrong | Typical mechanism | Where it's acceptable |
+|---|---|---|---|
+| At-most-once | Messages can be lost | Commit offset / ack *before* processing; producer `acks=0` | Metrics, telemetry, sampled logs |
+| At-least-once | Messages can be duplicated | Ack *after* processing; producer retries | The practical default — with idempotent consumers |
+| Exactly-once (effect) | Nothing within its scope (e.g. Kafka to Kafka), but it costs latency and complexity | Kafka transactions inside Kafka; idempotency at external boundaries | Money, inventory, ledgers |
+
+The full treatment — including why "exactly-once" means something narrower than it sounds — is in [Delivery Semantics](/learn/notes/delivery-semantics/) and [Kafka Transactions & EOS](/learn/notes/kafka-transactions-eos/).
+
+### Backpressure
+
+Backpressure is what happens when producers outrun consumers: queues grow, memory fills, latency climbs, and eventually something falls over. A healthy async system has an explicit answer for it.
+
+| Strategy | How | Trade-off |
+|---|---|---|
+| Buffer | Let the broker absorb the burst (Kafka's disk-backed retention is a huge buffer) | Lag grows; must catch up before retention expires |
+| Scale consumers | Add instances (Kafka: up to partition count) | Costs money; partition ceiling |
+| Throttle producers | Rate limits / Kafka client quotas | Pushes pressure back to the caller |
+| Shed load | Drop or sample low-priority messages | Data loss by design |
+| Pull-based consumption | Consumer asks for `max.poll.records` at a time | Built into Kafka — consumers can't be flooded |
+| Pause / resume | `consumer.pause(partitions)` while an internal worker pool is full | Must keep calling `poll()` to stay in the group |
+
+Kafka's pull model is the key point: the broker never pushes faster than the consumer asks. The pressure shows up as **consumer lag**, which you monitor and alert on, rather than as consumer crashes.
+
+### Idempotency
+
+An operation is **idempotent** if doing it twice has the same effect as doing it once. In at-least-once systems duplicates are not an edge case — they happen on every producer retry, every consumer crash before commit, and every rebalance. So the consumer must be safe to re-run.
+
+Techniques, from simplest to most general:
+
+1. **Naturally idempotent writes** — `SET status = 'SHIPPED'` is safe to repeat; `balance = balance - 100` is not.
+2. **Upsert by business key** — `INSERT ... ON CONFLICT (order_id) DO UPDATE`.
+3. **Dedup / inbox table** — insert the message ID into `processed_messages` (unique constraint) in the *same transaction* as the business change; a duplicate hits the constraint and is skipped.
+4. **Conditional / versioned updates** — `UPDATE ... SET v = v + 1 WHERE id = ? AND v = ?` (optimistic concurrency).
+5. **Idempotency keys downstream** — pass a stable key (e.g., `paymentId`) to external APIs like payment gateways so *their* retries are safe too.
+
+```sql
+BEGIN;
+INSERT INTO processed_messages (message_id) VALUES ('evt-8812');   -- fails on duplicate
+UPDATE accounts SET balance = balance - 100 WHERE id = 7;
+COMMIT;
+```
+
+The crucial detail is the **same transaction**: recording "processed" separately from the effect re-opens the window for duplicates or loss.
+
+### Correlation IDs
+
+A **correlation ID** is generated once at the edge (API gateway, first service) and attached to every message, log line, and downstream call that belongs to that business flow. In Kafka it lives in a **record header** (`correlation-id`, or W3C `traceparent` when using OpenTelemetry), so consumers can read it without deserializing the payload and re-attach it to anything they produce.
+
+Why it matters more in async systems: a single checkout may touch six services over thirty seconds. Without a shared ID, reconstructing "what happened to order 42" means correlating timestamps by hand. With it, one log query or one trace view shows the whole story. It is also the mechanism that makes request-reply over messaging work (below).
+
+### Request-reply over messaging
+
+Sometimes you need an answer but still want the broker in between (e.g., a long-running pricing calculation, or a team that only exposes a Kafka interface).
+
+```
+Requester                              Responder
+  │ produce → pricing.requests
+  │   headers: correlation-id=abc, reply-to=pricing.replies.instance-7
+  │                                        │ consume, compute
+  │                                        │ produce → pricing.replies.instance-7
+  │                                        │   headers: correlation-id=abc
+  │ consume pricing.replies.instance-7
+  │ pending["abc"].complete(result)
+```
+
+1. The requester keeps a map `correlationId → pending future` with a timeout.
+2. The request carries the correlation ID and a **reply-to** topic in headers.
+3. The responder publishes its result to that reply topic with the same correlation ID.
+4. The requester's reply consumer completes the matching future; timed-out entries are failed and cleaned up.
+
+Spring Kafka's `ReplyingKafkaTemplate` packages this. The caveats are what interviewers want: higher latency than direct RPC, timeouts are mandatory, and replies must reach the *same instance* that is waiting — so use a per-instance reply topic or pin reply partitions per instance. If you find yourself doing this a lot, a synchronous API is probably the right tool.
+
+## How it works (one order, end to end)
+
+```
+1. Client → OrderService: POST /orders  (correlation-id = c-91 generated at gateway)
+2. OrderService, in ONE DB transaction:
+     INSERT order 42
+     INSERT outbox row (OrderPlaced, key=42, headers: correlation-id=c-91)
+   → returns 201 immediately
+3. Outbox relay / CDC publishes OrderPlaced to topic orders.events (key = 42)
+4. Consumer groups react independently:
+     billing    → creates invoice      (dedup on event id)
+     inventory  → reserves stock       (emits InventoryReserved, same correlation id)
+     email      → sends confirmation   (idempotency key = event id)
+     analytics  → appends to warehouse
+5. Email provider is down → email group's lag grows; checkout is unaffected.
+   Provider recovers → group drains backlog. No messages lost, none double-sent.
+6. Support searches logs for correlation-id=c-91 → sees the whole flow.
+```
+
+## Real-world examples
+
+- **E-commerce checkout**: order placement returns immediately; payment confirmation, invoicing, emails, and warehouse picking run off events.
+- **LinkedIn**: Kafka was created there to move activity events (page views, clicks) to many downstream systems — a pub-sub fan-out problem at enormous scale.
+- **Uber, Netflix**: event backbones feeding real-time pricing, recommendations, and analytics from the same streams.
+- **Image/video pipelines**: classic competing-consumer task queues (upload → transcode workers).
+
+## Common pitfalls
+
+- **Async for everything**: using messaging where the caller genuinely needs an answer now (login, price check) adds latency and complexity for no benefit.
+- **Non-idempotent consumers**: "duplicates are rare" until a rebalance replays 5,000 messages and customers get five emails each.
+- **Events that are really commands**: `SendInvoiceEmail` as an "event" couples producer to consumer; publish `OrderPlaced` and let consumers decide.
+- **No correlation ID**: debugging a multi-service flow becomes archaeology.
+- **Ignoring backpressure**: unbounded in-memory queues inside consumers turn lag into OOM crashes.
+- **Assuming global order**: only per-key ordering is realistic; design around it.
+- **Request-reply without timeouts**: pending futures leak forever when a reply is lost.
+- **Recording "processed" outside the business transaction**: reintroduces the exact duplicate/loss window idempotency was meant to close.
+
+## Practice questions
+
+<Practice>
+
+<QA q="What is the difference between synchronous and asynchronous communication between services?" level="easy">
+
+- **Synchronous** (REST, gRPC): the caller sends a request and **blocks** until it gets a response. Its thread, its latency, and its availability are tied to the callee's.
+- **Asynchronous**: the caller hands a message to a broker and **continues immediately**. The consumer processes it whenever it can.
+- Async decouples the two sides in **time** (consumer can be down), **location** (no direct addressing), and **rate** (broker absorbs spikes).
+- Example: checkout returns `201` after publishing `OrderPlaced`; invoices, emails, and stock updates happen downstream.
+
+</QA>
+
+<QA q="What problems does asynchronous messaging solve in a microservices architecture?" level="easy">
+
+1. **Temporal decoupling** — consumer downtime doesn't fail the producer.
+2. **Load levelling** — traffic spikes are buffered; consumers drain at a sustainable rate.
+3. **Elastic scaling** — add consumers without touching producers.
+4. **Failure isolation** — a broken downstream doesn't cascade back to the caller.
+5. **Fan-out** — one event drives many independent consumers; new ones can be added without changing the producer.
+6. **Replay / audit** — with a log-based broker, history can be re-read to rebuild state or backfill a new service.
+
+</QA>
+
+<QA q="What are the disadvantages or trade-offs of going asynchronous?" level="easy">
+
+- **Eventual consistency** — downstream state lags; read-your-own-writes across services isn't automatic.
+- **Error handling is harder** — no caller to return an error to; you need retries, DLQs, alerts.
+- **Debugging is harder** — flows span services and time; requires correlation IDs + distributed tracing.
+- **Duplicates** — at-least-once delivery is the norm, so consumers must be idempotent.
+- **Ordering** — only per key/partition in practice; global ordering kills parallelism.
+- **Operational overhead** — the broker is another critical cluster to run and monitor.
+
+</QA>
+
+<QA q="What is the difference between a message queue and publish-subscribe? How does Kafka support both?" level="easy">
+
+- **Queue (point-to-point):** each message goes to **one** consumer from a competing pool, and is removed after ack. Good for distributing work.
+- **Pub-sub:** each message goes to **every** subscriber. Good for broadcasting facts.
+- **Kafka unifies them with consumer groups:** within one group, partitions are split across members → queue semantics. Different groups each read the whole topic independently → pub-sub semantics. You pick the behaviour by picking the `group.id`.
+
+</QA>
+
+<QA q="What is the difference between a message broker and an event streaming platform?" level="medium">
+
+- **Message broker** (RabbitMQ, ActiveMQ, SQS): routes messages to queues and **deletes them after acknowledgement**. The broker tracks per-message delivery state. Strong at routing rules, priorities, TTLs, delays — transient work distribution.
+- **Event streaming platform** (Kafka, Pulsar): stores events in a **durable, append-only log** with time/size-based retention. **Consumers track their own offsets**, so many readers can be at different positions and anyone can **replay**. Enables stream processing and event sourcing.
+- One-liner: a broker *delivers tasks and forgets them*; a streaming platform *records what happened so anyone can read it, now or later*.
+
+</QA>
+
+<QA q="What is event-driven architecture, and what are its main patterns?" level="medium">
+
+EDA is a style where services communicate by **emitting and reacting to events** — immutable facts such as `OrderPlaced` — instead of calling each other directly.
+
+1. **Event notification** — thin event ("order 42 changed"); consumers call back for details.
+2. **Event-carried state transfer** — the event contains the state consumers need; no callbacks, more autonomy, larger payloads.
+3. **Event sourcing** — the event log is the source of truth; current state = replay/fold of events.
+4. **CQRS** — separate write model from read models; read models are projections built from events.
+
+</QA>
+
+<QA q="Differentiate a command, an event, and a query." level="medium">
+
+- **Command** — an instruction to one handler: `ReserveInventory`. Imperative, can be **rejected**, has a single owner.
+- **Event** — a fact that already happened: `InventoryReserved`. Past tense, **broadcast**, cannot be rejected; consumers decide how to react.
+- **Query** — a request for data with **no side effects**.
+- In Kafka designs, commands usually go to a dedicated request topic owned by one service; events go to shared domain topics with many subscribers. An "event" named like an instruction (`SendEmail`) is a design smell — it's a command in disguise and couples the producer to one consumer.
+
+</QA>
+
+<QA q="What delivery guarantees exist in messaging systems, and how is each achieved?" level="medium">
+
+- **At-most-once** — may lose, never duplicates. Ack/commit **before** processing, or fire-and-forget producer (`acks=0`). Fine for telemetry.
+- **At-least-once** — never loses, may duplicate. Ack/commit **after** processing; producer retries. The practical default — requires idempotent consumers.
+- **Exactly-once** — each message affects state once. Kafka provides it *inside Kafka* (idempotent producer + transactions). Across external systems (DBs, email, payment APIs) you approximate it with at-least-once + idempotency/dedup.
+
+See [Delivery Semantics](/learn/notes/delivery-semantics/) for the full treatment.
+
+</QA>
+
+<QA q="What is backpressure, and how do you handle it in an asynchronous system?" level="medium">
+
+Backpressure is producers generating work faster than consumers can process it — leading to unbounded queues, memory exhaustion, and growing lag.
+
+Strategies:
+1. **Buffer** in the broker (Kafka's disk retention makes this natural) — but watch lag vs retention.
+2. **Scale consumers** (Kafka: up to the partition count) or add partitions.
+3. **Throttle producers** — rate limits, Kafka quotas.
+4. **Shed load** — drop/sample low-priority messages.
+5. **Pull-based consumption** — Kafka consumers fetch only what they can handle (`max.poll.records`); they can't be flooded like push consumers.
+6. **Pause/resume** — `consumer.pause()` partitions when an internal worker pool is saturated, keep polling to stay in the group, `resume()` when drained.
+
+</QA>
+
+<QA q="What is idempotency, and why is it critical for asynchronous consumers?" level="medium">
+
+An operation is idempotent if applying it many times has the same effect as applying it once. Async systems are at-least-once in practice — duplicates come from producer retries, consumer crashes before commit, and rebalances — so a consumer that isn't idempotent *will* double-apply effects eventually.
+
+Techniques:
+1. Naturally idempotent writes (`SET status = 'SHIPPED'` rather than `count = count + 1`).
+2. Upserts keyed on the business ID.
+3. A dedup/inbox table with a unique constraint on message ID, written **in the same DB transaction** as the effect.
+4. Conditional/versioned updates (optimistic locking).
+5. Passing idempotency keys to downstream APIs (payment gateways).
+
+</QA>
+
+<QA q="What is a correlation ID and what role does it play in async systems?" level="medium">
+
+- A unique ID created at the entry point of a request and **propagated through every message, log line, and downstream call** in that flow.
+- In async systems one business transaction spans many topics, services, and minutes; the correlation ID is the only practical way to stitch logs and traces together.
+- In Kafka it's carried in **record headers** (often the OpenTelemetry `traceparent`), so it can be read without deserializing the payload and is copied onto any message the consumer produces.
+- It also powers **request-reply over messaging**: the reply carries the same ID so the requester can match it to the pending request.
+
+</QA>
+
+<QA q="How would you implement request-reply over asynchronous messaging?" level="hard">
+
+1. Requester generates a **correlation ID**, stores `correlationId → pending future` (with a timeout), and publishes to a request topic with headers `correlation-id` and `reply-to`.
+2. Responder consumes, processes, and publishes the result to the `reply-to` topic with the **same correlation ID**.
+3. Requester consumes the reply topic, looks up the pending future by ID, and completes it. Timeouts fail and remove stale entries.
+
+Caveats to mention:
+- Extra latency and moving parts vs a direct RPC.
+- **Timeouts are mandatory** — replies can be lost.
+- Replies must reach the **waiting instance**: use a per-instance reply topic or assign specific reply partitions per instance.
+- Spring Kafka's `ReplyingKafkaTemplate` implements this. If most interactions need replies, a synchronous API is the better tool.
+
+</QA>
+
+<QA q="When should two services talk synchronously even though you have Kafka available?" level="hard">
+
+- The caller **needs the answer to proceed** — authentication, price/stock checks during checkout, validation that must reject bad input before accepting the request.
+- The interaction is a **query** with no side effects; async adds latency and correlation machinery for nothing.
+- Strong consistency is required at that moment (e.g., "is this seat still free?").
+- A common hybrid: keep the critical validation **synchronous** and move side effects (emails, analytics, search indexing, invoicing) to **events**.
+
+</QA>
+
+<QA q="A consumer updates a balance with `balance = balance - amount`. Messages are delivered at-least-once. What can go wrong and how do you fix it?" level="scenario">
+
+- A redelivered message (crash before offset commit, rebalance, producer retry) **debits twice** — the operation isn't idempotent.
+- Fixes:
+  - Record the message/event ID in a `processed_messages` table with a **unique constraint**, inside the **same DB transaction** as the debit. Duplicates fail the insert and are skipped.
+  - Or model the effect as an idempotent write: insert a ledger row keyed by `event_id` and derive the balance from the ledger.
+  - Commit the Kafka offset **after** the DB transaction commits.
+- Don't "fix" it by committing before processing — that trades duplicates for data loss.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="An order flow synchronously calls three services that are each 99.9% available. What is the best-case availability of the order request?" options={["99.9%", "About 99.7%", "About 99.97%", "100%, because retries hide failures"]} answer={1}>
+
+Synchronous dependencies multiply: 0.999 × 0.999 × 0.999 ≈ 0.997, so about 99.7%. 99.9% would only hold with no dependencies, 99.97% is not the product, and retries reduce but cannot eliminate failures when a callee is down.
+
+</MCQ>
+
+<MCQ q="How does Kafka deliver pub-sub semantics and queue semantics from the same topic?" options={["By using two different topic types", "By setting a delivery-mode flag per message", "Through consumer groups: members of one group split partitions, while each group reads the full stream", "Through exchanges and bindings like RabbitMQ"]} answer={2}>
+
+Inside a group, partitions are divided among members (competing consumers); across groups, each group reads every record with its own offsets. Kafka has no topic types, delivery-mode flags or exchanges for this.
+
+</MCQ>
+
+<MCQ q="Which statement best distinguishes an event streaming platform from a classic message broker?" options={["The streaming platform retains an append-only log and consumers track their own offsets, enabling replay", "The broker is always faster", "The streaming platform deletes messages as soon as one consumer acks them", "Only the broker supports multiple consumers"]} answer={0}>
+
+Log-based platforms keep records for a retention period and let each reader own its position, so replay is just moving an offset. Brokers delete after ack (the opposite of option C), speed depends on the workload, and brokers support many consumers by copying messages per queue.
+
+</MCQ>
+
+<MCQ q="A service publishes a message named SendWelcomeEmail to a shared domain topic. What is the design smell?" options={["The name is too long", "Events must always be commands", "It should be published with acks=0", "It is a command disguised as an event, coupling the producer to one specific consumer"]} answer={3}>
+
+Events are past-tense facts that anyone can react to; an imperative name means the producer is telling one consumer what to do. Publishing a fact such as UserRegistered lets consumers decide. Name length and acks settings are irrelevant.
+
+</MCQ>
+
+<MCQ q="Why must the dedup (inbox) insert happen in the same DB transaction as the business change?" options={["It makes the insert faster", "Otherwise a crash between the two writes reopens the window for duplicates or lost effects", "Kafka requires it for offset commits", "Unique constraints only work inside transactions"]} answer={1}>
+
+If the processed marker and the effect commit separately, a crash in between leaves either an effect without a marker (duplicate on redelivery) or a marker without an effect (lost work). Speed, Kafka requirements and constraint behaviour are not the reason.
+
+</MCQ>
+
+<MCQ q="Under Kafka's pull model, how does overload from fast producers typically show up?" options={["Consumers crash from being flooded with pushed messages", "The broker drops messages for slow consumers", "As growing consumer lag, which you monitor and alert on", "Producers are automatically blocked by consumers"]} answer={2}>
+
+Consumers only fetch what they ask for, so excess work stays in the log and appears as lag. Kafka does not push to consumers, does not drop unread data (until retention expires), and consumers do not throttle producers directly.
+
+</MCQ>
+
+<MCQ q="In request-reply over Kafka, why do you typically use a per-instance reply topic or pinned reply partitions?" options={["The reply must reach the specific instance holding the pending future for that correlation ID", "Kafka forbids sharing reply topics", "It removes the need for timeouts", "It guarantees exactly-once replies"]} answer={0}>
+
+The waiting future lives in one instance's memory; a reply consumed by another instance cannot complete it. Kafka allows shared topics, timeouts are still mandatory, and routing does not change delivery semantics.
+
+</MCQ>
+
+<MCQ q="Which consumer write is naturally idempotent?" options={["balance = balance - 100", "count = count + 1", "Appending a row without a unique key", "SET status = 'SHIPPED' for a given order"]} answer={3}>
+
+Setting a field to an absolute value yields the same state no matter how many times it runs. Relative updates and keyless appends change state on every repeat.
+
+</MCQ>
+
+<MCQ q="Where is a correlation ID usually carried on a Kafka record?" options={["In the partition number", "In a record header, such as correlation-id or the W3C traceparent", "In the offset", "Only in the consumer's logs"]} answer={1}>
+
+Headers carry metadata readable without deserializing the value, and consumers copy them onto records they produce. Partition numbers and offsets are assigned by Kafka, and logs alone do not propagate the ID.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- Async = sender doesn't wait; broker decouples **time, location, rate**.
+- Buys: failure isolation, load levelling, fan-out, independent scaling, replay (log-based).
+- Costs: eventual consistency, duplicates, limited ordering, harder debugging, a broker to operate.
+- **Queue** = one consumer per message; **pub-sub** = every subscriber gets it. Kafka does both via **consumer groups**.
+- **Broker** deletes after ack; **streaming platform** retains a replayable log, consumers own offsets.
+- **Command** = do X (one owner, can be rejected); **event** = X happened (broadcast, immutable).
+- At-least-once + **idempotent consumer** is the practical default.
+- Idempotency: unique key + dedup in the **same transaction** as the effect.
+- **Correlation ID** in headers on every hop; required for tracing and request-reply.
+- Backpressure: Kafka's pull model turns overload into **lag**, which you monitor.
+
+## Go deeper
+
+- **Martin Kleppmann**, *Designing Data-Intensive Applications* — Chapter 11 (Stream Processing).
+- **Gwen Shapira et al.**, *Kafka: The Definitive Guide* (2nd ed.) — chapters on producers, consumers, and reliable delivery.
+- **Martin Fowler**: ["What do you mean by 'Event-Driven'?"](https://martinfowler.com/articles/201701-event-driven.html) — the four EDA patterns.
+- **Gregor Hohpe & Bobby Woolf**, *Enterprise Integration Patterns* — request-reply, correlation identifier, competing consumers, dead-letter channel.
+- **Apache Kafka docs**: [Design](https://kafka.apache.org/documentation/#design).

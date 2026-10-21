@@ -1,7 +1,7 @@
 ---
 title: "CDN Basics"
 phase: "03-caching-redis"
-order: 17
+order: 23
 tags: ["caching"]
 premium: false
 previewParagraphs: 4
@@ -11,7 +11,9 @@ prerequisites: []
 
 ## Definition (interview-ready)
 
-A **CDN** (Content Delivery Network) is a globally distributed cache of edge servers (PoPs — Points of Presence) that sit close to users, serving static content (and increasingly dynamic content) on behalf of an origin server. Users hit the nearest PoP via **Anycast DNS** + **BGP**; caches are invalidated/refreshed by **purge** and **TTL** semantics.
+A **CDN** (Content Delivery Network) is a globally distributed cache of edge servers (PoPs — Points of Presence) that sit close to users, serving static content (and increasingly dynamic content) on behalf of an origin server. Users reach a nearby PoP through **anycast** routing (one IP announced from many places via **BGP**) or **GeoDNS** (DNS answers that depend on location); cached copies are refreshed by **TTL** expiry and removed early by **purge**.
+
+**One-liner:** A CDN is a network of edge caches near users that serves content on the origin's behalf — anycast or GeoDNS sends each user to a nearby PoP, `Cache-Control` headers and purges control freshness, and the result is lower latency, less origin load and DDoS absorption.
 
 ## Why it matters
 
@@ -21,7 +23,7 @@ Once your app has users in more than one country, the speed of light becomes the
 sequenceDiagram
     autonumber
     participant U as User (Mumbai)
-    participant DNS as Anycast DNS
+    participant DNS as CDN DNS (GeoDNS)
     participant POP as Edge PoP (Mumbai)
     participant ORG as Origin (us-east-1)
     U->>DNS: resolve cdn.example.com
@@ -51,7 +53,7 @@ sequenceDiagram
 
 - **Anycast**: same IP advertised from many locations via BGP. Internet routing chooses the closest.
 - **DNS-based**: `cname.cdn.com` resolves to different IPs based on the resolver's location (GeoDNS).
-- **Hybrid**: most modern CDNs do Anycast for speed and DNS for fallback / routing.
+- **Hybrid**: some CDNs combine both. Cloudflare is mostly anycast; Akamai has historically relied mostly on DNS-based mapping.
 
 ### What gets cached
 
@@ -59,7 +61,7 @@ sequenceDiagram
 - **HTML pages**: cacheable if not personalized.
 - **API responses**: cacheable for GET endpoints with stable keys.
 - **Video streaming**: HLS / DASH manifest + chunks. CDNs are the only way to scale this.
-- **Dynamic**: edge compute (Cloudflare Workers, Lambda@Edge, Fastly Compute@Edge) generates responses at the edge.
+- **Dynamic**: edge compute (Cloudflare Workers, Lambda@Edge, Fastly Compute) generates responses at the edge.
 
 ### Cache key
 
@@ -78,16 +80,16 @@ Default: full URL. You can include / exclude query params and headers per route.
 
 ### Invalidation (purge)
 
-- **Purge by URL**: invalidate a specific path. Fast, instant.
+- **Purge by URL**: invalidate a specific path. Usually takes effect within seconds (some CDNs, like CloudFront, can take longer).
 - **Purge by tag / surrogate key**: tag responses on origin (`Surrogate-Key: product-42`). Purge by tag to wipe all related responses (product page, listings showing it, search results).
 - **Wipe all**: nuclear option; expect a brief origin storm — use soft purge if possible.
 - **Soft purge**: mark stale; next request triggers async refresh while serving stale.
 
 ### Edge compute
 
-- **Cloudflare Workers**: V8 isolates, serverless functions in 250+ cities.
+- **Cloudflare Workers**: V8 isolates, serverless functions in Cloudflare's 300+ edge cities.
 - **Lambda@Edge / CloudFront Functions**: AWS equivalent.
-- **Fastly Compute@Edge**: WebAssembly-based, very fast.
+- **Fastly Compute** (formerly Compute@Edge): WebAssembly-based, very fast startup.
 - Use cases: A/B routing, header rewriting, auth checks, response personalization, light JSON shaping.
 
 ### Origin shield
@@ -98,7 +100,7 @@ Default: full URL. You can include / exclude query params and headers per route.
 ### Image / video optimization at the edge
 
 - Resize, reformat (AVIF/WebP), compress on the fly based on `Accept` header.
-- Adaptive bitrate streaming: PoP picks the right HLS variant based on the user's bandwidth.
+- Adaptive bitrate streaming: the CDN caches every HLS/DASH rendition, and the client player switches between them based on its measured bandwidth.
 - Saves origin storage + bandwidth.
 
 ## How it works (a CDN request)
@@ -117,7 +119,7 @@ Default: full URL. You can include / exclude query params and headers per route.
 - **Netflix**: huge CDN strategy. Built **Open Connect Appliances** — Netflix-owned CDN boxes inside ISPs. Saves transit cost, gets closest to users.
 - **YouTube / Google**: own private CDN backbone.
 - **Cloudflare**: anycast everywhere; powers a huge chunk of the public web.
-- **Fastly**: powered news sites with fast purge; famously had a major outage in 2021 that took down half the internet for an hour.
+- **Fastly**: popular with news sites for fast purge. In June 2021 one customer's valid config change triggered a latent bug, and many major sites (Amazon, Reddit, gov.uk, news outlets) were down for about an hour.
 - **Akamai**: original CDN, heavy enterprise / financial / video presence.
 
 ## Common pitfalls
@@ -128,48 +130,170 @@ Default: full URL. You can include / exclude query params and headers per route.
 - **Long TTL on something you'll need to change**: prefer cache-busting filenames (`app.abc123.js`) for static; short TTL or tag-purge for dynamic.
 - **Origin hiding behind CDN by IP**: attackers find your origin via historical DNS / SSL transparency logs. Use origin auth (CF Tunnel, AWS WAF + signed requests) to refuse non-CDN traffic.
 - **Purge floods**: aggressive purges trigger origin stampedes — use soft purge or staggered.
-- **HTTPS misconfiguration**: CDN ↔ origin TLS can be weaker than client ↔ CDN. Set "full strict" mode.
+- **HTTPS misconfiguration**: CDN ↔ origin TLS can be weaker than client ↔ CDN. Encrypt CDN-to-origin traffic and validate the origin certificate (Cloudflare calls this "Full (strict)" mode).
 
-## Interview questions
+## Practice questions
 
-### Q1 — Easy: What problems does a CDN solve?
-Latency (PoPs near users), throughput (massive aggregate bandwidth), origin offload (CDN absorbs >99% of traffic for static content), DDoS protection (edges have huge capacity), and TLS termination near the user.
+<Practice>
 
-### Q2 — Easy: What's the difference between max-age and s-maxage?
-`max-age` applies to all caches including browsers. `s-maxage` applies only to **shared caches** (CDNs, proxies) — useful when you want a different TTL at the edge vs in the browser.
+<QA q="What problems does a CDN solve?" level="easy">
 
-### Q3 — Medium: How does cache invalidation work in a CDN?
-Two main approaches: **TTL-based** — content expires automatically; new request re-validates with origin. **Purge** — explicit eviction by URL, tag/surrogate key, or all. Modern systems use both: long TTL + targeted purge on content changes. Soft purge marks stale and serves while async revalidating.
+**Latency** (PoPs near users), **throughput** (massive aggregate bandwidth), **origin offload** (the CDN absorbs the vast majority of static traffic), **DDoS protection** (edges have huge capacity), and **TLS termination** near the user.
 
-### Q4 — Medium: How does Anycast DNS work for a CDN?
-Multiple data centers advertise the same IP address via BGP. Internet routers pick the topologically closest one. So `1.1.1.1` resolves to a different physical box for users in different locations — without any per-user logic. Combined with PoP redundancy, it gives instant failover too.
+</QA>
 
-### Q5 — Medium: When can/can't you cache an API response in a CDN?
-**Can**: GET requests with stable keys, low personalization, public data (product catalog, public profile, public posts). **Can't (without care)**: personalized data, authenticated endpoints, anything with side effects. **Sometimes**: cache the public part of a personalized page, hydrate the rest client-side or via edge compute.
+<QA q="What's the difference between `max-age` and `s-maxage`?" level="easy">
 
-### Q6 — Hard: Design caching for a news site's article pages — millions of pageviews per article, occasional edits.
-- **Origin**: render full article HTML.
-- **Cache**: long TTL (1 hour), `s-maxage=3600` at CDN, shorter at browser.
-- **Surrogate-Key** = article ID + tag(s).
-- **Edit flow**: editorial CMS triggers purge by surrogate key → invalidates article and any pages tagged with it (category, search). Use soft purge to avoid origin spike.
-- **Edge compute** for personalization (recommended-for-you side panel) so the main article body stays cacheable.
-- **A/B variants** → separate cache key per variant; use Vary or distinct paths.
+`max-age` applies to all caches, including browsers. `s-maxage` applies only to **shared caches** (CDNs, proxies) — useful when you want a different TTL at the edge than in the browser, e.g. `s-maxage=600, max-age=60`.
 
-### Q7 — Hard: Your CDN hit rate is 70% but you expect 99%. Investigate.
-- **Cache-Control headers** missing or short-lived (audit a sample).
-- **Vary header** causing fragmentation (Vary: User-Agent is a classic killer).
-- **Query string variations** uncoalesced (utm tracking).
-- **Cookie variations** — auth cookies preventing caching.
-- **PoP-level evictions** — small/cold PoPs evict due to memory pressure.
-- **Origin sending no-store / private inadvertently** — CDN obeys.
-- **Inconsistent URLs** for the same asset (e.g., versioned vs unversioned).
+</QA>
 
-### Q8 — Hard: How do you protect origin behind a CDN from being hit directly?
-- **IP allowlist** at the firewall — only CDN IP ranges allowed.
-- **CDN-issued signed headers / mTLS** between CDN and origin — origin rejects requests without them.
-- **Cloudflare Tunnel / AWS PrivateLink** — no public origin at all; CDN connects via private network.
+<QA q="How do you ship static assets with very long TTLs and still deploy changes instantly?" level="easy">
+
+Use **cache-busting filenames** — put a content hash in the name (`app.abc123.js`) and give it a long `max-age`. A deploy references new filenames, so nothing needs purging; old files simply stop being requested. Reserve short TTLs or tag purges for content whose URL can't change, like HTML pages.
+
+</QA>
+
+<QA q="How does cache invalidation work in a CDN?" level="medium">
+
+- **TTL-based**: content expires automatically; the next request revalidates with the origin.
+- **Purge**: explicit eviction by URL, by tag/surrogate key, or everything.
+
+Modern setups combine a long TTL with targeted purges on content changes. **Soft purge** marks content stale and serves it while revalidating asynchronously, avoiding an origin spike.
+
+</QA>
+
+<QA q="How does Anycast work for a CDN?" level="medium">
+
+Many data centers advertise the **same IP address** via BGP, and internet routing sends each user to the topologically closest one. So one anycast IP reaches different physical machines for users in different places — no per-user logic needed. If a PoP goes down it stops advertising the route and traffic shifts to the next closest, giving fast failover.
+
+</QA>
+
+<QA q="What does `stale-while-revalidate` do?" level="medium">
+
+It lets a cache keep serving an expired response for a grace period (e.g., `stale-while-revalidate=300` for 5 minutes) while it refreshes from the origin in the background. Users get fast responses, and the origin sees one refresh instead of a burst of synchronous misses when the TTL expires.
+
+</QA>
+
+<QA q="What is an origin shield?" level="medium">
+
+An extra cache layer between the PoPs and the origin. A PoP that misses asks the shield first, which may already have the object. Instead of N PoPs each fetching from the origin, origin load drops to roughly one shield. CloudFront, Akamai, and Fastly all support it.
+
+</QA>
+
+<QA q="When can or can't you cache an API response in a CDN?" level="medium">
+
+**Can**: GET requests with stable keys and public, non-personalized data (product catalog, public profiles, public posts). **Can't (without care)**: personalized data, authenticated endpoints, anything with side effects. **Sometimes**: cache the public part of a page and fill in the personalized part client-side or via edge compute.
+
+</QA>
+
+<QA q="Why is `Vary: User-Agent` dangerous for a CDN?" level="hard">
+
+`Vary` makes the cache store a separate entry per value of that header. User-Agent strings have thousands of variants, so one URL fragments into thousands of entries and the hit rate collapses toward zero. Only vary on headers that really change the response (e.g., `Accept-Encoding`), and normalize anything else at the edge.
+
+</QA>
+
+<QA q="What is edge compute used for, and why does it help caching?" level="hard">
+
+Edge compute (Cloudflare Workers on V8 isolates, Lambda@Edge / CloudFront Functions, Fastly Compute on WebAssembly) runs code at the PoP. Uses: A/B routing, header rewriting, auth checks, response personalization, light JSON shaping. It helps caching because the main response can stay public and cacheable while the small personalized piece is added at the edge.
+
+</QA>
+
+<QA q="Design caching for a news site's article pages — millions of pageviews per article, occasional edits." level="scenario">
+
+- **Origin** renders the full article HTML.
+- **Cache**: long TTL at the CDN (`s-maxage=3600`), shorter in the browser.
+- **Surrogate-Key** = article ID plus tags.
+- **Edit flow**: the CMS purges by surrogate key → invalidates the article and every page tagged with it (category, search). Use soft purge to avoid an origin spike.
+- **Edge compute** for personalized panels, so the article body stays cacheable.
+- **A/B variants** get separate cache keys (distinct paths or a deliberate `Vary`).
+
+</QA>
+
+<QA q="Your CDN hit rate is 70% but you expect 99%. Investigate." level="scenario">
+
+- `Cache-Control` headers missing or short-lived (audit a sample).
+- `Vary` header fragmenting the cache (`Vary: User-Agent` is a classic killer).
+- Query-string variations not coalesced (`utm_*` tracking params).
+- Cookies on requests preventing caching.
+- PoP-level evictions — small or cold PoPs evicting under memory pressure.
+- The origin accidentally sending `no-store` / `private` — the CDN obeys.
+- Inconsistent URLs for the same asset (versioned vs unversioned).
+
+</QA>
+
+<QA q="How do you protect an origin behind a CDN from being hit directly?" level="scenario">
+
+- **IP allowlist** at the firewall — only CDN IP ranges.
+- **Signed headers or mTLS** between CDN and origin — the origin rejects requests without them.
+- **Cloudflare Tunnel / AWS PrivateLink** — no public origin at all.
 - **WAF rules** for bot signatures.
-- Watch out for: historical DNS records, certificate transparency logs leaking origin IP. Move origin to a new IP and lock it down if leaked.
+
+Watch for historical DNS records and certificate transparency logs leaking the origin IP; if it leaks, move the origin to a new IP and lock it down.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="An origin sends Cache-Control: s-maxage=600, max-age=60. What happens?" options={["Browsers cache for 600 s, the CDN for 60 s", "Both cache for 600 s", "The CDN caches for 600 s, browsers for 60 s", "Nothing is cached because the values conflict"]} answer={2}>
+
+s-maxage applies only to shared caches like CDNs and overrides max-age there; browsers use max-age. That's how you give the edge a longer TTL than the browser.
+
+</MCQ>
+
+<MCQ q="How does Anycast send a user to a nearby PoP?" options={["Many locations advertise the same IP via BGP, and routing picks the closest", "The CDN looks up the user's account location", "The origin redirects with HTTP 302 to the nearest PoP", "The browser pings every PoP and picks the fastest"]} answer={0}>
+
+Anycast relies on BGP: the same IP is announced from many PoPs and internet routing delivers packets to the topologically nearest one. No per-user lookup or redirect is involved.
+
+</MCQ>
+
+<MCQ q="A product's price changes and it appears on its own page, listing pages, and search results. Which purge fits best?" options={["Purge by the product page URL only", "Wipe the whole cache", "Wait for the TTL to expire", "Purge by a surrogate key such as product-42 tagged on all those responses"]} answer={3}>
+
+Tagging every response that includes the product lets one purge clear them all. A URL purge misses the listings, and a full wipe causes an origin storm.
+
+</MCQ>
+
+<MCQ q="What does a soft purge do differently from a hard purge?" options={["It deletes content from the origin", "It marks content stale and serves it while refreshing in the background", "It only purges the browser cache", "It purges only half the PoPs"]} answer={1}>
+
+Soft purge keeps the stale copy available while one async revalidation fetches the new version, avoiding a burst of origin requests.
+
+</MCQ>
+
+<MCQ q="An authenticated user's dashboard response is cached at the CDN and shown to other users. Which header should it have sent?" options={["Cache-Control: public, max-age=86400", "Cache-Control: s-maxage=600", "Cache-Control: private, no-store", "Vary: Accept-Encoding"]} answer={2}>
+
+private, no-store tells shared caches not to store the response, preventing one user's data leaking to another. The other headers allow or don't stop shared caching.
+
+</MCQ>
+
+<MCQ q="Your hit rate collapsed after a change that added Vary: User-Agent. Why?" options={["Each distinct User-Agent string gets its own cache entry, fragmenting the cache", "CDNs refuse to cache responses with Vary", "User-Agent forces TLS renegotiation", "It disables the origin shield"]} answer={0}>
+
+Vary splits entries by header value, and User-Agent has thousands of variants, so most requests miss.
+
+</MCQ>
+
+<MCQ q="What does an origin shield reduce?" options={["Browser cache size", "TLS handshake time for users", "The number of PoPs needed", "Origin load, by having missing PoPs fetch from one shared cache layer"]} answer={3}>
+
+PoP misses go to the shield first, so the origin sees roughly one fetch per object instead of one per PoP. It doesn't change user-side handshakes or PoP count.
+
+</MCQ>
+
+<MCQ q="Why name static files like app.abc123.js with a long max-age?" options={["Hashes make files smaller", "A new deploy uses new filenames, so no purge is needed and old files are never stale", "CDNs only cache hashed files", "It prevents DDoS attacks"]} answer={1}>
+
+The content hash changes when the file changes, so the long TTL is safe: updated content gets a new URL. File size and DDoS protection are unaffected.
+
+</MCQ>
+
+<MCQ q="Attackers bypass your CDN and hit the origin IP directly. Which fix stops this most robustly?" options={["Lower the CDN TTL", "Add more PoPs", "Only accept origin traffic carrying CDN-signed headers or mTLS, or use a private tunnel", "Enable stale-while-revalidate"]} answer={2}>
+
+Origin authentication (or no public origin at all) rejects anything that didn't come through the CDN. TTLs, PoPs, and stale serving don't affect direct-to-origin traffic.
+
+</MCQ>
+
+</Quiz>
 
 ## TL;DR cheat sheet
 
@@ -188,5 +312,5 @@ Multiple data centers advertise the same IP address via BGP. Internet routers pi
 - **Fastly blog**: surrogate keys, stale-while-revalidate, varnish-derived terminology.
 - **MDN**: [HTTP caching](https://developer.mozilla.org/en-US/docs/Web/HTTP/Caching) — the canonical reference for headers.
 - **Netflix Open Connect** docs and blog posts.
-- **RFC 7234** (HTTP caching) — short and worth reading once.
+- **RFC 9111** (HTTP Caching, which replaced RFC 7234 in 2022) — short and worth reading once.
 - **Cloudflare YouTube**: "How Cloudflare works" series.

@@ -1,0 +1,556 @@
+---
+title: "Behavioral Patterns: Strategy, Observer, State, Chain of Responsibility, Command"
+phase: "14-lld"
+order: 136
+tags: ["lld", "design-patterns", "java", "oop"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 24
+prerequisites: ["solid-principles", "structural-patterns"]
+summary: "How Strategy, Observer, State, Chain of Responsibility, Command and Template Method divide up behaviour between objects — with Java code, real JDK and Spring examples, and the classic interview comparisons."
+---
+
+## Definition (interview-ready)
+
+**Behavioral patterns** are about **who does what and how objects talk to each other**: how responsibilities are split and how a request or an event flows between objects. Their common trick is to **turn a behaviour into an object** (an algorithm, a request, a state, a listener) so it can be swapped, queued, chained or subscribed at runtime.
+
+| Pattern | One-line intent |
+|---|---|
+| **Strategy** | Put each interchangeable algorithm in its own class behind one interface; the client picks one. |
+| **Observer** | When one object changes, automatically notify every object that subscribed to it. |
+| **State** | Let an object change its behaviour when its internal state changes, by delegating to a state object. |
+| **Chain of Responsibility** | Pass a request along a chain of handlers; each handles it, passes it on, or stops it. |
+| **Command** | Wrap a request as an object, so it can be queued, logged, retried or undone. |
+| **Template Method** | Fix the steps of an algorithm in a base class; let subclasses fill in some steps. |
+
+All six are from the GoF book *Design Patterns* (1994), which lists eleven behavioral patterns in total.
+
+**One-liner:** Behavioral patterns decide how objects share work and communicate, usually by turning a behaviour (an algorithm, a request, a state or a listener) into an object that can be swapped, chained, queued or subscribed at runtime.
+
+## Why it matters
+
+- **Machine-coding problems are full of them.** Pricing/discount rules (Strategy), vending machine or order lifecycle (State), notification fan-out (Observer), request validation (Chain), undo in an editor (Command).
+- **Frameworks are built on them.** Servlet filters and Spring Security are chains. Spring application events are Observer. `Comparator` is Strategy. `Runnable` handed to an executor is Command. `HttpServlet` is Template Method.
+- **Their main payoff is removing big `if/else` or `switch` blocks** that every new requirement has to edit — which is exactly the Open/Closed Principle interviewers check for (see [SOLID Principles](/learn/notes/solid-principles/)).
+
+## Core concepts
+
+### Strategy
+
+**Intent:** define a family of algorithms, encapsulate each one, and make them interchangeable.
+
+**Problem it solves:** checkout code has `if (type == FLAT) ... else if (type == PERCENT) ... else if (type == BOGO) ...`. Every new discount means editing and retesting this method. With Strategy, each rule is a class, and the checkout just calls `strategy.apply(cart)`.
+
+```
+ Checkout ◆────► «interface» DiscountStrategy
+ (context)           + apply(cart): Money
+                    ▲        ▲          ▲
+          FlatDiscount  PercentDiscount  BuyXGetY
+```
+
+```java
+interface DiscountStrategy { Money apply(Cart cart); }
+
+class PercentDiscount implements DiscountStrategy {
+    private final int percent;
+    PercentDiscount(int percent) { this.percent = percent; }
+    public Money apply(Cart c) { return c.total().percentOf(percent); }
+}
+
+class FlatDiscount implements DiscountStrategy {
+    private final Money off;
+    FlatDiscount(Money off) { this.off = off; }
+    public Money apply(Cart c) { return Money.min(off, c.total()); }
+}
+
+class Checkout {
+    private final DiscountStrategy discount;           // injected, swappable
+    Checkout(DiscountStrategy discount) { this.discount = discount; }
+    Money payable(Cart c) { return c.total().minus(discount.apply(c)); }
+}
+```
+
+Since Java 8, a strategy with one method is just a **functional interface**, so a lambda is a strategy: `list.sort(Comparator.comparing(User::age))`. You often pick the strategy from a `Map` keyed by type instead of a `switch`.
+
+Head First Design Patterns introduces Strategy with ducks whose fly and quack behaviours are swappable objects instead of overridden methods.
+
+### Observer
+
+**Intent:** define a one-to-many dependency so that when one object (the **subject**) changes state, all its dependents (**observers**, also called listeners or subscribers) are notified automatically.
+
+**Problem it solves:** when an order is placed, you need to send email, update analytics, and award loyalty points. If `OrderService` calls all three directly, it must change every time a new reaction is added. With Observer, `OrderService` just publishes "order placed"; each reaction subscribes itself.
+
+```
+ OrderService (subject)                 «interface» OrderListener
+ - listeners: List  ──── notifies ───►   + onOrderPlaced(event)
+ + subscribe(l)                            ▲       ▲          ▲
+ + unsubscribe(l)                  EmailListener  Analytics  LoyaltyPoints
+```
+
+```java
+record OrderPlaced(String orderId, String userId, Money total) {}
+
+interface OrderListener { void onOrderPlaced(OrderPlaced e); }
+
+class OrderService {
+    private final List<OrderListener> listeners = new CopyOnWriteArrayList<>();
+
+    void subscribe(OrderListener l)   { listeners.add(l); }
+    void unsubscribe(OrderListener l) { listeners.remove(l); }
+
+    void placeOrder(Order o) {
+        // ... save order ...
+        OrderPlaced event = new OrderPlaced(o.id(), o.userId(), o.total());
+        for (OrderListener l : listeners) {
+            try { l.onOrderPlaced(event); }
+            catch (RuntimeException ex) { /* log; one bad listener must not break the rest */ }
+        }
+    }
+}
+```
+
+`CopyOnWriteArrayList` lets listeners subscribe or unsubscribe while a notification loop is running without a `ConcurrentModificationException`, and it suits the usual case of rare writes and frequent reads.
+
+#### Push vs pull
+
+| | Push model | Pull model |
+|---|---|---|
+| What the subject sends | The **data** observers need (an event object with the changed values) | Just a **"something changed"** signal, often with a reference to itself |
+| Observer then | Uses the data directly | Calls getters on the subject to fetch what it needs |
+| Pros | Observers don't need to know the subject; event can be immutable and sent across threads/processes | Each observer pulls exactly what it needs; subject doesn't guess |
+| Cons | Subject may send more than some observers need; event schema becomes a contract | Observers are coupled to the subject's API; values may have changed again by the time they pull |
+
+Modern code mostly **pushes immutable event objects** (records), as Spring events and message brokers do. Head First's weather-station example shows both styles.
+
+#### The lapsed-listener memory leak
+
+The subject keeps a **strong reference** to every observer in its list. If an observer forgets to unsubscribe, it can never be garbage collected while the subject lives — even after the rest of the app has stopped using it. With a long-lived subject (a singleton, an application-scoped bus) and short-lived observers (a UI screen, a per-request object), memory grows forever. This is often called the **lapsed listener problem**.
+
+Fixes:
+
+- Always pair `subscribe` with `unsubscribe` in a lifecycle hook (close, dispose, `@PreDestroy`), or return a handle: `Subscription s = bus.subscribe(l); ... s.close();`.
+- Make the observer's lifetime match the subject's (e.g. both singleton Spring beans).
+- Weak references (`WeakReference`) can help, but are subtle: a listener created as an anonymous lambda with no other strong reference may be collected immediately and stop receiving events.
+
+#### Other Observer pitfalls
+
+- **Synchronous by default:** a slow listener slows the publisher. An exception in a listener can break the publisher unless caught.
+- **Ordering** between observers is usually unspecified. Don't let correctness depend on it.
+- **Cascades:** an observer that changes state and triggers more notifications can create loops.
+- **In-process only:** if the JVM crashes after the DB commit but before listeners run, the reaction is lost. Durable reactions need a message broker plus the outbox pattern (see [Delivery Semantics](/learn/notes/delivery-semantics/)).
+
+### State
+
+**Intent:** allow an object to alter its behaviour when its internal state changes; the object will appear to change its class.
+
+**Problem it solves:** a vending machine's `insertCoin()`, `selectItem()` and `dispense()` each contain `switch (state)` with the same states. Adding a state means editing every method. With State, each state is a class implementing all actions; the machine (the **context**) delegates to its current state object, and states decide transitions.
+
+```
+ VendingMachine (context) ◆──► «interface» MachineState
+ - state: MachineState           + insertCoin(m, amount)
+ + insertCoin(amt) ─ delegates ─►+ select(m, item)
+ + select(item)                  + dispense(m)
+                                   ▲         ▲            ▲
+                                 Idle    HasMoney    Dispensing
+```
+
+```java
+interface MachineState {
+    default void insertCoin(VendingMachine m, int amt) { throw new IllegalStateException("not now"); }
+    default void select(VendingMachine m, String item)  { throw new IllegalStateException("not now"); }
+}
+
+class Idle implements MachineState {
+    public void insertCoin(VendingMachine m, int amt) { m.addBalance(amt); m.setState(new HasMoney()); }
+}
+
+class HasMoney implements MachineState {
+    public void insertCoin(VendingMachine m, int amt) { m.addBalance(amt); }
+    public void select(VendingMachine m, String item) {
+        if (!m.canAfford(item)) throw new IllegalStateException("insufficient balance");
+        m.release(item);
+        m.returnChange();
+        m.setState(new Idle());
+    }
+}
+
+class VendingMachine {
+    private MachineState state = new Idle();
+    void setState(MachineState s) { this.state = s; }
+    public void insertCoin(int amt)   { state.insertCoin(this, amt); }
+    public void select(String item)   { state.select(this, item); }
+    // addBalance, canAfford, release, returnChange ...
+}
+```
+
+Head First's gumball machine is the classic teaching example. For simple lifecycles (an order going CREATED → PAID → SHIPPED), an `enum` with an allowed-transitions table is often enough; use full State classes when **behaviour** differs a lot per state.
+
+#### Strategy vs State
+
+They have the **same class diagram** (a context holding an interface reference). The difference is who switches and why:
+
+| | Strategy | State |
+|---|---|---|
+| Who chooses the object | The **client** (or config) picks it, usually once | The **states themselves** (or context) switch it as events happen |
+| Do the implementations know each other? | No — strategies are independent | Yes — a state knows which state comes next |
+| What varies | **How** one task is done (algorithm) | **What** the object does in each phase of its lifecycle |
+| Changes during object's life? | Rarely | Constantly, that's the point |
+| Example | Payment fee calculation by method | Order: Created → Paid → Shipped → Delivered |
+
+**How to say it in an interview:** "Strategy is chosen from outside and the strategies don't know each other. State changes itself from inside — each state knows its transitions."
+
+### Chain of Responsibility
+
+**Intent:** avoid coupling the sender of a request to its receiver by giving more than one object a chance to handle it. Chain the receivers and pass the request along until it is handled.
+
+Two flavours appear in practice:
+
+1. **Classic GoF:** exactly one handler handles the request (e.g. support ticket: bot → L1 → L2 → manager). Each handler either handles it or passes it on.
+2. **Pipeline / middleware:** **every** handler gets a turn to do something, and any handler can **stop** the chain (auth fails → 401). This is how servlet filters and web middleware work.
+
+```
+request ──► [AuthHandler] ──► [RateLimitHandler] ──► [ValidationHandler] ──► business logic
+               │ stop:401           │ stop:429                │ stop:400
+```
+
+```java
+abstract class Handler {
+    private Handler next;
+    Handler linkWith(Handler next) { this.next = next; return next; }
+
+    void handle(Request req) {
+        if (!process(req)) return;          // this handler stopped the chain
+        if (next != null) next.handle(req);
+    }
+    protected abstract boolean process(Request req);   // true = continue
+}
+
+class AuthHandler extends Handler {
+    protected boolean process(Request r) {
+        if (r.token() == null) { r.reject(401, "missing token"); return false; }
+        return true;
+    }
+}
+
+class SchemaValidationHandler extends Handler {
+    protected boolean process(Request r) {
+        if (r.body().isBlank()) { r.reject(400, "empty body"); return false; }
+        return true;
+    }
+}
+
+Handler chain = new AuthHandler();
+chain.linkWith(new RateLimitHandler()).linkWith(new SchemaValidationHandler());
+chain.handle(request);
+```
+
+A simpler modern form is a **list of validators** run in order: `List<Validator>` where each returns errors — good for collecting *all* validation errors instead of stopping at the first.
+
+**Pitfalls:** a request that falls off the end unhandled (always have a default/terminal handler); order dependence (auth must come before rate-limit-by-user); long chains that are hard to debug (log which handler stopped the request).
+
+### Command
+
+**Intent:** encapsulate a request as an object, letting you parameterize clients with different requests, queue or log requests, and support undoable operations.
+
+A command object bundles **what to do + the receiver + the arguments** into something with a method like `execute()`. Because it's an object, you can store it, send it to another thread, put it in a queue, write it to a log, retry it, or keep it on a stack to undo later.
+
+```
+ Invoker (button, queue, scheduler)          «interface» Command
+ - history: Deque  ───── calls ─────►         + execute()
+                                              + undo()
+                                                 ▲
+                                        InsertTextCommand ◆──► Document (receiver)
+                                        - position, text
+```
+
+**Undo/redo:**
+
+```java
+interface Command { void execute(); void undo(); }
+
+class InsertText implements Command {
+    private final Document doc; private final int pos; private final String text;
+    InsertText(Document doc, int pos, String text) { this.doc = doc; this.pos = pos; this.text = text; }
+    public void execute() { doc.insert(pos, text); }
+    public void undo()    { doc.delete(pos, text.length()); }
+}
+
+class Editor {
+    private final Deque<Command> undo = new ArrayDeque<>();
+    private final Deque<Command> redo = new ArrayDeque<>();
+
+    void run(Command c) { c.execute(); undo.push(c); redo.clear(); }   // new action kills redo history
+    void undo() { if (!undo.isEmpty()) { Command c = undo.pop(); c.undo(); redo.push(c); } }
+    void redo() { if (!redo.isEmpty()) { Command c = redo.pop(); c.execute(); undo.push(c); } }
+}
+```
+
+**Queues and deferred work:** `Runnable` and `Callable` are command objects. `executor.submit(() -> sendInvoice(orderId))` packages the request; the executor's queue holds it and a worker thread executes it later. The same idea, made durable, is a job table or a message on a queue.
+
+Head First's example is a remote control whose buttons hold `Command` objects, including an undo button and a "macro" command that runs a list of commands.
+
+### Template Method (briefly)
+
+**Intent:** define the skeleton of an algorithm in a base-class method, deferring some steps to subclasses, without letting subclasses change the overall structure.
+
+```java
+abstract class DataExporter {
+    public final void export() {            // final: the order of steps is fixed
+        List<Row> rows = fetch();
+        String out = format(rows);
+        write(out);
+    }
+    protected abstract List<Row> fetch();
+    protected abstract String format(List<Row> rows);
+    protected void write(String out) { /* default: write to file */ }   // optional override (hook)
+}
+
+class CsvSalesExporter extends DataExporter { /* implements fetch + format */ }
+```
+
+**Template Method vs Strategy:** Template Method varies steps by **inheritance** (compile-time, the whole subclass), Strategy varies the algorithm by **composition** (runtime, swappable). Modern Java often prefers passing lambdas for the varying steps — Spring's `JdbcTemplate` and `TransactionTemplate` follow this "template + callback" style: a fixed workflow (open, run, handle errors, clean up) with your code supplied as a callback.
+
+## How it works
+
+### Picking the pattern from the problem statement
+
+| Clue in the requirement | Pattern |
+|---|---|
+| "Support multiple ways to compute/choose X, add more later" | **Strategy** |
+| "When X happens, do A, B, C (and more later)" | **Observer** (in-process) or events on a broker (cross-service) |
+| "Object behaves differently depending on its status; status transitions" | **State** |
+| "Run a series of checks/steps, any of which can reject" | **Chain of Responsibility** |
+| "Undo/redo", "queue/schedule/retry requests", "log every action" | **Command** |
+| "Same steps, slightly different details per type" | **Template Method** |
+
+### How Spring application events implement Observer
+
+- A publisher calls `ApplicationEventPublisher.publishEvent(event)`. Since Spring 4.2 the event can be **any object**; it doesn't have to extend `ApplicationEvent`.
+- Listeners are beans with an `@EventListener` method (since 4.2) or that implement `ApplicationListener`. Spring finds them, so the publisher never references them.
+- **By default listeners run synchronously in the publisher's thread**, so `publishEvent()` blocks until all listeners finish, and listeners take part in the publisher's transaction if there is one.
+- Add `@Async` for asynchronous handling; then exceptions are **not** propagated to the publisher.
+- An `@EventListener` method that returns a value publishes that value as a new event.
+- `@TransactionalEventListener` (spring-tx) runs the listener at a transaction phase, by default **after commit** — use it so you don't send an email for an order that was rolled back. Gotcha: if the event is published with **no active transaction**, the listener is skipped entirely unless you set `fallbackExecution = true`.
+
+```java
+@Service
+class OrderService {
+    private final ApplicationEventPublisher events;
+    OrderService(ApplicationEventPublisher events) { this.events = events; }
+
+    @Transactional
+    public void place(Order o) {
+        // ... save ...
+        events.publishEvent(new OrderPlaced(o.id(), o.userId(), o.total()));
+    }
+}
+
+@Component
+class LoyaltyListener {
+    @TransactionalEventListener   // runs after the order transaction commits
+    void on(OrderPlaced e) { /* award points */ }
+}
+```
+
+### How servlet filters implement Chain of Responsibility
+
+Each `Filter.doFilter(request, response, chain)` does its work and then calls `chain.doFilter(request, response)` to pass control to the next filter (or the servlet at the end). **Not** calling `chain.doFilter` stops the chain — that is how an auth filter rejects a request. Code after the call runs on the way back, which is how timing/logging filters work. (Since Jakarta EE 9 the package is `jakarta.servlet` instead of `javax.servlet`.) Spring Security plugs in its own ordered list of security filters through `FilterChainProxy`, and Spring MVC's `HandlerInterceptor.preHandle` returning `false` similarly stops processing.
+
+## Real-world examples
+
+- **Strategy**: `java.util.Comparator` passed to `List.sort` / `Collections.sort`; `java.util.concurrent.RejectedExecutionHandler` (`AbortPolicy`, `CallerRunsPolicy`, ...) plugged into a `ThreadPoolExecutor`.
+- **Observer**: Spring `ApplicationEventPublisher` + `@EventListener`; `java.beans.PropertyChangeListener`; Swing/AWT listeners (`ActionListener`). `java.util.Observer`/`Observable` exist but have been **deprecated since Java 9** — the Javadoc says their event model is limited and notification order unspecified. Reactive Streams (`java.util.concurrent.Flow`, Java 9+) is an Observer variant with back-pressure.
+- **State**: commonly hand-written for order, payment and ride lifecycles; Spring Statemachine is a library for it.
+- **Chain of Responsibility**: `javax.servlet.Filter` / `FilterChain` (`jakarta.servlet` in newer versions); Spring Security's filter chain; `java.util.logging.Logger` passing records to parent loggers' handlers.
+- **Command**: `java.lang.Runnable` and `java.util.concurrent.Callable` submitted to an `ExecutorService`; `javax.swing.Action`.
+- **Template Method**: `HttpServlet.service()` dispatching to `doGet`/`doPost` (whose defaults return an error, so you override only what you support); `java.util.AbstractList` (implement `get` and `size`, get the rest); non-abstract methods of `InputStream` built on the abstract `read()`.
+
+## Common pitfalls
+
+- **Pattern-itis.** Three discount types that never change don't need a Strategy hierarchy. Introduce patterns when there's a real axis of change, and say so in the interview.
+- **Confusing Strategy and State.** Same diagram, different intent — see the table above.
+- **Observer leaks and slow listeners.** Unsubscribe; catch exceptions per listener; go async (or to a broker) for slow work.
+- **Firing events inside a transaction that later rolls back.** Use `@TransactionalEventListener` or the outbox pattern.
+- **State transitions scattered everywhere.** Keep transitions inside state classes (or a single transition table), never `order.setStatus(...)` from random services.
+- **Chain with no terminal handler** silently drops requests; chain order bugs (validation before auth leaks information).
+- **Commands that can't really undo.** Undo of "send email" or "charge card" is not a reversal — it's a compensating action (refund). Know which commands are reversible (see [Distributed Transactions](/learn/notes/distributed-transactions/) for sagas and compensation).
+- **Template Method inheritance traps.** Deep hierarchies, and forgetting to mark the template method `final` so subclasses change the step order.
+
+## Practice questions
+
+<Practice>
+
+<QA q="What problem does the Strategy pattern solve? Give a JDK example." level="easy">
+
+It replaces a growing `if/else` or `switch` over algorithm types with **one class per algorithm behind a common interface**. The context holds a reference to the interface and the client (or config) chooses which implementation to inject. New algorithm = new class, no edits to the context (Open/Closed). JDK example: `Comparator` — `list.sort(Comparator.comparing(User::age))` passes the comparison strategy into the sort algorithm.
+
+</QA>
+
+<QA q="Explain the Observer pattern and where Spring uses it." level="easy">
+
+A subject keeps a list of observers and notifies all of them when something happens, so the subject doesn't depend on concrete reactions. In Spring, you publish with `ApplicationEventPublisher.publishEvent(...)` and handle with `@EventListener` methods or `ApplicationListener` beans. By default listeners run **synchronously in the publisher's thread**; `@Async` makes them asynchronous and `@TransactionalEventListener` runs them after commit.
+
+</QA>
+
+<QA q="What is the Command pattern? Name two uses." level="easy">
+
+It wraps a request (action + receiver + parameters) in an object with `execute()`. Because it's an object it can be **queued**, **scheduled**, **logged**, **retried** or **undone**. Uses: undo/redo in editors (stack of commands with `undo()`), and task queues — a `Runnable` submitted to an `ExecutorService` is a command that a worker executes later.
+
+</QA>
+
+<QA q="Strategy and State have the same class diagram. How are they different?" level="medium">
+
+- **Strategy**: the client picks an algorithm from outside, usually once; strategies are independent and don't know about each other. It varies **how** a task is done.
+- **State**: the object's behaviour changes as its internal state changes; **state objects trigger transitions** to other states, so they know about each other. It models **lifecycle**.
+
+Example: a fee-calculation strategy chosen by payment method vs an order moving Created → Paid → Shipped, where `ship()` is illegal in Created.
+
+</QA>
+
+<QA q="Push vs pull in Observer — which would you choose?" level="medium">
+
+- **Push**: the subject sends an event object containing the data. Observers don't need to call back into the subject, and the event can be immutable and handed to other threads or serialized to a broker.
+- **Pull**: the subject only says "changed" (maybe passing itself), and observers query what they need. Less guessing about payload, but observers are coupled to the subject's API and may read a newer state than the one that triggered the notification.
+
+I'd usually push an **immutable event record** with the essentials (IDs and changed fields), which is what Spring events and message brokers do.
+
+</QA>
+
+<QA q="How can the Observer pattern cause a memory leak?" level="medium">
+
+The subject holds **strong references** to registered observers. If a short-lived observer (a screen, a per-request object) registers on a long-lived subject (singleton, global event bus) and never unregisters, it stays reachable and can't be garbage collected — the **lapsed listener** problem. Fixes: unsubscribe in a lifecycle hook, return a closable subscription handle, align lifetimes, or carefully use weak references (beware listeners with no other strong reference getting collected and silently stopping).
+
+</QA>
+
+<QA q="How do servlet filters implement Chain of Responsibility, and how does a filter reject a request?" level="medium">
+
+Each filter's `doFilter(req, res, chain)` does its work and calls `chain.doFilter(req, res)` to pass control to the next filter, ending at the servlet. Code after that call runs on the way back out (good for timing and logging). To **reject**, a filter writes an error response (e.g. 401) and simply **doesn't call** `chain.doFilter`, so later filters and the servlet never run. Spring Security plugs its ordered security filters into this chain via `FilterChainProxy`.
+
+</QA>
+
+<QA q="Template Method vs Strategy?" level="medium">
+
+Both let part of an algorithm vary. Template Method uses **inheritance**: a base class's `final` method fixes the steps and calls abstract or hook methods that subclasses override — chosen at compile time. Strategy uses **composition**: the whole algorithm is an object injected at runtime and swappable. Prefer Strategy (or a template that accepts callbacks/lambdas, like `JdbcTemplate`) when you want runtime flexibility and to avoid deep hierarchies.
+
+</QA>
+
+<QA q="Design undo/redo for a text editor." level="hard">
+
+Command pattern. Each user action is a `Command` with `execute()` and `undo()`, storing what it needs to reverse itself (position, text inserted, or the deleted text). The editor keeps two stacks: `undo` and `redo`. Running a command executes it, pushes it on `undo`, and **clears `redo`**. Undo pops from `undo`, calls `undo()`, pushes onto `redo`; redo does the reverse. Extras: cap history size, merge consecutive typing into one command, a `MacroCommand` (Composite of commands) for multi-step actions, and snapshots (Memento) for operations that are hard to reverse.
+
+</QA>
+
+<QA q="Why should a listener that sends an order-confirmation email use @TransactionalEventListener instead of @EventListener?" level="hard">
+
+A plain `@EventListener` runs **synchronously inside the publisher's transaction**, at the moment `publishEvent` is called. If the transaction later rolls back (constraint violation, payment failure), the email has already been sent for an order that doesn't exist. `@TransactionalEventListener` defaults to the **after-commit** phase, so it runs only if the transaction committed. It's still in-memory: a crash right after commit loses the email, so for guaranteed delivery use the transactional outbox and a broker.
+
+</QA>
+
+<QA q="When would you choose an enum-based state machine over the State pattern?" level="hard">
+
+Use an **enum + transition table** when states mostly differ in **which transitions are allowed**, not in behaviour — e.g. `Map<Status, Set<Status>>` checked in one `transition(to)` method. It's compact, easy to persist (the enum is the DB column), and easy to visualize. Use **State classes** when each state has substantially different behaviour for many operations (vending machine, TCP connection, game character), because putting that behaviour in per-state classes removes repeated `switch` statements from every method. Either way, centralize transitions; never set status from arbitrary places.
+
+</QA>
+
+<QA q="A payment service has a 400-line method with a switch over 8 payment methods for fees, validation and routing. Refactor it." level="scenario">
+
+- **Strategy** per payment method: `PaymentMethodHandler` with `fee()`, `validate()`, `route()`. Register them in a `Map` keyed by method (Spring can inject all beans of the interface as a list/map). The service becomes a lookup plus a call.
+- Shared validation steps (amount limits, KYC, fraud score) become a **Chain** of validators that runs before the strategy.
+- If methods share the same flow with small differences, a **Template Method** base (or a template taking lambdas) avoids duplication.
+
+Result: adding a ninth method is a new class plus registration; tests per method are small and isolated.
+
+</QA>
+
+<QA q="Requests to an internal API need auth, rate limiting, input validation and audit logging, and teams keep adding checks. Design it." level="scenario">
+
+Chain of Responsibility / middleware. Each concern is a handler with one method that either continues or stops with an error. Chain order is explicit configuration: auth → rate limit (needs the user) → validation → audit (or audit as an outer wrapper so it records rejections too). New checks are new handlers; no edits to existing ones. Include a terminal handler (the business logic), log which handler rejected, and keep each handler stateless so the chain is thread-safe. In a Spring app this maps to servlet filters, Spring Security filters, or `HandlerInterceptor`s.
+
+</QA>
+
+<QA q="When an order ships, the team wants to email the buyer, notify the seller, update search and send analytics. The first version calls all four directly and shipping now fails whenever analytics is down. Fix the design." level="scenario">
+
+The shipping flow is coupled to every reaction, and a failure in any of them fails the core operation. Apply **Observer**: `ShippingService` publishes an `OrderShipped` event; each reaction is an independent listener. Make listeners resilient: catch and log per listener, run slow or unreliable ones asynchronously, and run them **after commit**. Because the reactions are cross-service and must not be lost, publish the event durably (outbox → Kafka) so each downstream consumer retries independently and analytics being down only delays analytics.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="Which statement best distinguishes State from Strategy?" options={["State uses inheritance, Strategy uses composition", "Strategy can only have two implementations", "State cannot use interfaces", "State objects usually trigger transitions to other states; strategies are chosen from outside and are independent"]} answer={3}>
+
+Both use composition with an interface. In State the states know their successors and switch the context; in Strategy the client chooses and strategies do not know each other.
+
+</MCQ>
+
+<MCQ q="By default, how does Spring deliver an event to an @EventListener method?" options={["On a separate thread pool", "Via Kafka", "Synchronously in the publisher's thread, inside its transaction if one exists", "Only after the transaction commits"]} answer={2}>
+
+The default multicaster is synchronous, so publishEvent blocks until listeners finish. @Async makes it asynchronous; @TransactionalEventListener ties it to a transaction phase (after commit by default).
+
+</MCQ>
+
+<MCQ q="A long-lived event bus keeps growing in memory as users open and close screens. Most likely cause?" options={["Observers registered by screens are never unsubscribed, so the bus keeps strong references to them", "Too many threads", "Events are immutable", "The bus uses CopyOnWriteArrayList"]} answer={0}>
+
+This is the lapsed listener problem: the subject's list keeps short-lived observers reachable. Immutable events and CopyOnWriteArrayList are not leaks by themselves.
+
+</MCQ>
+
+<MCQ q="In a servlet filter, how do you stop a request from reaching the servlet?" options={["Throw away the FilterChain object", "Write an error response and do not call chain.doFilter", "Call chain.doFilter twice", "Return false from doFilter"]} answer={1}>
+
+doFilter returns void; the chain continues only if the filter calls chain.doFilter. Spring's HandlerInterceptor.preHandle is the one that returns a boolean.
+
+</MCQ>
+
+<MCQ q="Which JDK type is the textbook example of Command?" options={["java.util.Comparator", "java.util.Observer", "java.io.InputStreamReader", "java.lang.Runnable"]} answer={3}>
+
+A Runnable packages work as an object that an executor can queue and run later. Comparator is Strategy, Observer is Observer, InputStreamReader is Adapter.
+
+</MCQ>
+
+<MCQ q="In an undo/redo implementation with two stacks, what should happen to the redo stack when the user performs a brand-new action?" options={["Nothing", "The new action is pushed onto it", "It is cleared", "It is merged into the undo stack"]} answer={2}>
+
+A new action creates a new branch of history, so previously undone actions can no longer be redone. Standard editors clear redo.
+
+</MCQ>
+
+<MCQ q="What is the status of java.util.Observable?" options={["Recommended for new code", "Removed in Java 8", "Deprecated since Java 9", "Replaced by java.util.Observer in Java 11"]} answer={2}>
+
+It is deprecated since Java 9; the Javadoc cites a limited event model and unspecified notification order, pointing to java.beans, java.util.concurrent and Flow instead. It has not been removed.
+
+</MCQ>
+
+<MCQ q="HttpServlet.service() calling doGet or doPost is an example of which pattern?" options={["Template Method", "Observer", "State", "Adapter"]} answer={0}>
+
+The base class fixes the dispatch algorithm and subclasses override the specific steps they support; un-overridden doXXX methods send an error response.
+
+</MCQ>
+
+<MCQ q="Which requirement most strongly suggests Chain of Responsibility?" options={["Undo the last five actions", "Run a configurable sequence of checks, any of which may reject the request", "Swap the shipping-cost formula per region", "Notify five services when a user signs up"]} answer={1}>
+
+A sequence of handlers that can each stop the request is a chain. Undo is Command, swappable formulas are Strategy, and fan-out notification is Observer.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **Behavioral** = how responsibilities and requests flow between objects. Turn behaviour into objects.
+- **Strategy**: interface per algorithm, injected; lambdas and `Comparator` are strategies. Kills `switch` on type.
+- **Observer**: subject notifies subscribers. Prefer **push** of immutable events. Unsubscribe or leak (**lapsed listener**). Spring events are sync by default; `@TransactionalEventListener` = after commit.
+- **State**: context delegates to current state object; **states drive transitions**. Strategy = chosen from outside; State = changes itself.
+- **Chain of Responsibility**: handlers in order, any can stop. Servlet filters (`chain.doFilter`), Spring Security, validation pipelines. Always have a terminal handler.
+- **Command**: request as an object → queue, log, retry, undo. `Runnable`/`Callable` + executor. Undo/redo = two stacks; new action clears redo.
+- **Template Method**: `final` skeleton in base class, steps overridden. `HttpServlet`, `AbstractList`. Prefer template + callback for flexibility.
+
+## Go deeper
+
+- **Book**: Gamma, Helm, Johnson, Vlissides — *Design Patterns* (1994), chapter 5 (Behavioral Patterns).
+- **Book**: Freeman & Robson — *Head First Design Patterns*, 2nd ed. (Strategy, Observer, Command, Template Method, State chapters).
+- **refactoring.guru**: [Behavioral patterns catalog](https://refactoring.guru/design-patterns/behavioral-patterns) — [Strategy](https://refactoring.guru/design-patterns/strategy), [Observer](https://refactoring.guru/design-patterns/observer), [State](https://refactoring.guru/design-patterns/state), [Chain of Responsibility](https://refactoring.guru/design-patterns/chain-of-responsibility), [Command](https://refactoring.guru/design-patterns/command).
+- **Spring Framework reference**: [Standard and Custom Events](https://docs.spring.io/spring-framework/reference/core/beans/context-introduction.html#context-functionality-events).
+- **JDK API**: [java.util.Observable (deprecated)](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/Observable.html).
+- Related notes: [Structural Patterns](/learn/notes/structural-patterns/), [Machine Coding Rounds](/learn/notes/machine-coding-strategy/), [Sync, Async & Event-Driven](/learn/notes/sync-async-event-driven/).

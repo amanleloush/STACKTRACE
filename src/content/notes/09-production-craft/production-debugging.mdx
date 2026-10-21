@@ -1,0 +1,509 @@
+---
+title: "Debugging Production Issues: A Systematic Approach"
+phase: "09-production-craft"
+order: 106
+tags: ["observability", "sre", "debugging", "incidents", "jvm", "go", "linux"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 22
+prerequisites: ["metrics-logs-traces", "red-use-golden-signals", "alerting-design"]
+summary: "A repeatable method for production incidents: stop the bleeding first, find what changed, narrow down with signals, confirm with JVM, Go and Linux tools, then write a blameless postmortem."
+---
+
+## Definition (interview-ready)
+
+Debugging a production issue is a **loop of hypotheses tested against evidence**, run under time pressure while real users are affected. The order matters:
+
+1. **Mitigate first.** Restore service by rolling back, flipping a feature flag, shifting traffic or shedding load. Finding the root cause can wait.
+2. **Scope the problem.** Who is affected, since when, and *what changed* around that time (a deploy, a config change, a traffic shift, a failing dependency)?
+3. **Narrow down.** Go from user-facing symptoms (golden signals) to the sick service, then to the sick resource. Use metrics to see the shape, traces to find where the time goes, and logs for the exact error.
+4. **Confirm on the box.** Thread dumps, heap dumps, profilers and Linux tools turn "probably the DB pool" into proof.
+5. **Learn.** Write a blameless postmortem whose action items fix the system, not the people.
+
+The Google SRE book puts step 1 bluntly: in a major outage, *stopping the bleeding* comes before finding the cause.
+
+**One-liner:** I mitigate first (roll back, flip the flag, shift traffic), then ask what changed, narrow from user-facing symptoms to the sick service and resource using metrics, traces and logs, prove it with dumps and profilers, and close with a blameless postmortem that fixes the system.
+
+## Why it matters
+
+- **Users only feel the outage time.** A rollback that takes 5 minutes beats a perfect diagnosis that takes 2 hours. Every minute spent on root cause while users are failing is a choice, and usually the wrong one.
+- **Unstructured debugging wastes time.** Without a method, people jump to their favourite theory ("it's always the database"), change several things at once, and can't tell which change helped.
+- **It's a top senior-engineer interview signal.** "Tell me about a hard production issue you debugged" shows up in almost every senior loop. Interviewers want structure, judgement under pressure, tool fluency, and what you changed afterwards.
+- **Most incidents are boring.** A large share are caused by something that changed: a deploy, a config push, a certificate that expired, a dependency that slowed down. A method that checks changes first finds these fast.
+
+## Core concepts
+
+### Mitigate before root-cause
+
+Think of an emergency room. The doctor stops the bleeding before ordering scans to work out why it happened. In production:
+
+| Mitigation | When it fits | Watch out for |
+|---|---|---|
+| **Roll back the deploy** | The problem started right after a release | Database migrations that can't be undone; keep schema changes backward compatible |
+| **Turn off a feature flag** | The new code path is behind a flag | Flags that nobody remembers the meaning of |
+| **Revert the config change** | A config push lines up with the start | Config that isn't versioned or logged |
+| **Drain a bad zone/host** | Only one zone, host or pod is sick | Remaining capacity must absorb the extra load |
+| **Scale out** | Real traffic growth, CPU or pool saturation | Doesn't help if the bottleneck is a shared DB; can make it worse |
+| **Shed load / rate-limit** | Overload, retry storm | Decide which traffic is least important first |
+| **Fail over to another region** | Regional outage | Data lag (RPO) and cold caches |
+
+Before you change anything, **save evidence** if it's cheap: grab a thread dump, note timestamps, copy the relevant dashboard links. A rollback or restart often destroys the state you'd need to find the cause.
+
+Rule of thumb: *if a change lines up with the start of the incident, roll it back first and ask questions later.* Rolling back a healthy change costs little. Leaving a bad one in place costs a lot.
+
+See [Feature Flags & Canary](/learn/notes/feature-flags-canary/) for how to make rollback cheap before you need it.
+
+### Incident roles and declaring early
+
+The SRE book's incident-management chapter separates the work:
+
+- **Incident commander**: owns the overall picture, assigns work, makes the calls. Does not dig into logs personally.
+- **Ops lead**: the only person (or small group) changing production during the incident.
+- **Communications lead**: posts regular updates to stakeholders and status pages.
+- **Planning**: files bugs, arranges hand-offs, tracks temporary changes that must be undone later.
+
+Keep a **live incident document**: a timeline of what was seen, tried and decided, with timestamps. It becomes the skeleton of the postmortem.
+
+Declare an incident **early**. The SRE book's triggers include: a second team is needed, customers can see it, or it's still unsolved after an hour of focused work. Declaring and then cancelling is cheap; declaring late is expensive.
+
+### Scoping: what changed?
+
+A system that was working tends to keep working until something changes it. So the first question is *what changed?* Build a timeline around the moment the graphs turned bad:
+
+| Category | Questions | Where to look |
+|---|---|---|
+| **Deploys** | Did any service in the request path release? Including dependencies you don't own? | CD pipeline history, deploy markers on dashboards |
+| **Config** | Feature flag flips, ZooKeeper/Consul edits, Kubernetes manifest changes, DNS records? | Config audit log, flag service history, `kubectl rollout history` |
+| **Traffic** | Spike, new client, bot, marketing push, unusual mix of endpoints? | Request-rate by endpoint and client, CDN/edge logs |
+| **Dependencies** | Is a database, cache, queue or third-party API slower or erroring? | Dependency panels, client-side latency metrics |
+| **Infrastructure** | Node replaced, autoscaling event, cloud provider incident, disk full? | Cloud status page, node events, `dmesg` |
+| **Time-based** | Cron job, batch run, certificate expiry, month-end, daylight-saving change? | Scheduler history, cert expiry dates |
+
+Then scope the blast radius by slicing the error/latency graphs: **all users or some?** One region, one zone, one pod, one app version, one customer, one endpoint? A problem limited to one pod points at that pod (bad node, noisy neighbour). A problem limited to one app version points at the deploy.
+
+### From golden signals to the culprit
+
+Use the dashboard hierarchy from [RED / USE / Golden Signals](/learn/notes/red-use-golden-signals/):
+
+```
+ User-facing symptom (golden signals)    "checkout p99 is 6 s, errors 4%"
+          │
+          ▼
+ Which service? (RED per service)        checkout fine on its own,
+                                         payment-service p99 jumped
+          │
+          ▼
+ Which dependency / resource? (USE)      payment DB: connection pool 100% used,
+                                         threads waiting on getConnection()
+          │
+          ▼
+ Why? (traces, logs, profiles)           one new query doing a full table scan
+                                         holds connections for 2 s each
+```
+
+Two habits help a lot:
+
+- **Look at the shape, not just the number.** A sudden step usually means a change (deploy, config). A slow ramp suggests a leak or growing data. A saw-tooth suggests GC, cron jobs or restarts. Errors that start exactly on the hour suggest a scheduled job or an expiry.
+- **Correlation is not causation.** Big systems have many metrics, so some will wiggle by chance at the same time. A metric that moved is a hypothesis, not a verdict. Test it.
+
+### Metrics, traces and logs together
+
+Each signal answers a different question (see [Metrics, Logs, Traces](/learn/notes/metrics-logs-traces/) for the details):
+
+| Signal | Question it answers | Typical move |
+|---|---|---|
+| **Metrics** | Is something wrong, since when, how big, where? | Spot the time window and the dimension (endpoint, pod, region) |
+| **Traces** | Where does the time go in *one* slow request? | Open a slow trace from the bad window; find the long span |
+| **Logs** | What exactly happened in that request? | Filter by `trace_id` from the slow trace; read the error and stack trace |
+| **Profiles** | Which code is burning CPU, allocating, or waiting? | CPU or allocation flame graph from the sick instance |
+
+The common workflow: metrics give a time window and a dimension → pick a slow or failed trace in that window → jump to its logs via `trace_id` → form a hypothesis → check it with resource metrics or a profile.
+
+### Common culprits and how they show up
+
+| Culprit | What you see | How to confirm |
+|---|---|---|
+| **Slow DB query** | Latency up, DB CPU or I/O up, one query dominating | Slow query log, `pg_stat_statements` / Performance Schema, `EXPLAIN` showing a full scan |
+| **Connection pool exhaustion** | Requests time out waiting for a connection; DB itself may look calm | Pool metrics (active = max, pending greater than 0), thread dump shows many threads in `getConnection()` |
+| **GC pauses** | Latency spikes in a saw-tooth, CPU spent in GC, heap close to its limit | GC logs (`-Xlog:gc*` on JDK 9+), `GODEBUG=gctrace=1` in Go |
+| **Thread starvation** | Low CPU but high latency; queues grow | Thread dump: all workers blocked on the same lock, I/O, or a slow downstream |
+| **Memory leak** | Memory climbs steadily across hours, then OOM kills or GC thrash | Heap dumps compared over time; heap profile in Go |
+| **Retry storm** | Dependency briefly slows, then traffic to it multiplies and it never recovers | Request rate to the dependency far above incoming user rate; retries per request greater than 1 |
+| **DNS** | Sudden "unknown host" or connect errors to one name; slow first requests | `dig` the name from the pod; check resolver timeouts and TTLs |
+| **Certificate expiry** | TLS handshake failures starting at an exact time | `openssl s_client -connect host:443` and check the `notAfter` date |
+| **Noisy neighbour** | Only some hosts/pods slow; CPU steal or disk latency on those nodes | `vmstat` `st` column, `iostat` `await`, node-level metrics; compare sick vs healthy nodes |
+| **Resource limits** | Containers throttled or OOM-killed | Kubernetes events, CPU throttling metrics, `dmesg` for OOM-killer lines |
+
+More on a few of these:
+
+- **Connection pool exhaustion** is often the *symptom*, not the cause. If each request holds a connection longer (a slow query, a slow downstream call made while a transaction is open), the same traffic needs more connections. HikariCP, for example, has a default pool size of 10 and throws an `SQLException` after waiting `connectionTimeout` (30 s by default). Raising the pool size may just move the bottleneck to the database.
+- **Retry storms**: if three layers each make up to 3 attempts (the first try plus 2 retries), one user request can become up to 3 × 3 × 3 = 27 calls to the bottom service just when it is weakest. With 3 *retries* per layer (4 attempts) it is 4 × 4 × 4 = 64. Use retry budgets, exponential backoff with jitter, and circuit breakers ([Circuit Breakers & Retries](/learn/notes/circuit-breakers-retries/)).
+- **Certificate expiry** is entirely predictable, which makes it embarrassing. Alert on days-to-expiry ([mTLS & Certificates](/learn/notes/mtls-certificates/)).
+- **DNS** problems include a record changed with a long TTL, resolver overload, or clients that cache a lookup forever ([DNS & Load Balancing](/learn/notes/dns-load-balancing/)).
+
+### JVM tooling
+
+| Need | Tool | Command |
+|---|---|---|
+| What is every thread doing? | Thread dump | `jcmd <pid> Thread.print -l` (or `jstack <pid>`, or `kill -3 <pid>` which prints to the JVM's stdout) |
+| What fills the heap? | Heap dump | `jcmd <pid> GC.heap_dump /tmp/heap.hprof`, then open in Eclipse MAT or VisualVM |
+| Quick per-class object counts | Class histogram | `jcmd <pid> GC.class_histogram` |
+| Heap and GC summary | Heap info | `jcmd <pid> GC.heap_info` |
+| Low-overhead recording of everything | Java Flight Recorder | `jcmd <pid> JFR.start duration=60s filename=/tmp/rec.jfr` |
+| Off-heap memory growth | Native memory tracking | Start with `-XX:NativeMemoryTracking=summary`, then `jcmd <pid> VM.native_memory summary` |
+| Which code burns CPU / allocates / waits on locks? | async-profiler | `asprof -d 30 -f flame.html <pid>` |
+
+Tips:
+
+- **Take 3 thread dumps a few seconds apart.** One dump is a snapshot; three show which threads are *stuck* (same stack every time) versus just busy.
+- In a thread dump look for: many threads `BLOCKED` on the same monitor (lock contention), many `WAITING` in a pool's `getConnection()` (pool exhaustion), many in socket reads to the same host (slow downstream), and `Found one Java-level deadlock`.
+- **Heap dumps are heavy.** `GC.heap_dump` triggers a full GC by default and pauses the JVM while it writes a file about the size of the live heap. Take one from an instance you've already pulled out of the load balancer.
+- `jcmd` is the recommended tool. Oracle's JDK docs mark `jstack` as experimental and suggest `jcmd` instead, though `jstack` still works.
+- **Why async-profiler?** Many older Java profilers only sample at *safepoints* (points where the JVM can pause threads), which skews results. async-profiler avoids this safepoint bias and can also show native and kernel frames.
+
+Deeper JVM memory and GC material: [JVM Memory](/learn/notes/jvm-memory/) and [Memory & GC](/learn/notes/memory-gc/).
+
+### Go tooling
+
+Import `net/http/pprof` for its side effect and serve it on an internal port:
+
+```go
+import _ "net/http/pprof"
+
+go func() { log.Println(http.ListenAndServe("localhost:6060", nil)) }()
+```
+
+| Need | Command |
+|---|---|
+| CPU profile (30 s) | `go tool pprof http://localhost:6060/debug/pprof/profile?seconds=30` |
+| Heap in use | `go tool pprof http://localhost:6060/debug/pprof/heap` |
+| Goroutine leak / stuck goroutines | `curl 'localhost:6060/debug/pprof/goroutine?debug=2'` |
+| Blocking and lock contention | `/debug/pprof/block` and `/debug/pprof/mutex`, after calling `runtime.SetBlockProfileRate` / `runtime.SetMutexProfileFraction` |
+| Scheduler / GC timeline | `curl -o trace.out '.../debug/pprof/trace?seconds=5'` then `go tool trace trace.out` |
+| GC behaviour | Run with `GODEBUG=gctrace=1` (one line per GC to stderr) |
+| Dump all goroutines and exit | Send `SIGQUIT`: the default action is to exit with a stack dump |
+
+A steadily growing goroutine count is the Go version of a thread leak. Usually it's goroutines blocked forever on a channel or a network call with no timeout. Never expose `/debug/pprof` on a public port. See [Go Runtime & Scheduler](/learn/notes/go-runtime-scheduler/).
+
+### Linux tooling and the 60-second checklist
+
+When you land on a sick host, Netflix's performance team (Brendan Gregg among them) published a 10-command first pass that takes about a minute:
+
+```
+uptime               # load averages 1/5/15 min: rising or falling?
+dmesg | tail         # kernel errors: OOM killer, dropped packets, disk errors
+vmstat 1             # r (run queue) > CPU count = CPU saturation; si/so = swapping;
+                     # us/sy/id/wa/st = user/system/idle/IO-wait/steal
+mpstat -P ALL 1      # per-CPU: one hot CPU = single-threaded bottleneck
+pidstat 1            # per-process CPU over time
+iostat -xz 1         # per-disk: await (latency incl. queue), %util near 100 = saturated
+free -m              # memory; buffers/cached near 0 = more disk I/O
+sar -n DEV 1         # network throughput per interface vs link limit
+sar -n TCP,ETCP 1    # active/s, passive/s new connections; retrans/s = network trouble
+top                  # overall sanity check
+```
+
+This is really the [USE method](/learn/notes/red-use-golden-signals/) applied to CPU, memory, disk and network. Then reach for more targeted tools:
+
+| Tool | Use it for |
+|---|---|
+| `top` / `htop` | Which process is using CPU and memory right now |
+| `ss -s`, `ss -tanp` | Socket summary; connections by state (lots of `TIME-WAIT` or `CLOSE-WAIT`, full accept queues) |
+| `strace -p <pid>` | Which system calls a process is stuck in. Adds heavy overhead; use briefly |
+| `perf record -F 99 -a -g -- sleep 30` then `perf report` | CPU sampling with stacks across the whole box; feed `perf script` into the FlameGraph scripts for a flame graph |
+| `lsof -p <pid>` | Open files and sockets; file-descriptor leaks |
+| `dig` / `nslookup` | DNS answers and TTLs from the host's point of view |
+| `openssl s_client` | TLS handshake and certificate dates |
+
+`CLOSE-WAIT` piling up usually means *your* application isn't closing connections the peer already closed (a leak in your code). See [OS & Concurrency](/learn/notes/os-concurrency/) and [Networking: TCP/UDP/TLS](/learn/notes/networking-tcp-udp-tls/).
+
+### Blameless postmortems
+
+After the fire is out, write it up. The SRE book's typical triggers: user-visible impact beyond a threshold, any data loss, an on-call intervention like a rollback, long resolution time, or a failure noticed by humans instead of monitoring.
+
+**Blameless** means you assume everyone acted in good faith with the information they had, and you ask *why the system let this happen*. If people get blamed, they stop reporting problems, and you lose the information you need.
+
+A good postmortem has:
+
+- **Summary and impact**: who was affected, for how long, how badly (numbers).
+- **Timeline**: detection, escalation, mitigation, resolution, with timestamps.
+- **Root cause and trigger**: the underlying weakness plus what set it off.
+- **What went well / badly / where we got lucky.**
+- **Action items**: each with **one owner**, a priority and a tracking ticket. Prefer fixes to the system (guardrails, alerts, automation) over "be more careful".
+
+### 5 whys
+
+Ask "why?" repeatedly until you reach something you can fix in the system:
+
+```
+Checkout failed for 40 minutes.
+ Why? Payment service returned 500s.
+ Why? Its DB connection pool was exhausted.
+ Why? A new report query held connections for seconds each.
+ Why? The query ran on the primary, without an index, inside a request.
+ Why? Nothing in review or CI flagged unindexed queries on hot paths.
+→ Actions: add the index; move reports to a replica; add a slow-query check to CI;
+           alert on pool wait time.
+```
+
+Its weakness: real incidents usually have **several contributing factors**, and a single chain of whys can stop at one convenient answer. Branch the tree when more than one thing had to go wrong, and stop at a fixable system gap, never at "an engineer made a mistake".
+
+## How it works (a full walkthrough)
+
+```
+14:02  Alert: checkout SLO burn rate 14x (page)                       DETECT
+14:04  IC declared, incident doc opened                               ORGANISE
+14:05  Golden signals: checkout p99 0.3 s → 6 s, 5xx 4%,
+       all regions, started 13:58                                     SCOPE
+14:06  What changed? payment-service deploy v412 at 13:56             CHANGES
+14:07  Roll back payment-service to v411                              MITIGATE
+14:12  p99 back to 0.3 s, errors normal. Users OK.                    VERIFY
+-- now root cause, without the pressure --
+14:30  Trace from 13:59: 5.6 s in payment-service span
+       "acquire DB connection"                                        NARROW
+14:35  Saved thread dump (taken at 14:06): 200 threads WAITING
+       in HikariPool.getConnection                                    CONFIRM
+14:40  Diff v411..v412: new fraud-check query, no index,
+       called inside an open transaction                              CAUSE
+Next day: postmortem, 5 whys, actions with owners                     LEARN
+```
+
+Note the order: the rollback happened 5 minutes after the page, *before* anyone knew about the missing index. The thread dump captured before rollback is what made the root cause quick to prove.
+
+## Real-world examples
+
+- **Google SRE practice**: the SRE book's troubleshooting chapter frames debugging as hypothesis testing (triage, examine, diagnose, test, treat) and says stopping the bleeding is the first priority in a major outage. Its postmortem chapter defines the blameless culture most of the industry copies.
+- **Netflix's 60-second checklist**: Netflix's performance engineering team published the 10-command Linux first pass shown above as "Linux Performance Analysis in 60,000 Milliseconds".
+- **Flame graphs**: Brendan Gregg created flame graphs to visualise sampled stack traces. They're now built into async-profiler, Go's pprof web UI, and many vendor profilers.
+
+## Common pitfalls
+
+- **Root-causing while users burn.** Mitigate first; investigate on a stable system.
+- **Changing several things at once.** You won't know which one helped, and you may make it worse.
+- **Restarting without saving evidence.** A restart clears the leak, the stuck threads and the clues. Take a thread dump or pull one instance out of rotation first.
+- **Trusting averages.** Average latency hides the slow tail; look at p99 and at per-endpoint and per-pod breakdowns.
+- **Mistaking correlation for cause.** "CPU went up too" may be a *result* of the problem (retries, GC), not its cause.
+- **Ignoring dependencies you don't own.** Check upstream and downstream deploys and status pages early.
+- **Raising pool sizes or timeouts as a "fix".** Often hides the slow query or slow dependency and moves the bottleneck.
+- **Taking a heap dump on a live, in-rotation instance.** It pauses the JVM; take it out of the load balancer first.
+- **Postmortems that end with "be more careful".** Action items must change the system and have owners.
+- **Tools you've never practised.** The incident is the worst time to learn `jcmd` or `pprof`. Rehearse in game days.
+
+## Practice questions
+
+<Practice>
+
+<QA q="Why should you mitigate before finding the root cause?" level="easy">
+
+Users only feel the time the system is broken. A rollback, flag flip or traffic shift can often restore service in minutes, while a root-cause hunt can take hours. Once service is stable you can investigate calmly, with less risk of making things worse. The Google SRE book calls this stopping the bleeding first. The one thing to do before mitigating, if it's cheap, is save evidence (a thread dump, timestamps, links), because a rollback or restart can wipe it.
+
+</QA>
+
+<QA q="What is the first question you ask when an incident starts, and where do you look?" level="easy">
+
+*What changed?* A working system usually keeps working until something changes. Build a timeline around when the graphs turned bad and check: deploys (yours and your dependencies'), config and feature-flag changes, traffic shifts, dependency health, infrastructure events, and time-based things like cron jobs or certificate expiry. Deploy markers on dashboards and a searchable change log make this fast.
+
+</QA>
+
+<QA q="How do metrics, traces and logs work together during debugging?" level="easy">
+
+**Metrics** tell you something is wrong, since when, and along which dimension (endpoint, pod, region). **Traces** show where the time goes inside one slow request across services. **Logs** give the exact error and context for that request, found by filtering on its `trace_id`. A typical path: metrics → a time window → a slow trace in that window → the logs for that trace → a hypothesis you confirm with resource metrics or a profile.
+
+</QA>
+
+<QA q="What do the roles in incident management do?" level="easy">
+
+The **incident commander** owns the overall picture, assigns work and makes decisions, without hands-on debugging. The **ops lead** is the only one changing production. The **communications lead** sends regular updates to stakeholders. **Planning** files bugs, arranges hand-offs and tracks temporary changes to undo later. Splitting roles stops people from making conflicting changes and keeps stakeholders informed without distracting the debuggers.
+
+</QA>
+
+<QA q="What does it mean for a postmortem to be blameless, and why bother?" level="easy">
+
+It assumes everyone acted in good faith with the information they had, and focuses on how the system (tools, processes, guardrails) allowed the failure. If people are blamed, they hide mistakes and stop reporting near-misses, so the organisation loses the information it needs to improve. Action items should change the system, each with one owner and a tracking ticket.
+
+</QA>
+
+<QA q="CPU is at 20% but p99 latency has jumped from 100 ms to 3 s. What do you suspect and how do you check?" level="medium">
+
+Low CPU plus high latency means requests are **waiting**, not computing. Suspects: connection pool exhaustion, a slow downstream service or DB, lock contention, or thread pool starvation. Check:
+
+- pool metrics (active connections at max, waiters greater than 0),
+- traces from the slow window to see which span grew,
+- 2–3 thread dumps a few seconds apart: many threads `WAITING` in `getConnection()`, `BLOCKED` on one lock, or stuck in socket reads to the same host,
+- downstream latency dashboards.
+
+</QA>
+
+<QA q="How do you read a JVM thread dump during an incident?" level="medium">
+
+Take **three dumps a few seconds apart** with `jcmd <pid> Thread.print -l`. Threads with the same stack in every dump are stuck. Look for:
+
+- many threads `BLOCKED` waiting on the same monitor → lock contention,
+- many `WAITING` in a connection pool's borrow method → pool exhaustion,
+- many in `socketRead` to one host → slow downstream,
+- a `Found one Java-level deadlock` section → deadlock.
+
+Group threads by top frames; the biggest group usually points at the bottleneck.
+
+</QA>
+
+<QA q="Memory grows slowly over days until the pod is OOM-killed. How do you investigate in Java and in Go?" level="medium">
+
+It's likely a leak: something keeps references to objects that should be freed (an unbounded cache, a listener list, a static map, a `ThreadLocal`). In Java, take two heap dumps hours apart (`jcmd <pid> GC.heap_dump`) from an instance out of rotation, then compare them in Eclipse MAT, looking at the dominator tree and what grew. If the heap is flat but the process (RSS) grows, check off-heap memory with Native Memory Tracking. In Go, compare two `/debug/pprof/heap` profiles with `go tool pprof -base old new`, and check the goroutine count, since leaked goroutines hold memory too. Confirm the OOM kill with Kubernetes events or `dmesg`.
+
+</QA>
+
+<QA q="What is Brendan Gregg's 60-second Linux checklist and what does it tell you?" level="medium">
+
+Ten commands from Netflix's performance team: `uptime`, `dmesg | tail`, `vmstat 1`, `mpstat -P ALL 1`, `pidstat 1`, `iostat -xz 1`, `free -m`, `sar -n DEV 1`, `sar -n TCP,ETCP 1`, `top`. Together they check load trends, kernel errors, CPU saturation (run queue above CPU count), swapping, per-CPU imbalance, per-process CPU, disk latency and utilisation, memory, network throughput and TCP retransmits. It's the USE method (utilisation, saturation, errors) applied quickly to every major resource.
+
+</QA>
+
+<QA q="What is a retry storm and how do you stop one?" level="medium">
+
+A dependency slows briefly, callers time out and retry, and the retries add load, which makes it slower, which causes more retries. With retries at several layers the load multiplies (3 attempts at each of 3 layers can mean up to 27 calls per user request). During the incident: shed load, cut retries via config, open circuit breakers, or rate-limit at the edge so the dependency can recover. Long-term: retry only at one layer, add exponential backoff with jitter, use retry budgets and circuit breakers, and make timeouts shrink as you go deeper.
+
+</QA>
+
+<QA q="How do you profile a Go service in production?" level="medium">
+
+Expose `net/http/pprof` on an internal-only port. Then `go tool pprof .../debug/pprof/profile?seconds=30` for CPU, `/heap` for memory, `/goroutine?debug=2` for full goroutine stacks, and `/block` or `/mutex` for contention (after enabling them with `runtime.SetBlockProfileRate` and `runtime.SetMutexProfileFraction`). `go tool trace` shows scheduler and GC timelines, and `GODEBUG=gctrace=1` prints a line per GC cycle. A steadily rising goroutine count usually means goroutines blocked forever on a channel or a call without a timeout.
+
+</QA>
+
+<QA q="Why is the 5 whys technique useful, and what is its weakness?" level="hard">
+
+It pushes past the obvious trigger ("a bad query") to the system gap that allowed it ("nothing in review or CI catches unindexed queries on hot paths"), which leads to fixes that prevent a whole class of incidents. The weakness is that it follows **one chain**, while real incidents usually have several contributing factors. It can also stop at a convenient answer or at a person. Branch the tree when more than one thing had to go wrong, and stop at something the system can change.
+
+</QA>
+
+<QA q="Why can increasing the DB connection pool size make an incident worse?" level="hard">
+
+Pool exhaustion is usually a symptom: each request holds a connection longer because of a slow query or a slow call made inside a transaction. More connections let more of those slow queries run at once on the database, raising its CPU, I/O and lock contention, so every query gets slower. Across many app instances, the database may also hit its own connection limit. The fix is to shorten how long connections are held (index the query, move work out of the transaction, add timeouts), not to widen the pipe.
+
+</QA>
+
+<QA q="Errors started at exactly 00:00 UTC across all services that call one partner API. Nothing was deployed. What do you check?" level="scenario">
+
+An exact time with no deploy suggests something **time-based**:
+
+- **Certificate expiry**: run `openssl s_client -connect partner:443` and check `notAfter`, on both their cert and any client cert you present (mTLS).
+- **Credential or token expiry**: API keys, OAuth client secrets.
+- **Scheduled jobs** on either side, or a quota that resets or kicks in daily.
+- **Partner-side change**: check their status page and contact them.
+
+Mitigation depends on what you find: rotate the cert or secret, fail over to a backup provider, or degrade gracefully (queue requests for later). Postmortem action: alert on days-to-expiry for every cert and credential.
+
+</QA>
+
+<QA q="Only 3 of 50 pods of a service show high latency after a routine traffic increase. How do you approach it?" level="scenario">
+
+Because only some pods are affected, look at what's **different about those pods**, not at the code (all pods run the same version). Compare sick and healthy pods: which nodes they're on (shared with a noisy neighbour?), CPU throttling against limits, CPU steal (`st` in `vmstat`), disk `await`, and whether they took an uneven share of traffic (sticky sessions, poor load balancing, hot keys). **Mitigate** by cordoning those nodes or deleting the pods so they get rescheduled. Then confirm the cause from node metrics and fix it: resource requests and limits, anti-affinity, or load-balancing changes.
+
+</QA>
+
+<QA q="Tell me about a production issue you debugged. How do you structure the answer?" level="scenario">
+
+Use a STAR-style story with debugging beats:
+
+1. **Situation**: the system, the symptom, the impact in numbers ("checkout p99 rose from 300 ms to 6 s, 4% errors, all regions").
+2. **Mitigation**: what you did first and why ("rolled back the 13:56 deploy; recovered in 5 minutes").
+3. **Investigation**: your hypotheses and how you tested each, naming the tools (trace showed connection waits; thread dump showed 200 threads in `getConnection()`; diff found an unindexed query inside a transaction). Mention a hypothesis you ruled out; it shows method.
+4. **Fix**: short term and long term.
+5. **Learning**: postmortem actions that changed the system (CI check, new alert, runbook).
+
+Say "I" for what you did, be honest about mistakes, and keep it to about 3 minutes. See [Behavioral STAR Stories](/learn/notes/behavioral-star-stories/).
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="A deploy went out 3 minutes before error rates spiked. What is the best first action?" options={["Read the diff to find the bug", "Roll back the deploy, then investigate", "Scale out the service", "Restart all pods"]} answer={1}>
+
+A change that lines up with the start is the prime suspect, and rollback is fast and low risk. Reading the diff first prolongs user impact. Scaling out does not fix bad code, and a restart redeploys the same bad version while destroying evidence.
+
+</MCQ>
+
+<MCQ q="In vmstat output, what suggests CPU saturation?" options={["High free memory", "Non-zero si and so", "The r column consistently above the number of CPUs", "A high id percentage"]} answer={2}>
+
+r counts runnable processes, running or waiting for a CPU. More than the CPU count means work is queuing. si and so indicate swapping (memory pressure), and high id means the CPU is idle.
+
+</MCQ>
+
+<MCQ q="Service CPU is low but latency is high, and thread dumps show most workers WAITING in a connection pool borrow method. What is most likely?" options={["Connection pool exhaustion, often caused by connections being held too long", "A CPU-bound hot loop", "A GC pause", "DNS misconfiguration"]} answer={0}>
+
+Threads waiting to borrow a connection means the pool is empty. The usual root cause is that each request holds a connection longer, such as a slow query. A hot loop would show high CPU, a GC pause stops all threads rather than parking them in the pool, and DNS errors show up as resolution failures.
+
+</MCQ>
+
+<MCQ q="Why take three thread dumps a few seconds apart instead of one?" options={["The JVM only prints part of the threads each time", "To tell threads stuck in one place from threads that are merely busy", "Thread dumps cause GC, so three average it out", "To get deadlock detection, which needs three samples"]} answer={1}>
+
+A single dump is a snapshot; a thread with the same stack across all three is stuck. Each dump includes all threads, deadlock detection works from one dump, and thread dumps do not trigger a full GC.
+
+</MCQ>
+
+<MCQ q="Which jcmd command produces a heap dump?" options={["jcmd pid Thread.print", "jcmd pid GC.class_histogram", "jcmd pid GC.heap_dump /tmp/h.hprof", "jcmd pid VM.flags"]} answer={2}>
+
+GC.heap_dump writes an HPROF file and triggers a full GC by default. Thread.print is a thread dump, GC.class_histogram prints per-class counts without writing a dump, and VM.flags lists JVM flags.
+
+</MCQ>
+
+<MCQ q="A Go service's goroutine count rises steadily for hours. What is the most likely cause?" options={["The Go GC is disabled", "GOMAXPROCS is too low", "The heap is too small", "Goroutines blocked forever, for example on a channel nobody writes to or a call without a timeout"]} answer={3}>
+
+A growing goroutine count is a goroutine leak, nearly always goroutines waiting forever. GOMAXPROCS limits parallel execution, not goroutine count, and GC settings do not create goroutines.
+
+</MCQ>
+
+<MCQ q="TLS handshake errors to one host begin at exactly midnight with no deploy. What should you check first?" options={["Certificate expiry dates", "Garbage collection logs", "The database slow query log", "CPU steal time"]} answer={0}>
+
+An exact time with TLS failures strongly suggests an expired certificate; openssl s_client shows the notAfter date. The other options do not explain handshake failures starting at a precise moment.
+
+</MCQ>
+
+<MCQ q="What is the main weakness of the 5 whys technique?" options={["It takes too long for small incidents", "It needs a dedicated tool", "It follows a single causal chain when incidents often have several contributing factors", "It cannot be used in blameless postmortems"]} answer={2}>
+
+One linear chain can miss other factors or stop at a convenient answer. It is quick, needs no tools, and fits well in a blameless postmortem if it stops at system gaps rather than people.
+
+</MCQ>
+
+<MCQ q="Which is a good postmortem action item?" options={["Engineers should be more careful with queries", "Improve monitoring", "Add a CI check that fails on unindexed queries on hot tables; owner: Priya; ticket PAY-123", "Discuss the incident again next quarter"]} answer={2}>
+
+Good action items change the system, are specific enough to verify, and have one owner and a ticket. Be more careful relies on people, and improve monitoring is too vague to know when it is done.
+
+</MCQ>
+
+<MCQ q="Why does async-profiler give more accurate Java CPU profiles than many older profilers?" options={["It runs inside the GC thread", "It avoids safepoint bias by not sampling only at safepoints", "It instruments every method call", "It uses heap dumps to infer CPU usage"]} answer={1}>
+
+Profilers that sample only at safepoints over-report code near safepoints. async-profiler collects stacks without waiting for safepoints, and can show native and kernel frames. Instrumenting every call adds heavy overhead, and heap dumps say nothing about CPU.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **Order**: stop the bleeding → scope → narrow → confirm → postmortem. Save cheap evidence before mitigating.
+- **Mitigations**: rollback, flag off, config revert, drain a bad zone, scale out, shed load, fail over.
+- **What changed?** Deploys (yours and dependencies'), config, traffic, dependencies, infrastructure, time-based events.
+- **Narrow**: golden signals → RED per service → USE per resource → traces, logs and profiles.
+- **Shapes**: a step means a change; a ramp means a leak or growth; a saw-tooth means GC, cron or restarts.
+- **Usual suspects**: slow query, pool exhaustion, GC, thread starvation, leaks, retry storms, DNS, cert expiry, noisy neighbours, resource limits.
+- **JVM**: `jcmd Thread.print` (×3), `GC.heap_dump`, `GC.class_histogram`, JFR, async-profiler.
+- **Go**: `net/http/pprof` → profile, heap, goroutine, block, mutex, trace; `GODEBUG=gctrace=1`; SIGQUIT dumps stacks.
+- **Linux 60 s**: `uptime`, `dmesg | tail`, `vmstat 1`, `mpstat -P ALL 1`, `pidstat 1`, `iostat -xz 1`, `free -m`, `sar -n DEV 1`, `sar -n TCP,ETCP 1`, `top`.
+- **Postmortem**: blameless, impact in numbers, timeline, root cause and trigger, action items with one owner each.
+- **Interview story**: symptom and impact → mitigation → hypotheses and tools → fix → system-level learning.
+
+## Go deeper
+
+- **Google SRE book**: [Effective Troubleshooting](https://sre.google/sre-book/effective-troubleshooting/), [Managing Incidents](https://sre.google/sre-book/managing-incidents/), [Postmortem Culture](https://sre.google/sre-book/postmortem-culture/).
+- **SRE Workbook**: [Postmortem Culture: Learning from Failure](https://sre.google/workbook/postmortem-culture/) (good vs bad postmortem examples).
+- **Netflix Tech Blog**: [Linux Performance Analysis in 60,000 Milliseconds](https://netflixtechblog.com/linux-performance-analysis-in-60-000-milliseconds-accc10403c55).
+- **Brendan Gregg**: [The USE Method](https://www.brendangregg.com/usemethod.html), [perf examples](https://www.brendangregg.com/perf.html), [Flame Graphs](https://www.brendangregg.com/flamegraphs.html).
+- **JDK docs**: [jcmd](https://docs.oracle.com/en/java/javase/21/docs/specs/man/jcmd.html).
+- **async-profiler**: [GitHub project](https://github.com/async-profiler/async-profiler).
+- **Go**: [net/http/pprof](https://pkg.go.dev/net/http/pprof), [Diagnostics](https://go.dev/doc/diagnostics).

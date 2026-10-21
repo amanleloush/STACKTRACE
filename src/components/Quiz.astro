@@ -1,0 +1,149 @@
+---
+/**
+ * Wraps a run of <MCQ> blocks: handles answering, shows the running
+ * score, and offers a reset. Wrong answers on tracked questions (those
+ * with `data-mcq-id`, i.e. on notes) are saved to the mistakes notebook
+ * (/review/mistakes/); a right answer resolves a saved one.
+ *
+ *   ## Quiz
+ *   <Quiz>
+ *   <MCQ q="…" options={["…", "…"]} answer={0}>…</MCQ>
+ *   </Quiz>
+ */
+---
+<div class="quiz" data-quiz>
+  <div class="quiz__bar">
+    <span class="quiz__score" data-quiz-score aria-live="polite">Pick an answer for each question.</span>
+    <button type="button" class="quiz__reset" data-quiz-reset hidden>Retry quiz</button>
+  </div>
+  <slot />
+</div>
+
+<script>
+  import { initMistakesStore, recordAnswer, type AnswerOutcome } from '~/lib/mistakes-store';
+
+  const NOTEBOOK = '/review/mistakes/';
+  const SAVED_TEXT: Record<Exclude<AnswerOutcome, null>, string> = {
+    saved: 'Saved to your mistakes notebook.',
+    resolved: '✓ Marked resolved in your mistakes notebook.',
+    limit: 'Your mistakes notebook is full, so this one wasn’t saved.',
+  };
+
+  /** Update the notebook and say so under the verdict. Never throws. */
+  function track(q: HTMLElement, picked: number, right: boolean): void {
+    const line = q.querySelector<HTMLElement>('[data-mcq-saved]');
+    const id = q.dataset.mcqId;
+    const slug = q.dataset.noteSlug;
+    if (!line || !id || !slug) return;
+    let outcome: AnswerOutcome = null;
+    try {
+      // Lazy: the sync GET only happens once someone actually answers.
+      initMistakesStore();
+      outcome = recordAnswer(id, slug, picked, right);
+    } catch {
+      return;
+    }
+    if (!outcome) return;
+    const link = document.createElement('a');
+    link.href = NOTEBOOK;
+    link.textContent = 'Review mistakes →';
+    line.replaceChildren(SAVED_TEXT[outcome] + ' ', link);
+    line.hidden = false;
+  }
+
+  function wire(root: HTMLElement) {
+    if (root.dataset.wired) return;
+    root.dataset.wired = '1';
+    const scoreEl = root.querySelector<HTMLElement>('[data-quiz-score]')!;
+    const resetBtn = root.querySelector<HTMLButtonElement>('[data-quiz-reset]')!;
+    const questions = Array.from(root.querySelectorAll<HTMLElement>('[data-mcq]'));
+
+    const render = () => {
+      const answered = questions.filter((q) => q.dataset.picked != null);
+      const right = answered.filter((q) => q.dataset.picked === q.dataset.answer).length;
+      scoreEl.textContent = answered.length
+        ? `Score: ${right} / ${answered.length} answered (${questions.length} total)`
+        : 'Pick an answer for each question.';
+      resetBtn.hidden = answered.length === 0;
+    };
+
+    questions.forEach((q) => {
+      const answer = Number(q.dataset.answer);
+      const opts = Array.from(q.querySelectorAll<HTMLButtonElement>('.mcq__opt'));
+      opts.forEach((btn) => {
+        btn.addEventListener('click', () => {
+          if (q.dataset.picked != null) return;
+          const picked = Number(btn.dataset.idx);
+          q.dataset.picked = String(picked);
+          opts.forEach((o, i) => {
+            o.disabled = true;
+            o.dataset.state = i === answer ? 'correct' : i === picked ? 'wrong' : 'dim';
+            if (i === answer) o.dataset.tag = i === picked ? 'Your answer ✓' : 'Correct answer';
+            else if (i === picked) o.dataset.tag = 'Your answer';
+          });
+          const verdict = q.querySelector<HTMLElement>('[data-mcq-verdict]')!;
+          const right = picked === answer;
+          const correct = opts[answer]!;
+          const letter = correct.querySelector('.mcq__letter')?.textContent ?? '';
+          const text = correct.textContent!.replace(letter, '').trim();
+          verdict.dataset.ok = String(right);
+          verdict.textContent = right
+            ? '✓ Correct!'
+            : `✗ Not quite — the correct answer is ${letter}: ${text}`;
+          q.querySelector<HTMLElement>('.mcq__why')!.hidden = false;
+          track(q, picked, right);
+          render();
+        });
+      });
+    });
+
+    resetBtn.addEventListener('click', () => {
+      questions.forEach((q) => {
+        delete q.dataset.picked;
+        q.querySelectorAll<HTMLButtonElement>('.mcq__opt').forEach((o) => {
+          o.disabled = false;
+          delete o.dataset.state;
+          delete o.dataset.tag;
+        });
+        q.querySelector<HTMLElement>('.mcq__why')!.hidden = true;
+        const saved = q.querySelector<HTMLElement>('[data-mcq-saved]');
+        if (saved) saved.hidden = true;
+      });
+      render();
+      questions[0]?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
+  }
+  document.querySelectorAll<HTMLElement>('[data-quiz]').forEach(wire);
+</script>
+
+<style>
+  .quiz { margin: 1rem 0 2rem; }
+  .quiz__bar {
+    position: sticky;
+    top: 4.5rem;
+    z-index: 2;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
+    flex-wrap: wrap;
+    padding: 0.5rem 0.8rem;
+    border: 1px solid var(--card-border);
+    border-radius: 999px;
+    background: var(--bg-soft);
+    font-size: 0.85rem;
+  }
+  .quiz__score { color: var(--fg-muted); font-weight: 600; }
+  .quiz__reset {
+    font: inherit;
+    font-weight: 600;
+    color: var(--primary-light);
+    background: transparent;
+    border: 1px solid var(--card-border);
+    border-radius: 999px;
+    padding: 0.2rem 0.75rem;
+    cursor: pointer;
+  }
+  .quiz__reset:hover { border-color: var(--accent); }
+  .quiz__reset:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+</style>

@@ -1,7 +1,7 @@
 ---
 title: "File Formats: Parquet, ORC, Avro"
 phase: "08-data-engineering"
-order: 53
+order: 80
 tags: []
 premium: false
 previewParagraphs: 4
@@ -13,9 +13,11 @@ prerequisites: []
 
 **Parquet** and **ORC** are **columnar** file formats optimized for analytics: store each column separately, enabling column pruning, predicate pushdown, and efficient compression. **Avro** is a **row-based** format with strong schema evolution support, optimized for streaming and serialization (Kafka payloads, RPC).
 
+**One-liner:** Parquet and ORC store data column by column so analytics queries read only the columns and row groups they need; Avro stores data row by row with a schema, which makes it the go-to for Kafka messages and evolving record schemas.
+
 ## Why it matters
 
-The file format decision affects every downstream query's performance and cost. Storing analytics data in JSON or CSV instead of Parquet typically multiplies your S3 + query costs by 5-50× and slows queries by 10-100×.
+The file format decision affects every downstream query's performance and cost. Storing analytics data in JSON or CSV instead of Parquet can multiply storage and scan costs several times over (5-50× is common in benchmarks) and make queries an order of magnitude or more slower.
 
 ```mermaid
 flowchart TB
@@ -37,9 +39,9 @@ flowchart TB
 |---|---|---|---|
 | Layout | columnar | columnar | row |
 | Best for | analytics (Spark/Trino) | analytics (Hive) | streaming, RPC payloads |
-| Compression | strong (per-column) | strong (stripe-level) | good |
+| Compression | strong (per-column) | strong (per-column streams) | good (per block) |
 | Schema evolution | yes (loose) | yes | strongest |
-| Predicate pushdown | yes (stats per page) | yes (indexes per stripe) | no |
+| Predicate pushdown | yes (row-group stats, optional page indexes and bloom filters) | yes (file, stripe and row-index stats, optional bloom filters) | no (row format: whole records are read) |
 
 ## Core concepts
 
@@ -90,7 +92,7 @@ Encoding: per column. RLE, dictionary, delta — adapts to data type.
 
 - Apache ORC, Hive-native.
 - Similar to Parquet: stripes (≈ row groups), columns inside.
-- Better metadata: bloom filters built-in, fine indexes per column.
+- Rich metadata: bloom filters and lightweight row indexes (stats every 10,000 rows) per column. (Parquet also gained bloom filters in parquet-format 2.7 / parquet-mr 1.12, plus page-level column indexes.)
 - Strong predicate pushdown.
 - Spark and Hive both support ORC; Parquet is more widely supported across non-Hadoop tools.
 
@@ -119,9 +121,9 @@ Parquet vs ORC: 95% similar; choose based on tooling. Spark/Athena: Parquet. Hiv
 ### Compression codecs
 
 - **Snappy**: fast compression / decompression. Default for many systems.
-- **GZIP**: ~30% smaller than Snappy, ~2x slower. Use for cold storage.
+- **GZIP**: often 20-30% smaller files than Snappy, but much slower, especially to compress. Use for cold storage.
 - **ZSTD**: best ratio, fast decompression, slightly slower compression. **Often the best choice now.**
-- **LZ4**: very fast, lower compression ratio than Snappy.
+- **LZ4**: very fast, compression ratio roughly comparable to Snappy.
 
 ### File size guidance
 
@@ -132,7 +134,7 @@ Parquet vs ORC: 95% similar; choose based on tooling. Spark/Athena: Parquet. Hiv
 ### Partitioning
 
 - Files organized by partition columns (e.g., `year=2026/month=05/`).
-- Helps with predicate pushdown at the directory level: query for `year=2026` skips other directories entirely.
+- Enables **partition pruning** (filtering at the directory level): a query for `year=2026` skips other directories entirely.
 - Avoid over-partitioning (many small partitions = small file problem).
 
 ## How Parquet read works
@@ -151,8 +153,8 @@ Query: SELECT col_a, col_b FROM t WHERE col_b > 100;
 ## Real-world examples
 
 - **Almost every modern data lake**: Parquet on S3.
-- **Iceberg, Delta Lake, Hudi**: lakehouse formats — all built on Parquet (and sometimes ORC).
-- **Kafka + Confluent Schema Registry**: Avro is the canonical payload format.
+- **Iceberg, Delta Lake, Hudi**: lakehouse table formats that store data in Parquet by default. Delta uses Parquet only; Iceberg also supports ORC and Avro; Hudi uses Parquet (or ORC) base files plus Avro log files for merge-on-read.
+- **Kafka + Confluent Schema Registry**: Avro is the original and most common payload format (Protobuf and JSON Schema also supported since Confluent Platform 5.5).
 - **Cloudera (Hadoop-native)**: heavy ORC usage.
 
 ## Common pitfalls
@@ -160,47 +162,154 @@ Query: SELECT col_a, col_b FROM t WHERE col_b > 100;
 - **CSV / JSON for warehouse**: huge cost; do NOT.
 - **Per-row Parquet writes**: tiny files explosion. Buffer to ~128MB before writing.
 - **Bad partitioning**: hour partitions for hourly data — fine. Per-user partitions: hundreds of millions of dirs, kills metastore.
-- **Missing or stale statistics**: row-group skipping doesn't fire. Re-collect stats (`ANALYZE TABLE`).
+- **Unsorted data / stats not written**: row-group min/max stats are written into the file footer at write time; if data isn't sorted/clustered on the filter column, every row group's range overlaps and skipping doesn't fire. Sort or cluster on write (`ANALYZE TABLE` only refreshes optimizer stats, not file stats).
 - **Snappy + tiny files**: not amortizing the overhead.
 - **No compression at all**: ridiculous.
 - **Schema evolution mismatch**: writing a column then renaming → tools may fail to read older files. Use Parquet field IDs (Iceberg helps).
 - **`SELECT *` on wide tables**: defeats column pruning.
 
-## Interview questions
+## Practice questions
 
-### Q1: Why is Parquet faster than CSV for analytics?
-- Columnar storage → read only the columns needed.
-- Compression per column (each type uses optimal encoding).
+<Practice>
+
+<QA q="Why is Parquet faster than CSV for analytics?" level="easy">
+
+- Columnar storage: read only the columns the query needs.
+- Per-column compression and encoding suited to each type.
 - Predicate pushdown via min/max stats per row group.
-- Binary encoding (no text parsing).
-Typical: 5-50× I/O reduction, 10-100× query speedup.
+- Binary encoding: no text parsing.
 
-### Q2: Parquet vs ORC?
-Both are columnar with row groups/stripes, predicate pushdown, compression. Largely interchangeable. Choose by ecosystem: Parquet for Spark/Trino/Athena/Snowflake, ORC for Hive-native stacks. Functionally 95% the same.
+Typical result: 5–50× less I/O and 10–100× faster queries.
 
-### Q3: When use Avro instead of Parquet?
-Avro for row-by-row workloads with schema evolution needs: Kafka payloads, RPC serialization, intermediate Hadoop data, situations where you read one row at a time. Parquet is for analytics queries on many rows of selected columns.
+</QA>
 
-### Q4: How does Parquet do predicate pushdown?
-Each row group has min/max statistics per column in the footer. Query engine reads footer, checks stats against predicate: if no row in group could match, skip the entire row group without reading data pages. For ranges, this skip is very effective on sorted-ish data.
+<QA q="When use Avro instead of Parquet?" level="easy">
 
-### Q5: What's the ideal Parquet file size?
-~128 MB to 1 GB per file. Smaller = small-file overhead (each file = separate task + metadata read). Larger = wastes parallelism (one task per file unless engine splits within). Compact regularly via maintenance jobs.
+Avro is row-based with the strongest schema evolution, so use it for row-at-a-time workloads: Kafka payloads, RPC serialization, intermediate Hadoop data. The schema travels with the data or lives in a schema registry. Parquet is for analytics queries over many rows of a few columns.
 
-### Q6: Compression: Snappy vs ZSTD vs GZIP?
-Snappy: fast, default. ZSTD: best balance — high compression ratio, fast decompression — **often the modern default**. GZIP: highest ratio but slow CPU; use only for archive. LZ4: fast but worse ratio than Snappy.
+</QA>
 
-### Q7: A team writes Parquet files of 5 MB each. What goes wrong?
-- Each file = separate read task → planning overhead dominates.
-- Small file count grows huge over time; S3 listing slow.
-- Cluster doesn't utilize parallelism well per row group.
-- Solution: buffer writes to reach ~128MB-1GB; compact periodically (OPTIMIZE in Delta/Iceberg, custom job otherwise).
+<QA q="Why does SELECT * hurt on a wide Parquet table?" level="easy">
 
-### Q8: Schema evolution in Parquet.
-- Add column: safe — readers ignore unknown; older files return NULL.
-- Remove column: safe for readers requesting it; writers stop including it.
-- Rename: not safe by name — engines may break. Use **field IDs** (Iceberg's contribution).
-- Type change: usually unsafe (silent corruption). Test carefully.
+Columnar formats are fast because they read only the requested column chunks. `SELECT *` on a 50-column table reads all 50, throwing away column pruning and most of the I/O savings. Select only the columns you need.
+
+</QA>
+
+<QA q="Parquet vs ORC?" level="medium">
+
+Both are columnar with row groups/stripes, predicate pushdown, and per-column compression; they're about 95% the same. ORC has rich built-in indexes (bloom filters, stats every 10,000 rows); Parquet added bloom filters and page-level column indexes later. Choose by ecosystem: Parquet for Spark/Trino/Athena/Snowflake, ORC for Hive-native stacks.
+
+</QA>
+
+<QA q="How does Parquet do predicate pushdown?" level="medium">
+
+Each row group stores min/max statistics per column in the footer. The engine reads the footer and checks the stats against the predicate; if no row in a group can match, it skips the whole row group without reading its data pages. It works best when data is sorted or clustered on the filter column.
+
+</QA>
+
+<QA q="How does Parquet encode columns besides general compression?" level="medium">
+
+Encoding is chosen per column to fit the data: **dictionary** encoding replaces repeated values with small IDs (great for low-cardinality strings), **RLE** stores runs of the same value once with a count, and **delta** encoding stores differences between consecutive values (good for sorted numbers or timestamps). A codec (Snappy, ZSTD, GZIP) is then applied on top.
+
+</QA>
+
+<QA q="What's the ideal Parquet file size?" level="medium">
+
+About 128 MB to 1 GB per file. Smaller files add per-file overhead (separate tasks, metadata reads, S3 listing). Larger files limit parallelism unless the engine splits within the file by row group. Compact regularly with maintenance jobs.
+
+</QA>
+
+<QA q="Compression: Snappy vs ZSTD vs GZIP?" level="medium">
+
+Snappy: fast, a common default. ZSTD: high ratio with fast decompression and slightly slower compression; **often the best modern choice**. GZIP: often 20–30% smaller than Snappy but much slower, especially to compress; use for cold or archive data. LZ4: very fast, ratio roughly like Snappy.
+
+</QA>
+
+<QA q="How should you partition files, and what's over-partitioning?" level="medium">
+
+Partition directories by columns that queries filter on (`year=2026/month=05/`), so engines skip whole directories. Over-partitioning, such as per-user partitions, creates hundreds of millions of directories full of tiny files: it kills the metastore and brings back the small-file problem. Keep partitions coarse and sort or cluster within them.
+
+</QA>
+
+<QA q="Row-group stats exist, but a filter on col_b still reads every row group. Why?" level="hard">
+
+Min/max stats are written into the footer at write time. If the data isn't sorted or clustered on `col_b`, every row group contains a wide range of values, all ranges overlap the predicate, and nothing can be skipped. Fix it by sorting or clustering on write. Running `ANALYZE TABLE` doesn't help; it only refreshes optimizer stats, not the file stats.
+
+</QA>
+
+<QA q="Schema evolution in Parquet." level="hard">
+
+- Add column: safe; older files return NULL for it.
+- Remove column: safe; writers stop including it, and readers just don't request it.
+- Rename: not safe when columns are matched by name; engines may fail or read NULLs. Use **field IDs** (as Iceberg does).
+- Type change: usually unsafe and can corrupt silently. Test carefully.
+
+</QA>
+
+<QA q="A team writes Parquet files of 5 MB each. What goes wrong?" level="scenario">
+
+- Each file is a separate read task, so planning and open overhead dominate.
+- The file count balloons and S3 listing slows down.
+- Compression and encoding can't amortize over so little data.
+- Fix: buffer writes to ~128 MB–1 GB and compact periodically (`OPTIMIZE` in Delta, the `rewrite_data_files` procedure in Iceberg, or a custom job).
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="A query reads 2 of 50 columns. Why does Parquet beat a row format here?" options={["It reads only the 2 needed column chunks", "It caches the whole table in memory", "It stores rows in sorted order", "It uses a schema registry"]} answer={0}>
+
+Columnar layout stores each column separately, so only the needed chunks are read. A row format must read every column to extract two.
+
+</MCQ>
+
+<MCQ q="Which format fits Kafka message payloads with evolving schemas?" options={["Parquet", "ORC", "Avro", "CSV"]} answer={2}>
+
+Avro is row-based, compact, and has the strongest schema evolution, which suits one-message-at-a-time streams. Parquet and ORC are for analytics over many rows.
+
+</MCQ>
+
+<MCQ q="A Parquet table is filtered on event_time, but row-group skipping never fires. Most likely cause?" options={["Compression is disabled", "The files are too large", "The table uses ORC", "Data wasn't sorted or clustered on event_time, so every row group's min/max range overlaps"]} answer={3}>
+
+Skipping depends on min/max ranges being narrow. Unsorted data gives every row group a wide range, so none can be excluded.
+
+</MCQ>
+
+<MCQ q="What file size range should Parquet files target?" options={["1 to 5 MB", "About 128 MB to 1 GB", "10 to 50 GB", "Exactly one row group of 1 MB"]} answer={1}>
+
+Around 128 MB to 1 GB balances per-file overhead against parallelism. Tiny files cause the small-file problem; huge ones limit parallel reads.
+
+</MCQ>
+
+<MCQ q="Which codec is often the best modern choice for a good ratio with fast decompression?" options={["GZIP", "No compression", "Snappy", "ZSTD"]} answer={3}>
+
+ZSTD gives a high ratio and fast decompression. GZIP compresses smaller than Snappy but is much slower; Snappy is fast but compresses less.
+
+</MCQ>
+
+<MCQ q="Which schema change is risky in plain Parquet without field IDs?" options={["Renaming a column", "Adding a nullable column", "Dropping a column no one reads", "Adding a new partition"]} answer={0}>
+
+Engines match columns by name, so a rename makes older files look like they lack the column. Field IDs, as in Iceberg, fix this. Adding a column is safe; old files return NULL.
+
+</MCQ>
+
+<MCQ q="A team partitions a table by user_id across 200 million users. What happens?" options={["Queries become faster for all filters", "Compression improves", "The metastore struggles with huge numbers of directories and tiny files", "Predicate pushdown is disabled"]} answer={2}>
+
+Very high-cardinality partition columns create hundreds of millions of directories and tiny files, which overwhelms metadata systems.
+
+</MCQ>
+
+<MCQ q="Which encoding suits a low-cardinality string column like country?" options={["Delta encoding", "Dictionary encoding", "Plain encoding only", "Bloom filter encoding"]} answer={1}>
+
+Dictionary encoding swaps repeated strings for small IDs. Delta suits sorted numbers; bloom filters are an index, not an encoding.
+
+</MCQ>
+
+</Quiz>
 
 ## TL;DR cheat sheet
 
@@ -208,16 +317,16 @@ Snappy: fast, default. ZSTD: best balance — high compression ratio, fast decom
 - **Avro**: row-based, schema-evolution-friendly. Kafka payloads, RPC.
 - **CSV/JSON**: never for production warehouse.
 - Target file size: 128 MB - 1 GB. Compact small files.
-- ZSTD is the modern default compression.
+- ZSTD is often the best modern codec (Snappy is still the common default).
 - Partition for directory-level pruning, but not too granular.
-- Keep statistics fresh.
+- Sort or cluster on common filter columns so min/max stats can skip row groups.
 - Avoid `SELECT *` to leverage column pruning.
 
 ## Go deeper
 
 - **Apache Parquet docs**: [parquet.apache.org](https://parquet.apache.org/docs/).
 - **Apache ORC docs**: [orc.apache.org](https://orc.apache.org/docs/).
-- **Apache Avro docs**: [avro.apache.org](https://avro.apache.org/docs/1.11.1/).
-- **Uber engineering**: ["Why we use Parquet"](https://www.uber.com/blog/cost-efficiency-big-data/) at scale.
+- **Apache Avro docs**: [avro.apache.org](https://avro.apache.org/docs/).
+- **Uber engineering**: ["Cost Efficiency @ Scale in Big Data File Format"](https://www.uber.com/blog/cost-efficiency-big-data/) — Parquet compression tuning at scale.
 - **DDIA Chapter 3** (storage formats), 4 (encoding).
 - **Compression benchmarks**: ZSTD vs Snappy vs GZIP per workload.

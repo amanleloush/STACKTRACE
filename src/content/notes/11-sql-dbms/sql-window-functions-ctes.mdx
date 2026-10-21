@@ -1,0 +1,754 @@
+---
+title: "SQL Window Functions and CTEs (incl. Recursive)"
+phase: "11-sql-dbms"
+order: 112
+tags: ["sql", "db", "window-functions", "cte"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 25
+prerequisites: ["sql-execution-order-joins"]
+summary: "Ranking, LAG/LEAD, running totals and frames, the default-frame and LAST_VALUE traps, CTEs and how Postgres 12+ inlines them, recursive CTEs with cycle guards, and the classic top-N, gaps-and-islands and sessionization patterns."
+---
+
+## Definition (interview-ready)
+
+A **window function** computes a value for each row from a set of related rows (its *window*) **without collapsing them** the way `GROUP BY` does. You write it as `function(...) OVER (PARTITION BY ... ORDER BY ... frame)`. `PARTITION BY` splits rows into independent groups, `ORDER BY` orders rows inside each group, and the **frame** picks which rows around the current one an aggregate sees. Ranking (`ROW_NUMBER`, `RANK`, `DENSE_RANK`), offsets (`LAG`, `LEAD`) and running aggregates (`SUM(...) OVER`) are the everyday tools.
+
+A **CTE** (common table expression) is a named subquery introduced with `WITH`. It makes long queries readable, and its **recursive** form (`WITH RECURSIVE`) can walk hierarchies and graphs or generate series, which plain SQL otherwise can't do.
+
+Both are supported in PostgreSQL (window functions since 8.4, CTEs since 8.4) and **MySQL 8.0+**. MySQL 5.7 had neither.
+
+**One-liner:** A window function computes a per-row value over related rows (rank, running total, previous row) without collapsing them like GROUP BY; a CTE is a named subquery in `WITH`, and `WITH RECURSIVE` repeats a step on its own output to walk hierarchies or graphs.
+
+## Why it matters
+
+- **Most "hard" SQL interview questions are window-function questions in disguise**: top N per group, running totals, month-over-month change, consecutive-day streaks, sessionizing clickstreams, deduplicating to the latest row.
+- **Without windows** you'd write correlated subqueries or self-joins, which are harder to read and often O(n²).
+- **Subtle defaults bite in production.** A running total that jumps on duplicate dates, or a `LAST_VALUE` that just returns the current row, are classic bugs caused by the default frame.
+- **CTEs change performance**, not just readability, depending on the database and version. Knowing when Postgres inlines a CTE and when it materializes it is a common senior-level follow-up.
+
+## Core concepts
+
+### Window vs GROUP BY
+
+```sql
+-- GROUP BY: one row per department
+SELECT dept, AVG(salary) FROM employees GROUP BY dept;
+
+-- Window: every employee row stays, with the department average next to it
+SELECT name, dept, salary,
+       AVG(salary) OVER (PARTITION BY dept) AS dept_avg,
+       salary - AVG(salary) OVER (PARTITION BY dept) AS diff_from_avg
+FROM employees;
+```
+
+Window functions are computed in the `SELECT` step, **after** `WHERE`, `GROUP BY` and `HAVING`. So you can't filter on them in `WHERE`. Wrap the query in a subquery or CTE and filter outside. (Some warehouses such as Snowflake, BigQuery and DuckDB add a `QUALIFY` clause for this; PostgreSQL and MySQL don't have it.) You **can** put an aggregate inside a window function, for example `SUM(COUNT(*)) OVER ()`, because aggregates run first.
+
+### Anatomy of OVER
+
+```
+SUM(amount) OVER (
+    PARTITION BY user_id                    -- independent groups (optional)
+    ORDER BY created_at                     -- order within each group (optional)
+    ROWS BETWEEN 2 PRECEDING AND CURRENT ROW  -- frame: which rows the aggregate sees (optional)
+)
+```
+
+Reuse a definition with a named window (supported in both Postgres and MySQL):
+
+```sql
+SELECT name, score,
+       ROW_NUMBER() OVER w, RANK() OVER w, DENSE_RANK() OVER w
+FROM scores
+WINDOW w AS (ORDER BY score DESC);
+```
+
+### ROW_NUMBER vs RANK vs DENSE_RANK
+
+Scores: A 100, B 90, C 90, D 80, ordered by score descending.
+
+| name | score | `ROW_NUMBER()` | `RANK()` | `DENSE_RANK()` | `PERCENT_RANK()` |
+|---|---|---|---|---|---|
+| A | 100 | 1 | 1 | 1 | 0 |
+| B | 90 | 2 | 2 | 2 | 0.333 |
+| C | 90 | 3 | 2 | 2 | 0.333 |
+| D | 80 | 4 | **4** | **3** | 1 |
+
+- **`ROW_NUMBER`**: always unique, 1, 2, 3, 4. Ties get an **arbitrary** order unless you add a tie-breaker (`ORDER BY score DESC, id`).
+- **`RANK`**: ties share a rank, then it **skips** (1, 2, 2, 4), like Olympic medals.
+- **`DENSE_RANK`**: ties share a rank, **no gaps** (1, 2, 2, 3). Use it for "Nth highest distinct value".
+- `PERCENT_RANK` = (rank − 1) / (rows − 1). `CUME_DIST` = rows up to and including peers / rows.
+
+Which to use: "exactly N rows per group" → `ROW_NUMBER`. "Everyone tied for a place" → `RANK` or `DENSE_RANK`. "Nth highest salary, counting duplicates once" → `DENSE_RANK`.
+
+### PARTITION BY and ORDER BY
+
+- No `PARTITION BY` → the whole result is one partition.
+- No `ORDER BY` in the window → all rows in the partition are **peers**, ranking functions give 1 to everyone, and aggregates see the whole partition.
+- **The window's `ORDER BY` doesn't sort the output.** Add a query-level `ORDER BY` if you need sorted results.
+
+### Frames: ROWS vs RANGE (and GROUPS)
+
+The frame decides which rows an aggregate such as `SUM` or `AVG` (and `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`) looks at. Ranking functions and `LAG`/`LEAD` ignore it.
+
+| Unit | Bounds counted in | Peers (ties in ORDER BY) | Support |
+|---|---|---|---|
+| `ROWS` | Physical rows | Treated individually | Postgres, MySQL 8 |
+| `RANGE` | Values of the ORDER BY column | All peers in or out together | Postgres, MySQL 8 (offsets like `INTERVAL 6 DAY` in MySQL; `INTERVAL '6 days'` in Postgres 11+) |
+| `GROUPS` | Peer groups | Counted as one unit | Postgres 11+ only |
+
+Bounds: `UNBOUNDED PRECEDING`, `n PRECEDING`, `CURRENT ROW`, `n FOLLOWING`, `UNBOUNDED FOLLOWING`. With a `RANGE` offset there must be exactly one `ORDER BY` column (numeric or date/time).
+
+### The default frame gotcha
+
+Both manuals define the same default:
+
+- **With `ORDER BY`**: `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`. That is "from the start of the partition up to the current row **and all its peers**".
+- **Without `ORDER BY`**: the whole partition.
+
+Because it's `RANGE`, rows with the same ORDER BY value are summed together:
+
+```
+sales(day, amount): (1,10) (2,20) (2,30) (3,40)
+
+SELECT day, amount,
+  SUM(amount) OVER (ORDER BY day)                                          AS default_range,
+  SUM(amount) OVER (ORDER BY day ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rows_sum
+FROM sales;
+
+ day | amount | default_range | rows_sum
+-----+--------+---------------+---------
+  1  |   10   |      10       |   10
+  2  |   20   |      60   ◄── |   30
+  2  |   30   |      60   ◄── |   60
+  3  |   40   |     100       |  100
+```
+
+Both rows for day 2 get 60 under the default, because they're peers. That might be what you want for "total up to and including this day", but it's wrong for a per-row running balance. For a row-by-row running total, write `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` (and add a tie-breaker to `ORDER BY` so the result is deterministic).
+
+Another consequence the MySQL manual calls out: **adding `ORDER BY` to a window changes the frame**, so `SUM(x) OVER (PARTITION BY g)` (partition total) and `SUM(x) OVER (PARTITION BY g ORDER BY t)` (running total) are different things.
+
+### FIRST_VALUE / LAST_VALUE pitfall
+
+`FIRST_VALUE`, `LAST_VALUE` and `NTH_VALUE` read from the **frame**, not the whole partition. With the default frame ending at the current row (and its peers), `LAST_VALUE` returns the current row's value (or its last peer's), not the partition's last value:
+
+```sql
+SELECT day, amount,
+  LAST_VALUE(amount) OVER (ORDER BY day)                       AS looks_wrong,   -- 10, 30, 30, 40
+  LAST_VALUE(amount) OVER (ORDER BY day
+       ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS real_last     -- 40, 40, 40, 40
+FROM sales;
+```
+
+Fixes: widen the frame to `UNBOUNDED FOLLOWING`, or use `FIRST_VALUE` with the opposite sort (`FIRST_VALUE(amount) OVER (ORDER BY day DESC)`). `FIRST_VALUE` is fine with the default frame because the frame always starts at the partition's first row.
+
+MySQL 8 and PostgreSQL 18 and older don't support `IGNORE NULLS` on these functions (MySQL parses it and raises an error; PostgreSQL 19 adds `IGNORE NULLS` for `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE` and `NTH_VALUE`), so on those versions "last non-null value" needs a workaround such as a running `COUNT` of non-null values used as a group key.
+
+### LAG and LEAD
+
+`LAG(expr, offset, default)` reads a value from a row **before** the current one in the window order; `LEAD` reads **after**. Offset defaults to 1, default to `NULL`.
+
+```sql
+-- month-over-month revenue change
+SELECT month, revenue,
+       LAG(revenue) OVER (ORDER BY month) AS prev,
+       ROUND(100.0 * (revenue - LAG(revenue) OVER (ORDER BY month))
+             / LAG(revenue) OVER (ORDER BY month), 1) AS pct_change
+FROM monthly_revenue;
+
+--  month    | revenue | prev | pct_change
+-- 2024-01   |   100   | NULL |   NULL
+-- 2024-02   |   120   | 100  |   20.0
+-- 2024-03   |    90   | 120  |  -25.0
+-- 2024-04   |   150   |  90  |   66.7
+```
+
+`LAG` is about **row positions**, not calendar time. If a month is missing, the "previous row" is two months back. Fill gaps with a calendar table or series first when that matters. Use `NULLIF(prev, 0)` in the denominator to avoid divide-by-zero.
+
+### Running totals and moving averages
+
+```sql
+SELECT d, amt,
+  SUM(amt) OVER (ORDER BY d ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_total,
+  AVG(amt) OVER (ORDER BY d ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)         AS ma_3_rows,
+  -- Postgres 11+: last 7 calendar days, robust to missing days
+  AVG(amt) OVER (ORDER BY d RANGE BETWEEN INTERVAL '6 days' PRECEDING AND CURRENT ROW) AS ma_7_days
+FROM daily_sales;
+-- MySQL 8: RANGE BETWEEN INTERVAL 6 DAY PRECEDING AND CURRENT ROW
+```
+
+`ROWS BETWEEN 2 PRECEDING` means "the last 3 rows". If a day is missing, those 3 rows span more than 3 days. A `RANGE` with an interval means "the last N days of data", however many rows that is. The first rows of a moving average use a partial window (fewer than 3 rows); filter them out if you need only full windows.
+
+### NTILE
+
+`NTILE(n)` splits the ordered partition into `n` buckets as evenly as possible. When rows don't divide evenly, the **earlier** buckets get one extra row. Ten rows into 4 buckets → sizes 3, 3, 2, 2. Use it for quartiles and deciles ("top 10% of customers by spend" is `NTILE(10) ... = 1`). It's not a percentile value calculator; for medians use `PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY x)` in Postgres. MySQL 8 has no percentile aggregate, so you compute the median with `ROW_NUMBER` and `COUNT`.
+
+### CTEs
+
+```sql
+WITH paid_orders AS (
+  SELECT customer_id, SUM(total) AS spend
+  FROM orders WHERE status = 'paid'
+  GROUP BY customer_id
+),
+ranked AS (
+  SELECT customer_id, spend, NTILE(10) OVER (ORDER BY spend DESC) AS decile
+  FROM paid_orders
+)
+SELECT * FROM ranked WHERE decile = 1;
+```
+
+Why use them:
+
+- **Readability**: a pipeline of named steps instead of nested subqueries.
+- **Reuse**: reference the same CTE more than once.
+- **Recursion**: only `WITH RECURSIVE` can do it.
+- **Postgres extra**: data-modifying CTEs (`WITH moved AS (DELETE ... RETURNING *) INSERT INTO archive SELECT * FROM moved`). They always run exactly once and to completion.
+
+### CTE materialization (Postgres 12+ and MySQL)
+
+Is a CTE computed once into a temporary result (**materialized**), or folded into the main query like a view (**inlined**)? It matters because inlining lets the planner push filters down and use indexes.
+
+| | Behaviour |
+|---|---|
+| **PostgreSQL 11 and older** | Every CTE was materialized. It acted as an **optimization fence**: an outer `WHERE id = 5` couldn't be pushed inside, so the CTE might scan a whole table. |
+| **PostgreSQL 12+** | A CTE that is non-recursive, side-effect free (a `SELECT` with no volatile functions) and **referenced once** is inlined. Referenced **more than once** → materialized. Override with `AS MATERIALIZED` or `AS NOT MATERIALIZED`. |
+| **MySQL 8** | CTEs are optimized like derived tables and views: the optimizer **merges** them into the outer query when it can and materializes them otherwise (for example with aggregates, `DISTINCT`, `GROUP BY`, `LIMIT`, window functions). `MERGE`/`NO_MERGE` optimizer hints control it per reference. |
+
+```sql
+-- Postgres 12+: force a single evaluation of an expensive CTE used twice
+WITH stats AS MATERIALIZED (SELECT key, expensive_fn(val) AS f FROM big)
+SELECT ... FROM stats s1 JOIN stats s2 ON ...;
+
+-- Postgres 12+: let the planner push the filter down even though it's referenced twice
+WITH w AS NOT MATERIALIZED (SELECT * FROM big_table)
+SELECT * FROM w a JOIN w b ON a.key = b.ref WHERE b.key = 123;
+```
+
+**How to say it**: "Since Postgres 12, a CTE referenced once is inlined like a subquery; referenced more than once it's materialized. I can force either with `MATERIALIZED` or `NOT MATERIALIZED`. Before 12 CTEs were always an optimization fence."
+
+### Recursive CTEs
+
+Shape:
+
+```sql
+WITH RECURSIVE cte(cols) AS (
+    anchor_query                -- runs once: the starting rows
+  UNION ALL
+    recursive_query             -- references cte; runs on the rows produced by the previous step
+)
+SELECT ... FROM cte;
+```
+
+Evaluation: run the anchor. Then repeatedly run the recursive part against **only the rows produced in the previous iteration** (the "working table"), appending results, until an iteration produces no rows. It's iteration, not true recursion.
+
+Rules: the recursive part can reference the CTE only once, and neither database allows aggregate functions in it. MySQL is stricter: its recursive part also can't contain window functions, `GROUP BY`, `ORDER BY` or `DISTINCT`, and `LIMIT` is allowed only since MySQL 8.0.19. In Postgres, the anchor's column types must match the recursive part's, or you get an error such as `type integer in non-recursive term but type bigint overall`; cast in the anchor to fix it.
+
+**1. Number series**
+
+```sql
+WITH RECURSIVE nums(n) AS (
+  SELECT 1
+  UNION ALL
+  SELECT n + 1 FROM nums WHERE n < 5      -- the stop condition
+)
+SELECT n FROM nums;                        -- 1, 2, 3, 4, 5
+```
+
+Postgres also has `generate_series(1, 5)`; MySQL doesn't, so the recursive CTE is the standard way to build a number or calendar table there. MySQL caps recursion with `cte_max_recursion_depth` (default **1000**), so a 5,000-day calendar needs `SET SESSION cte_max_recursion_depth = 10000`.
+
+**2. Org chart (top-down) with depth and path**
+
+```sql
+WITH RECURSIVE org AS (
+  SELECT id, name, manager_id, 1 AS depth, CAST(name AS CHAR(500)) AS path   -- Postgres: name::text
+  FROM employees WHERE manager_id IS NULL                                   -- anchor: the CEO
+  UNION ALL
+  SELECT e.id, e.name, e.manager_id, o.depth + 1, CONCAT(o.path, ' > ', e.name)
+  FROM employees e JOIN org o ON e.manager_id = o.id                        -- step: direct reports
+)
+SELECT depth, name, path FROM org ORDER BY path;
+
+-- 1 Asha  Asha
+-- 2 Ben   Asha > Ben
+-- 3 Dev   Asha > Ben > Dev
+-- 4 Eve   Asha > Ben > Dev > Eve
+-- 2 Chen  Asha > Chen
+-- 3 Fay   Asha > Chen > Fay
+```
+
+MySQL gotcha: column types come from the **anchor** only. Without the `CAST(... AS CHAR(500))`, the path column is only as wide as the CEO's name, and longer paths are truncated, or fail with "Data too long" in strict mode.
+
+**3. Hierarchy (bottom-up): the management chain of one employee**
+
+```sql
+WITH RECURSIVE chain AS (
+  SELECT id, name, manager_id FROM employees WHERE name = 'Eve'
+  UNION ALL
+  SELECT m.id, m.name, m.manager_id
+  FROM employees m JOIN chain c ON m.id = c.manager_id
+)
+SELECT name FROM chain;      -- Eve, Dev, Ben, Asha
+```
+
+**4. Graph walk with a cycle guard**
+
+Edges A→B, B→C, C→A, C→D. Without a guard, A→B→C→A→B... never ends. Carry the visited path and refuse to revisit:
+
+```sql
+-- PostgreSQL: array path
+WITH RECURSIVE walk(node, path) AS (
+  SELECT 'A'::text, ARRAY['A']
+  UNION ALL
+  SELECT e.dst, w.path || e.dst
+  FROM edges e JOIN walk w ON e.src = w.node
+  WHERE NOT e.dst = ANY(w.path)                 -- cycle guard
+)
+SELECT node, path FROM walk;     -- A {A}, B {A,B}, C {A,B,C}, D {A,B,C,D}
+
+-- MySQL 8: comma-separated string path
+WITH RECURSIVE walk(node, path) AS (
+  SELECT 'A', CAST('A' AS CHAR(1000))
+  UNION ALL
+  SELECT e.dst, CONCAT(w.path, ',', e.dst)
+  FROM edges e JOIN walk w ON e.src = w.node
+  WHERE FIND_IN_SET(e.dst, w.path) = 0          -- cycle guard
+)
+SELECT node, path FROM walk;
+```
+
+**PostgreSQL 14+** has the standard `CYCLE` clause, which does this bookkeeping for you:
+
+```sql
+WITH RECURSIVE walk(node) AS (
+  SELECT 'A'::text
+  UNION ALL
+  SELECT e.dst FROM edges e JOIN walk w ON e.src = w.node
+) CYCLE node SET is_cycle USING path
+SELECT node, path FROM walk WHERE NOT is_cycle;
+```
+
+Note that `CYCLE` still emits the row that closes the loop (with `is_cycle = true`), so filter it out. Postgres 14 also added `SEARCH DEPTH FIRST BY ... SET ordercol` / `SEARCH BREADTH FIRST` for ordering the output.
+
+Other guards: `UNION` instead of `UNION ALL` discards rows identical to earlier ones, which stops simple cycles **only if** the rows don't carry a changing column like depth. A depth limit (`WHERE depth < 20`) is a cheap safety net. MySQL's `cte_max_recursion_depth` and `max_execution_time` are last-resort guards.
+
+## How it works
+
+Three patterns cover most of the hard interview questions.
+
+### Top-N per group
+
+"Top 2 earners in each department":
+
+```sql
+SELECT dept, name, salary
+FROM (
+  SELECT dept, name, salary,
+         ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC, id) AS rn
+  FROM employees
+) t
+WHERE rn <= 2;
+```
+
+- `ROW_NUMBER` → exactly 2 per department. `DENSE_RANK` → everyone in the top two salary levels, which may be more than 2 people.
+- Postgres shortcut for top-1: `SELECT DISTINCT ON (dept) dept, name, salary FROM employees ORDER BY dept, salary DESC, id;`
+- For a few groups with an index on `(dept, salary DESC)`, a `LATERAL` join (`JOIN LATERAL (... ORDER BY salary DESC LIMIT 2)`; MySQL 8.0.14+ also supports `LATERAL`) can read just 2 index entries per group instead of ranking every row.
+
+### Gaps and islands
+
+"Find each user's streaks of consecutive login days." The trick: in a run of consecutive dates, `date − row_number` is **constant**.
+
+```
+login_date   rn   login_date - rn
+2024-01-01   1    2023-12-31   ┐
+2024-01-02   2    2023-12-31   ├ island 1 (3 days)
+2024-01-03   3    2023-12-31   ┘
+2024-01-05   4    2024-01-01   ┐ island 2 (2 days)
+2024-01-06   5    2024-01-01   ┘
+```
+
+```sql
+WITH d AS (SELECT DISTINCT user_id, login_date FROM logins),       -- dedupe same-day logins first
+g AS (
+  SELECT user_id, login_date,
+         login_date - CAST(ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY login_date) AS int) AS grp
+         -- MySQL: DATE_SUB(login_date, INTERVAL ROW_NUMBER() OVER (...) DAY)
+  FROM d
+)
+SELECT user_id, MIN(login_date) AS streak_start, MAX(login_date) AS streak_end, COUNT(*) AS days
+FROM g
+GROUP BY user_id, grp
+HAVING COUNT(*) >= 3;          -- streaks of 3+ days
+```
+
+"Gaps" (missing ranges) is the mirror image, using `LEAD`:
+
+```sql
+SELECT id + 1 AS gap_start, next_id - 1 AS gap_end
+FROM (SELECT id, LEAD(id) OVER (ORDER BY id) AS next_id FROM t) x
+WHERE next_id - id > 1;        -- ids 1,2,3,6,7,10 → gaps 4-5 and 8-9
+```
+
+### Sessionization
+
+"Split each user's clicks into sessions; a gap of more than 30 minutes starts a new session." Two steps: **flag** rows that start a session, then a **running sum** of the flags is the session number.
+
+```sql
+WITH flagged AS (
+  SELECT user_id, ts,
+         CASE WHEN LAG(ts) OVER (PARTITION BY user_id ORDER BY ts) IS NULL
+                OR ts - LAG(ts) OVER (PARTITION BY user_id ORDER BY ts) > INTERVAL '30 minutes'
+              -- MySQL: TIMESTAMPDIFF(MINUTE, LAG(ts) OVER (...), ts) > 30
+              THEN 1 ELSE 0 END AS new_session
+  FROM clicks
+)
+SELECT user_id, ts,
+       SUM(new_session) OVER (PARTITION BY user_id ORDER BY ts
+                              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS session_no
+FROM flagged;
+
+-- user 1: 10:00 → 1, 10:10 → 1, 11:00 → 2, 11:05 → 2
+```
+
+From there, group by `(user_id, session_no)` for session length, clicks per session, and so on. The same "flag + running sum" trick solves many island problems where the break condition isn't simple arithmetic.
+
+### What the engine does
+
+For each distinct window definition, the executor sorts (or reuses an existing order from an index) by `PARTITION BY` keys and then `ORDER BY` keys, walks each partition once, and maintains the frame incrementally where it can. So:
+
+- Several window functions with the **same** `OVER` clause share one sort. Use a named `WINDOW` to keep them identical.
+- An index matching `(partition cols, order cols)` can remove the sort.
+- Window functions don't reduce rows, so a window over a 100M-row table produces 100M rows. Filter in `WHERE` first.
+
+## Real-world examples
+
+- **PostgreSQL 12** made CTE inlining automatic (with `MATERIALIZED`/`NOT MATERIALIZED` overrides). Before that, the "CTEs are an optimization fence" rule was a well-known Postgres tuning tip; Markus Winand's modern-sql.com notes Postgres was the outlier that optimized each `WITH` query separately until version 12.
+- **PostgreSQL 14** implemented the SQL-standard `SEARCH` and `CYCLE` clauses for recursive CTEs.
+- **MySQL 8.0** introduced CTEs and window functions, which removed the need for the user-variable tricks (`@rn := @rn + 1`) that MySQL 5.x code used to number rows.
+
+## Common pitfalls
+
+- **Filtering on a window function in `WHERE`.** Not allowed; wrap it and filter outside.
+- **Relying on the default frame** for row-by-row running totals when the order column has ties. Use `ROWS`.
+- **`LAST_VALUE` with the default frame** returns the current row. Widen the frame or flip the sort with `FIRST_VALUE`.
+- **`ROW_NUMBER` without a tie-breaker.** Results change between runs. Add a unique column to `ORDER BY`.
+- **`RANK` when you meant `DENSE_RANK`** (or vice versa) for "Nth highest".
+- **`LAG` across missing periods.** It goes back one row, not one month.
+- **Recursive CTE without a stop condition or cycle guard.** Runs forever in Postgres; in MySQL hits `cte_max_recursion_depth` (default 1000) and errors.
+- **MySQL recursive string columns** sized by the anchor row: `CAST` to a wide `CHAR` in the anchor.
+- **Assuming CTEs are always materialized** (pre-12 thinking) or **always inlined**. In Postgres 12+, it depends on the reference count; check `EXPLAIN`.
+- **Assuming the window's `ORDER BY` sorts the result.** Add an outer `ORDER BY`.
+
+## Practice questions
+
+<Practice>
+
+<QA q="What's the difference between ROW_NUMBER, RANK and DENSE_RANK?" level="easy">
+
+For scores 100, 90, 90, 80 (descending):
+
+- `ROW_NUMBER`: 1, 2, 3, 4. Always unique; ties broken arbitrarily unless you add a tie-breaker.
+- `RANK`: 1, 2, 2, 4. Ties share a rank, then the next rank skips.
+- `DENSE_RANK`: 1, 2, 2, 3. Ties share a rank, no gaps.
+
+Use `ROW_NUMBER` for exactly N rows, `DENSE_RANK` for "Nth distinct value".
+
+</QA>
+
+<QA q="How is a window function different from GROUP BY?" level="easy">
+
+`GROUP BY` collapses each group into one output row. A window function computes a value over a set of related rows but **keeps every input row**, so you can show a row's detail next to its group's aggregate (salary next to department average). Window functions run after `WHERE`/`GROUP BY`/`HAVING`, in the `SELECT` step.
+
+</QA>
+
+<QA q="Find the top 3 highest-paid employees in each department." level="easy">
+
+```sql
+SELECT dept, name, salary
+FROM (
+  SELECT dept, name, salary,
+         DENSE_RANK() OVER (PARTITION BY dept ORDER BY salary DESC) AS rnk
+  FROM employees
+) t
+WHERE rnk <= 3
+ORDER BY dept, rnk;
+```
+
+`DENSE_RANK` returns everyone in the top three salary levels (ties included). If the requirement is exactly three people, use `ROW_NUMBER()` with a tie-breaker such as `ORDER BY salary DESC, id`. In Postgres, top-1 per group can also be written with `DISTINCT ON (dept) ... ORDER BY dept, salary DESC`.
+
+</QA>
+
+<QA q="Compute a running total and a 7-day moving average of daily revenue." level="easy">
+
+```sql
+SELECT d, revenue,
+  SUM(revenue) OVER (ORDER BY d ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_total,
+  AVG(revenue) OVER (ORDER BY d ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)         AS ma7_rows,
+  AVG(revenue) OVER (ORDER BY d RANGE BETWEEN INTERVAL '6 days' PRECEDING AND CURRENT ROW) AS ma7_days
+FROM daily_revenue;
+-- MySQL 8: RANGE BETWEEN INTERVAL 6 DAY PRECEDING AND CURRENT ROW
+```
+
+`ROWS` counts the last 7 rows; `RANGE` with an interval counts the last 7 calendar days and stays correct when days are missing (Postgres 11+, MySQL 8). The first six rows average fewer than seven values.
+
+</QA>
+
+<QA q="What is the default window frame, and how can it break a running total?" level="medium">
+
+With `ORDER BY` in the window and no frame clause, the default is `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`, so the frame includes **all peers** of the current row (rows with the same ORDER BY value). If two rows share a date, both get the same running total, which already includes both amounts: 10, 60, 60, 100 instead of 10, 30, 60, 100. Fix with `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` and a unique tie-breaker. Without `ORDER BY`, the default frame is the whole partition.
+
+</QA>
+
+<QA q="Why does LAST_VALUE(x) OVER (ORDER BY t) often just return the current row's x?" level="medium">
+
+`LAST_VALUE` returns the last row **of the frame**, and the default frame ends at the current row (plus its peers). So the "last" row is the current row. Fix it with `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING`, or use `FIRST_VALUE(x) OVER (ORDER BY t DESC)`, which works with the default frame because the default frame always starts at the partition's first row.
+
+</QA>
+
+<QA q="Calculate month-over-month revenue growth as a percentage." level="medium">
+
+```sql
+SELECT month, revenue,
+       LAG(revenue) OVER (ORDER BY month) AS prev_revenue,
+       ROUND(100.0 * (revenue - LAG(revenue) OVER (ORDER BY month))
+             / NULLIF(LAG(revenue) OVER (ORDER BY month), 0), 1) AS mom_pct
+FROM monthly_revenue
+ORDER BY month;
+```
+
+The first month has no previous row, so it gets `NULL`. `NULLIF` avoids division by zero. `100.0` forces decimal division (integer division would truncate). If months can be missing, join to a generated month series first, because `LAG` looks one **row** back, not one month.
+
+</QA>
+
+<QA q="Delete duplicate rows, keeping only the most recent row per user_id." level="medium">
+
+```sql
+DELETE FROM events
+WHERE id IN (
+  SELECT id FROM (
+    SELECT id,
+           ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY updated_at DESC, id DESC) AS rn
+    FROM events
+  ) ranked
+  WHERE rn > 1
+);
+```
+
+This works in Postgres and in MySQL 8. MySQL normally forbids selecting from the table you're deleting from in a subquery, but the rule doesn't apply when the subquery uses a derived table that is materialized, and a derived table containing a window function can't be merged, so it is materialized. For a read-only version, just `SELECT ... WHERE rn = 1`.
+
+</QA>
+
+<QA q="Find users who logged in on at least 3 consecutive days." level="medium">
+
+```sql
+WITH d AS (
+  SELECT DISTINCT user_id, login_date FROM logins
+),
+g AS (
+  SELECT user_id, login_date,
+         login_date - CAST(ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY login_date) AS int) AS grp
+  FROM d
+)
+SELECT DISTINCT user_id
+FROM g
+GROUP BY user_id, grp
+HAVING COUNT(*) >= 3;
+-- MySQL: DATE_SUB(login_date, INTERVAL ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY login_date) DAY)
+```
+
+Gaps-and-islands: within a run of consecutive dates, the date minus its row number is constant, so it labels the island. Deduplicate same-day logins first, or the row numbers advance without the date advancing.
+
+</QA>
+
+<QA q="Split a clickstream into sessions where an inactivity gap over 30 minutes starts a new session." level="hard">
+
+```sql
+WITH flagged AS (
+  SELECT user_id, ts,
+         CASE WHEN LAG(ts) OVER w IS NULL
+                OR ts - LAG(ts) OVER w > INTERVAL '30 minutes'
+              THEN 1 ELSE 0 END AS new_session
+  FROM clicks
+  WINDOW w AS (PARTITION BY user_id ORDER BY ts)
+),
+sessions AS (
+  SELECT user_id, ts,
+         SUM(new_session) OVER (PARTITION BY user_id ORDER BY ts
+                                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS session_no
+  FROM flagged
+)
+SELECT user_id, session_no, MIN(ts) AS started, MAX(ts) AS ended, COUNT(*) AS clicks
+FROM sessions
+GROUP BY user_id, session_no;
+-- MySQL: TIMESTAMPDIFF(MINUTE, LAG(ts) OVER w, ts) > 30
+```
+
+Flag each row that starts a session, then a running sum of the flags numbers the sessions. Use `ROWS` so two clicks with the same timestamp don't confuse the running sum.
+
+</QA>
+
+<QA q="Write a recursive CTE that lists every employee under a given manager, with their depth." level="medium">
+
+```sql
+WITH RECURSIVE reports AS (
+  SELECT id, name, manager_id, 0 AS depth
+  FROM employees WHERE id = 2                       -- the starting manager
+  UNION ALL
+  SELECT e.id, e.name, e.manager_id, r.depth + 1
+  FROM employees e
+  JOIN reports r ON e.manager_id = r.id
+  WHERE r.depth < 50                                -- safety net against bad data
+)
+SELECT * FROM reports WHERE depth > 0;
+```
+
+The anchor selects the manager; each iteration finds the direct reports of the rows found in the previous iteration, and it stops when an iteration finds nobody. The depth limit protects against an accidental cycle (A manages B, B manages A). An index on `employees(manager_id)` makes each step an index lookup.
+
+</QA>
+
+<QA q="How do you prevent a recursive CTE from looping forever on a graph with cycles?" level="hard">
+
+Carry the path of visited nodes and refuse to step onto a node already in it:
+
+- **Postgres**: `ARRAY[start]` in the anchor, `path || next` in the step, `WHERE NOT next = ANY(path)`. Since Postgres 14, `CYCLE node SET is_cycle USING path` generates this automatically (filter `WHERE NOT is_cycle`, since the closing row is still emitted).
+- **MySQL 8**: a string path built with `CONCAT`, guarded with `FIND_IN_SET(next, path) = 0`. `CAST` the anchor's path to a wide `CHAR`, because column widths come from the anchor.
+
+Also add a max-depth condition as a safety net. MySQL additionally stops at `cte_max_recursion_depth` (default 1000) with an error. `UNION` instead of `UNION ALL` only helps when revisited rows are fully identical, which isn't true once you carry depth or path.
+
+</QA>
+
+<QA q="Are CTEs materialized in PostgreSQL? Does it matter for performance?" level="hard">
+
+Since **Postgres 12**, a non-recursive, side-effect-free CTE that is referenced **once** is inlined into the main query, so filters push down and indexes are used. If it's referenced **more than once**, it's materialized (computed once into a temporary result). You can override with `WITH x AS MATERIALIZED (...)` (compute once, for example to avoid repeating an expensive function) or `AS NOT MATERIALIZED` (inline even when referenced twice, so each use can push its own filter down). In Postgres 11 and earlier, CTEs were **always** materialized and acted as an optimization fence. In MySQL 8, CTEs are merged or materialized like derived tables, controllable with `MERGE`/`NO_MERGE` hints.
+
+</QA>
+
+<QA q="Find the median salary per department in Postgres and in MySQL 8." level="hard">
+
+```sql
+-- PostgreSQL: ordered-set aggregate
+SELECT dept, PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY salary) AS median
+FROM employees GROUP BY dept;
+
+-- MySQL 8: no percentile aggregate, so use ROW_NUMBER and COUNT
+SELECT dept, AVG(salary) AS median
+FROM (
+  SELECT dept, salary,
+         ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary) AS rn,
+         COUNT(*)     OVER (PARTITION BY dept)                 AS cnt
+  FROM employees
+) t
+WHERE rn IN (FLOOR((cnt + 1) / 2), FLOOR(cnt / 2) + 1)
+GROUP BY dept;
+```
+
+For an odd count both expressions point at the same middle row; for an even count they point at the two middle rows, and `AVG` interpolates them. `PERCENTILE_CONT` also interpolates; `PERCENTILE_DISC` would return an actual value from the set.
+
+</QA>
+
+<QA q="A dashboard query using several window functions over a 200M-row events table is slow. How do you approach it?" level="scenario">
+
+1. **Filter first**: window functions don't remove rows, so restrict the date range in `WHERE` (or in a CTE) before the windows run.
+2. **Make windows share a sort**: identical `PARTITION BY`/`ORDER BY` clauses (use a named `WINDOW`) let the engine sort once. Different window definitions each need their own sort.
+3. **Index to avoid the sort**: an index on `(user_id, ts)` can feed `PARTITION BY user_id ORDER BY ts` in order.
+4. **Check `EXPLAIN (ANALYZE)`** for sorts spilling to disk; raise `work_mem` for that query in Postgres if needed.
+5. **Precompute**: if the dashboard tolerates staleness, materialize daily aggregates (materialized view or summary table) and run windows over the much smaller result.
+
+</QA>
+
+<QA q="A product manager says weekly active-user streaks look wrong for users with multiple logins on the same day. What's happening?" level="scenario">
+
+The gaps-and-islands query assigns `ROW_NUMBER` per **row**, not per **day**. Two logins on the same day get row numbers n and n+1 with the same date, so `date − rn` shifts and the streak splits into two islands (or, with `RANK`/`DENSE_RANK` misuse, lengths are miscounted). Fix: deduplicate to one row per user per day first (`SELECT DISTINCT user_id, login_date`, or `DENSE_RANK` over the date), then compute `date − ROW_NUMBER`. Also check time zones: converting timestamps to dates in UTC versus the user's local zone can move logins across midnight.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="Scores 100, 90, 90, 80 ordered descending. What does RANK() give the 80?" options={["3", "4", "2", "5"]} answer={1}>
+
+RANK gives tied rows the same rank and then skips: 1, 2, 2, 4. DENSE_RANK would give 3, and ROW_NUMBER would also give 4 but without sharing ranks for the ties.
+
+</MCQ>
+
+<MCQ q="What is the default frame for SUM(x) OVER (ORDER BY d) in PostgreSQL and MySQL 8?" options={["ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW", "The whole partition", "RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW, including peers", "ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING"]} answer={2}>
+
+With ORDER BY and no frame clause, both databases use RANGE from the partition start to the current row's last peer. Without ORDER BY the default is the whole partition.
+
+</MCQ>
+
+<MCQ q="LAST_VALUE(price) OVER (ORDER BY ts) mostly returns each row's own price. Why?" options={["LAST_VALUE ignores ORDER BY", "The default frame ends at the current row and its peers", "LAST_VALUE needs PARTITION BY", "It is a MySQL bug"]} answer={1}>
+
+LAST_VALUE reads the last row of the frame. The default frame stops at the current row (and peers), so that is what it returns. Widen the frame to UNBOUNDED FOLLOWING or use FIRST_VALUE with a descending sort.
+
+</MCQ>
+
+<MCQ q="Where can a window function appear?" options={["WHERE and HAVING", "GROUP BY only", "The SELECT list and ORDER BY", "Anywhere an aggregate can"]} answer={2}>
+
+Window functions are computed after WHERE, GROUP BY and HAVING, so they're only allowed in the SELECT list and ORDER BY. Filter on them by wrapping the query.
+
+</MCQ>
+
+<MCQ q="In PostgreSQL 12+, a non-recursive SELECT-only CTE is referenced twice in the main query. By default it is:" options={["Inlined into both references", "Materialized once", "Rejected with an error", "Executed twice and cached"]} answer={1}>
+
+Postgres 12+ inlines side-effect-free CTEs only when they are referenced once. Referenced more than once, they are materialized unless you write AS NOT MATERIALIZED.
+
+</MCQ>
+
+<MCQ q="MySQL 8 stops a runaway recursive CTE by default after how many recursion levels?" options={["100", "1000", "10000", "It never stops"]} answer={1}>
+
+The cte_max_recursion_depth system variable defaults to 1000; exceeding it terminates the statement with an error. You can raise it per session.
+
+</MCQ>
+
+<MCQ q="NTILE(4) over 10 ordered rows produces buckets of which sizes?" options={["3, 3, 2, 2", "2, 2, 3, 3", "3, 2, 3, 2", "2, 3, 3, 2"]} answer={0}>
+
+NTILE spreads the remainder over the earliest buckets, so 10 rows into 4 buckets gives 3, 3, 2, 2.
+
+</MCQ>
+
+<MCQ q="In the gaps-and-islands technique for consecutive dates, what stays constant within one island?" options={["ROW_NUMBER", "The date", "The date minus its ROW_NUMBER", "LAG of the date"]} answer={2}>
+
+Both the date and the row number increase by one per step inside a run, so their difference is constant and labels the island. A break in the dates changes the difference.
+
+</MCQ>
+
+<MCQ q="A MySQL recursive CTE builds a path with CONCAT and fails with 'Data too long'. What's the fix?" options={["Switch UNION ALL to UNION", "Raise cte_max_recursion_depth", "CAST the anchor's path column to a wide CHAR", "Add ORDER BY to the recursive part"]} answer={2}>
+
+MySQL derives recursive CTE column types from the non-recursive (anchor) part, so the path is only as wide as the anchor's value. Casting it to a wider CHAR in the anchor fixes truncation and the strict-mode error.
+
+</MCQ>
+
+<MCQ q="Which statement about PostgreSQL's CYCLE clause (14+) is true?" options={["It is MySQL syntax", "It removes the need for UNION ALL", "It emits the row that closes a cycle with is_cycle true, so you usually filter it out", "It limits recursion depth to 100"]} answer={2}>
+
+CYCLE tracks a path and marks the row that revisits a node with the cycle flag set. Recursion stops there, but that row is still in the output, so add WHERE NOT is_cycle.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- `f() OVER (PARTITION BY ... ORDER BY ... frame)`: per-row result, rows not collapsed. Computed in the SELECT step → filter in an outer query.
+- Ranking: `ROW_NUMBER` 1,2,3,4 · `RANK` 1,2,2,4 · `DENSE_RANK` 1,2,2,3. Always add a tie-breaker for `ROW_NUMBER`.
+- **Default frame with ORDER BY = `RANGE UNBOUNDED PRECEDING` to current row incl. peers.** Use explicit `ROWS` for row-by-row running totals.
+- `LAST_VALUE` needs `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING` (or use `FIRST_VALUE` DESC).
+- `LAG`/`LEAD` = previous/next **row**, not previous period. `NULLIF` the denominator.
+- Moving average: `ROWS BETWEEN n PRECEDING` (rows) vs `RANGE BETWEEN INTERVAL ... PRECEDING` (time). `GROUPS` is Postgres 11+ only.
+- `NTILE(n)`: earlier buckets get the extra rows. Median: `PERCENTILE_CONT` (Postgres); `ROW_NUMBER` + `COUNT` (MySQL).
+- CTEs: Postgres 12+ inlines single-reference CTEs, materializes multi-reference ones; `MATERIALIZED` / `NOT MATERIALIZED` to override. MySQL merges or materializes like derived tables.
+- Recursive CTE = anchor `UNION ALL` step, iterating on the previous step's rows until empty. Always have a stop condition.
+- Cycle guard: path array + `ANY` (Postgres), `CYCLE` clause (Postgres 14+), string path + `FIND_IN_SET` (MySQL). MySQL: `cte_max_recursion_depth` = 1000; `CAST` anchor columns wide.
+- Patterns: **top-N per group** (`ROW_NUMBER` ≤ N), **gaps-and-islands** (date − row_number), **sessionization** (flag with `LAG`, running `SUM` of flags), **dedupe latest** (`ROW_NUMBER` DESC = 1).
+
+## Go deeper
+
+- **PostgreSQL docs**: [Window functions tutorial](https://www.postgresql.org/docs/current/tutorial-window.html), [Window function list](https://www.postgresql.org/docs/current/functions-window.html), [Window call syntax and frames](https://www.postgresql.org/docs/current/sql-expressions.html).
+- **PostgreSQL docs**: [WITH queries (CTEs), recursion, SEARCH/CYCLE, materialization](https://www.postgresql.org/docs/current/queries-with.html).
+- **MySQL 8.0 manual**: [Window functions](https://dev.mysql.com/doc/refman/8.0/en/window-functions.html), [Window function frame specification](https://dev.mysql.com/doc/refman/8.0/en/window-functions-frames.html), [WITH (common table expressions)](https://dev.mysql.com/doc/refman/8.0/en/with.html).
+- **modern-sql.com** (Markus Winand): [The WITH clause](https://modern-sql.com/feature/with).
+- **Use The Index, Luke**: [Top-N queries](https://use-the-index-luke.com/sql/partial-results/top-n-queries).
+- Related notes: [SQL Essentials: Execution Order, Joins, Views](/learn/notes/sql-execution-order-joins/), [MySQL vs Postgres internals](/learn/notes/mysql-postgres-internals/).

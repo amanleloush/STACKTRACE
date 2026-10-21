@@ -1,13 +1,21 @@
 ---
 title: "HLD: Payment System (Idempotent Transfer)"
 phase: "07-hld-problems"
-order: 43
+order: 66
 tags: []
 premium: false
 previewParagraphs: 4
 estimatedMinutes: 5
 prerequisites: []
 ---
+
+## Definition (interview-ready)
+
+A **payment system** moves money between parties (charge a customer, credit a merchant, refund) without ever charging twice, losing a transfer or losing the audit trail, even when networks time out and clients retry. Every mutating API takes an **idempotency key**, which is stored with the response and forwarded to the payment provider, so retries are safe end to end. Money is recorded in an append-only **double-entry ledger**: each transfer writes a debit and a matching credit in one database transaction, so every transaction sums to zero. A **payment state machine**, driven by a saga orchestrator, walks each payment through authorize, capture and settle, with void and refund as compensations. Provider webhooks are verified and deduped, and a daily **reconciliation** job compares the ledger with provider reports. Card data stays in a PCI-scoped vault or with the provider as tokens.
+
+The main trade-off is correctness over latency and availability: money movement uses strong consistency, while read views such as balances can lag.
+
+**One-liner:** Idempotency keys on every write, an append-only double-entry ledger, a saga-driven authorize-capture-settle state machine, deduped webhooks and daily reconciliation, so retries and failures can never double-charge or lose money.
 
 ## Problem statement
 
@@ -65,11 +73,11 @@ Design a payment system that processes money movement (debit A, credit B) with s
 ### Idempotency
 
 Every mutation API takes an `Idempotency-Key`:
-1. Lookup in idempotency store (Redis or Postgres with unique constraint).
-2. If exists: return the previous response — no new action.
-3. If not: execute, store the response keyed by the idempotency key, return.
+1. Atomically reserve the key in the idempotency store (for example `INSERT` into a Postgres table with a unique constraint, or Redis `SET NX`). This stops two concurrent retries from both executing.
+2. If the key already exists with a stored response: return that response, with no new action. If it exists but is still in progress, return a conflict (Stripe returns 409) so the client retries later. If it was reused with different request parameters, reject it.
+3. If the reservation succeeded: execute, store the response against the key, return.
 
-Window: 24h+. Forwarded to upstream providers as their idempotency key too (Stripe, Adyen support this).
+Window: 24h+ (Stripe keeps keys for at least 24 hours). Forwarded to upstream providers as their idempotency key too (Stripe and Adyen both accept an `Idempotency-Key` header).
 
 ### Ledger (double-entry bookkeeping)
 
@@ -119,12 +127,9 @@ State machine in a saga orchestrator (Temporal). Each step is idempotent.
 
 ```
 NEW → AUTHORIZED → CAPTURED → SETTLED
-   ↓
-   FAILED  →  (terminal)
-   ↓
-   VOIDED  →  (terminal)
-   ↓
-   REFUNDED
+ ↓        ↓            ↓          ↓
+FAILED  VOIDED         └─ REFUNDED ┘
+(terminal) (terminal)   (full / partial)
 ```
 
 Persisted with every state change.
@@ -143,7 +148,7 @@ Providers send async events: "payment_succeeded," "payment_failed," "chargeback.
 - Verify signature (HMAC, JWS).
 - Idempotency: provider event IDs deduped.
 - Apply state change in ledger / payment state.
-- Acknowledge — provider retries until acked.
+- Acknowledge with a 2xx. Until it gets one, the provider retries for a limited window (Stripe retries for up to 3 days), so processing must be idempotent.
 
 ### Reconciliation
 
@@ -154,7 +159,8 @@ Providers send async events: "payment_succeeded," "payment_failed," "chargeback.
 
 ### Compliance: PCI DSS
 
-- Card data NEVER stored in plaintext.
+- Card numbers (PAN) are never stored in plaintext; if stored at all they must be unreadable (tokenized, truncated or strongly encrypted).
+- The CVV/CVC must never be stored after authorization, not even encrypted.
 - Tokenized via provider (Stripe Token) or in our own vault (separate strict env).
 - App tier sees only tokens (`tok_xxx`).
 - Vault is isolated network, audited, encrypted.
@@ -167,7 +173,7 @@ Providers send async events: "payment_succeeded," "payment_failed," "chargeback.
 ## Bottlenecks & optimizations
 
 - **Hot account** (a popular merchant): high write concurrency on their balance row. Use:
-  - Atomic increments (not read-then-write).
+  - Atomic increments (not read-then-write). These prevent lost updates, but every update still waits for the same row lock.
   - Sharded counter (split balance into N partitions, sum on read).
 - **Synchronous provider calls**: typical 200-500 ms. Don't block user-facing requests longer than needed; capture sync, settle async.
 - **Saga orchestrator load**: Temporal/Cadence scale horizontally.
@@ -179,39 +185,145 @@ Providers send async events: "payment_succeeded," "payment_failed," "chargeback.
 - **Strong vs eventual consistency**: ledger needs strong consistency (transactions); balance materialized view can be eventually consistent.
 - **In-house ledger vs SaaS**: many startups use Stripe/Adyen end-to-end; bigger companies build their own ledger for control + cost.
 
-## Interview questions
+## Practice questions
 
-### Q1: How do you guarantee no double charges?
-Idempotency keys on every mutation. Stored in a dedupe table with the response. Retries return cached response. Forward the same key to the upstream provider so they dedupe too.
+<Practice>
 
-### Q2: Why double-entry bookkeeping?
+<QA q="Why double-entry bookkeeping?" level="easy">
+
 Every money movement is two entries: debit + credit. Sum per transaction = 0 (invariant). Account balance = sum of its entries. Auditable, balances are derivable, errors are detectable.
 
-### Q3: Walk through a payment saga.
-Authorize (provider hold) → Capture (provider takes money) → Settle (provider deposits). State persisted between steps. Compensations: void (if capture fails) or refund (if needed post-capture). All steps idempotent.
+</QA>
 
-### Q4: How do you handle a provider webhook arriving twice?
-Dedupe by provider's event ID. Idempotent state machine — applying "captured" twice is a no-op if already captured. Acknowledge after applying.
+<QA q="Why store amounts as integers in minor units instead of floats?" level="easy">
 
-### Q5: Reconciliation strategy?
-Daily pull of provider's transaction report. Diff against our ledger. Discrepancies → reconciliation queue; ops team investigates. Common cases: webhook lost, state out of sync, fraud-related reversal we didn't process.
+Floating point can't represent most decimal fractions exactly, so sums drift by fractions of a cent. Store integer minor units (cents) plus an ISO currency code, and the ledger's sum-to-zero check stays exact. For FX, record both the source and converted amounts.
 
-### Q6: How would you store sensitive card data?
-Don't, if you can avoid it. Use provider tokenization (Stripe, Adyen). If you must, build a separate PCI-scoped vault: encrypted-at-rest, encrypted-in-transit, separate network, narrow API, audit logs. App tier sees only tokens.
+</QA>
 
-### Q7: A bug double-credits an account. How do you recover?
+<QA q="What is the difference between authorize and capture?" level="easy">
+
+Authorize asks the provider to place a hold on the card for the amount; no money moves yet. Capture actually takes the authorized amount. Settlement, when the provider moves the money, happens over days. If you never capture, you void the authorization to release the hold.
+
+</QA>
+
+<QA q="How do you guarantee no double charges?" level="medium">
+
+Idempotency keys on every mutation. Stored in a dedupe table (Redis or Postgres with a unique constraint) along with the response, for 24h or more. Reserve the key atomically before doing the work, so two concurrent retries can't both execute. Retries return the cached response. Forward the same key to the upstream provider so it dedupes too.
+
+</QA>
+
+<QA q="Walk through a payment saga." level="medium">
+
+Authorize (provider hold) → Capture (provider takes money) → Settle (provider deposits). State persisted between steps by an orchestrator (Temporal). Compensations: void (if capture fails) or refund (if needed post-capture). All steps idempotent.
+
+</QA>
+
+<QA q="How do you handle a provider webhook arriving twice?" level="medium">
+
+Verify the signature (HMAC/JWS) first. Dedupe by the provider's event ID. Idempotent state machine — applying captured twice is a no-op if already captured. Acknowledge after applying; the provider keeps retrying until it gets an ack.
+
+</QA>
+
+<QA q="Reconciliation strategy?" level="medium">
+
+Daily pull of the provider's transaction report. Diff against our ledger. Discrepancies → reconciliation queue; ops team investigates. Common cases: webhook lost, state out of sync, fraud-related reversal we didn't process. Missing money is a P0.
+
+</QA>
+
+<QA q="A popular merchant's balance row is a write hot spot. How do you fix it?" level="hard">
+
+Use atomic increments instead of read-then-write, so concurrent updates don't race. If that still contends, shard the balance into N sub-rows, update one at random, and sum them on read. The ledger entries remain the source of truth; the balance is a materialized view that can be eventually consistent.
+
+</QA>
+
+<QA q="How would you store sensitive card data?" level="hard">
+
+Don't, if you can avoid it. Use provider tokenization (Stripe, Adyen). If you must, build a separate PCI-scoped vault: encrypted at rest, encrypted in transit, separate network, narrow API, audit logs. The app tier sees only tokens (`tok_xxx`).
+
+</QA>
+
+<QA q="A capture call to the provider times out. Did the charge happen? What do you do?" level="scenario">
+
+You don't know, so never assume failure and never retry with a new key. Keep the payment in its current state, retry with the same idempotency key (the provider dedupes, so at most one charge happens), or query the provider for status. A webhook may also settle it. Daily reconciliation catches anything still out of sync.
+
+</QA>
+
+<QA q="A bug double-credits an account. How do you recover?" level="scenario">
+
 - **Investigate**: find the entries; verify it's a double credit (not legitimate).
-- **Reverse**: insert a compensating entry (debit) with a clear `reason` field linking to the bug ticket.
+- **Reverse**: insert a compensating entry (debit) with a clear `reason` field linking to the bug ticket. Never edit or delete existing entries.
 - **Audit log**: every change traceable.
 - **Communicate**: inform user / merchant.
 - **Prevent**: fix the bug; add idempotency at the source; add a balance invariant check.
 
-### Q8: How to handle a sudden 10× spike in payments?
+</QA>
+
+<QA q="How to handle a sudden 10× spike in payments?" level="scenario">
+
 - Async provider calls where possible (defer settlement).
 - Horizontal scale of payment service + orchestrator.
 - Database read replicas for read-heavy operations (balances, history).
 - Rate-limit at the API edge to protect downstream provider quotas.
 - Pre-warm caches.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="A transfer writes ledger entries of -1000 for the user and +1000 for the merchant. Which invariant does that satisfy?" options={["Every account balance is positive", "Entries for a transaction sum to zero", "Each account has one entry per day", "The merchant balance equals the user balance"]} answer={1}>
+
+Double-entry means each transaction's entries net to zero, which makes errors detectable. Balances can go negative, accounts have many entries, and two parties' balances are unrelated.
+
+</MCQ>
+
+<MCQ q="A client retries POST /payments with the same Idempotency-Key after a network error. What should the server do?" options={["Return the stored response from the first attempt without charging again", "Charge again, since it's a new HTTP request", "Reject the request with an error", "Charge again but mark it as a duplicate"]} answer={0}>
+
+The key maps to the stored result, so a retry gets the same response and no new charge. Charging again is the double charge idempotency prevents, and rejecting leaves the client unsure of the outcome.
+
+</MCQ>
+
+<MCQ q="Capture fails after a successful authorize. Which compensation fits?" options={["Refund", "Chargeback", "Void the authorization", "Retry settlement"]} answer={2}>
+
+No money was taken, so you release the hold with a void. Refund is for money already captured, a chargeback is initiated by the cardholder's bank, and settlement comes after capture.
+
+</MCQ>
+
+<MCQ q="A bug wrote a wrong ledger entry last week. How do you correct it?" options={["UPDATE the entry's amount", "DELETE the entry", "Rebuild the ledger from provider reports", "Insert a compensating entry that references the bug"]} answer={3}>
+
+The ledger is append-only for auditability, so you reverse with a new entry. Updating or deleting destroys the audit trail, and rebuilding from provider reports discards your own records.
+
+</MCQ>
+
+<MCQ q="Why forward your idempotency key to Stripe or Adyen?" options={["So the provider also dedupes if your retry reaches it twice", "To speed up authorization", "It is required for PCI DSS", "So the provider can compute FX"]} answer={0}>
+
+If your call reaches the provider but the response is lost, your retry would charge twice unless the provider dedupes on the same key. It doesn't affect speed, PCI scope or FX.
+
+</MCQ>
+
+<MCQ q="Why store 10.99 USD as 1099 with currency USD?" options={["To save storage", "Because providers reject decimals", "To support negative amounts", "Integer minor units avoid floating-point rounding errors"]} answer={3}>
+
+Floats can't represent many decimal amounts exactly, so totals drift. Storage, provider formats and negative amounts aren't the reason; integers handle negatives either way.
+
+</MCQ>
+
+<MCQ q="A webhook for payment_succeeded arrives for a payment already marked CAPTURED. What is correct?" options={["Capture again", "Treat it as a no-op after deduping by event ID, then acknowledge", "Ignore it without acknowledging", "Mark the payment as REFUNDED"]} answer={1}>
+
+The state machine is idempotent and the event ID dedupes it; you still ack so the provider stops retrying. Capturing again double-charges, not acking causes endless retries, and refunding is wrong.
+
+</MCQ>
+
+<MCQ q="Daily reconciliation finds a payment our ledger marks SETTLED but the provider report doesn't include. What happens?" options={["Delete it from our ledger", "Ignore it, since our ledger is the source of truth", "Put it on the reconciliation queue for investigation", "Automatically refund the customer"]} answer={2}>
+
+Discrepancies go to a reconciliation queue for ops to investigate, because the cause could be a lost webhook, a reversal or a bug. Deleting, ignoring or auto-refunding all act before knowing what happened.
+
+</MCQ>
+
+</Quiz>
 
 ## TL;DR cheat sheet
 
@@ -226,9 +338,9 @@ Don't, if you can avoid it. Use provider tokenization (Stripe, Adyen). If you mu
 
 ## Go deeper
 
-- **Stripe Engineering**: [idempotency](https://stripe.com/blog/idempotency), [reconciliation](https://stripe.com/blog), payment-system architecture posts.
+- **Stripe Engineering**: ["Designing robust and predictable APIs with idempotency"](https://stripe.com/blog/idempotency), plus other payment-architecture posts on the [Stripe blog](https://stripe.com/blog).
 - **Square engineering**: payment flow + saga posts.
 - **Adyen engineering blog**: payment architecture.
-- **DDIA Chapter 11** — stream processing + correctness.
-- **Book**: *Building Event-Driven Microservices* — saga and event patterns for finance.
+- **DDIA Chapters 11–12** — stream processing, idempotence and end-to-end correctness ("Aiming for Correctness").
+- **Book**: *Building Event-Driven Microservices* (Adam Bellemare) — saga and event patterns.
 - **PCI DSS** standards: brief read for scope and impact.

@@ -1,0 +1,525 @@
+---
+title: "Query Processing: Indexes, Join Algorithms, Optimizer"
+phase: "11-sql-dbms"
+order: 117
+tags: ["sql", "dbms", "indexes", "query-optimizer", "explain"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 25
+prerequisites: ["mysql-postgres-internals", "sql-execution-order-joins"]
+summary: "What happens between SQL text and rows: clustered vs secondary indexes in InnoDB and Postgres, selectivity, the four join algorithms and their costs, how a cost-based optimizer uses statistics, how to read EXPLAIN and EXPLAIN ANALYZE in both engines, and the usual reasons a plan goes bad."
+---
+
+## Definition (interview-ready)
+
+**Query processing** turns a declarative SQL statement into an executable **plan**: a tree of physical operators (scans, joins, sorts, aggregates) that produces the rows. The steps are **parse → rewrite → optimize → execute**.
+
+The **cost-based optimizer** is the brain. It enumerates possible plans (which index, which join algorithm, which join order), estimates each one's cost from **statistics** about the data, and picks the cheapest. Its biggest weakness is **cardinality estimation** — guessing how many rows each step produces. Most bad plans trace back to a bad row estimate.
+
+`EXPLAIN` shows the chosen plan with estimates; `EXPLAIN ANALYZE` actually runs the query and shows real row counts and times next to the estimates. Comparing the two is the core skill of query tuning.
+
+**One-liner:** The database parses SQL, and a cost-based optimizer uses table statistics to estimate row counts and pick the cheapest plan (which indexes, which join algorithms, which join order); most slow queries come from a bad row estimate, which you find by comparing estimated and actual rows in `EXPLAIN ANALYZE`.
+
+## Why it matters
+
+- **Most production slowness is a bad plan**, not slow hardware: a missing index, an index the query can't use, or a join algorithm chosen from a wildly wrong row estimate.
+- **Indexes are not free.** Each one slows writes and uses memory. Knowing how the engine stores rows (clustered or heap) tells you what an index really costs and when it helps.
+- **Interviews** ask "why isn't my index used?", "hash join vs nested loop?", "how do you read this EXPLAIN?". Being able to reason about it from first principles stands out.
+
+This builds on [MySQL/Postgres Internals](/learn/notes/mysql-postgres-internals/) (B+ trees, the basics of EXPLAIN) and goes deeper on joins, costs and plan debugging.
+
+## Core concepts
+
+### The pipeline
+
+```
+ SQL text
+   │  parser        → syntax tree
+   │  analyzer      → resolve tables/columns, types
+   │  rewriter      → expand views, simplify, flatten subqueries
+   │  optimizer     → enumerate plans, cost them with statistics, pick cheapest
+   ▼  executor      → run the operator tree, pulling rows up from the leaves
+ rows
+```
+
+Most engines execute plans in the **iterator (Volcano) model**: each operator has a "give me the next row" call and pulls rows from its children. That's why a `LIMIT 10` on top of an index scan can stop after reading 10 rows.
+
+### Clustered vs non-clustered (secondary) indexes
+
+A **clustered index** *is* the table: the B+ tree's leaf pages hold the full rows, sorted by the index key. A table can have only one. A **non-clustered (secondary) index** is a separate B+ tree whose leaves hold the key plus a **pointer** to the row.
+
+The two big engines make opposite choices:
+
+| | **InnoDB (MySQL)** | **PostgreSQL** |
+|---|---|---|
+| Table storage | **Clustered on the primary key.** Rows live in PK order inside the PK B+ tree. | **Heap**: rows stored in no particular order in pages. Every index, including the PK, is secondary. |
+| Secondary index leaf holds | key + **primary key value** | key + **TID / ctid** (physical page number and slot) |
+| Lookup via secondary index | find PK in secondary tree, then **search the PK tree again** | find TID, then fetch that heap page directly |
+| No PK defined | first `UNIQUE NOT NULL` index, else a hidden 6-byte row ID (`GEN_CLUST_INDEX`) | doesn't matter, heap either way |
+| Range scan by PK | very fast (rows physically adjacent) | rows scattered unless recently ordered with `CLUSTER` (a one-off rewrite, not maintained) |
+| Big PK (say a 36-char UUID string) | bloats **every** secondary index, random inserts split pages | only the PK index itself is big |
+| An update changing one indexed column | only that index plus the clustered row change | new tuple version; every index needs a new entry unless it's a **HOT** update (no indexed column changed and room on the same page) |
+
+**Consequences to remember:**
+
+- InnoDB: keep the PK **short and roughly increasing** (`BIGINT AUTO_INCREMENT`, or time-ordered IDs). Random UUIDv4 PKs cause page splits and a fragmented clustered index.
+- InnoDB secondary indexes contain the PK for free, so an index on `(email)` already **covers** `SELECT id FROM users WHERE email = ?`.
+- Postgres: an **index-only scan** can skip the heap only for pages marked all-visible in the **visibility map**, so it depends on VACUUM keeping that map current.
+
+### Covering indexes and index-only scans
+
+If every column the query needs is in the index, the engine never touches the table.
+
+```sql
+CREATE INDEX idx_orders_user_created ON orders (user_id, created_at, status);
+
+-- covered: needs only user_id, created_at, status
+SELECT created_at, status FROM orders WHERE user_id = 42 ORDER BY created_at DESC LIMIT 20;
+```
+
+MySQL shows `Using index` in EXPLAIN's `Extra` column; Postgres shows `Index Only Scan` (with `Heap Fetches: N` under ANALYZE — ideally near 0). Postgres 11+ also supports `INCLUDE (...)` to add non-key payload columns to a B-tree index.
+
+### Selectivity and why the optimizer ignores your index
+
+**Selectivity** = fraction of rows a predicate matches. `WHERE id = 5` on a unique column is highly selective (one row). `WHERE is_active = true` when 95% of rows are active is not.
+
+An index lookup costs a tree descent plus, for each matching row, a fetch from the table — often a **random** I/O. A sequential scan reads every page, but sequentially. So:
+
+- **Few matching rows** → index scan wins.
+- **Many matching rows** → sequential scan wins, because thousands of random fetches are slower than one pass. There's no universal cutoff; it depends on row width, caching, and how physically correlated the index order is with the table order.
+- **In between (Postgres)** → **Bitmap Index Scan + Bitmap Heap Scan**: collect all matching row locations from the index, sort them by page, then read each heap page once in physical order. Bitmaps can also be AND-ed / OR-ed across several indexes.
+
+Postgres models this with `seq_page_cost = 1.0` and `random_page_cost = 4.0` (defaults). On SSDs or fully cached data, lowering `random_page_cost` (for example to about 1.1) makes index scans look cheaper, which is often closer to reality.
+
+**Composite index rule (leftmost prefix):** an index on `(a, b, c)` helps `WHERE a = ?`, `WHERE a = ? AND b = ?`, `WHERE a = ? AND b > ?`, but not `WHERE b = ?` alone, at least not efficiently. (MySQL 8.0.13+ and PostgreSQL 18+ can sometimes use a **skip scan** for that case, which works well only when `a` has few distinct values.) Put equality columns first and the range column last.
+
+### Join algorithms
+
+Notation (from CMU 15-445): outer table R has **M** pages and **m** rows; inner table S has **N** pages and **n** rows; **B** buffer pages of memory; **C** is the cost of one index probe. Costs count page I/Os.
+
+**1. Nested loop join (NLJ)**
+
+```
+for each row r in R:            -- outer
+    for each row s in S:        -- inner, scanned again and again
+        if match(r, s): emit
+```
+
+- Simple version: M + m·N. Terrible for large tables.
+- **Block nested loop**: load a chunk of R (B − 2 pages) and scan S once per chunk: M + ⌈M / (B − 2)⌉ · N.
+- Works with **any** join condition (`<`, `LIKE`, functions).
+- Wins when the outer side is **tiny** (a handful of rows).
+
+**2. Index nested loop join**
+
+```
+for each row r in R:
+    look up matching rows in S via an index on S.join_col
+```
+
+- Cost: M + m·C, where C is a B-tree lookup (a few page reads, often cached).
+- **Wins when the outer side is small and the inner has an index on the join key** — the bread and butter of OLTP: "get this user's 20 orders and their products".
+- Degrades badly if the optimizer **underestimates** the outer rows: 10 estimated becomes 1,000,000 actual → a million index probes.
+
+**3. Hash join**
+
+```
+build:  scan the smaller input, put rows into a hash table keyed on the join column
+probe:  scan the larger input, hash each row's join key, look up matches
+```
+
+- In memory: about M + N (each input read once).
+- If the build side doesn't fit in memory, **Grace / hybrid hash join** partitions both inputs to disk by hash first: about 3(M + N).
+- **Equality joins only** in the classic algorithm (Postgres hash join requires `=`; MySQL 8.0.20+ can also run non-equi joins through its hash join by filtering afterwards; 8.0.18 and 8.0.19 needed an equi-join condition).
+- No index needed, no sorted input needed.
+- **Wins for large, unsorted inputs with an equality condition** — analytics, reporting, big batch joins.
+- Memory: Postgres sizes it with `work_mem` (times `hash_mem_multiplier`); MySQL with `join_buffer_size`. Spilling to disk shows up as `Batches: N` greater than 1 in Postgres.
+
+**4. Sort-merge join**
+
+```
+sort R on the key, sort S on the key
+walk both sorted lists together, emitting matches
+```
+
+- Cost: sort(R) + sort(S) + (M + N). Sorting is about 2M · (1 + ⌈log base (B−1) of ⌈M/B⌉⌉) I/Os for external sort, and **free if the input is already sorted** (from an index or an earlier step).
+- Works for equality (and in some engines, range) joins. Worst case is many duplicates of the same key on both sides.
+- **Wins when both inputs are already sorted on the join key**, or when the output must be sorted anyway (`ORDER BY` the join key), or for huge inputs where a hash table would spill.
+
+**Summary**
+
+| Algorithm | Needs | Cost (I/O, roughly) | Best when | Engines |
+|---|---|---|---|---|
+| Nested loop | nothing | M + m·N (block: M + ⌈M/(B−2)⌉·N) | outer tiny, or non-equi condition | PG, MySQL |
+| Index nested loop | index on inner join key | M + m·C | small outer, indexed inner (OLTP) | PG, MySQL |
+| Hash join | equality condition, memory | about M + N; 3(M + N) if partitioned | big unsorted inputs, equi-join | PG; MySQL 8.0.18+ |
+| Sort-merge | sortable keys | sort costs + M + N | inputs already sorted / output needs order | PG (MySQL has no merge join) |
+
+MySQL history worth knowing: before 8.0.18 MySQL only had nested-loop variants (plus block nested loop). 8.0.18 added hash join; from 8.0.20 block nested loop was removed and hash join is used wherever BNL was used before.
+
+### The cost-based optimizer
+
+**Statistics** the optimizer keeps per table and column:
+
+- row count and page count,
+- number of distinct values (n_distinct),
+- fraction of NULLs,
+- **most common values** (MCVs) and their frequencies,
+- a **histogram** of the remaining values,
+- **correlation** between physical row order and column order (Postgres) — high correlation makes index range scans cheaper.
+
+Postgres collects them with `ANALYZE` (autovacuum runs it automatically); detail is controlled by `default_statistics_target` (default 100), adjustable per column. MySQL InnoDB keeps persistent index statistics (refreshed by `ANALYZE TABLE` and automatic recalculation) and, since 8.0, optional column **histograms** (`ANALYZE TABLE t UPDATE HISTOGRAM ON col`).
+
+**Cardinality estimation** — rows out of each operator:
+
+- `col = const` → MCV frequency, or (1 − null fraction − MCV total) / remaining distinct values.
+- `col < x` → histogram fraction.
+- `a = 1 AND b = 2` → by default, **multiply** selectivities, assuming the columns are **independent**. When they're correlated (city and zip code), this badly underestimates. Postgres 10+ offers `CREATE STATISTICS` for multi-column dependencies and distinct counts; MCV lists on column groups arrived in 12.
+- Join output size → estimated from the distinct counts on both sides of the key.
+
+Errors **multiply up the tree**: a 10x error at the bottom can become 1000x after a few joins. Research (Leis et al., "How Good Are Query Optimizers, Really?", VLDB 2015) found cardinality estimation errors, not the cost model, are the main cause of bad plans.
+
+**Join ordering.** For n tables there are a huge number of possible orders (n! left-deep orders alone). The classic approach (System R, Selinger et al. 1979) is **dynamic programming** over subsets of tables, keeping the cheapest plan per subset and noting "interesting orders" (sorted outputs useful later).
+
+- Postgres uses exhaustive dynamic programming up to `geqo_threshold` (default 12) FROM items, then switches to a genetic algorithm (GEQO). `join_collapse_limit` and `from_collapse_limit` (default 8) limit how much it reorders explicit joins and subqueries.
+- MySQL's optimizer does a greedy/heuristic search over join orders bounded by `optimizer_search_depth`.
+
+**Hints.** MySQL supports index hints (`USE INDEX`, `FORCE INDEX`, `IGNORE INDEX`) and optimizer hints (`/*+ ... */`). Core Postgres has **no hints**; you fix statistics, rewrite the query, or (session-level, for debugging) toggle `enable_nestloop`, `enable_seqscan` and friends. The `pg_hint_plan` extension adds hints if you must.
+
+## How it works (reading plans)
+
+### Postgres EXPLAIN
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT o.id, o.total, u.email
+FROM orders o
+JOIN users u ON u.id = o.user_id
+WHERE o.created_at >= now() - interval '1 day'
+  AND o.status = 'PAID';
+```
+
+```
+Hash Join  (cost=1250.40..9832.11 rows=4810 width=48) (actual time=12.1..58.7 rows=5122 loops=1)
+  Hash Cond: (o.user_id = u.id)
+  Buffers: shared hit=3120 read=410
+  ->  Bitmap Heap Scan on orders o  (cost=210.3..8540.2 rows=4810 width=24) (actual time=3.2..41.0 rows=5122 loops=1)
+        Recheck Cond: (created_at >= (now() - '1 day'::interval))
+        Filter: (status = 'PAID'::text)
+        Rows Removed by Filter: 830
+        ->  Bitmap Index Scan on idx_orders_created_at  (cost=0.00..209.1 rows=5900 width=0) (actual time=2.1..2.1 rows=5952 loops=1)
+              Index Cond: (created_at >= (now() - '1 day'::interval))
+  ->  Hash  (cost=790.0..790.0 rows=20000 width=32) (actual time=8.4..8.4 rows=20000 loops=1)
+        Buckets: 32768  Batches: 1  Memory Usage: 1400kB
+        ->  Seq Scan on users u  (cost=0.00..790.0 rows=20000 width=32) (actual time=0.01..3.9 rows=20000 loops=1)
+Planning Time: 0.4 ms
+Execution Time: 59.3 ms
+```
+
+(Illustrative output; your numbers will differ.)
+
+How to read it:
+
+- **Read inside-out, bottom-up.** Indented nodes are children; they run first and feed their parent.
+- `cost=startup..total` — planner's estimate in arbitrary units (not ms). Startup is the cost before the first row (a Hash must build fully first).
+- `rows` — **estimated** rows; `actual ... rows` — **real** rows **per loop**. Multiply by `loops` for totals (important for the inner side of a nested loop).
+- **Compare estimated vs actual rows at every node.** Within a few times is fine; 100x or more off is the first thing to fix.
+- `Rows Removed by Filter` — rows read and thrown away. Large numbers mean the index isn't selective enough or the filter column isn't indexed.
+- `Buffers: shared hit / read` — pages from cache vs from disk (or OS cache). `BUFFERS` is included automatically with `ANALYZE` since Postgres 18; add it explicitly on older versions.
+- `Batches` greater than 1 on a Hash, or `Sort Method: external merge  Disk: ...` → spilled to disk; consider more `work_mem`.
+- Node types to know: `Seq Scan`, `Index Scan`, `Index Only Scan` (check `Heap Fetches`), `Bitmap Heap/Index Scan`, `Nested Loop`, `Hash Join`, `Merge Join`, `Sort`, `HashAggregate`, `Gather` (parallel).
+
+**Warning:** `EXPLAIN ANALYZE` really executes the statement. For `UPDATE`/`DELETE`/`INSERT`, wrap it: `BEGIN; EXPLAIN ANALYZE ...; ROLLBACK;`.
+
+### MySQL EXPLAIN
+
+Classic tabular output, one row per table access:
+
+```sql
+EXPLAIN SELECT o.id, o.total, u.email
+FROM orders o JOIN users u ON u.id = o.user_id
+WHERE o.user_id = 42 AND o.status = 'PAID';
+```
+
+```
++----+-------------+-------+-------+-----------------+-----------------+---------+-------------+------+-------+
+| id | select_type | table | type  | possible_keys   | key             | key_len | ref         | rows | Extra |
++----+-------------+-------+-------+-----------------+-----------------+---------+-------------+------+-------+
+|  1 | SIMPLE      | u     | const | PRIMARY         | PRIMARY         | 8       | const       |    1 | NULL  |
+|  1 | SIMPLE      | o     | ref   | idx_user_status | idx_user_status | 10      | const,const |   12 | NULL  |
++----+-------------+-------+-------+-----------------+-----------------+---------+-------------+------+-------+
+```
+
+(Illustrative; actual output includes `partitions` and `filtered` columns too.)
+
+The columns that matter:
+
+- **`type`** (access type), best to worst: `system` / `const` (at most one row, by PK or unique key) → `eq_ref` (one row per outer row via a unique key — ideal join) → `ref` (non-unique index lookup) → `range` (index range) → `index` (full index scan) → **`ALL`** (full table scan — investigate).
+- **`key`** — index actually chosen; `possible_keys` — candidates. `key = NULL` with non-empty `possible_keys` means the optimizer decided the index wasn't worth it.
+- **`key_len`** — bytes of the index used; tells you how many columns of a composite index were used.
+- **`rows`** × **`filtered`** — estimated rows examined and the percentage surviving the conditions.
+- **`Extra`**: `Using index` (covering, good), `Using where` (filter after reading), `Using filesort` (extra sort step), `Using temporary` (temp table, often for GROUP BY / DISTINCT), `Using index condition` (index condition pushdown), `Using join buffer (hash join)`.
+
+**Tree format and ANALYZE** (MySQL 8.0.16+ for `FORMAT=TREE`, 8.0.18+ for `EXPLAIN ANALYZE`):
+
+```
+EXPLAIN ANALYZE SELECT ...;
+
+-> Nested loop inner join  (cost=5.4 rows=12) (actual time=0.05..0.09 rows=12 loops=1)
+    -> Index lookup on o using idx_user_status (user_id=42, status='PAID')  (cost=4.2 rows=12) (actual time=0.04..0.06 rows=12 loops=1)
+    -> Single-row index lookup on u using PRIMARY (id=o.user_id)  (cost=0.25 rows=1) (actual time=0.002..0.002 rows=1 loops=12)
+```
+
+Same reading rules as Postgres: compare estimated `rows` with actual `rows`, and multiply by `loops`. MySQL's `EXPLAIN ANALYZE` also runs the query. It prints tree format by default; MySQL 8.3+ can also print it as JSON (with `explain_json_format_version = 2`).
+
+## Common plan problems
+
+### 1. Stale or missing statistics
+
+After a bulk load, a big delete, or on a fast-growing table, stats describe yesterday's data. Symptom: estimated rows wildly different from actual; a nested loop chosen for what is really a million-row input.
+
+Fix: `ANALYZE table` (Postgres) / `ANALYZE TABLE t` (MySQL); run it after bulk loads; raise per-column statistics targets for skewed columns; add extended statistics (`CREATE STATISTICS`, Postgres) for correlated columns; MySQL histograms for non-indexed filter columns.
+
+### 2. Functions or expressions on the indexed column
+
+```sql
+-- index on created_at can't be used: the column is wrapped in a function
+WHERE DATE(created_at) = '2026-10-01'
+WHERE lower(email) = 'a@b.com'
+WHERE amount * 100 > 5000
+```
+
+The B-tree is sorted by `created_at`, not by `DATE(created_at)`. Fix by making the predicate **sargable** (the column alone on one side):
+
+```sql
+WHERE created_at >= '2026-10-01' AND created_at < '2026-10-02'
+WHERE amount > 50
+```
+
+or index the expression: Postgres `CREATE INDEX ON users (lower(email));`, MySQL 8.0.13+ functional key parts `CREATE INDEX idx ON users ((lower(email)));`.
+
+### 3. Implicit type conversion
+
+```sql
+-- phone is VARCHAR and indexed
+SELECT * FROM users WHERE phone = 9876543210;     -- number literal
+```
+
+In MySQL, comparing a string column with a number converts both to floating point; many strings ('1', ' 1', '1a') can equal the number, so **the index can't be used**. Quote the literal: `WHERE phone = '9876543210'`. Similar traps: joining columns of different types or collations, and ORM parameters bound with the wrong type. In Postgres, a mismatched type may force a cast on the column side and prevent index use; check EXPLAIN for casts like `(col)::numeric` on the column.
+
+### 4. OR conditions
+
+```sql
+WHERE user_id = 42 OR email = 'a@b.com'
+```
+
+A single index can't serve both branches. Engines can combine two indexes (Postgres **BitmapOr**, MySQL **index_merge** union), but often fall back to a full scan. A reliable rewrite is `UNION ALL` (or `UNION` if duplicates are possible) of two indexed queries. `OR` on the same column (`status = 'A' OR status = 'B'`) is fine; write it as `IN (...)`.
+
+### 5. Other frequent ones
+
+- **Leading wildcard**: `LIKE '%foo'` can't use a B-tree. Use a trigram index (Postgres `pg_trgm`) or full-text search.
+- **Wrong composite column order**: index `(created_at, user_id)` won't help `WHERE user_id = ?` alone (skip scan can't help either, because `created_at` has too many distinct values).
+- **Correlated columns** → underestimates → nested loops on huge inputs.
+- **Parameter-sensitive plans**: a cached generic plan that's good for a rare value and terrible for a common one (Postgres prepared statements use custom plans for the first five executions, then may switch to a cached generic plan if it doesn't look more expensive; `plan_cache_mode` controls this).
+- **`OFFSET` pagination**: `OFFSET 100000` still reads and discards 100,000 rows. Use keyset pagination: `WHERE (created_at, id) < (?, ?) ORDER BY created_at DESC, id DESC LIMIT 20`.
+- **`SELECT *`** defeats covering indexes and moves more data.
+- **`NOT IN` with a nullable subquery column** returns no rows if any NULL exists, and often plans badly; prefer `NOT EXISTS`.
+
+## Real-world examples
+
+- **Postgres planner settings** are documented with their defaults (`random_page_cost = 4.0`, `default_statistics_target = 100`, `geqo_threshold = 12`), and the docs recommend fixing statistics or cost constants rather than leaving `enable_*` switches off.
+- **MySQL 8.0.20** removed block nested loop entirely in favour of hash join — a real change that altered plans for many unindexed joins.
+- **Leis et al. (VLDB 2015)** benchmarked real optimizers on the Join Order Benchmark and showed that cardinality errors grow quickly with the number of joins.
+
+## Common pitfalls
+
+- **Adding an index without checking EXPLAIN** — it might not be used, and it still costs every write.
+- **Trusting `EXPLAIN` without `ANALYZE`** — estimates can be wildly wrong; only actuals tell you.
+- **Running `EXPLAIN ANALYZE` on a write in production** without a rollback.
+- **Forgetting `loops`** — a node with `actual rows=10 loops=50000` produced 500,000 rows.
+- **Long, random UUID primary keys in InnoDB** — slow inserts and bloated secondary indexes.
+- **Turning off `enable_nestloop` globally** to fix one query — fixes one plan, breaks others.
+- **Ignoring autovacuum** in Postgres — stale stats and a stale visibility map mean bad estimates and no index-only scans.
+- **Over-indexing** — many single-column indexes are usually worse than one well-ordered composite index.
+
+## Practice questions
+
+<Practice>
+
+<QA q="What is the difference between a clustered and a non-clustered index?" level="easy">
+
+A **clustered** index stores the actual rows in its leaf pages, sorted by the key, so it *is* the table and there can be only one. A **non-clustered (secondary)** index is a separate structure whose leaves hold the key and a pointer to the row. InnoDB clusters every table on its primary key, and secondary index leaves hold the PK value. Postgres stores rows in an unordered heap, and every index (PK included) is secondary, pointing to a physical tuple ID.
+
+</QA>
+
+<QA q="What is a covering index and how do you spot it in EXPLAIN?" level="easy">
+
+An index that contains every column a query needs, so the engine answers from the index alone without visiting the table. MySQL shows `Using index` in `Extra`; Postgres shows `Index Only Scan`, ideally with `Heap Fetches` near 0 (which depends on the visibility map being current). In InnoDB, secondary indexes implicitly include the PK columns.
+
+</QA>
+
+<QA q="Why might the optimizer choose a sequential scan even though an index exists?" level="easy">
+
+Because the predicate isn't selective: if it matches a large fraction of rows, thousands of random index-to-table fetches cost more than one sequential pass. Other reasons: the table is tiny, stats are stale and over-estimate the matches, the query wraps the column in a function or cast so the index can't apply, or the index's leading column isn't in the filter.
+
+</QA>
+
+<QA q="Describe the four join algorithms in one line each." level="easy">
+
+**Nested loop**: for each outer row, scan the inner — works for any condition, good only when the outer is tiny. **Index nested loop**: for each outer row, probe an index on the inner — best for small outer and indexed inner (OLTP). **Hash join**: build a hash table on the smaller input, probe with the larger — best for big unsorted equi-joins. **Sort-merge**: sort both on the key and merge — best when inputs are already sorted or output must be sorted.
+
+</QA>
+
+<QA q="Why does InnoDB care so much about primary key choice?" level="medium">
+
+The table is clustered on the PK, so the PK decides physical row order, and every secondary index stores the PK value as its row pointer. A long PK (like a 36-character UUID string) makes every secondary index larger. A random PK (UUIDv4) inserts into random pages, causing page splits, fragmentation and poor cache locality. A short, increasing PK (`BIGINT AUTO_INCREMENT` or time-ordered IDs) appends to the right edge of the tree.
+
+</QA>
+
+<QA q="When does a hash join beat an index nested loop join, and vice versa?" level="medium">
+
+Index nested loop costs about one index probe per outer row (M + m·C), so it wins when the outer side is small, the inner has an index on the join key, or you need only the first few rows (it streams). Hash join reads each input once (about M + N, or 3(M + N) if it spills), so it wins when both inputs are large, or there's no useful index, and the condition is equality. The crossover depends on the outer row count, which is why a bad cardinality estimate flips the choice the wrong way.
+
+</QA>
+
+<QA q="What statistics does an optimizer use and how does it estimate rows for a = 1 AND b = 2?" level="medium">
+
+Per table: row and page counts. Per column: distinct count, NULL fraction, most common values with frequencies, a histogram, and (Postgres) physical correlation. For `a = 1 AND b = 2` it estimates each selectivity from MCVs or histogram/distinct counts, then **multiplies** them, assuming independence. If `a` and `b` are correlated (city and zip), the true result is much larger than the product and the plan may pick nested loops wrongly. Postgres `CREATE STATISTICS` can capture such dependencies.
+
+</QA>
+
+<QA q="How do you read an EXPLAIN ANALYZE plan in Postgres? What do you look for first?" level="medium">
+
+Read bottom-up, inside-out: indented children run first and feed their parent. For each node compare estimated `rows` with `actual rows` times `loops` — a large mismatch is the root cause of most bad plans. Then look for the most expensive node by actual time, big `Rows Removed by Filter`, sequential scans on large tables, nested loops with huge loop counts, hash `Batches` above 1 or sorts spilling to disk, and `Buffers: read` (disk) vs `hit` (cache). Remember ANALYZE executes the statement.
+
+</QA>
+
+<QA q="What do the MySQL EXPLAIN type values mean? Rank them." level="medium">
+
+From best to worst: `system`/`const` (at most one matching row by PK or unique key), `eq_ref` (exactly one row per outer row via unique key — ideal for joins), `ref` (non-unique index lookup), `range` (index range scan), `index` (full scan of an index), `ALL` (full table scan). `ALL` on a big table in an OLTP query is usually a missing or unusable index.
+
+</QA>
+
+<QA q="Why is `WHERE DATE(created_at) = '2026-10-01'` slow, and how do you fix it?" level="medium">
+
+The index on `created_at` is ordered by the raw column, not by `DATE(created_at)`, so the engine must compute the function for every row (full scan). Rewrite it as a sargable range: `created_at >= '2026-10-01' AND created_at < '2026-10-02'`. Or create an expression index (Postgres `CREATE INDEX ON t ((created_at::date))` for a `timestamp` column; on `timestamptz` the cast depends on the time zone, isn't immutable and is rejected; MySQL 8.0.13+ functional index) if you can't change the query.
+
+</QA>
+
+<QA q="How does a cost-based optimizer choose a join order for many tables?" level="hard">
+
+It can't try all n! orders, so it uses **dynamic programming** (System R style): find the best plan for every single table, then every pair, then every set of three, and so on, keeping the cheapest plan per subset (plus plans with useful sort orders). Postgres does exhaustive DP up to `geqo_threshold` (12) FROM items and then switches to a genetic algorithm; `join_collapse_limit` (8) limits reordering of explicit JOINs. MySQL uses a greedy search bounded by `optimizer_search_depth`. Every step relies on cardinality estimates, so errors in estimates compound across joins.
+
+</QA>
+
+<QA q="Explain the Postgres bitmap heap scan. When is it chosen?" level="hard">
+
+It's the middle ground between an index scan and a sequential scan. The Bitmap Index Scan collects all matching tuple locations from one or more indexes into an in-memory bitmap, which can be AND-ed or OR-ed across indexes. The Bitmap Heap Scan then visits heap pages in physical order, reading each page once. It's chosen when the predicate matches too many rows for random index fetches but few enough that a full scan is wasteful, or to combine several indexes for AND/OR conditions. If the bitmap gets too big for `work_mem` it goes lossy (remembers whole pages, not rows), shown as `Heap Blocks: lossy=...` and `Rows Removed by Index Recheck`, because every row on those pages must be re-checked.
+
+</QA>
+
+<QA q="Why can an index on a VARCHAR column be ignored when the query compares it to a number in MySQL?" level="hard">
+
+MySQL compares a string with a number as floating-point values, so many different strings ('1', ' 1', '1a') equal the number 1. Because the mapping isn't one-to-one with the index order, MySQL can't do an index lookup and scans instead. Fix: pass the value as a string literal or bind it with the right type in the driver/ORM. Comparing an integer column with a string literal is fine, because the string converts to one number.
+
+</QA>
+
+<QA q="A query that ran in 20 ms now takes 30 s after a nightly bulk import. Nothing in the code changed. How do you debug it?" level="scenario">
+
+Suspect a plan change caused by stale statistics. Run `EXPLAIN (ANALYZE, BUFFERS)` (on a replica or with a timeout) and compare estimated vs actual rows; typically an estimate of tens of rows hides millions after the import, and the planner picked a nested loop. Fix: `ANALYZE` the imported tables (and add it to the import job), consider raising the statistics target for skewed columns, and check autovacuum/analyze is keeping up. In MySQL, `ANALYZE TABLE` and check whether persistent stats recalculated.
+
+</QA>
+
+<QA q="A dashboard query uses WHERE customer_id = ? OR referrer_id = ? and does a full scan on a 200M-row table. Both columns are indexed. What do you do?" level="scenario">
+
+A single B-tree can't satisfy an OR across two columns, and the optimizer judged index merge or BitmapOr too costly (or stats were off). Rewrite as two index-friendly queries combined: `SELECT ... WHERE customer_id = ? UNION SELECT ... WHERE referrer_id = ?`. `UNION` removes the rows that match both branches. `UNION ALL` is cheaper because it skips that dedup step; to use it safely, make the second branch exclude rows the first already returned (for example `AND customer_id IS DISTINCT FROM ?`). Verify each branch uses its index with EXPLAIN. Also make sure stats are fresh, since a bad estimate can make the bitmap/index-merge plan look worse than it is.
+
+</QA>
+
+<QA q="Deep pagination with OFFSET 500000 LIMIT 20 is slow even with an index on created_at. Why, and what is the fix?" level="scenario">
+
+The engine still has to walk and discard 500,000 index entries (and often fetch their rows) before returning 20. Cost grows linearly with the offset. Use **keyset (seek) pagination**: remember the last row's sort key and query `WHERE (created_at, id) < (:last_created_at, :last_id) ORDER BY created_at DESC, id DESC LIMIT 20` with an index on `(created_at, id)`. Each page is then a short index range scan regardless of depth.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="In InnoDB, what does a secondary index leaf entry store to locate the full row?" options={["The physical page and slot number", "The primary key value", "A hash of the row", "The row's undo log pointer"]} answer={1}>
+
+InnoDB secondary indexes store the primary key, then look up the clustered index. Postgres indexes store a physical tuple ID (ctid) into the heap.
+
+</MCQ>
+
+<MCQ q="Which join algorithm works for a non-equality condition like a.ts BETWEEN b.start AND b.end without any index?" options={["Classic hash join", "Nested loop join", "Index nested loop join", "None of them"]} answer={1}>
+
+Nested loop evaluates any predicate for each pair of rows. Classic hash join needs equality, and index nested loop needs a usable index.
+
+</MCQ>
+
+<MCQ q="An EXPLAIN ANALYZE node shows rows=10 estimated and actual rows=2 with loops=40000. How many rows did it really produce in total?" options={["10", "2", "80,000", "400,000"]} answer={2}>
+
+Actual rows are per loop. 2 × 40,000 = 80,000. Forgetting loops is a common mistake when reading the inner side of nested loops.
+
+</MCQ>
+
+<MCQ q="Which predicate can use a B-tree index on created_at directly?" options={["WHERE DATE(created_at) = '2026-10-01'", "WHERE created_at + interval '1 day' > now()", "WHERE created_at >= '2026-10-01' AND created_at < '2026-10-02'", "WHERE CAST(created_at AS text) LIKE '2026-10-01%'"]} answer={2}>
+
+Only the range with the bare column on one side is sargable. The others apply a function or expression to the column for every row.
+
+</MCQ>
+
+<MCQ q="Why does the optimizer underestimate rows for WHERE city = 'Pune' AND pincode = '411001'?" options={["Histograms ignore string columns", "It multiplies the two selectivities, assuming the columns are independent, but they are strongly correlated", "Indexes on two columns cancel out", "The planner always assumes 1 row for AND"]} answer={1}>
+
+The independence assumption multiplies selectivities. Correlated columns make the real result much larger. Postgres CREATE STATISTICS can model such dependencies.
+
+</MCQ>
+
+<MCQ q="In MySQL EXPLAIN, which access type is best for the inner table of a join?" options={["ALL", "index", "range", "eq_ref"]} answer={3}>
+
+eq_ref means exactly one row per outer row through a unique or primary key, which is the ideal join access. ALL is a full table scan.
+
+</MCQ>
+
+<MCQ q="Which statement about MySQL hash joins is correct?" options={["They have existed since MySQL 5.5", "They were added in 8.0.18 and replaced block nested loop from 8.0.20", "They require an index on the join column", "They are only used for outer joins"]} answer={1}>
+
+Hash join arrived in 8.0.18; in 8.0.20 block nested loop was removed and hash join used in its place. Hash joins need no index.
+
+</MCQ>
+
+<MCQ q="A Postgres Hash node shows Batches: 16. What does that indicate?" options={["The hash table did not fit in work_mem and spilled to disk in partitions", "The query ran in 16 parallel workers", "16 indexes were used", "The plan was re-optimized 16 times"]} answer={0}>
+
+More than one batch means the build side exceeded the memory budget and was partitioned to disk (a hybrid hash join). Raising work_mem for the session or reducing the build input avoids it.
+
+</MCQ>
+
+<MCQ q="Postgres has no built-in optimizer hints. What is the recommended first fix for a plan built on bad row estimates?" options={["Set enable_nestloop = off globally", "Rebuild all indexes", "Refresh or improve statistics (ANALYZE, higher statistics target, extended statistics)", "Increase shared_buffers"]} answer={2}>
+
+Bad estimates come from bad statistics. Fix the stats first; the docs describe enable_* switches as temporary per-query workarounds, not tuning.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- Pipeline: parse → rewrite → **cost-based optimize** (stats → cardinality → cost → pick) → execute (iterator model).
+- **InnoDB** = clustered on PK; secondary → PK → row (double lookup). Keep the PK short and increasing. **Postgres** = heap; every index → ctid; index-only scans need the visibility map.
+- Selective predicate → index; non-selective → seq scan; in between → **bitmap scan** (PG).
+- Joins: **NLJ** (tiny outer / any condition), **index NLJ** (small outer + indexed inner, OLTP), **hash** (big equi-joins, about M + N), **sort-merge** (already sorted inputs). MySQL: hash join 8.0.18+, no merge join.
+- Bad plans usually = **bad row estimates**: stale stats, correlated columns, skew. Fix stats before forcing plans.
+- **EXPLAIN ANALYZE**: bottom-up; compare est vs actual rows × loops; watch Rows Removed by Filter, Batches, disk sorts, Buffers. It executes the query.
+- MySQL `type`: const, eq_ref, ref, range, index, **ALL**. `Extra`: Using index (good), Using filesort / temporary (look closer).
+- Index killers: functions on the column, implicit casts (string column vs number), OR across columns, leading `%`, wrong composite order, OFFSET pagination.
+
+## Go deeper
+
+- **CMU 15-445 notes**: [Join Algorithms](https://15445.courses.cs.cmu.edu/fall2019/notes/11-joins.pdf).
+- **PostgreSQL docs**: [Using EXPLAIN](https://www.postgresql.org/docs/current/using-explain.html), [Statistics Used by the Planner](https://www.postgresql.org/docs/current/planner-stats.html), [Index-Only Scans](https://www.postgresql.org/docs/current/indexes-index-only-scans.html), [Indexes on Expressions](https://www.postgresql.org/docs/current/indexes-expressional.html), [CREATE STATISTICS](https://www.postgresql.org/docs/current/sql-createstatistics.html).
+- **MySQL docs**: [EXPLAIN Output Format](https://dev.mysql.com/doc/refman/8.4/en/explain-output.html), [Hash Join Optimization](https://dev.mysql.com/doc/refman/8.4/en/hash-joins.html), [Clustered and Secondary Indexes](https://dev.mysql.com/doc/refman/8.4/en/innodb-index-types.html), [Type Conversion in Expression Evaluation](https://dev.mysql.com/doc/refman/8.4/en/type-conversion.html), [Optimizer Statistics](https://dev.mysql.com/doc/refman/8.4/en/optimizer-statistics.html).
+- **Leis et al. (VLDB 2015)**: [How Good Are Query Optimizers, Really?](https://www.vldb.org/pvldb/vol9/p204-leis.pdf)
+- **Markus Winand**: [Use The Index, Luke](https://use-the-index-luke.com/) — free book on indexing for developers.
+- Related notes: [Concurrency Control](/learn/notes/concurrency-control-locking/), [Crash Recovery](/learn/notes/recovery-wal-aries/).

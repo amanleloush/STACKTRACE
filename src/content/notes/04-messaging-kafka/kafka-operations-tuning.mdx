@@ -1,0 +1,393 @@
+---
+title: "Kafka in Production: Sizing, Tuning, Monitoring, Security"
+phase: "04-messaging-kafka"
+order: 38
+tags: ["messaging"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 15
+prerequisites: ["kafka-internals", "kafka-consumer-rebalancing"]
+summary: "How to size partitions, which configs actually move throughput, the runbooks for lag and producer slowdowns, tiered storage, securing a cluster, and the handful of metrics worth alerting on."
+---
+
+## Definition (interview-ready)
+
+**Operating Kafka in production** comes down to five jobs:
+
+1. **Sizing** topics: partition count, replication factor and retention, based on throughput, consumer parallelism and recovery needs.
+2. **Tuning** producers, consumers, brokers and the OS for the throughput–latency–durability trade-off you actually want.
+3. **Diagnosing** the two classic incidents: growing consumer lag, and producer slowdowns.
+4. **Securing** the cluster: encryption, authentication, authorization and quotas.
+5. **Monitoring** a small set of metrics that predict trouble, chiefly under-replicated partitions, offline partitions, controller count and consumer lag *in seconds*.
+
+**One-liner:** Running Kafka in production means sizing partitions from throughput and consumer parallelism with headroom, tuning batching and fetch sizes for your latency and throughput goals, securing it with TLS, authentication and default-deny ACLs, and alerting on under-replicated partitions and consumer lag in seconds.
+
+## Why it matters
+
+Most Kafka outages aren't Kafka bugs. They're **operational choices**: a topic created with 3 partitions that now needs 30 consumers, `acks=1` on payment events, retention shorter than the worst catch-up time, a consumer group stuck in a rebalance loop, or an unsecured cluster that any pod can write to. Senior interviews almost always include "lag is growing, what do you do?" or "how many partitions?". The interviewer wants a **structured diagnosis**, not a guess.
+
+## Core concepts
+
+### Choosing the partition count
+
+Partitions set the ceiling on **parallelism**: at most one consumer per partition within a group. Increasing the count later **remaps keys** (`hash(key) % N` changes), which breaks per-key ordering for keyed topics. So size up front with headroom.
+
+**Formula:**
+
+```
+partitions ≥ max( T / P_producer , T / P_consumer )
+then × headroom (2–3× expected growth), rounded to a highly divisible number
+```
+
+**Worked example.** An order-events topic:
+- Peak target throughput **T = 60 MB/s**. Average record 1 KB, so about 60k msgs/s.
+- One partition's produce path handles about **P_producer ≈ 10 MB/s** on your brokers, measured with `kafka-producer-perf-test`.
+- One consumer instance processes about **P_consumer ≈ 4 MB/s**. It's bounded by the DB writes downstream, which is usually the real limit.
+- Producer side needs 60 / 10 = 6. Consumer side needs 60 / 4 = **15**, so the consumer is the bottleneck.
+- Allow 2x growth → 30. Round to a divisible number → **30** (divides by 1, 2, 3, 5, 6, 10, 15 and 30, so consumer counts balance evenly). 24 or 36 would also be reasonable.
+
+**Other forces on the number:**
+- **Key cardinality and skew.** You need enough distinct keys to spread load. A few hot keys will dominate a few partitions regardless of the count.
+- **Per-partition cost.** Every partition replica means open file handles (segments and indexes), replica fetcher work, client memory (per-partition batches in the producer), and controller work during failover. Keep it to **low thousands of partition replicas per broker**. KRaft raised the *cluster-wide* metadata ceiling into the millions, but per-broker resource costs are unchanged.
+- **Don't wildly over-provision** (thousands of partitions for a 1 MB/s topic). End-to-end latency, rebalance time and recovery time all get worse.
+
+### Tuning knobs that matter
+
+| Layer | Config | Default | Throughput-leaning value | Why |
+|---|---|---|---|---|
+| Producer | `linger.ms` | 5 (Kafka 4.0+; 0 before) | 5–20 | Wait briefly so batches fill. A big win under light or moderate load |
+| Producer | `batch.size` | 16 KB | 64–256 KB | Bigger batches mean fewer requests and better compression |
+| Producer | `compression.type` | none | `lz4` or `zstd` | Compresses whole batches; saves network **and** disk |
+| Producer | `buffer.memory` | 32 MB | Sized for bursts | When full, `send()` blocks up to `max.block.ms` (60s) |
+| Producer | `acks` | all (3.0+) | all for important data | Durability, not throughput; keep `all` + idempotence |
+| Consumer | `fetch.min.bytes` | 1 | 64 KB–1 MB | The broker waits until enough data is ready, so fewer, larger fetches |
+| Consumer | `fetch.max.wait.ms` | 500 | 100–500 | Upper bound on that wait (the latency cost) |
+| Consumer | `max.poll.records` | 500 | Tuned to handler speed | Keep `max.poll.records × per-record time` well under `max.poll.interval.ms` |
+| Consumer | `max.partition.fetch.bytes` | 1 MB | Larger for big batches | Must be at least the largest record batch |
+| Broker | `num.network.threads` / `num.io.threads` | 3 / 8 | Scale with cores and disks | Watch request handler idle ratio |
+| Broker | `num.replica.fetchers` | 1 | 2–4 | Helps when followers lag (ISR churn) |
+| Broker | `socket.*.buffer.bytes` | 100 KB | Larger for cross-DC | High bandwidth-delay links need bigger windows |
+| Broker | `log.segment.bytes` | 1 GB | Usually leave alone | Affects retention granularity and file count |
+| Host | RAM for page cache | — | As much as possible | Kafka's read path *is* the page cache; keep the JVM heap small (6–8 GB is typical) |
+| OS | `vm.swappiness` | 60 | 1 | Never swap the broker |
+| OS | File descriptor limit | 1024 | 100k+ | Segments and sockets use FDs |
+| OS | Filesystem | — | XFS or ext4, `noatime` | Sequential I/O, less metadata churn |
+
+**The real lever is usually the consumer's processing code**, not the fetch configs: bulk DB writes, async I/O, and no synchronous HTTP call per record.
+
+### Why Kafka is fast (the summary)
+
+1. **Sequential appends** to segment files, with no random writes.
+2. **The OS page cache** acts as the cache. There's no copy in the JVM heap, GC pressure stays small, and data stays warm across broker restarts.
+3. **Zero-copy** (`sendfile`) from page cache to socket for consumers. This is lost with TLS, which needs user-space encryption.
+4. **Batching everywhere.** Producer batches are stored as-is and fetched in large chunks.
+5. **End-to-end compression** of batches, with the broker passing them through untouched.
+6. **Partitioning** spreads load across brokers and disks.
+7. **Pull consumers with long polling.** The broker tracks no per-message delivery state; consumers track their own offsets.
+8. **Sparse indexes** (offset and time index) instead of per-message indexes.
+
+Internals are covered in [Kafka internals](/learn/notes/kafka-internals/).
+
+### Tiered storage (KIP-405)
+
+Each partition's log is split into two tiers:
+- a **local hot tier**: recent segments on broker disks, served from the page cache.
+- a **remote cold tier**: older, closed segments uploaded to object storage (S3, GCS, Azure Blob).
+
+Consumers reading old offsets are served transparently, with the broker fetching remote segments. It became generally available in Apache Kafka **3.9**; vendors (Confluent, MSK and others) offered it earlier.
+
+Why it matters:
+- **Retention decoupled from disk.** Months or years of history without huge broker disks (`local.retention.ms` is short, `retention.ms` is long).
+- **Faster operations.** Less local data means faster broker replacement, partition reassignment and recovery.
+- **Compute and storage scale independently.**
+- It makes **Kafka as a replayable source of truth** affordable.
+
+Trade-offs: reads from the cold tier have object-store latency, and there are limits (compacted topics are still not supported).
+
+### Securing a cluster
+
+| Layer | What to do |
+|---|---|
+| **Encryption in transit** | TLS on client and inter-broker listeners. It costs CPU and disables zero-copy, so budget for it. |
+| **Authentication** | **SASL/SCRAM-SHA-512** (username and password, stored hashed), **SASL/OAUTHBEARER** (OIDC tokens from your IdP), **SASL/GSSAPI** (Kerberos, common in enterprises), or **mTLS** (client certificates; see [mTLS & certificates](/learn/notes/mtls-certificates/)). Avoid SASL/PLAIN unless it runs over TLS with an external credential store. |
+| **Authorization** | ACLs per principal on resources (topic, group, cluster, transactional ID) and operations (Read, Write, Create, Describe…). **Default deny** (`allow.everyone.if.no.acl.found=false`). Use **prefixed ACLs** for team namespaces (`payments.*`). |
+| **Encryption at rest** | Kafka has no native at-rest encryption. Use encrypted disks or volumes. For PII, use **client-side field-level encryption** so brokers never see plaintext. |
+| **Network** | Separate listeners for internal, replication and external traffic, and correct `advertised.listeners`. Restrict broker ports with security groups or network policies. |
+| **Abuse protection** | **Quotas** per principal (produce and fetch bytes per second, request-time %). This stops one team's backfill from starving everyone else. |
+| **Hygiene** | Credentials in a secrets manager, rotated; audit logs for ACL and admin changes; no `auto.create.topics.enable` in production. |
+
+### Metrics that actually matter
+
+| Metric | Healthy | Why you alert |
+|---|---|---|
+| `UnderReplicatedPartitions` | **0** | **The #1 broker alert.** A replica has fallen behind: a broker is down, a disk is slow or the network is saturated. Durability is reduced right now |
+| `OfflinePartitionsCount` | 0 | Partitions with no leader can't be read or written. This is an outage |
+| `ActiveControllerCount` | **Exactly 1** across the cluster | 0 means no one is managing leadership; more than 1 is split-brain |
+| `UnderMinIsrPartitionCount` | 0 | `acks=all` producers are getting `NotEnoughReplicas` |
+| ISR shrink / expand rate | Low, steady | Flapping replicas: GC pauses, network or disk problems |
+| Request handler avg idle % | Above ~30% | Below it, brokers are saturated and latency climbs |
+| Produce / fetch request latency p99 | Stable | Early sign of disk or network trouble |
+| Disk usage per broker | Below ~70–80% | A full disk takes the broker down and shrinks ISR |
+| **Consumer lag, records *and seconds*** | Bounded, recovers | Lag in seconds is what users feel. Records alone mislead across topics with different rates |
+| Rebalance rate | Rare | Rebalance storms mean zero progress |
+| Producer `record-error-rate`, `buffer-available-bytes` | 0, healthy | Lost sends, and backpressure reaching the app |
+| **End-to-end canary latency** | Within SLO | A synthetic producer and consumer on a canary topic measures what users actually experience |
+
+**Typical stack:** JMX → Prometheus (`jmx_exporter`) → Grafana and Alertmanager; **Burrow** or an exporter for lag evaluation; **Cruise Control** for partition balancing and self-healing. See [Metrics, logs, traces](/learn/notes/metrics-logs-traces/) for general observability practice.
+
+## How it works (runbooks)
+
+### Runbook 1: consumer lag is growing steadily
+
+```
+1. SCOPE     kafka-consumer-groups.sh --describe --group G
+             All partitions lagging?  → capacity problem.
+             One/few partitions?      → hot key, poison pill, or one slow instance.
+
+2. CHURN     Is the group rebalancing constantly? (logs: "rebalancing", heartbeat failures)
+             → max.poll.interval.ms exceeded by slow batches → shrink max.poll.records / speed handler.
+             A rebalancing group makes ~zero progress, so fix this first.
+
+3. HANDLER   Measure time per record/batch. Usually one sync DB/HTTP call dominates.
+             → batch writes, async I/O, connection pool sizing.
+
+4. MATH      incoming msg/s  vs  consumers × per-consumer msg/s
+             Below partition count? → add consumers.
+             At the ceiling?        → more partitions (mind key remap) or two-stage topology.
+
+5. ERRORS    Same offset retried forever? → poison pill → DLQ it and move on.
+
+6. SINK      Is the downstream DB/API at capacity? Adding consumers makes it WORSE.
+             → fix the sink (bulk upserts, indexes, more capacity).
+
+7. SAFETY    While fixing: is retention.ms > worst-case catch-up time?
+             If lag outruns retention, data is deleted unread.
+```
+
+### Runbook 2: producer throughput drops and latency spikes
+
+```
+1. BROKERS   UnderReplicatedPartitions > 0? A slow/dead broker shrinks ISR; acks=all waits on it.
+             Check disk I/O saturation, GC pauses, NIC.
+2. MIN ISR   NotEnoughReplicas errors → ISR < min.insync.replicas. Kafka is choosing
+             consistency over availability on purpose. Fix the broker, don't lower the floor.
+3. BUFFER    buffer-available-bytes ≈ 0 and send() blocking up to max.block.ms
+             → brokers are slow, so backpressure has reached the app.
+4. BATCHING  batch-size-avg / records-per-request dropped after a deploy?
+             A partitioner/key change can shatter batching; compression ratio drops too.
+5. QUOTAS    produce-throttle-time > 0 → hitting a client quota.
+6. LEADERS   After restarts, leadership piles onto a few brokers → run preferred leader election
+             / Cruise Control rebalance.
+7. NETWORK   Connection churn, TLS handshake storms after an LB/DNS/cert change.
+```
+
+## Real-world examples
+
+- **Cruise Control** (open-sourced by LinkedIn) automates partition rebalancing and broker decommissioning on large clusters.
+- **Burrow** (also from LinkedIn) evaluates consumer lag status across groups, instead of relying on fixed thresholds.
+- Managed services (Confluent Cloud, Amazon MSK, Aiven) remove broker operations but **not** partition sizing, client tuning, ACL design or lag monitoring. Those stay your job.
+
+## Common pitfalls
+
+- **Under-provisioned partitions on keyed topics.** Adding partitions later breaks per-key order. See [Kafka scenarios](/learn/notes/kafka-scenarios/).
+- **Alerting on lag in records only.** 10k records may be 1 second on one topic and 3 hours on another. Alert on **time lag**.
+- **No alert on `UnderReplicatedPartitions`.** You find out about durability loss during the second broker failure.
+- **Giant JVM heap.** It starves the page cache and causes long GC pauses, which cause ISR flapping. Keep the heap modest and leave RAM to the OS.
+- **Retention shorter than worst-case lag** with `auto.offset.reset=latest`. Data is skipped silently.
+- **Raising `max.poll.interval.ms` to an hour** to hide a slow handler. A truly stuck consumer then goes undetected for an hour.
+- **Turning on TLS without capacity planning.** CPU rises and zero-copy is gone.
+- **`allow.everyone.if.no.acl.found=true`** or `auto.create.topics.enable=true` in production. A typo creates a topic, and anyone can read payments.
+- **Scaling consumers when the sink is the bottleneck.** That just raises load on an already struggling DB.
+
+## Practice questions
+
+<Practice>
+
+<QA q="How do you decide the number of partitions for a new topic?" level="easy">
+
+Work from throughput and parallelism:
+- `partitions ≥ max(target ÷ per-partition producer throughput, target ÷ per-consumer throughput)`. Example: consumers handle 10 MB/s each and you need 100 MB/s, so at least **10**.
+- Partitions cap consumer parallelism, so add **2–3x headroom**. Increasing the count later remaps keys and breaks per-key ordering.
+- Have enough distinct keys to spread the load, but don't create thousands for a tiny topic. Each partition costs file handles, replication work, client memory and failover time.
+- Round to a highly divisible number (12, 24, 30, 60) so consumer counts divide evenly.
+
+</QA>
+
+<QA q="Which metric is the single most important broker alert, and why?" level="easy">
+
+**`UnderReplicatedPartitions` > 0.** It means some follower isn't keeping up with its leader, so that data currently has fewer copies than the replication factor promises. Causes include a dead broker, a slow disk, a saturated network or GC pauses. It's an early warning: one more failure and you may lose data or availability. Pair it with `OfflinePartitionsCount` (must be 0) and `ActiveControllerCount` (exactly 1 across the cluster).
+
+</QA>
+
+<QA q="Name the most important producer, consumer and broker configs for throughput tuning." level="medium">
+
+- **Producer:** `linger.ms` 5–20, `batch.size` 64–256 KB, `compression.type` lz4 or zstd, `buffer.memory` sized for bursts. Keep `acks=all` and idempotence for important data.
+- **Consumer:** higher `fetch.min.bytes` (e.g. 64 KB), `max.poll.records` matched to handler speed, enough `max.partition.fetch.bytes`, and above all an efficient handler (bulk writes, no per-record sync calls).
+- **Broker:** `num.io.threads` and `num.network.threads` sized to cores and disks, more `num.replica.fetchers` if followers lag, bigger socket buffers for cross-DC links, **lots of RAM for the page cache** with a small heap, multiple data dirs or fast disks, or tiered storage for cold data.
+- **OS:** high FD limits, `vm.swappiness=1`, XFS or ext4 with `noatime`.
+
+</QA>
+
+<QA q="How does Kafka achieve such high throughput? Summarize the design choices." level="medium">
+
+1. Append-only **sequential I/O** to segment files.
+2. **OS page cache** instead of an in-heap cache: small heaps, warm reads.
+3. **Zero-copy** `sendfile` from page cache to socket.
+4. **Batching** end to end. Batches are stored as-is.
+5. **Batch compression** that the broker passes through untouched.
+6. **Partitioning** spreads load across brokers and disks.
+7. **Pull consumers** with long polling. The broker keeps no per-message delivery state.
+8. **Sparse offset and time indexes**, not per-message ones.
+
+</QA>
+
+<QA q="What is tiered storage in Kafka and why does it matter?" level="medium">
+
+Tiered storage (KIP-405, GA in Kafka 3.9; vendors had it earlier) keeps **recent segments on local broker disks** and **offloads older closed segments to object storage** (S3, GCS). Brokers fetch remote segments transparently when consumers read old offsets.
+
+Why it matters: long retention without huge disks; faster broker recovery and reassignment because there's less local data; compute and storage scale independently; and Kafka becomes affordable as a long-term replayable log. Trade-offs: higher latency for deep historical reads, and some restrictions (e.g. compacted topics aren't supported).
+
+</QA>
+
+<QA q="How do you secure a Kafka cluster end to end?" level="medium">
+
+1. **TLS** on client and inter-broker listeners. It costs CPU and loses zero-copy.
+2. **Authentication**: SASL/SCRAM-SHA-512, SASL/OAUTHBEARER (OIDC), Kerberos (GSSAPI), or mTLS client certificates.
+3. **Authorization**: ACLs per principal on topics, groups, cluster and transactional IDs. Default deny (`allow.everyone.if.no.acl.found=false`). Prefixed ACLs for team namespaces.
+4. **At rest**: disk or volume encryption. Kafka has none natively. Use client-side field-level encryption for PII.
+5. **Hygiene**: separate internal and external listeners, quotas per principal, secrets in a vault, audit logs, network policies, and no auto-topic-creation.
+
+</QA>
+
+<QA q="Which metrics do you monitor for Kafka in production?" level="medium">
+
+- **Broker:** UnderReplicatedPartitions (0), OfflinePartitionsCount (0), ActiveControllerCount (exactly 1), UnderMinIsr, ISR shrink and expand rate, request handler idle % (alert below ~30%), produce and fetch p99 latency, disk usage.
+- **Consumer:** lag in **records and seconds**, rebalance frequency, commit failures.
+- **Producer:** record-error-rate, retry rate, buffer-available-bytes, batch-size-avg, request latency p99.
+- **End to end:** a canary producer and consumer measuring real latency.
+- **Stack:** JMX → Prometheus → Grafana and alerts, Burrow for lag, Cruise Control for balancing.
+
+</QA>
+
+<QA q="Why is alerting on consumer lag in records alone misleading?" level="medium">
+
+Records don't account for throughput. 50k records of lag is about 1 second on a topic doing 50k msg/s, and many hours on a topic doing 5 msg/s. What users feel is **how far behind in time** the consumer is: the timestamp of the last processed record compared with now, or lag in records divided by recent consume rate.
+
+Alert on time lag against the SLO. Also alert when time lag approaches **retention**, because past that point data is deleted before it's read.
+
+</QA>
+
+<QA q="Why should brokers have a small JVM heap and lots of free RAM?" level="medium">
+
+Kafka deliberately doesn't cache data in the heap. Reads of recent data come from the **OS page cache**, and producer writes land there before being flushed. A large heap takes RAM away from the page cache, so more reads hit the disk, and it causes long GC pauses. Those pauses make followers miss `replica.lag.time.max.ms`, which shrinks the ISR and can stall `acks=all` producers. A typical setup is a 6–8 GB heap with the rest of the machine's RAM left to the OS.
+
+</QA>
+
+<QA q="A consumer group's lag is growing steadily. Walk through your diagnosis." level="scenario">
+
+1. **Scope**: `kafka-consumer-groups.sh --describe`. If all partitions lag, it's a capacity problem. If one or a few lag, suspect a hot key, a poison pill or one slow instance.
+2. **Rebalance churn**: frequent rebalances, often from `max.poll.interval.ms` being exceeded, mean almost no progress. Fix that first.
+3. **Handler profiling**: usually one synchronous DB or HTTP call dominates. Batch it or make it async.
+4. **Throughput math**: incoming rate vs consumers × per-consumer rate. Add consumers up to the partition count. Beyond that, add partitions or use a two-stage topology.
+5. **Errors**: is the same offset retrying forever? Send it to a DLQ.
+6. **Sink**: if the downstream DB is saturated, more consumers make it worse. Fix the sink.
+7. Meanwhile, **confirm retention exceeds worst-case catch-up time**.
+
+</QA>
+
+<QA q="Producer throughput suddenly drops and request latency spikes. What do you check?" level="scenario">
+
+1. **Broker health**: UnderReplicatedPartitions > 0, a slow or dead broker, disk I/O saturation, GC pauses, network.
+2. **`NotEnoughReplicas` errors**: the ISR is below `min.insync.replicas`, and Kafka is refusing writes on purpose. Fix the broker; don't lower the floor.
+3. **Producer buffer**: `buffer-available-bytes` near 0 and `send()` blocking on `max.block.ms` means backpressure has reached the app.
+4. **Batching regression**: has `batch-size-avg` or records-per-request dropped after a deploy (e.g. a key or partitioner change)?
+5. **Quotas**: is produce throttle time above 0?
+6. **Leader skew**: after restarts, leaders may sit on a few brokers. Run preferred leader election or a Cruise Control rebalance.
+7. **Network, DNS, TLS**: connection churn or handshake storms after an infrastructure change.
+
+</QA>
+
+<QA q="You must take one broker out of a 6-broker cluster for maintenance without impacting producers using acks=all and min.insync.replicas=2. How?" level="scenario">
+
+- Check that every partition has **RF=3** and a healthy ISR first. Then losing one broker leaves an ISR of 2, which still satisfies min ISR.
+- **Controlled shutdown** (the default) moves leadership off the broker before it stops, so clients see a quick leader change instead of timeouts.
+- For a long absence or a decommission, **reassign its partitions** to other brokers first (Cruise Control or `kafka-reassign-partitions.sh` with a throttle on replication traffic).
+- Do **one broker at a time** and wait for UnderReplicatedPartitions to return to 0 before the next.
+- Afterwards, run preferred leader election so leadership is balanced again.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="A topic needs 60 MB/s. One partition handles 10 MB/s on the produce path, and one consumer handles 4 MB/s. What is the minimum partition count before headroom?" options={["6", "10", "15", "60"]} answer={2}>
+
+Take the max of T / P_producer = 6 and T / P_consumer = 15. The consumer is the bottleneck, so you need at least 15 partitions, then add 2 to 3x headroom and round to a divisible number.
+
+</MCQ>
+
+<MCQ q="What is the producer `linger.ms` default in Kafka 4.0 and later?" options={["5 ms, raised from 0 by KIP-1030", "0 ms, unchanged since 0.8", "100 ms, to match `commit.interval.ms`", "1,000 ms, to maximize batching"]} answer={0}>
+
+KIP-1030 changed the `linger.ms` default from 0 to 5 in Kafka 4.0, so producers wait briefly for batches to fill. Throughput-tuned producers still often use 5 to 20 ms.
+
+</MCQ>
+
+<MCQ q="Which metric is usually treated as the number one broker alert?" options={["`BytesInPerSec` above a fixed threshold", "Consumer lag in records", "`ActiveControllerCount` equal to 1", "`UnderReplicatedPartitions` above 0"]} answer={3}>
+
+Under-replicated partitions mean some data has fewer copies than the replication factor promises right now, often from a dead broker, slow disk or GC pauses. `ActiveControllerCount` equal to 1 is the healthy state, not an alert.
+
+</MCQ>
+
+<MCQ q="Why do Kafka brokers usually run with a modest JVM heap of about 6 to 8 GB?" options={["Kafka stores all messages in the heap and larger heaps fragment", "The OS page cache serves reads, and a large heap steals that RAM and causes long GC pauses", "The JVM cannot address more than 8 GB", "Larger heaps disable zero-copy"]} answer={1}>
+
+Kafka relies on the OS page cache, not an in-heap cache. A big heap leaves less RAM for the page cache and causes long GC pauses, which make followers miss `replica.lag.time.max.ms` and shrink the ISR.
+
+</MCQ>
+
+<MCQ q="Why is alerting on consumer lag in records alone misleading?" options={["Records are counted differently by each client library", "Lag in records is always zero for compacted topics", "The same record count can mean one second on a busy topic and hours on a quiet one", "Kafka does not expose lag in records"]} answer={2}>
+
+Lag in records ignores throughput. What users feel is lag in time. Alert on time lag against the SLO, and on time lag approaching retention.
+
+</MCQ>
+
+<MCQ q="Which statement about Kafka tiered storage (KIP-405) is correct?" options={["It became generally available in Apache Kafka 3.9 and does not support compacted topics", "It was GA in Kafka 2.8 alongside KRaft", "It moves the active segment to object storage immediately", "It makes reads of old data faster than local reads"]} answer={0}>
+
+Tiered storage was early access in 3.6 and GA in 3.9. Only closed segments are uploaded, compacted topics are not supported, and cold reads have object-store latency.
+
+</MCQ>
+
+<MCQ q="What does enabling TLS on Kafka listeners cost besides CPU?" options={["It disables idempotent producers", "It forces `acks=1`", "It prevents use of SASL authentication", "Zero-copy `sendfile` from page cache to socket is lost"]} answer={3}>
+
+Data must be encrypted in user space, so the broker can no longer use zero-copy transfers to consumers. Plan for higher CPU and memory bandwidth when turning it on.
+
+</MCQ>
+
+<MCQ q="Lag is growing on all partitions, but the downstream database is already saturated. What is the right move?" options={["Add more consumers up to the partition count", "Fix the sink with bulk upserts, indexes or more capacity", "Increase the partition count", "Lower `fetch.min.bytes` to 1"]} answer={1}>
+
+If the sink is the bottleneck, more consumers only push more load onto an already struggling database. Fix the sink first, and meanwhile confirm that retention exceeds worst-case catch-up time.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **Partitions** = max(T / per-partition, T / per-consumer) × 2–3x headroom, rounded to a divisible number. Treat it as fixed for keyed topics.
+- **Throughput knobs**: `linger.ms` 5–20, `batch.size` 64–256 KB, `zstd`/`lz4`, `fetch.min.bytes` up, sane `max.poll.records`. A **fast handler** matters most.
+- **Brokers**: small heap, big page cache, `vm.swappiness=1`, high FD limits, fast disks.
+- **Lag runbook**: scope → rebalance churn → handler → throughput math → poison pill → sink → retention safety.
+- **Producer slowdown runbook**: under-replicated partitions → min ISR → buffer → batching → quotas → leader skew → network.
+- **Tiered storage** (KIP-405, GA in 3.9): hot local tier plus cold object store, for cheap long retention and faster operations.
+- **Security**: TLS + SASL (SCRAM, OAUTHBEARER, Kerberos) or mTLS + default-deny ACLs + disk encryption + client-side PII encryption + quotas.
+- **Alert on**: UnderReplicatedPartitions, OfflinePartitions, ActiveControllerCount ≠ 1, UnderMinIsr, request idle % low, **lag in seconds**, rebalance rate, canary end-to-end latency.
+
+## Go deeper
+
+- **Apache Kafka docs**: [Operations](https://kafka.apache.org/documentation/#operations), [Monitoring](https://kafka.apache.org/documentation/#monitoring) and [Security](https://kafka.apache.org/documentation/#security).
+- **KIP-405**: [Kafka Tiered Storage](https://cwiki.apache.org/confluence/display/KAFKA/KIP-405%3A+Kafka+Tiered+Storage).
+- **Confluent docs**: [Monitoring Kafka](https://docs.confluent.io/platform/current/kafka/monitoring.html).
+- **Book**: *Kafka: The Definitive Guide*, 2nd ed., chapters on administering, monitoring and securing Kafka.
+- **LinkedIn**: [Cruise Control](https://github.com/cruise-control-for-kafka/cruise-control) and [Burrow](https://github.com/linkedin/Burrow) on GitHub.

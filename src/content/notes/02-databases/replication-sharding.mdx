@@ -1,7 +1,7 @@
 ---
 title: "Replication + Sharding"
 phase: "02-databases"
-order: 10
+order: 11
 tags: ["db", "sharding"]
 premium: false
 previewParagraphs: 4
@@ -11,7 +11,9 @@ prerequisites: []
 
 ## Definition (interview-ready)
 
-**Replication** copies the same data to multiple nodes for read scaling, durability, and HA — synchronous (strong consistency, slower writes) or asynchronous (fast writes, possible loss). **Sharding** (a.k.a. partitioning) splits a dataset across nodes so each holds a subset — for write scaling and storage scaling.
+**Replication** copies the same data to multiple nodes for read scaling, durability, and HA — synchronous (strong consistency, slower writes) or asynchronous (fast writes, possible loss). **Sharding** (a.k.a. horizontal partitioning) splits a dataset across nodes so each holds a subset — for write scaling and storage scaling.
+
+**One-liner:** Replication keeps copies of the same data on several nodes to scale reads and survive failures; sharding splits the data across nodes by a shard key to scale writes and storage, and large systems usually do both.
 
 ## Why it matters
 
@@ -25,11 +27,11 @@ You hit replication when reads outgrow one machine (most apps); you hit sharding
 
 - **Single-leader (primary/replica)**: writes to one leader, asynchronous (or sync) replication to replicas. Reads can hit replicas for scale. Failure of leader → promote a replica (auto or manual).
 - **Multi-leader**: multiple leaders accept writes, replicate to each other. Useful across regions. Requires conflict resolution (last-write-wins, CRDTs, application logic).
-- **Leaderless**: any node accepts writes, writes go to R replicas, reads from W. Requires read-repair, anti-entropy. Used by Cassandra, DynamoDB.
+- **Leaderless**: any node accepts writes, writes go to W replicas, reads from R. Requires read-repair, anti-entropy. Used by Cassandra, Riak, and Amazon's original Dynamo (not DynamoDB, which uses a leader per partition).
 
 ### Sync vs async replication
 
-- **Sync**: leader doesn't ack until N replicas confirm. Stronger durability; commit latency = slowest replica's RTT.
+- **Sync**: leader doesn't ack until N replicas confirm. Stronger durability; commit latency is gated by the slowest replica it waits for.
 - **Async**: leader acks immediately. Faster, but on crash you can lose unreplicated writes — that's your **RPO** (recovery point objective).
 - **Semi-sync** (MySQL): wait for at least one replica to receive (not apply) the write before ack — middle ground.
 
@@ -49,7 +51,7 @@ Consequence patterns:
 - Reconfigure clients.
 - Old leader rejoins as replica (may need to discard unreplicated writes — **split-brain risk** if not handled).
 
-Tools: AWS RDS Multi-AZ, PgBouncer + repmgr/Patroni for Postgres, Orchestrator for MySQL, Cloud SQL HA.
+Tools: AWS RDS Multi-AZ, Patroni or repmgr for Postgres (often with PgBouncer or HAProxy in front to redirect clients), Orchestrator for MySQL, Cloud SQL HA.
 
 ### Sharding (partitioning) strategies
 
@@ -77,7 +79,7 @@ Real-world: tenant ID, user ID, customer ID are common. Time is a frequent **ant
 
 ### Rebalancing
 
-- Adding a shard: with hash sharding and `% N`, almost all keys remap. **Use consistent hashing** or vnodes (Cassandra, Riak, Vitess).
+- Adding a shard: with hash sharding and `% N`, almost all keys remap. **Use consistent hashing** / vnodes (Cassandra, Riak) or splittable ranges over a hashed keyspace (Vitess).
 - Tools split shards online (Vitess Reshard, MongoDB chunk migration).
 
 ## How it works (a sharded read/write)
@@ -95,9 +97,9 @@ Client                          Router/Proxy                Shard
 ## Real-world examples
 
 - **YouTube → Vitess**: sharded MySQL with online resharding, query routing, transparent to apps.
-- **Uber → Schemaless**: leaderless replicated KV on top of MySQL, sharded by trip ID.
-- **Discord**: messages sharded by channel ID over Cassandra (now ScyllaDB) — channel = unit of locality.
-- **Stripe**: payments sharded by merchant ID; reporting reads cross-shard via DBT/Trino over a warehouse copy.
+- **Uber → Schemaless**: append-only key-value store layered on sharded MySQL (rows keyed by UUID, e.g., a trip ID); each storage cluster is a MySQL master with minion replicas.
+- **Discord**: messages partitioned by channel ID plus a time bucket over Cassandra (now ScyllaDB) — channel = unit of locality.
+- **Stripe**: runs its own sharded document database (DocDB, built on MongoDB) and moves data between shards online with zero-downtime migrations.
 - **MongoDB / Cassandra / DynamoDB**: sharding is built-in.
 
 ## Common pitfalls
@@ -105,45 +107,174 @@ Client                          Router/Proxy                Shard
 - **Picking a low-cardinality shard key** (e.g., `country`) → 5 countries = 5 shards forever, hot ones unmanageable.
 - **Time as shard key** → all writes to today's shard.
 - **Cross-shard joins**: slow, fragile. Denormalize or use a query layer.
-- **Forgetting to replicate the WAL**: replicas built from snapshots only → recovery gap.
+- **Snapshots without the log**: building replicas or backups from periodic snapshots without also shipping/archiving the WAL (or MySQL binlog) → every write since the last snapshot is unrecoverable.
 - **Replication lag during a deploy**: long-running migration backs up the replication stream. Use online schema change tools.
 - **Failover during a network partition**: two nodes both think they're leader → **split brain**, divergent data. Use fencing (STONITH), majority quorum, or hosted HA.
 - **Read-after-write surprises**: API returns 200 OK, user refresh shows old data. Route critical follow-up reads to leader.
 
-## Interview questions
+## Practice questions
 
-### Q1 — Easy: When do you replicate vs shard?
+<Practice>
+
+<QA q="When do you replicate vs shard?" level="easy">
+
 Replicate when **reads** outgrow one node, or for HA/durability. Shard when **writes or storage** outgrow one node. They're complementary — most large systems do both.
 
-### Q2 — Easy: What is replication lag and why does it matter?
-The delay between a write committing on the leader and being applied on a replica. Matters because users who write and then read from a replica may not see their own write — "read-your-writes" violation.
+</QA>
 
-### Q3 — Medium: How would you pick a shard key for an e-commerce orders table?
-Likely `customer_id` (or `merchant_id` depending on access pattern). High cardinality, present in most queries, balanced (no super-customer dominating). Time-only (`created_at`) would be terrible because today's shard takes all writes.
+<QA q="What is replication lag and why does it matter?" level="easy">
 
-### Q4 — Medium: Compare sync and async replication tradeoffs.
-Sync: stronger durability (write isn't acked until replicas confirm), higher write latency (gated by slowest replica). Async: low latency, but on leader crash you lose unreplicated writes (RPO > 0). Many setups use semi-sync — wait for at least one replica to receive.
+The delay between a write committing on the leader and being applied on a replica. It matters because users who write and then read from a replica may not see their own write — a **read-your-writes** violation.
 
-### Q5 — Medium: How does consistent hashing help when adding shards?
-With `hash(key) % N`, adding a shard remaps ~all keys (massive data movement). Consistent hashing places nodes on a ring; adding one moves only ~1/N keys (the ones closer to the new node). Critical for online rebalancing of caches and KV stores.
+</QA>
 
-### Q6 — Hard: A sharded MySQL setup needs a transaction across two shards. Options?
-(1) **Two-phase commit**: slow, fragile (prepare then commit phases; coordinator failure leaves locks). (2) **Saga**: break into compensable local transactions; orchestrator or choreography. (3) **Re-shard**: pick a key that keeps the txn local (e.g., wrap both records under same tenant). (4) **Outbox + idempotent retry**: write the intention in shard A, async process picks up and applies on B. Most teams choose (3) or (4).
+<QA q="Compare single-leader, multi-leader, and leaderless replication." level="easy">
 
-### Q7 — Hard: Production setup: 1 leader, 3 async replicas. Leader crashes. How do you fail over safely?
-- Detect via consensus (don't fail over on a single missed heartbeat).
-- Among replicas, pick the **most up-to-date** (highest WAL position / GTID).
-- Promote it; reconfigure clients (DNS, proxy, etcd).
-- Old leader, when it returns, may have **unreplicated writes** — these must be discarded (and ideally logged) to avoid divergence. This is data loss; that's the cost of async.
+- **Single-leader**: all writes go to one leader, which replicates to replicas; reads can be spread across replicas. Simplest; failover means promoting a replica.
+- **Multi-leader**: several leaders accept writes and replicate to each other — useful across regions, but concurrent writes conflict and need resolution (last-write-wins, CRDTs, application logic).
+- **Leaderless**: any node accepts writes; a write goes to W replicas and a read queries R. Needs read-repair and anti-entropy. Used by Cassandra, Riak, and Amazon's original Dynamo (not DynamoDB, which has a leader per partition).
+
+</QA>
+
+<QA q="How would you pick a shard key for an e-commerce orders table?" level="medium">
+
+Likely `customer_id` (or `merchant_id`, depending on the access pattern). It has high cardinality, appears in most queries, and is balanced (no single customer dominates). Time alone (`created_at`) would be terrible because today's shard takes all the writes.
+
+</QA>
+
+<QA q="Compare sync and async replication tradeoffs." level="medium">
+
+**Sync**: stronger durability (the write isn't acked until replicas confirm) but higher write latency, gated by the slowest replica. **Async**: low latency, but on a leader crash you lose unreplicated writes (RPO greater than 0). Many setups use **semi-sync** — wait for at least one replica to receive (not apply) the write before acking.
+
+</QA>
+
+<QA q="A user refreshes a page twice and sees newer data, then older data. What happened and how do you fix it?" level="medium">
+
+A **monotonic reads** violation: the first read hit a replica that had caught up (saw v1), the second hit a more-lagged replica (saw v0), so time appeared to go backwards. Fix by making each user's reads **sticky to one replica** (e.g., route by a hash of the user ID), so they never move to a replica that's further behind.
+
+</QA>
+
+<QA q="Compare range and hash partitioning." level="medium">
+
+- **Range**: shard by key range (ids 1–1M on A, 1M–2M on B). Range scans stay on one shard, but monotonic keys (ids, timestamps) send all new writes to the last shard — a **hot shard**.
+- **Hash**: shard by `hash(key) % N`. Spreads load evenly but loses range-scan locality, and with plain modulo, changing N remaps almost every key — hence consistent hashing or splittable ranges over a hashed keyspace.
+
+</QA>
+
+<QA q="How does consistent hashing help when adding shards?" level="medium">
+
+With `hash(key) % N`, adding a shard remaps almost all keys (massive data movement). Consistent hashing places nodes on a ring; adding one moves only about 1/N of the keys (the ones that now fall to the new node). Critical for online rebalancing of caches and KV stores.
+
+</QA>
+
+<QA q="How are queries that span shards handled — joins, aggregations, and lookups by a non-shard-key column?" level="hard">
+
+- **Joins**: scatter-gather across shards — slow and fragile, so most teams denormalize or co-locate related rows under the same shard key.
+- **Aggregations**: each shard computes a partial result locally; a coordinator merges them.
+- **Lookups by another column**: without help this is a query to every shard. A **global secondary index** — an index materialized across shards (DynamoDB GSI, Vitess) — routes it to the right place.
+
+</QA>
+
+<QA q="What is split brain and how do you prevent it?" level="hard">
+
+During a network partition, two nodes both believe they're the leader and both accept writes, so the data diverges. Prevent it with a **majority quorum** for leader election (only one side can have a majority), **fencing** the old leader (STONITH, firewall rules) so it can't accept writes, or a hosted HA service that does both.
+
+</QA>
+
+<QA q="A sharded MySQL setup needs a transaction across two shards. What are your options?" level="scenario">
+
+1. **Two-phase commit**: slow and fragile (prepare then commit; coordinator failure leaves locks held).
+2. **Saga**: break the work into compensable local transactions, coordinated by an orchestrator or by choreography.
+3. **Re-shard**: pick a key that keeps the transaction local (e.g., put both records under the same tenant).
+4. **Outbox + idempotent retry**: record the intent on shard A; an async process picks it up and applies it on B.
+
+Most teams choose (3) or (4).
+
+</QA>
+
+<QA q="Production setup: 1 leader, 3 async replicas. The leader crashes. How do you fail over safely?" level="scenario">
+
+- Detect failure via consensus — don't fail over on a single missed heartbeat.
+- Among the replicas, pick the **most up-to-date** one (highest WAL position / GTID).
+- Promote it and reconfigure clients (DNS, proxy, etcd).
+- When the old leader returns it may hold **unreplicated writes** — discard them (ideally logging them) to avoid divergence. This is data loss; that's the cost of async.
 - Fence the old leader (firewall, STONITH) until you're sure it won't accept writes.
 
-### Q8 — Hard: Re-sharding a 10TB Postgres on `tenant_id` to add capacity, with zero downtime. Approach?
-- Double-write to old + new for a transition period.
+</QA>
+
+<QA q="Re-shard a 10 TB Postgres on `tenant_id` to add capacity, with zero downtime. Approach?" level="scenario">
+
+- Double-write to old and new for a transition period.
 - Backfill historical data into the new shard (chunked, throttled).
-- Cut reads over once new shard is verified consistent.
-- Stop double-writing, decommission slice of old shard.
-- Tools: logical replication (Postgres pglogical), Debezium for CDC, Citus for native sharding.
-- The hardest part is **invariants that cross shards** — those need application-level handling first.
+- Cut reads over once the new shard is verified consistent.
+- Stop double-writing and decommission the moved slice of the old shard.
+- Tools: logical replication (pglogical), Debezium for CDC, Citus for native sharding.
+
+The hardest part is **invariants that cross shards** — those need application-level handling first.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="Your app's reads have outgrown one database node but writes are modest. What is the usual first step?" options={["Shard by user ID", "Add read replicas", "Switch to multi-leader replication", "Partition by created_at"]} answer={1}>
+
+Replication scales reads; sharding is for when writes or storage outgrow one node. Multi-leader adds conflict resolution for no benefit here, and time-based partitioning creates a hot shard.
+
+</MCQ>
+
+<MCQ q="With asynchronous replication, what does a leader crash risk?" options={["Higher write latency on every commit", "Losing writes that were acked but not yet replicated", "Replicas rejecting reads permanently", "Automatic split brain on every failover"]} answer={1}>
+
+Async acks before replicas confirm, so acked writes not yet shipped are lost on a crash (RPO greater than 0). Higher commit latency is the cost of sync replication, not async.
+
+</MCQ>
+
+<MCQ q="What does MySQL semi-sync replication wait for before acknowledging a commit?" options={["All replicas to apply the write", "No replicas at all", "A majority of replicas to apply the write", "At least one replica to receive the write"]} answer={3}>
+
+Semi-sync waits for at least one replica to receive (not apply) the write — a middle ground between async speed and sync durability.
+
+</MCQ>
+
+<MCQ q="Which shard key is the worst choice for a high-write orders table?" options={["created_at", "customer_id", "merchant_id", "order_id hashed"]} answer={0}>
+
+Time is the classic anti-pattern: every new order lands on the current shard, making it hot while others sit idle. The ID-based keys have high cardinality and spread writes.
+
+</MCQ>
+
+<MCQ q="A cluster uses hash(key) % N with 8 shards. Why is adding a 9th shard painful?" options={["Hash functions cannot handle 9 buckets", "Range scans stop working", "Almost every key maps to a different shard and must move", "Only the new shard receives writes afterward"]} answer={2}>
+
+Changing N changes the modulo result for nearly every key. Consistent hashing (or splittable ranges over a hashed keyspace) limits movement to roughly 1/N of the keys.
+
+</MCQ>
+
+<MCQ q="A user posts a comment, refreshes, and the comment is missing. Which fix targets this directly?" options={["Add more async replicas", "Route that user's reads right after a write to the leader", "Switch from hash to range partitioning", "Increase the replica heartbeat interval"]} answer={1}>
+
+This is a read-your-writes violation from replication lag. Reading from the leader (or a sticky, caught-up path) right after a write fixes it; the other options don't affect lag visibility.
+
+</MCQ>
+
+<MCQ q="During failover after a leader crash, which replica should be promoted?" options={["The one with the lowest load", "The one in the same AZ as most clients", "A random replica to avoid bias", "The most up-to-date one, by highest WAL position or GTID"]} answer={3}>
+
+Promoting the replica furthest ahead minimizes lost writes. Load or locality matter less than not discarding data that a more caught-up replica already has.
+
+</MCQ>
+
+<MCQ q="Which mechanism prevents two nodes from both acting as leader during a network partition?" options={["Majority quorum for election plus fencing the old leader", "Shorter TTLs on DNS records", "Switching to async replication", "Adding read replicas in each region"]} answer={0}>
+
+Only one side of a partition can hold a majority, and fencing (STONITH, firewall) stops the old leader from accepting writes. DNS TTLs and extra replicas don't stop a stale leader from writing.
+
+</MCQ>
+
+<MCQ q="A query filters orders by product_id, but the table is sharded by customer_id. Without extra structures, what happens?" options={["It routes to one shard by hashing product_id", "It is rejected by the router", "It must scatter to every shard and merge results", "It reads only from the leader shard"]} answer={2}>
+
+The router can only target a shard when the shard key is in the WHERE clause. Otherwise it scatter-gathers; a global secondary index on product_id avoids that.
+
+</MCQ>
+
+</Quiz>
 
 ## TL;DR cheat sheet
 

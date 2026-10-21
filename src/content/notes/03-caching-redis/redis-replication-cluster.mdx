@@ -1,0 +1,717 @@
+---
+title: "Redis High Availability: Replication, Sentinel, Cluster"
+phase: "03-caching-redis"
+order: 26
+tags: ["caching"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 22
+prerequisites: ["redis-deep", "replication-sharding"]
+summary: "How Redis stays up and scales out: async primary-replica replication with partial resync, Sentinel for automatic failover of one primary, and Cluster for hash-slot sharding plus built-in failover, along with exactly where each one can lose acknowledged writes."
+---
+
+## Definition (interview-ready)
+
+Redis high availability is built in three layers. **Replication** keeps one or more replicas as asynchronous copies of a primary: the primary streams its write commands, and a replica that falls behind catches up with a partial resync (`PSYNC`) or, failing that, a full RDB transfer. **Sentinel** is a separate group of processes that watches one primary and its replicas. When enough Sentinels agree the primary is down, they elect a leader, promote the best replica, and tell clients the new address. **Redis Cluster** shards the keyspace into **16384 hash slots** (`CRC16(key) mod 16384`) spread across several primaries, each with its own replicas. Nodes find failures and promote replicas over a gossip bus, so no external Sentinel is needed. Replication is asynchronous in every layer, so all three can lose writes that were already acknowledged when a failover happens. `WAIT` and `min-replicas-to-write` make that window smaller, but neither one closes it.
+
+**One-liner:** Redis gets high availability from asynchronous replicas plus automatic failover, done by Sentinel for a single primary or built into Redis Cluster, which also shards keys across 16384 hash slots; because replication is async, a failover can still lose writes that were already acknowledged.
+
+## Why it matters
+
+A single Redis process is fast but also a single point of failure, and its memory limits the size of the dataset. Almost every production Redis setup answers two questions. First, **what happens when the primary dies?** That is replication plus Sentinel or Cluster failover. Second, **what happens when the data or the write throughput outgrows one box?** That is sharding. Interviewers like this topic because the clean answer ('add replicas, use Cluster') hides some sharp edges: acknowledged writes can be lost, split brain is possible during partitions, multi-key commands fail with `CROSSSLOT`, hot slots appear, and clients need to understand redirects.
+
+If you can explain **why** Redis picks availability and latency over strong consistency, and which knobs reduce the damage, you can answer most HA questions about Redis.
+
+## Core concepts
+
+### 1. Replication: the foundation
+
+Replication in Redis is **leader-follower and asynchronous**. The primary answers the client first. The write reaches replicas a moment later as a stream of commands in the same RESP format clients use.
+
+```bash
+# On the replica (or put 'replicaof 10.0.0.1 6379' in redis.conf)
+redis-cli -p 6380 REPLICAOF 10.0.0.1 6379
+# If the primary has requirepass set
+redis-cli -p 6380 CONFIG SET masterauth s3cret
+# Inspect
+redis-cli -p 6379 INFO replication   # role, connected_slaves, master_repl_offset
+redis-cli -p 6380 ROLE               # machine-friendly: role, primary host, offset, state
+# Promote a replica manually
+redis-cli -p 6380 REPLICAOF NO ONE
+```
+
+`REPLICAOF` is the current name. `SLAVEOF` is the older alias and is still accepted. Since Redis 2.6, replicas are **read-only by default** (`replica-read-only yes`). Writable replicas still exist for historical reasons, but they cause divergence, so avoid them.
+
+#### Replication ID and offset
+
+Every primary has a **replication ID**, a large random string that names one *history* of the dataset. It also keeps an **offset** that grows by one for every byte of replication stream it produces, and the offset grows even when no replica is connected. Together, the pair `(replid, offset)` identifies one exact version of the dataset.
+
+- Two nodes with the same replid and offset hold identical data.
+- Same replid with different offsets means the node with the lower offset is behind and can catch up by applying the missing bytes.
+- A node keeps **two** IDs: the main one and a secondary one. When a replica is promoted, it moves its old ID into the secondary slot, records the offset at which it switched, and generates a new main ID. The other replicas, which still present the old ID, can then **partially** resync with the new primary. This has worked since Redis 4.0. A promoted replica must take a new ID because the old primary might still be running and accepting writes on the other side of a partition. Reusing the ID would break the rule that a `(replid, offset)` pair identifies exactly one dataset.
+
+#### PSYNC: partial vs full resynchronization
+
+```
+replica reconnects ──> PSYNC <replid> <offset+1>
+                          │
+          ┌───────────────┴────────────────┐
+  replid known AND offset             replid unknown OR offset
+  still inside the backlog            fell out of the backlog
+          │                                │
+   +CONTINUE                          +FULLRESYNC <replid> <offset>
+   send only the missing bytes        1. primary forks, produces an RDB
+   (cheap, seconds)                   2. buffers new writes meanwhile
+                                      3. ships RDB; replica flushes + loads it
+                                      4. streams the buffered writes
+                                      (expensive: fork + CPU + network + replica blocked while loading)
+```
+
+The **replication backlog** is a circular buffer on the primary that holds the most recent stream bytes.
+
+| Config | Default | What it does |
+|---|---|---|
+| `repl-backlog-size` | `1mb` | Size of the circular buffer. A bigger backlog lets a replica stay disconnected longer and still partially resync. Memory is allocated only once at least one replica is connected. |
+| `repl-backlog-ttl` | `3600` (seconds) | Frees the backlog after the primary has had no replicas for this long. Replicas never free theirs, because they may be promoted. |
+| `repl-timeout` | `60` (seconds) | Timeout on the replication link. |
+| `client-output-buffer-limit replica` | `256mb 64mb 60` | If a replica's output buffer goes past 256 MB, or stays above 64 MB for 60 s, the link is cut. A large write burst during a full sync can therefore trigger another full sync. |
+
+**Sizing the backlog:** a common rule of thumb is `backlog ≥ write_bytes_per_sec × longest_disconnect_you_want_to_survive`. A primary that produces 5 MB/s of replication traffic needs about 300 MB to survive a 60-second network blip without a full sync. The 1 MB default is tiny for busy primaries. Check `master_repl_offset` deltas in `INFO replication` to measure your actual rate.
+
+#### Full sync and diskless replication
+
+In a classic full sync, the primary forks, the child writes an RDB file to disk, and the parent then sends that file to the replica. With **diskless replication** (`repl-diskless-sync`, available since 2.8.18), the child writes the RDB **straight to the replica sockets** and skips the disk. This helps when disks are slow and the network is fast.
+
+| Config | Default | Notes |
+|---|---|---|
+| `repl-diskless-sync` | `yes` (since 7.0; was `no` in 6.2) | Stream the RDB over the socket instead of through a file. |
+| `repl-diskless-sync-delay` | `5` (seconds) | Wait for more replicas to arrive so one transfer can serve them all. Once a transfer starts, late replicas wait for the next one. |
+| `repl-diskless-load` | `disabled` | On the replica side, load the RDB from the socket instead of writing it to disk first. |
+
+If several replicas ask for a full sync at the same time, the primary serves them all from **one** background save.
+
+#### How replicas handle expiry and maxmemory
+
+Replicas do **not** expire or evict keys themselves. The primary turns each expiry or eviction into a `DEL` and replicates it. To avoid returning stale data, a replica still uses its own clock to *report* a logically expired key as missing on reads. Replicas ignore `maxmemory` by default (`replica-ignore-maxmemory yes`), so give them memory headroom.
+
+#### Persistence-off primary + auto-restart = data wipe
+
+The docs spell out this trap. Suppose the primary runs with persistence disabled, crashes, and is restarted automatically. It comes back **empty**, and its replicas resync to that empty dataset. With Sentinel the primary can even restart fast enough that no failover happens at all. Rule: if the primary does not persist, **do not auto-restart it**.
+
+### 2. Consistency limits of async replication
+
+```
+Client      Primary P            Replica R
+  │  SET k v   │                     │
+  │──────────> │ apply locally       │
+  │ <── OK ─── │                     │
+  │            │──── stream "SET" ──>│  (in flight)
+  │            X  P crashes here     │
+  │                                  │  R promoted, never saw SET k v
+  │                                  │  → acknowledged write is gone
+```
+
+This is the main fact to remember: **an OK from the primary does not mean any replica has the write.**
+
+**`WAIT numreplicas timeout`** (since 3.0) blocks the calling connection until all of its earlier writes have been acknowledged by at least `numreplicas` replicas, or until the timeout in milliseconds expires. A timeout of `0` means wait forever. It returns the number of replicas that actually acknowledged, so **you must check the return value**: a timeout is not an error. The docs say directly that `WAIT` *does not make Redis strongly consistent*. A write acknowledged by replicas can still be lost if failover promotes a different replica, or if a replica restarts without having persisted the data. What `WAIT` does is make losing the write much less likely.
+
+```bash
+SET order:991 paid
+WAIT 1 100        # (integer) 1  → at least one replica has it
+```
+
+Redis 7.2 added `WAITAOF`, which waits until writes have been fsynced to the AOF on the local node and/or replicas. It is the durability counterpart of `WAIT`.
+
+**`min-replicas-to-write N` + `min-replicas-max-lag M`** (since 2.8): the primary **refuses writes** unless at least N replicas have sent an acknowledgement within the last M seconds. Replicas ping the primary every second. Defaults are `min-replicas-to-write 0` (disabled) and `min-replicas-max-lag 10`. This does not guarantee that any particular write was replicated. It **puts a bound on how long** a primary that has been cut off from its replicas will keep accepting writes that are doomed to be lost. The trade-off is that if your replicas die, the primary stops accepting writes.
+
+| Tool | Guarantees | Does not guarantee | Cost |
+|---|---|---|---|
+| Plain async | Lowest latency | Any copy beyond the primary | Unbounded loss window on partition |
+| `WAIT n t` | Your earlier writes reached n replicas (if the return value is at least n) | Survival through every failover | Extra latency per call, one RTT to replicas |
+| `min-replicas-*` | An isolated primary stops accepting writes after about M s | Replication of any individual write | Writes fail when replicas are down |
+| `WAITAOF` (7.2+) | Writes fsynced to AOF on local/replicas | Linearizability | fsync latency |
+
+If you need real linearizable writes, use a consensus-backed store (etcd, ZooKeeper, a Raft DB) or a managed offering that documents synchronous semantics. Do not try to build them out of Redis primitives.
+
+### 3. Redis Sentinel
+
+Sentinel (the stable "Sentinel 2" ships with Redis since 2.8) is the HA layer for **non-clustered** Redis. You run it as `redis-sentinel sentinel.conf` or `redis-server sentinel.conf --sentinel`, and it listens on **port 26379** by default. It provides four things:
+
+1. **Monitoring**: it pings the primary, the replicas, and the other Sentinels.
+2. **Notification**: it publishes events such as `+sdown`, `+odown`, `+switch-master`, and can run scripts.
+3. **Automatic failover**: it promotes a replica and repoints the other replicas at it.
+4. **Configuration provider**: clients ask Sentinel for the current primary address instead of hard-coding it.
+
+```conf
+# sentinel.conf (same on all 3+ sentinels)
+sentinel monitor mymaster 10.0.0.1 6379 2      # name ip port QUORUM
+sentinel down-after-milliseconds mymaster 5000
+sentinel failover-timeout mymaster 60000
+sentinel parallel-syncs mymaster 1
+```
+
+Sentinels discover one another and the replicas automatically. Each Sentinel publishes a hello message to the `__sentinel__:hello` channel on every monitored instance every 2 seconds, so you list only the primary.
+
+#### SDOWN, ODOWN, quorum vs majority
+
+- **SDOWN (subjectively down)**: a single Sentinel has had no valid reply from an instance for `down-after-milliseconds`.
+- **ODOWN (objectively down)**: at least **quorum** Sentinels report SDOWN for the primary within a time window. This is gossip-based agreement, not a consensus round. ODOWN applies only to primaries.
+- **Quorum detects; majority authorizes.** ODOWN *triggers* a failover attempt. To *carry it out*, one Sentinel has to win a leader election by getting votes from a **majority of all known Sentinels**, or from more than a majority if quorum is set higher. The winner gets a unique **configuration epoch** that versions the new configuration.
+
+Example: with 5 Sentinels and quorum 2, two Sentinels that see the primary down are enough to start a failover. The failover only proceeds if the leader collects 3 votes. Therefore **a minority partition can never fail over**. If a Sentinel voted for another one, it waits `2 × failover-timeout` before trying to fail over the same primary itself.
+
+#### Replica selection
+
+Sentinel first discards replicas that have been disconnected too long, specifically longer than `(down-after-milliseconds × 10) + time since the primary went SDOWN`. It then sorts the remaining replicas by:
+
+1. Lowest `replica-priority` (default 100, and `0` means never promote).
+2. Highest processed replication offset, meaning the most data.
+3. Lexicographically smallest run ID, which is only a tie-break.
+
+The leader sends `REPLICAOF NO ONE` to the chosen replica. Once the switch appears in `INFO`, the failover counts as successful, and the new configuration spreads with the higher epoch. The other replicas are repointed `parallel-syncs` at a time. When the old primary comes back, it is demoted to a replica.
+
+#### Client discovery
+
+```bash
+redis-cli -p 26379 SENTINEL get-master-addr-by-name mymaster
+# 1) "10.0.0.2"
+# 2) "6379"
+redis-cli -p 26379 SENTINEL replicas mymaster
+redis-cli -p 26379 SENTINEL ckquorum mymaster   # can we reach quorum AND majority?
+redis-cli -p 26379 SENTINEL failover mymaster   # force a failover without agreement
+```
+
+A Sentinel-aware client (Jedis `JedisSentinelPool`, Lettuce, redis-py `Sentinel`, go-redis `NewFailoverClient`) works like this:
+
+1. It connects to any Sentinel and asks for the primary.
+2. It verifies with `ROLE` that the node really is the primary.
+3. It subscribes to `+switch-master` so it can reconnect after a failover.
+
+#### Deployment rules
+
+- Run **at least three Sentinels** on hosts or AZs that fail independently. With two, a partition can leave neither side with a majority, or put a lone Sentinel next to the old primary.
+- Sentinel does **not** shard. It provides HA for one primary at a time, although one Sentinel group can monitor several named primaries.
+- To limit split-brain writes, pair Sentinel with `min-replicas-to-write 1` / `min-replicas-max-lag 10`. Without it, an old primary isolated together with some clients keeps accepting writes, and they are discarded when it rejoins as a replica.
+
+### 4. Redis Cluster
+
+Redis Cluster (since 3.0) provides sharding and HA in one system: there is no proxy, replication is async, and values are never merged. It supports only **database 0** (`SELECT` is not allowed). The minimum working cluster has **3 primaries**, and the docs recommend 3 primaries with 3 replicas for deployment. The design targets about **1000 nodes** at most.
+
+#### Hash slots
+
+```
+key ──► hash-tag extraction ──► CRC16 (XMODEM) ──► mod 16384 ──► slot ──► owning primary
+
+         slot  0 ─────────── 5460 │ 5461 ────────── 10922 │ 10923 ────────── 16383
+               [   primary A    ] │ [   primary B       ] │ [   primary C       ]
+                  replica A1      │    replica B1         │    replica C1
+
+  CLUSTER KEYSLOT user:42             → 15880   (owned by C)
+  CLUSTER KEYSLOT user:43             → 11817   (owned by C)
+  CLUSTER KEYSLOT {user:42}:cart      → 15880   only 'user:42' is hashed
+  CLUSTER KEYSLOT {user:42}:profile   → 15880   same slot → multi-key OK
+```
+
+- **Why 16384?** antirez explained that heartbeat packets carry the sender's slot bitmap in raw form. 16384 slots take 2 KB, whereas 65536 would take 8 KB per heartbeat. Because the cluster is not expected to grow past about 1000 primaries, 16k slots still gives each primary plenty of slots.
+- **Hash tags.** If a key has a `{` followed later by a `}` with at least one character between them, only the text between the **first** `{` and the first `}` after it is hashed. `foo{}{bar}` hashes the whole key because the first pair is empty. `foo{{bar}}zap` hashes `{bar`. Use hash tags to co-locate related keys, but make sure **one tag does not become a hot slot**.
+- Slots, not keys, are the unit of movement. Resharding moves whole slots between nodes.
+
+#### MOVED vs ASK
+
+| | `-MOVED 3999 10.0.0.3:6381` | `-ASK 3999 10.0.0.3:6381` |
+|---|---|---|
+| Meaning | Slot 3999 now *belongs* to that node, permanently | The slot is *being migrated*. This key may already be on the target, so try there **for this one request** |
+| Client action | Update the slot map (most clients refresh the whole map with `CLUSTER SHARDS`, or `CLUSTER SLOTS` before 7.0), then retry | Send `ASKING` and then the command to the target. **Do not** update the slot map |
+| When | After resharding or failover completes, or when a client has a stale map | While `MIGRATING`/`IMPORTING` is in progress |
+
+`ASKING` sets a one-shot flag on the connection that lets the importing node serve a slot it does not own yet. During migration, a multi-key command whose keys are split between source and target fails with **`-TRYAGAIN`**.
+
+#### Cluster bus and failure detection
+
+Each node opens a second TCP port, the **cluster bus**, at **data port + 10000** by default (for example 16379), or at whatever `cluster-port` sets. It carries a binary gossip protocol: pings and pongs with slot bitmaps and epochs, failure reports, failover votes, and configuration updates. **Both ports must be open** between all nodes.
+
+```
+                          cluster-node-timeout (default 15000 ms)
+t=0          primary B stops answering
+t≈NT         peers mark B  PFAIL   (local suspicion, pending ping older than NODE_TIMEOUT)
+t≈NT+gossip  majority of PRIMARIES reported PFAIL/FAIL within 2×NT
+             → some node broadcasts FAIL(B)
+t+DELAY      replica B1 starts election
+             DELAY = 500ms + random(0..500ms) + REPLICA_RANK × 1000ms
+             (rank 0 = most up-to-date offset → goes first)
+             B1 bumps currentEpoch, sends FAILOVER_AUTH_REQUEST to all primaries
+             primaries vote once per epoch; no second vote for B's replicas for 2×NT
+t+...        B1 gets majority of primaries' ACKs → takes configEpoch, owns B's slots
+             broadcasts new config; clients get MOVED to B1
+(old B rejoins later → sees higher configEpoch → becomes replica of B1)
+
+Minority side: a primary that cannot reach a majority of primaries for NODE_TIMEOUT
+stops accepting writes → this caps the split-brain write-loss window.
+```
+
+Relevant knobs:
+
+- **`cluster-node-timeout`** (default **15000 ms**). Most internal timers are multiples of it. A lower value fails over faster but produces more false positives and more gossip traffic.
+- **`cluster-replica-validity-factor`** (default **10**). A replica whose link to the primary has been down longer than `node-timeout × factor` will not try to fail over. `0` means it always tries, which favors availability over freshness.
+- **`cluster-migration-barrier`** (default **1**). A primary keeps at least this many replicas before one of them may **migrate** to an orphaned primary. This is replica migration (`cluster-allow-replica-migration yes`).
+- **`cluster-require-full-coverage`** (default **yes**). If any slot has no live owner, the **whole cluster** stops accepting queries. Set it to `no` to keep serving the slots that are still covered.
+- **`cluster-allow-reads-when-down`** (default **no**). If set to `yes`, a node still serves reads while the cluster is marked failed.
+
+**Reads from replicas** in Cluster need the `READONLY` command on the connection, and `READWRITE` turns it off. Without it, replicas answer with `MOVED` to the primary.
+
+#### Multi-key limits
+
+A multi-key command (`MGET`, `MSET`, `SUNIONSTORE`, `RENAME`, transactions, and Lua scripts touching several keys) works **only if every key hashes to the same slot**. Otherwise the server answers `CROSSSLOT Keys in request don't hash to the same slot`. Regular `PUBLISH` is broadcast across the whole cluster bus. Redis 7.0 added **sharded Pub/Sub** (`SPUBLISH`/`SSUBSCRIBE`), which hashes channels to slots so messages stay within one shard.
+
+#### Resharding and membership with redis-cli
+
+```bash
+# Create: 6 nodes, 1 replica per primary (redis-cli assigns 0-5460 / 5461-10922 / 10923-16383)
+redis-cli --cluster create 10.0.0.1:7000 10.0.0.2:7000 10.0.0.3:7000 \
+  10.0.0.4:7000 10.0.0.5:7000 10.0.0.6:7000 --cluster-replicas 1
+
+# Health
+redis-cli --cluster check 10.0.0.1:7000
+redis-cli -c -p 7000 CLUSTER INFO      # cluster_state:ok, cluster_slots_assigned:16384
+redis-cli -c -p 7000 CLUSTER SHARDS    # 7.0+: slot ranges + nodes per shard
+
+# Add an empty primary, then move slots to it
+redis-cli --cluster add-node 10.0.0.7:7000 10.0.0.1:7000
+redis-cli --cluster reshard 10.0.0.1:7000 \
+  --cluster-from <src-id> --cluster-to <new-id> --cluster-slots 1000 --cluster-yes
+# Or let redis-cli spread slots evenly (weights optional)
+redis-cli --cluster rebalance 10.0.0.1:7000 --cluster-use-empty-masters
+
+# Add a replica (to a specific primary)
+redis-cli --cluster add-node 10.0.0.8:7000 10.0.0.1:7000 \
+  --cluster-slave --cluster-master-id <primary-id>
+
+# Remove: a primary must be EMPTY first (reshard its slots away), then
+redis-cli --cluster del-node 10.0.0.1:7000 <node-id>
+# A dead node can't be del-node'd (connection refused): make everyone forget it
+redis-cli --cluster call 10.0.0.1:7000 CLUSTER FORGET <node-id>
+```
+
+Under the hood, moving one slot runs `CLUSTER SETSLOT <slot> IMPORTING` on the target and `MIGRATING` on the source. It then loops `CLUSTER GETKEYSINSLOT` plus `MIGRATE` batches, and finishes with `CLUSTER SETSLOT <slot> NODE <target>`. Each `MIGRATE` is atomic per key and **blocks both nodes** while it serializes the key, so big keys make migrations stall.
+
+### 5. Ways to scale Redis
+
+| Option | Scales | Keeps | Watch out for |
+|---|---|---|---|
+| **Vertical** (bigger box) | Memory, some throughput (I/O threads since 6.0) | Simplicity, all multi-key ops | Command execution is still single-threaded. Bigger RDB forks and longer full syncs |
+| **Read replicas** | Read QPS | All commands on the primary | Stale reads (async lag), no write scaling, more full-sync load |
+| **Client-side sharding** (consistent hashing in the app/library) | Memory + writes | No extra hop | Every client must agree on the ring. Resharding is manual. No failover of its own |
+| **Proxy** (twemproxy/nutcracker, Envoy Redis proxy) | Memory + writes, thin clients | Clients see one endpoint | Extra hop, proxy HA, unsupported commands. Twemproxy does not rebalance live |
+| **Redis Cluster** | Memory + writes + built-in failover | Native, no proxy | Cluster-aware client, `CROSSSLOT`, hot slots, db 0 only |
+
+Twemproxy was built at Twitter, mainly to cut the number of connections to cache servers and to shard across them. Envoy's Redis proxy can either hash keys across standalone instances or front a real Redis Cluster for clients that do not understand Cluster.
+
+### 6. Sentinel vs Cluster
+
+| | Sentinel | Cluster |
+|---|---|---|
+| Sharding | None (one primary holds all data) | 16384 slots across N primaries |
+| Write scaling | One primary | Linear-ish with primaries |
+| Failover brain | External Sentinel processes (at least 3) | Built into nodes via the cluster bus (majority of primaries votes) |
+| Client | Sentinel-aware (asks for primary address) | Cluster-aware (slot map, `MOVED`/`ASK`) |
+| Multi-key / Lua / `MULTI` | Anything | Same-slot keys only (hash tags) |
+| Databases | 16 (`SELECT`) | db 0 only |
+| Ops complexity | Lower | Higher (resharding, slot balance) |
+| Split-brain mitigation | `min-replicas-to-write` | Minority primaries stop writes after `cluster-node-timeout` (plus `min-replicas-*`) |
+| Good fit | Dataset fits one node, needs HA and cross-key ops | Dataset or write load beyond one node |
+
+## How it works
+
+### Failover timeline (Sentinel, 3 Sentinels, quorum 2)
+
+```
+time ──────────────────────────────────────────────────────────────────────────►
+ P (primary)   ███ serving ███ X crash
+ Writes acked             ▲ last acked writes not yet on R1 → LOST on failover
+ S1,S2,S3       ping ping ping │ no reply ............ down-after-ms (5s) ...
+ S1                            └──────────────── +sdown
+ S2                            └────────────────── +sdown
+ S1                                               +odown (2 ≥ quorum)
+ S1                                               +try-failover, asks votes
+ S2,S3                                            vote S1 (epoch 7) → majority 3/3
+ S1                                               +elected-leader
+ S1                                               +selected-slave R1 (priority, offset)
+ R1                                               REPLICAOF NO ONE → primary
+ S1                                               +switch-master mymaster P → R1
+ R2                                               repointed (parallel-syncs=1), PSYNC continues
+ Clients        errors / retries ──────────────── reconnect via +switch-master
+ P (restarts)                                     demoted → replica of R1, its writes discarded
+ Downtime  ≈ down-after-milliseconds + election + promotion + client reconnect
+```
+
+### Write path in Cluster with a stale client
+
+```
+client(map: slot 15880→A) ── GET user:42 ──► A
+A ── -MOVED 15880 10.0.0.3:7000 ──► client
+client refreshes CLUSTER SHARDS → caches 15880→C
+client ── GET user:42 ──► C ──► "value"
+```
+
+## Real-world examples
+
+- **AWS ElastiCache / MemoryDB "cluster mode enabled"** expose the Redis Cluster protocol with slots, so clients must handle `MOVED` and `CROSSSLOT`. This is why AWS documents the hash-tag fix for CROSSSLOT errors.
+- **Twitter** built **twemproxy** to shard memcached and Redis behind a proxy and to cut connection counts.
+- **Envoy** ships a Redis proxy filter used in service meshes to shard across standalone Redis instances, or to give cluster-unaware clients a single endpoint in front of a Redis Cluster.
+- **Jepsen (2013)** tested Redis Sentinel of that era under partitions and saw a large share of acknowledged writes lost. It is the standard citation for "do not use async-replicated Redis as a system of record or lock service."
+
+## Common pitfalls
+
+- **Treating OK as durable.** Async replication loses acknowledged writes on failover. Use `WAIT` for important writes and keep the real source of truth elsewhere.
+- **Backlog too small.** The 1 MB default plus a busy primary turns every short blip into a full resync, which means fork, CPU and network spikes and a replica that blocks while loading. Size the backlog from your replication byte rate.
+- **Full-sync loops.** A full sync takes longer than the replica output buffer allows (`client-output-buffer-limit replica 256mb 64mb 60`), the link drops, and the sync restarts. Raise the limit or the backlog, or reduce write bursts during the sync.
+- **Two Sentinels, or Sentinels co-located with the primary.** No majority survives a partition, or a failover cannot happen. Run 3 or more Sentinels in separate failure domains.
+- **No `min-replicas-to-write`.** An isolated old primary keeps taking writes, and they are thrown away when it rejoins.
+- **Persistence off plus auto-restart.** The primary comes back empty and replicas copy the empty dataset.
+- **Hash-tag hot spots.** `{tenant}` on a huge tenant pins all its traffic to one primary. Use tags at the granularity of one entity, not one tenant.
+- **Big keys in Cluster.** `MIGRATE` blocks both nodes while serializing a multi-GB key, and one huge key cannot be split across slots.
+- **`cluster-require-full-coverage yes` surprise.** Losing one shard with no replica takes the **whole** cluster offline. Decide on purpose between `no` (partial availability) and keeping `yes`.
+- **Non-cluster clients against Cluster.** They get `MOVED` errors instead of data. Also, `KEYS`/`SCAN` only cover the node you are connected to, so iterate every primary.
+- **Opening only port 6379.** The cluster bus port (+10000) must be reachable between nodes, or nodes keep flagging each other as failed.
+- **Reading from replicas without `READONLY`** in Cluster. You get redirected back to the primary.
+
+## Practice questions
+
+<Practice>
+
+<QA q="What is Redis replication and how do you set it up?" level="easy">
+
+Replication keeps one or more **replicas** as asynchronous copies of a **primary**. The primary executes writes, replies to the client, and streams the same commands to its replicas.
+
+Setup on the replica:
+
+```bash
+# redis.conf
+replicaof 10.0.0.1 6379
+masterauth <password>        # if the primary uses requirepass
+# or at runtime
+REPLICAOF 10.0.0.1 6379
+```
+
+Verify with `INFO replication` on both sides (`role`, `connected_slaves`, `master_repl_offset`, `master_link_status:up`) or with `ROLE`.
+
+What happens next:
+
+1. On first connect, the replica sends `PSYNC`.
+2. Since it has no shared history, the primary does a **full sync**: it forks and produces an RDB (diskless by default since 7.0), buffers new writes, sends the RDB, then streams the buffered writes.
+3. After that the primary streams commands continuously.
+
+Replicas are read-only by default. A replica can have its own replicas in a cascade, and all sub-replicas receive the exact stream sent by the top-level primary.
+
+</QA>
+
+<QA q="How does Redis maintain high availability?" level="easy">
+
+There are three layers:
+
+1. **Replication** gives you standby copies.
+2. **Failover automation** promotes a replica when the primary fails. Sentinel does this for non-clustered setups. Redis Cluster does it internally, with the majority of primaries voting over the cluster bus.
+3. **Client discovery** sends traffic to the new primary. Clients either ask Sentinel (`SENTINEL get-master-addr-by-name`) or follow `MOVED` redirects and refresh the slot map in Cluster.
+
+Persistence (RDB/AOF) is what lets a restarted node recover its data, and placing nodes across availability zones protects against correlated failures. Because replication is async, HA in Redis means **high availability, not zero data loss**.
+
+</QA>
+
+<QA q="Explain how Redis Sentinel works." level="medium">
+
+Sentinel is a set of at least three independent processes (port 26379) that monitor a named primary and its replicas.
+
+- **Discovery**: you configure only the primary. Sentinels find replicas through `INFO` and find each other through hello messages on `__sentinel__:hello`.
+- **Detection**: a Sentinel marks the primary **SDOWN** after `down-after-milliseconds` without a valid reply. Once at least **quorum** Sentinels agree, the primary becomes **ODOWN**.
+- **Authorization**: the Sentinel that wants to fail over must win a vote from a **majority** of all Sentinels. The winner gets a unique configuration epoch. A minority partition can never fail over.
+- **Promotion**: the leader skips replicas that have been disconnected too long. It picks by lowest `replica-priority` (`0` means never), then highest replication offset, then smallest run ID. It sends `REPLICAOF NO ONE` to that replica and repoints the others `parallel-syncs` at a time.
+- **Propagation**: the new configuration with the higher epoch spreads through the Sentinels. Clients subscribed to `+switch-master` reconnect. When the old primary returns, it is demoted to a replica.
+
+</QA>
+
+<QA q="What is Redis Cluster and how does it improve scalability and availability?" level="medium">
+
+Redis Cluster is Redis's built-in sharded mode.
+
+- **Scalability**: the keyspace is divided into 16384 hash slots (`CRC16(key) mod 16384`), and each primary owns a subset. Adding primaries and moving slots to them spreads both memory and write load. There is no proxy, because clients route directly using a cached slot map.
+- **Availability**: each primary has replicas. Nodes gossip over the cluster bus (port +10000). If a primary is unreachable by a majority of primaries for `cluster-node-timeout`, it is marked FAIL, and one of its replicas wins an election (majority of primaries vote) and takes over its slots.
+
+The limits:
+
+- The cluster becomes unavailable if a majority of primaries fail, or if a slot loses all its copies (with the default `cluster-require-full-coverage yes`).
+- Multi-key operations need same-slot keys.
+- Writes can still be lost because replication is async.
+
+</QA>
+
+<QA q="How do you shard data in a Redis Cluster?" level="medium">
+
+Sharding is by **hash slot**: `slot = CRC16_XMODEM(key) mod 16384`. If the key contains a non-empty hash tag (text between the first `{` and the next `}`), only the tag is hashed.
+
+```bash
+CLUSTER KEYSLOT user:42            # 15880
+CLUSTER KEYSLOT {user:42}:cart     # 15880
+CLUSTER KEYSLOT {user:42}:profile  # 15880 → MGET/MULTI/Lua across them works
+```
+
+Slots are assigned to primaries. `redis-cli --cluster create` splits them evenly, for example 0-5460 / 5461-10922 / 10923-16383 for three primaries. Design guidance:
+
+- Pick keys whose hash spreads load evenly.
+- Use hash tags only to co-locate keys that must be operated on together, and only at a fine granularity (per user or per order, not per tenant).
+- Avoid a few huge keys, because a slot is the smallest unit you can move.
+
+</QA>
+
+<QA q="How do you ensure data consistency across Redis replicas?" level="medium">
+
+You can **bound** inconsistency, but you cannot eliminate it, because replication is async.
+
+- **Reads**: replicas lag behind. For read-your-writes, read from the primary, or pin a session to the primary for a short time after it writes.
+- **`WAIT n timeout`** after critical writes. Check that the returned count is at least n. This lowers the chance of loss but is not strong consistency.
+- **`min-replicas-to-write` / `min-replicas-max-lag`** stops a primary that has lost its replicas from accepting writes, which bounds split-brain loss to about max-lag seconds.
+- **`WAITAOF`** (7.2+) when you also need fsync durability.
+- **Keep replicas read-only.** Writable replicas diverge, because expiries and evictions are driven by the primary's `DEL`s.
+- **Persistence on**, and **no auto-restart of a primary without persistence**.
+- Monitor `master_repl_offset` against each replica's offset, `master_link_status`, and `sync_full` counts.
+
+For anything that needs linearizability (money, locks guarding correctness), use a consensus system or the database, and treat Redis as a derived cache.
+
+</QA>
+
+<QA q="How do you scale Redis?" level="medium">
+
+Work up the ladder:
+
+1. **Optimize first**: pipelining, avoiding O(N) commands and big keys, compact encodings.
+2. **Vertical**: more RAM, faster CPU, and I/O threads (6.0+) to offload socket reads and writes. Command execution is still single-threaded.
+3. **Read replicas** for read-heavy load. Accept staleness, and remember that writes do not scale.
+4. **Sharding** when memory or write throughput outgrows one node. There are three ways:
+   - **Client-side** consistent hashing: simple, but resharding and failover are manual.
+   - **Proxy** (twemproxy, Envoy): one endpoint, but an extra hop and the proxy itself needs HA.
+   - **Redis Cluster**: native slots, failover and online resharding, but you need a cluster-aware client and same-slot multi-key operations.
+
+Managed services (ElastiCache, MemoryDB, Redis Cloud) take away much of the operational work.
+
+</QA>
+
+<QA q="Discuss the pros and cons of Redis Sentinel vs Redis Cluster." level="medium">
+
+**Sentinel**
+
+- Pros: simple data model (every command works, including any multi-key operation, Lua and `MULTI`). Multiple DBs. Simpler operations. A mature client ecosystem.
+- Cons: no sharding, so memory and write throughput are capped at one primary. It needs a separate group of at least three Sentinels. Failover depends on clients rediscovering the primary.
+
+**Cluster**
+
+- Pros: horizontal scaling of memory and writes. Failover is built in, so there are no extra processes. Resharding happens online.
+- Cons: cross-slot operations fail (`CROSSSLOT`), so you have to design hash tags. Only db 0. It needs cluster-aware clients. Hot slots and big keys are harder to fix. More moving parts (slot balance, coverage settings, bus port).
+
+Neither one gives strong consistency. Choose Sentinel when the dataset fits one node and you need HA. Choose Cluster when you need to scale out.
+
+</QA>
+
+<QA q="Explain PSYNC, the replication ID and the backlog. When does a replica fall back to a full sync?" level="hard">
+
+The primary's state is identified by `(replid, offset)`. When a replica reconnects, it sends `PSYNC <replid> <offset+1>`. The primary answers `+CONTINUE` and sends only the missing bytes **if** the replid matches its current ID, or its secondary ID up to the switch offset, **and** the requested offset is still in the circular **replication backlog**.
+
+A full sync (`+FULLRESYNC`) happens when:
+
+- The replica is new.
+- The backlog has wrapped (`repl-backlog-size` defaults to 1 MB, so it is easy to overrun).
+- The history is unknown, for example because the primary restarted and generated a new replid.
+- The replica restarted from AOF only (partial sync after restart needs the RDB metadata written by a clean `SHUTDOWN`).
+
+The secondary ID is what lets replicas partially resync with a **newly promoted** primary after a failover (4.0+). Size the backlog at roughly replication bytes per second times the longest outage you want to survive.
+
+</QA>
+
+<QA q="Explain how failover works in a Redis Cluster." level="hard">
+
+1. **PFAIL**: a node that has had a ping pending for longer than `cluster-node-timeout` (default 15 s) flags the peer as PFAIL. This is local suspicion only.
+2. **FAIL**: once a majority of **primaries** have reported PFAIL or FAIL within `2 × node-timeout`, a node broadcasts FAIL, and every node marks the peer failed.
+3. **Election**: the failed primary's replicas wait `500 ms + random(0-500 ms) + rank × 1000 ms`. Rank 0 is the replica with the highest replication offset, so the freshest replica usually goes first. The replica then increments `currentEpoch` and sends `FAILOVER_AUTH_REQUEST` to all primaries.
+4. **Vote**: each primary votes at most once per epoch, and refuses another replica of the same primary for `2 × node-timeout`. A replica that gets a majority wins.
+5. **Promotion**: the winner takes a new `configEpoch`, claims the slots, and broadcasts. Higher epochs win any conflict, so the old primary rejoins as a replica, and clients get `MOVED`.
+
+A replica disconnected for more than `node-timeout × cluster-replica-validity-factor` will not attempt promotion. A manual `CLUSTER FAILOVER` on a replica is safer than an automatic failover. The primary pauses clients, the replica catches up to the exact offset, and only then switches, so nothing is lost. `FORCE` skips the handshake for when the primary is dead. `TAKEOVER` also skips the vote, which is useful for DC evacuation but can cause epoch collisions.
+
+</QA>
+
+<QA q="How do you add or remove nodes in a Redis Cluster?" level="hard">
+
+**Add a primary**
+
+1. Start the node with `cluster-enabled yes`.
+2. Run `redis-cli --cluster add-node NEW:7000 EXISTING:7000`. The node joins with no slots.
+3. Move slots onto it with `redis-cli --cluster reshard EXISTING:7000 --cluster-from ... --cluster-to NEW_ID --cluster-slots N`, or with `--cluster rebalance --cluster-use-empty-masters`.
+
+Internally, each slot is set `IMPORTING` on the target and `MIGRATING` on the source, keys are moved with batched `MIGRATE`, and finally `SETSLOT ... NODE`. While that runs, clients see `ASK` redirects.
+
+**Add a replica**
+
+Run `add-node ... --cluster-slave --cluster-master-id <id>`, or `CLUSTER REPLICATE <id>` on the new node.
+
+**Remove**
+
+- A replica: `redis-cli --cluster del-node ANY:7000 <id>`.
+- A primary: first reshard **all** its slots away until it is empty, then `del-node`. Alternatively, if you are only replacing hardware, fail it over to a replica with `CLUSTER FAILOVER` and remove the node once it is a replica.
+- A dead node: `del-node` cannot connect to it, so run `redis-cli --cluster call ANY:7000 CLUSTER FORGET <id>`.
+
+Afterwards, run `redis-cli --cluster check` and confirm that `cluster_slots_assigned:16384` and `cluster_state:ok`.
+
+</QA>
+
+<QA q="What maintenance operations are needed for a Redis Cluster?" level="hard">
+
+- **Health checks**: `redis-cli --cluster check`, `CLUSTER INFO` (`cluster_state`, `cluster_slots_fail`), and `CLUSTER SHARDS`/`CLUSTER NODES`. Alert on PFAIL/FAIL flags, replication link down, and offset lag.
+- **Fix**: after an interrupted reshard, slots can be left open in `MIGRATING`/`IMPORTING`. `redis-cli --cluster fix` closes them.
+- **Rebalancing**: `--cluster rebalance` when memory or QPS per primary drifts. Hunt hot keys and big keys (`redis-cli --bigkeys`, `--hotkeys` with an LFU policy, `MEMORY USAGE`).
+- **Rolling upgrades**: upgrade replicas first. For each primary, run `CLUSTER FAILOVER` on its replica, upgrade the old primary (now a replica), and optionally fail back.
+- **Replica coverage**: make sure every primary has at least one replica in another AZ. Replica migration (`cluster-migration-barrier`) can move spare replicas to orphaned primaries.
+- **Persistence and backups**: RDB/AOF on every node, with backups taken per shard.
+- **Capacity**: memory headroom for forks (copy-on-write), an adequate `repl-backlog-size`, and an output-buffer limit large enough for a full sync.
+- **Forget dead nodes**: `CLUSTER FORGET` puts the node ID on a 60-second ban list so gossip cannot re-add it. Before 7.2 you had to send it to every node inside that window, which `redis-cli --cluster call` does. From 7.2 the ban list travels in gossip, so the change usually spreads from one node to the rest.
+
+</QA>
+
+<QA q="Discuss the challenges of running a Redis Cluster in production." level="hard">
+
+- **Write loss and split brain**:
+  - Async replication loses writes the primary acknowledged just before it died.
+  - A primary in a minority partition keeps accepting writes for up to `cluster-node-timeout` before it refuses them, and those writes are lost once a replica on the majority side is promoted.
+  - `WAIT` and `min-replicas-*` shrink the window.
+- **Cross-slot operations**: `MGET`, transactions and Lua across slots fail with `CROSSSLOT`, so the data model has to plan for hash tags.
+- **Hot slots/keys**: one celebrity key, or an over-broad hash tag, saturates one primary while the others sit idle. Resharding cannot split a single key. Mitigate with key splitting, local caching, or read replicas with `READONLY`.
+- **Big keys**: slow `MIGRATE` blocks both nodes during resharding, plus memory imbalance.
+- **Client support**: clients must handle `MOVED`/`ASK`/`TRYAGAIN`, refresh topology, and route pipelines per node. Some libraries or proxies handle this badly. `SCAN`/`KEYS`/`FLUSHALL` work per node.
+- **Full coverage**: with the default `cluster-require-full-coverage yes`, a shard that loses every copy stops the whole cluster.
+- **Operational complexity**: two ports per node, slot balance, rolling upgrades, AZ placement of replicas, backups per shard, and only db 0.
+- **Pub/Sub fan-out**: classic `PUBLISH` floods the bus to every node. Use sharded Pub/Sub (7.0+).
+
+</QA>
+
+<QA q="What are some strategies for Redis failover management?" level="scenario">
+
+- **Automate detection, but tune it.** Use Sentinel or Cluster. Set `down-after-milliseconds` or `cluster-node-timeout` above normal GC/network hiccups but below your RTO. Values that are too low cause flapping failovers.
+- **Prefer planned failovers.** Use `CLUSTER FAILOVER` (no loss) or `SENTINEL FAILOVER` for upgrades and host moves, during low traffic.
+- **Control promotion.** Set `replica-priority`, with `0` for DR or analytics replicas that must never become primary. Keep replicas in separate AZs, and keep the backlog large enough that repointed replicas partially resync.
+- **Limit split brain.** Run at least 3 Sentinels in independent zones, set `min-replicas-to-write 1` / `min-replicas-max-lag 10`, and in Cluster rely on minority primaries refusing writes after node-timeout.
+- **Make clients failover-friendly.** Use Sentinel/Cluster-aware clients with topology refresh, retries with backoff and jitter, idempotent writes, and timeouts shorter than your failover window.
+- **Protect important writes.** `WAIT`, and replay from a durable source (DB or Kafka) after an incident.
+- **Practice.** Run game days (`DEBUG SLEEP`, killing the primary, partitioning an AZ), measure the real RTO, and alert on `+switch-master` and `cluster_state`.
+
+</QA>
+
+<QA q="Scenario: after a network partition your Sentinel-managed primary was failed over and some recent orders vanished from Redis. Walk through what happened and how you would prevent it." level="scenario">
+
+**What happened**
+
+The old primary P ended up on the minority side with some app servers. The Sentinels on the majority side reached ODOWN and a majority vote, and promoted R1. Meanwhile, the app servers on P's side kept writing to P, because P never noticed it was isolated. When the partition healed, Sentinel demoted P to a replica of R1. P did a resync and **discarded** every write it took during the partition. In addition, writes P had acknowledged right before the cut but had not yet streamed were never on R1.
+
+**Prevention**
+
+1. Set `min-replicas-to-write 1` and `min-replicas-max-lag 10`, so an isolated P rejects writes after about 10 s.
+2. Use `WAIT 1 <ms>` on order writes and treat a short count as a failure to retry or compensate.
+3. Make Redis a cache or projection of a durable store (the orders DB or an event log), not the system of record.
+4. Make sure Sentinels sit in at least 3 independent zones, and that clients rediscover the primary quickly.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="A replica disconnects for 3 minutes from a primary producing about 2 MB/s of replication traffic, with repl-backlog-size left at its default. What happens on reconnect?" options={["Partial resync, because the replication ID still matches", "Full resync, because about 360 MB of stream far exceeds the 1 MB backlog", "The replica refuses to reconnect until restarted", "The replica replays the missing commands from its own AOF"]} answer={1}>
+
+A partial resync needs both a matching replication ID **and** an offset that is still inside the backlog. With a 1 MB default and about 360 MB missed, the offset has fallen out of the buffer, so the primary sends `+FULLRESYNC`. Replicas reconnect automatically, and a replica's AOF cannot supply data it never received.
+
+</MCQ>
+
+<MCQ q="You run 5 Sentinels with quorum 2. Two Sentinels lose contact with the primary, while the other three can still reach it. What happens?" options={["Failover happens immediately because quorum is met", "The primary is marked ODOWN, but the failover leader still needs votes from a majority (3) of Sentinels to proceed", "Nothing, because quorum must always equal the majority", "The two Sentinels promote a replica on their own and the others follow"]} answer={1}>
+
+Quorum controls only failure **detection** (ODOWN). To **authorize** a failover, one Sentinel must win votes from a majority of all Sentinels, here 3 of 5. In this scenario all five Sentinels can still talk to each other, so the leader can collect those 3 votes and the failover goes ahead (the docs' own 5-Sentinel, quorum-2 example). The majority rule is what stops a Sentinel minority that is *partitioned from the others* from failing over on its own.
+
+</MCQ>
+
+<MCQ q="What does WAIT 2 500 returning (integer) 1 tell you?" options={["The write was rolled back because only 1 replica acknowledged it", "Redis guarantees the write survives any failover", "The write is on the primary and at least 1 replica. The timeout hit before a second replica acknowledged, and the write is NOT undone", "WAIT failed and the client must re-send the write"]} answer={2}>
+
+`WAIT` never rolls anything back. It reports how many replicas acknowledged the connection's earlier writes. You must compare that number with what you asked for and decide what to do. Even meeting the target is not a guarantee against failover loss.
+
+</MCQ>
+
+<MCQ q="Keys user:42:cart and user:42:profile must be updated in one MULTI transaction on Redis Cluster. What is the correct fix?" options={["Nothing, because keys sharing a prefix always share a slot", "Wrap the shared part user:42 in a hash tag (curly braces) in both key names so only that part is hashed", "Run MULTI on the replica instead of the primary", "Set cluster-require-full-coverage no"]} answer={1}>
+
+Without a hash tag the full key string is hashed, and a shared prefix means nothing to CRC16, so the two keys usually land in different slots (12984 for the cart key, 9133 for the profile key) and the transaction fails with `CROSSSLOT`. With `{user:42}:cart` and `{user:42}:profile`, only `user:42` is hashed, so both go to slot 15880. Remember that the tag is the **first** non-empty brace pair: in `foo{}{bar}` the first pair is empty, so the whole key is hashed. Replicas do not accept writes, and the coverage setting has nothing to do with slot co-location.
+
+</MCQ>
+
+<MCQ q="A client gets -ASK 3999 10.0.0.3:6381. What is the correct behavior?" options={["Update the slot map so slot 3999 points to 10.0.0.3:6381 and retry", "Retry the same node after a backoff", "Send the command to the replica of the original node", "Send ASKING and then the command to 10.0.0.3:6381, without changing the cached slot map"]} answer={3}>
+
+`ASK` means the slot is in the middle of a migration and this particular key may already be on the target. The client sends `ASKING`, which is a one-shot permission, and then the command. It must keep routing other keys in slot 3999 to the source until it sees a `MOVED`, which signals that ownership has changed permanently.
+
+</MCQ>
+
+<MCQ q="Why did Redis Cluster choose 16384 slots instead of 65536?" options={["Heartbeats carry the slot bitmap in raw form. 16k slots is 2 KB versus 8 KB for 65k, and clusters are not expected to exceed about 1000 primaries", "CRC16 cannot produce values above 16383", "Lua scripts can only address 14-bit integers", "To make CROSSSLOT errors less likely"]} answer={0}>
+
+antirez's explanation is about the size of gossip messages. CRC16 produces 16-bit values, and the server only uses 14 of those bits (mod 16384). With at most about 1000 primaries, 16k slots is still plenty per node.
+
+</MCQ>
+
+<MCQ q="In a 3-primary cluster, primary B and a few clients are partitioned away from everything else, and B's replica is on the majority side. Which statement is correct?" options={["B keeps accepting writes indefinitely and they merge back after healing", "B rejects writes immediately when the partition starts", "B accepts writes until about cluster-node-timeout, then refuses them. Writes accepted in that window are lost if its replica gets promoted", "The cluster cannot fail over B because B is still alive"]} answer={2}>
+
+A primary that cannot reach a majority of primaries for `NODE_TIMEOUT` stops accepting writes, which bounds the split-brain window. Until then it keeps accepting writes, and after the majority side promotes B's replica, the old B rejoins as a replica and those writes are discarded. Redis never merges values.
+
+</MCQ>
+
+<MCQ q="You want to decommission a primary that owns 3000 slots and reduce the number of shards. What is the correct order?" options={["redis-cli --cluster del-node right away, since slots auto-migrate", "CLUSTER FAILOVER to its replica and then del-node the replica", "Reshard all 3000 slots to the other primaries until the node is empty, then del-node it (and its replicas)", "CLUSTER FORGET it on one node"]} answer={2}>
+
+`del-node` refuses to remove a primary that still has slots, because Redis never moves data automatically. Failing over keeps the shard count the same, since it only swaps which node is primary. `CLUSTER FORGET` only removes the node from the other nodes' tables. It moves no data, so the 3000 slots would be left without an owner.
+
+</MCQ>
+
+<MCQ q="Which setting makes the whole cluster stop serving queries when any slot has no reachable owner?" options={["cluster-allow-reads-when-down yes", "cluster-migration-barrier 1", "cluster-require-full-coverage yes (the default)", "cluster-replica-validity-factor 0"]} answer={2}>
+
+With full coverage required, an uncovered slot puts the cluster into the fail state. Setting it to `no` keeps the other slots available. `allow-reads-when-down` only allows reads while the cluster is down. The migration barrier controls replica migration, and validity-factor 0 lets any replica try to fail over regardless of how stale it is.
+
+</MCQ>
+
+<MCQ q="Why must a promoted replica generate a NEW replication ID instead of keeping its old primary's ID?" options={["Replication IDs encode the node's IP address", "To force every other replica into a full resync", "Because Sentinel requires unique IDs per epoch", "The old primary may still be running and accepting writes on the other side of a partition, so the same (ID, offset) could then describe two different datasets"]} answer={3}>
+
+A `(replid, offset)` pair must uniquely identify one dataset. The promoted node keeps the old ID as its **secondary** ID, so the other replicas can still partially resync up to the switch offset. Forcing full resyncs is exactly what this design avoids.
+
+</MCQ>
+
+<MCQ q="Your primary has persistence disabled and is managed by systemd with Restart=always, with two replicas and Sentinel. What is the main risk?" options={["The primary may crash and restart empty before Sentinel notices, and the replicas then resync to the empty dataset, wiping all copies", "Sentinel cannot monitor primaries without persistence", "Replicas will refuse to sync from a non-persistent primary", "Writes become synchronous"]} answer={0}>
+
+The replication docs warn about exactly this failure mode. A fast restart can beat `down-after-milliseconds`, so no failover happens, and the replicas faithfully copy the empty primary. Either enable persistence or disable auto-restart.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **Replication** is async. A node's state is `(replid, offset)`. Reconnecting replicas use `PSYNC`: partial if the offset is still in `repl-backlog-size` (default 1 MB, size it to write rate × outage), otherwise a full RDB sync. Diskless sync is the default since 7.0.
+- **Two replication IDs** let replicas partially resync with a newly promoted primary (4.0+).
+- **OK does not mean replicated.** `WAIT n ms` (check the return value) reduces loss but is not strong consistency. `min-replicas-to-write` / `min-replicas-max-lag` (default 0 / 10) caps how long an isolated primary keeps taking writes. `WAITAOF` arrived in 7.2.
+- **Sentinel**: at least 3 processes, port 26379. SDOWN leads to ODOWN by **quorum**, and the failover needs a **majority** vote plus a config epoch. Promotion order is priority, then offset, then run ID. Clients use `get-master-addr-by-name` and `+switch-master`. No sharding.
+- **Cluster**: 16384 slots, `CRC16(key) mod 16384`, hash tag = first non-empty `{...}`. `MOVED` means update the map. `ASK` means one-shot `ASKING` and no map update. Bus port = port + 10000.
+- **Cluster failover**: PFAIL after node-timeout (default 15 s), FAIL by a majority of primaries, replica delay `500 + rand(500) + rank×1000` ms, majority of primaries vote. Minority primaries refuse writes after node-timeout.
+- **Ops**: `redis-cli --cluster create|add-node|reshard|rebalance|del-node|check|fix|call`. Empty a primary before del-node. Use `CLUSTER FAILOVER` for rolling upgrades.
+- **Gotchas**: CROSSSLOT, hot slots from broad hash tags, big keys blocking `MIGRATE`, `cluster-require-full-coverage yes`, db 0 only, `READONLY` for replica reads, open both ports.
+
+Related notes: [Redis deep dive](/learn/notes/redis-deep/), [Replication and sharding](/learn/notes/replication-sharding/), [Distributed cache HLD](/learn/notes/hld-distributed-cache/).
+
+## Go deeper
+
+- **Redis docs: Replication**: [redis.io/docs/latest/operate/oss_and_stack/management/replication/](https://redis.io/docs/latest/operate/oss_and_stack/management/replication/). Covers replid, PSYNC, diskless sync, `min-replicas-*`, and the persistence-off trap.
+- **Redis docs: Sentinel**: [redis.io/docs/latest/operate/oss_and_stack/management/sentinel/](https://redis.io/docs/latest/operate/oss_and_stack/management/sentinel/). Covers quorum vs majority, epochs, and replica selection.
+- **Redis docs: Scale with Redis Cluster**: [redis.io/docs/latest/operate/oss_and_stack/management/scaling/](https://redis.io/docs/latest/operate/oss_and_stack/management/scaling/). Covers redis-cli `--cluster` ops, manual failover, and upgrades.
+- **Redis Cluster specification**: [redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/). Covers slots, MOVED/ASK, failure detection, and elections.
+- **`WAIT`**: [redis.io/docs/latest/commands/wait/](https://redis.io/docs/latest/commands/wait/) and **`CLUSTER FAILOVER`**: [redis.io/docs/latest/commands/cluster-failover/](https://redis.io/docs/latest/commands/cluster-failover/).
+- **antirez on why 16384 slots**: [github.com/redis/redis/issues/2576](https://github.com/redis/redis/issues/2576). More from the original author at [antirez.com](http://antirez.com).
+- **Jepsen: Redis (2013)**: [aphyr.com/posts/283-call-me-maybe-redis](https://aphyr.com/posts/283-call-me-maybe-redis). The classic look at write loss under partition.
+- **twemproxy**: [github.com/twitter/twemproxy](https://github.com/twitter/twemproxy). **Envoy Redis proxy**: [envoyproxy.io docs](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/other_protocols/redis).
+- **Book**: *Redis in Action* (Josiah Carlson). Older, but the chapters on replication and sharding still build good intuition.

@@ -1,0 +1,526 @@
+---
+title: "Machine Coding Rounds: A 60-Minute Strategy"
+phase: "14-lld"
+order: 137
+tags: ["lld", "machine-coding", "java", "interview"]
+premium: false
+previewParagraphs: 4
+estimatedMinutes: 25
+prerequisites: ["solid-principles", "creational-patterns", "structural-patterns", "behavioral-patterns"]
+summary: "A minute-by-minute plan for machine-coding rounds — what evaluators grade, how to clarify scope, how to go from entities to services to interfaces, handle concurrency and demo — with a fully worked parking-lot design in Java."
+---
+
+## Definition (interview-ready)
+
+A **machine-coding round** is a timed interview (commonly 60–120 minutes) where you build a **small, working, in-memory application** from a short problem statement — a parking lot, an expense splitter, a snake-and-ladder game — on your own machine, in your own IDE. There is usually no database, no web framework and no UI: a `main` method or a few tests drive the code.
+
+It is **not** a DSA round (the algorithms are easy) and **not** a whiteboard LLD round (diagrams alone don't count). It tests whether you can turn vague requirements into **clean, correct, extensible code under time pressure** — essentially a compressed version of your day job.
+
+**One-liner:** A machine-coding round asks you to build a small, working, in-memory app in 60–120 minutes, and it grades working code first, then clean modular design, extensibility, readability and edge-case handling.
+
+## Why it matters
+
+- Many product companies use it as an elimination round for SDE-1 to SDE-3 roles, and it's the round where strong DSA candidates most often fail — usually because they run out of time or produce one giant class.
+- Evaluators read your code afterwards, often asking for a small **extension** in the last 10–15 minutes ("now add a premium tier", "now support percentage splits"). If your design was extensible, the change is ten lines. If not, you're rewriting in front of them.
+- The skills transfer directly: modelling a domain, separating layers, choosing patterns only where they pay off (see [Behavioral Patterns](/learn/notes/behavioral-patterns/) and [Structural Patterns](/learn/notes/structural-patterns/)).
+
+## Core concepts
+
+### What evaluators actually grade
+
+Rubrics differ by company, but these five show up almost everywhere, roughly in priority order:
+
+| Criterion | What "good" looks like | Common failure |
+|---|---|---|
+| **Working code** | Must-have features run end-to-end; a demo `main` or tests show it. | Beautiful interfaces, nothing runs. |
+| **Modularity / separation of concerns** | Models, repositories, services, strategies in separate classes/packages. Each class has one job. | A 600-line `ParkingLotManager` doing everything. |
+| **Extensibility** | New vehicle type, new pricing, new split type = **add a class**, not edit five `if`s. Interfaces at the axes of change. | `switch (vehicleType)` repeated in many methods. |
+| **Naming and readability** | Domain names (`Ticket`, `SpotAllocator`, `ExpenseSplitter`), small methods, no clever tricks. | `data`, `mgr`, `process2()`, magic numbers. |
+| **Tests and edge cases** | A few unit tests for core logic; invalid input and "lot full" handled with clear exceptions. | Only the happy path; `null` returned on errors. |
+
+Also noticed: **concurrency awareness** (thread-safe where it matters), **exception handling** (custom domain exceptions), and how you **communicate** trade-offs.
+
+**How to say it in an interview:** "I'll get the core flow working end-to-end first, keep each class to one responsibility, and put interfaces where I expect change — pricing and allocation — so extensions are additive."
+
+### Clarifying requirements checklist (first 5–7 minutes)
+
+Ask, then **write the answers down** as comments at the top of `Main` — it becomes your spec and shows the evaluator your scope.
+
+1. **Actors** — who uses it? (Customer, admin, attendant, system.)
+2. **Must-have operations** — list the 3–5 core commands. Everything else is "nice to have".
+3. **Input/output format** — commands from stdin, a fixed driver, or just method calls? Exact output strings?
+4. **Entities and their variants** — which types exist now (vehicle sizes, user roles, split types)? Which are likely to be added later?
+5. **Business rules** — allocation order (nearest spot? lowest floor?), pricing rules, limits, rounding.
+6. **Error cases** — what happens when full, invalid ID, duplicate entry, insufficient balance?
+7. **Concurrency** — single-threaded driver, or multiple entry gates / users at once?
+8. **Persistence** — in-memory OK? (Almost always yes.) Any need to survive restart?
+9. **Scale hints** — 100 spots or a million? (Affects data structures, not architecture.)
+10. **Out of scope** — confirm: no UI, no DB, no auth, no payments integration.
+
+### From statement to classes: entities → relationships → services → interfaces
+
+A repeatable four-step method:
+
+1. **Entities (nouns)** — underline nouns in the problem: *parking lot, floor, spot, vehicle, ticket, gate, payment*. Keep the ones with state or rules. These become model classes (mostly plain data plus small invariants).
+2. **Relationships** — who owns whom and how many: a lot **has many** floors, a floor **has many** spots, a ticket **refers to** one vehicle and one spot. Decide which side holds the reference (usually the owner, and use IDs across aggregates).
+3. **Services (verbs)** — underline verbs: *park, unpark, calculate fee, show availability*. Each cluster of verbs becomes a service class that orchestrates entities and repositories.
+4. **Interfaces (axes of change)** — anything the interviewer said "may change" or has variants: pricing → `PricingStrategy`, spot choice → `SpotAllocationStrategy`, notification → `Notifier`, storage → `Repository`. Everything else stays concrete — don't interface every class.
+
+A typical package layout:
+
+```
+com.example.parking
+├── model/        Vehicle, VehicleType, ParkingSpot, SpotType, Floor, Ticket
+├── repository/   SpotRepository, TicketRepository (+ InMemory implementations)
+├── strategy/     PricingStrategy, HourlyPricing, SpotAllocationStrategy, NearestFirst
+├── service/      ParkingService
+├── exception/    ParkingFullException, InvalidTicketException
+└── Main.java     demo driver
+```
+
+### In-memory repositories
+
+Hide storage behind a small interface even though it's a `HashMap`. It costs two minutes, makes the service layer read like real code, and lets you say "swapping to a DB is a new implementation". Use `ConcurrentHashMap` if more than one thread can touch it.
+
+```java
+public interface TicketRepository {
+    Ticket save(Ticket t);
+    Optional<Ticket> findById(String id);
+    void delete(String id);
+}
+
+public class InMemoryTicketRepository implements TicketRepository {
+    private final Map<String, Ticket> store = new ConcurrentHashMap<>();
+    public Ticket save(Ticket t)                   { store.put(t.id(), t); return t; }
+    public Optional<Ticket> findById(String id)    { return Optional.ofNullable(store.get(id)); }
+    public void delete(String id)                  { store.remove(id); }
+}
+```
+
+Return `Optional` (or throw a domain exception) instead of `null`. Generate IDs with an `AtomicLong` counter or `UUID.randomUUID()`.
+
+### Concurrency considerations
+
+Even if the driver is single-threaded, evaluators often ask "what if two gates park at once?" Know the hot spots and fixes:
+
+- **Check-then-act races** — "find a free spot, then mark it occupied" is two steps. Two threads can find the same spot. Fix: make the claim atomic — a `synchronized` allocation method, a lock per floor, or a compare-and-set on the spot (`AtomicBoolean.compareAndSet(false, true)`).
+- **Shared maps** — use `ConcurrentHashMap`, and its atomic methods (`computeIfAbsent`, `merge`, `compute`) rather than `get`-then-`put`.
+- **Counters and IDs** — `AtomicLong.incrementAndGet()`, not `id++`.
+- **Balances** (expense splitters, wallets) — update both sides under one lock, or use `merge` with `BigDecimal::add` per key; lock in a consistent order if you need two locks (avoids deadlock).
+- **Lock granularity** — one global lock is simple and correct; per-floor or per-spot locks scale better. Say which you chose and why.
+- **Immutability** — make value objects (`Money`, `Vehicle`, events) immutable records; they're automatically thread-safe.
+
+See [OS & Concurrency](/learn/notes/os-concurrency/) for the underlying primitives.
+
+### How to demo
+
+- A `Main` that runs a **scripted scenario**: happy path, then each edge case (full lot, invalid ticket), printing clear output.
+- Or 4–6 **JUnit tests** named like sentences: `parksCarInNearestFreeSpot`, `throwsWhenLotIsFull`, `feeRoundsUpToNextHour`.
+- Walk the evaluator through **one request end-to-end**: `Main` → service → strategy → repository.
+- Then point at the **extension points**: "to add EV charging spots I'd add a `SpotType` and a pricing rule — nothing else changes."
+
+## How it works
+
+### The minute-by-minute plan (60 minutes)
+
+| Time | Do | Output |
+|---|---|---|
+| **0–7** | Read twice. Ask the clarifying checklist. Write must-haves vs nice-to-haves as comments. | Agreed scope |
+| **7–15** | Entities → relationships → services → interfaces. Sketch classes on paper or in a comment block. Pick 1–2 patterns only where variation was mentioned. | Class list + method signatures |
+| **15–20** | Create packages, models (records/enums), repository interfaces + in-memory implementations. | Compiling skeleton |
+| **20–40** | Implement the **core flow end-to-end first** (e.g. park + unpark + fee). Run it from `Main` as soon as the first operation works. | Working must-haves |
+| **40–48** | Error handling and edge cases: custom exceptions, validation, "full", "not found". Make shared state thread-safe. | Robust core |
+| **48–55** | Tests or demo script covering happy path + 2–3 edge cases. Run everything. | Proof it works |
+| **55–60** | Clean up names, delete dead code, add a short README/comment on assumptions and extension points. Rehearse the walkthrough. | Presentable code |
+
+For a 90- or 120-minute round, scale the build phase, not the design phase. **Rule:** if at minute 35 nothing runs end-to-end, cut scope immediately — a working subset beats a complete design that doesn't compile.
+
+### Worked example: Parking Lot
+
+**Problem (as typically given):** A multi-floor parking lot has spots of types SMALL, MEDIUM, LARGE. Bikes need SMALL, cars MEDIUM, trucks LARGE. Support: park a vehicle (assign nearest available spot of the right type, issue a ticket), unpark with a ticket (free the spot, compute the fee), and show free spots per floor and type. Fees are hourly and differ by vehicle type. Multiple entry gates may operate concurrently.
+
+**Clarified assumptions** (written at the top of `Main`): nearest = lowest floor, then lowest spot number; a vehicle can't take a bigger spot (keeps it simple, mention it as an extension); partial hours round up; minimum one hour; in-memory only.
+
+**Entities → relationships → services → interfaces**
+
+```
+ Entities:   Vehicle(number, type)  ParkingSpot(id, floor, number, type, occupied)
+             Ticket(id, vehicle, spotId, entryTime)   VehicleType  SpotType
+ Relations:  ParkingLot 1──* Floor 1──* ParkingSpot ;  Ticket ──► Vehicle, ParkingSpot(id)
+ Services:   ParkingService.park(vehicle) / unpark(ticketId) / availability()
+ Interfaces: SpotAllocationStrategy (which free spot?)   PricingStrategy (how much?)
+             TicketRepository (where are tickets kept?)
+
+ ParkingService ◆──► SpotAllocationStrategy ◁── NearestFirstAllocation
+       │        ◆──► PricingStrategy        ◁── HourlyPricing
+       │        ◆──► TicketRepository       ◁── InMemoryTicketRepository
+       └──────► ParkingLot ◆── Floor ◆── ParkingSpot
+```
+
+**Models**
+
+```java
+public enum SpotType { SMALL, MEDIUM, LARGE }
+
+public enum VehicleType {
+    BIKE(SpotType.SMALL), CAR(SpotType.MEDIUM), TRUCK(SpotType.LARGE);
+    private final SpotType requiredSpot;
+    VehicleType(SpotType s) { this.requiredSpot = s; }
+    public SpotType requiredSpot() { return requiredSpot; }
+}
+
+public record Vehicle(String number, VehicleType type) {}
+
+public record Ticket(String id, Vehicle vehicle, String spotId, Instant entryTime) {}
+
+public final class ParkingSpot {
+    private final String id; private final int floor; private final int number; private final SpotType type;
+    private final AtomicBoolean occupied = new AtomicBoolean(false);
+
+    public ParkingSpot(int floor, int number, SpotType type) {
+        this.floor = floor; this.number = number; this.type = type;
+        this.id = "F" + floor + "-" + number;
+    }
+    /** Atomically claim the spot; false if another thread got it first. */
+    public boolean tryOccupy() { return occupied.compareAndSet(false, true); }
+    public void release()      { occupied.set(false); }
+    public boolean isFree()    { return !occupied.get(); }
+    public String id() { return id; }  public int floor() { return floor; }
+    public int number() { return number; } public SpotType type() { return type; }
+}
+
+public final class ParkingLot {
+    private final List<ParkingSpot> spots;           // built once at startup, never resized
+    private final Map<String, ParkingSpot> byId;
+    public ParkingLot(List<ParkingSpot> spots) {
+        this.spots = List.copyOf(spots);
+        this.byId = spots.stream().collect(Collectors.toUnmodifiableMap(ParkingSpot::id, s -> s));
+    }
+    public List<ParkingSpot> spots() { return spots; }
+    public ParkingSpot spot(String id) { return byId.get(id); }
+}
+```
+
+**Strategies (the extension points)**
+
+```java
+public interface SpotAllocationStrategy {
+    Optional<ParkingSpot> allocate(ParkingLot lot, SpotType type);
+}
+
+public class NearestFirstAllocation implements SpotAllocationStrategy {
+    private static final Comparator<ParkingSpot> NEAREST =
+        Comparator.comparingInt(ParkingSpot::floor).thenComparingInt(ParkingSpot::number);
+
+    @Override
+    public Optional<ParkingSpot> allocate(ParkingLot lot, SpotType type) {
+        return lot.spots().stream()
+                  .filter(s -> s.type() == type && s.isFree())
+                  .sorted(NEAREST)
+                  .filter(ParkingSpot::tryOccupy)      // atomic claim; losers move to next spot
+                  .findFirst();
+    }
+}
+
+public interface PricingStrategy { BigDecimal fee(Ticket t, Instant exit); }
+
+public class HourlyPricing implements PricingStrategy {
+    private final Map<VehicleType, BigDecimal> ratePerHour;
+    public HourlyPricing(Map<VehicleType, BigDecimal> ratePerHour) { this.ratePerHour = Map.copyOf(ratePerHour); }
+
+    @Override
+    public BigDecimal fee(Ticket t, Instant exit) {
+        long seconds = Duration.between(t.entryTime(), exit).toSeconds();
+        long hours = Math.max(1, (seconds + 3599) / 3600);              // any partial hour rounds up, min 1 hour
+        return ratePerHour.get(t.vehicle().type()).multiply(BigDecimal.valueOf(hours));
+    }
+}
+```
+
+The `filter(ParkingSpot::tryOccupy)` step is the concurrency fix: two gates may both see spot F1-3 as free, but only one `compareAndSet` succeeds; the other thread's stream simply moves to the next candidate. Stream laziness means it stops at the first spot it successfully claims. This relies on a sequential stream and a side effect inside `filter`, which the Stream docs discourage; a plain `for` loop over the sorted candidates that returns on the first successful `tryOccupy()` does the same thing and is clearer if the evaluator objects. (Scanning every spot is O(n); for a large lot, keep a per-type `PriorityBlockingQueue` or `ConcurrentSkipListSet` of free spots ordered by nearness — mention this as the scaling step.)
+
+**Service**
+
+```java
+public class ParkingService {
+    private final ParkingLot lot;
+    private final SpotAllocationStrategy allocator;
+    private final PricingStrategy pricing;
+    private final TicketRepository tickets;
+    private final Clock clock;                       // injectable for tests
+    private final AtomicLong seq = new AtomicLong();
+
+    public ParkingService(ParkingLot lot, SpotAllocationStrategy allocator,
+                          PricingStrategy pricing, TicketRepository tickets, Clock clock) {
+        this.lot = lot; this.allocator = allocator; this.pricing = pricing;
+        this.tickets = tickets; this.clock = clock;
+    }
+
+    public Ticket park(Vehicle v) {
+        ParkingSpot spot = allocator.allocate(lot, v.type().requiredSpot())
+                .orElseThrow(() -> new ParkingFullException(v.type()));
+        Ticket t = new Ticket("T" + seq.incrementAndGet(), v, spot.id(), clock.instant());
+        return tickets.save(t);
+    }
+
+    public BigDecimal unpark(String ticketId) {
+        Ticket t = tickets.findById(ticketId)
+                .orElseThrow(() -> new InvalidTicketException(ticketId));
+        tickets.delete(ticketId);
+        lot.spot(t.spotId()).release();
+        return pricing.fee(t, clock.instant());
+    }
+
+    public Map<Integer, Map<SpotType, Long>> availability() {
+        return lot.spots().stream().filter(ParkingSpot::isFree)
+                  .collect(Collectors.groupingBy(ParkingSpot::floor, TreeMap::new,
+                           Collectors.groupingBy(ParkingSpot::type, Collectors.counting())));
+    }
+}
+```
+
+A note on `unpark`: two threads unparking the same ticket could both find it before either deletes it. If double-unpark matters, use `ConcurrentHashMap.remove(id)` as the atomic "find and delete" (have the repository return the removed ticket) so only one caller gets it.
+
+**Tests (JUnit 5)**
+
+```java
+class ParkingServiceTest {
+    MutableClock clock = new MutableClock(Instant.parse("2026-01-01T10:00:00Z"));
+    ParkingService service = new ParkingService(
+        new ParkingLot(List.of(new ParkingSpot(1, 1, SpotType.MEDIUM), new ParkingSpot(0, 1, SpotType.MEDIUM))),
+        new NearestFirstAllocation(),
+        new HourlyPricing(Map.of(VehicleType.CAR, new BigDecimal("40"))),
+        new InMemoryTicketRepository(), clock);
+
+    @Test void parksInLowestFloorFirst() {
+        assertEquals("F0-1", service.park(new Vehicle("KA01", VehicleType.CAR)).spotId());
+    }
+
+    @Test void throwsWhenNoSpotOfRequiredType() {
+        assertThrows(ParkingFullException.class, () -> service.park(new Vehicle("KA02", VehicleType.TRUCK)));
+    }
+
+    @Test void feeRoundsUpToNextHour() {
+        Ticket t = service.park(new Vehicle("KA03", VehicleType.CAR));
+        clock.advance(Duration.ofMinutes(61));
+        assertEquals(new BigDecimal("80"), service.unpark(t.id()));
+    }
+}
+```
+
+(`MutableClock` is a tiny test helper extending `java.time.Clock` — injecting a `Clock` instead of calling `Instant.now()` is what makes time-based logic testable.)
+
+**Extensions you should be able to do in under 10 minutes:**
+
+- *Weekend/peak pricing* → new `PricingStrategy` (or a decorator over `HourlyPricing`).
+- *Let a bike use a car spot if small is full* → new `SpotAllocationStrategy` that tries a list of acceptable spot types.
+- *EV spots* → new `SpotType` value + vehicle flag; allocation and pricing strategies handle it.
+- *Display boards update on every park/unpark* → Observer: `ParkingService` publishes `SpotOccupied`/`SpotFreed` events to listeners.
+
+### Ten popular machine-coding problems and what they test
+
+| Problem | Core entities | Patterns / ideas it tests |
+|---|---|---|
+| **Parking lot** | Lot, floor, spot, vehicle, ticket | Strategy (allocation, pricing), enum mapping, atomic spot claim |
+| **Splitwise / expense sharing** | User, group, expense, split, balance sheet | Strategy or Factory for split types (equal, exact, percent), validation (splits sum to total), `BigDecimal` rounding, balance simplification |
+| **Snake and ladder** | Board, player, dice, snake, ladder | Turn loop, `Dice` as an interface (testable with a fixed dice), clean game-over rules |
+| **Tic-tac-toe / chess** | Board, piece, player, move | Strategy for win checks or piece moves, polymorphic `Piece.validMoves()`, State for game status |
+| **Elevator system** | Elevator, request, controller, direction | Strategy for scheduling, State for each car (idle/moving up/down/doors open), concurrency between request producers and controller |
+| **Vending machine** | Machine, item, inventory, coin | **State** pattern (idle, has money, dispensing), change-making, inventory thread safety |
+| **Movie ticket booking (BookMyShow-like)** | Movie, show, screen, seat, booking | Seat locking with timeout, preventing double booking under concurrency, Strategy for pricing |
+| **LRU cache** | Cache, node, eviction policy | `HashMap` + doubly linked list (O(1) get/put), Strategy for eviction (LRU/LFU), thread safety |
+| **Rate limiter** | Limiter, client bucket, rule | Strategy per algorithm (token bucket, sliding window), per-key state in `ConcurrentHashMap`, injectable clock (see [Rate Limiting](/learn/notes/rate-limiting/)) |
+| **In-memory pub-sub / message queue** | Topic, publisher, subscriber, offset | Observer, per-subscriber offsets, producer-consumer threads with `BlockingQueue`, retries |
+
+## Real-world examples
+
+- The patterns here are the same ones real Java code uses: `java.time.Clock` exists so time can be injected (its Javadoc recommends passing a `Clock` for testability), `ConcurrentHashMap.computeIfAbsent`/`merge` are the standard atomic map updates, and `AtomicBoolean.compareAndSet` is the standard lock-free claim.
+- Production systems you'll recognise follow the same layering: entity/model, repository (Spring Data's `Repository` interfaces — see [Spring Data JPA](/learn/notes/spring-data-jpa/)), and service classes with injected strategies.
+
+## Common pitfalls
+
+- **Designing for 25 minutes, coding for 25.** Design is 8–10 minutes. Refine as you code.
+- **Building everything before running anything.** Get one operation working from `Main` by minute ~30.
+- **God class.** One `Manager` holding all maps and all logic. Split into models, repositories, services, strategies.
+- **Pattern overload.** Abstract factories and visitors for a 60-minute problem read as over-engineering. Use patterns only at the stated axes of change, and be ready to justify each.
+- **`switch` on type in many places.** Move type-specific behaviour into the enum or a strategy.
+- **Anemic error handling.** Returning `null` or `-1`, printing errors instead of throwing domain exceptions, crashing on invalid input.
+- **`double` for money.** Use `BigDecimal` (or `long` paise/cents) and define rounding.
+- **`Instant.now()` everywhere.** Inject a `Clock` so fee and expiry logic can be tested.
+- **Ignoring concurrency when asked.** Non-atomic check-then-act, `HashMap` shared across threads, `id++`.
+- **Public mutable fields and setters for everything.** Prefer constructor-initialized, `final` fields and records.
+- **Silent scope changes.** If you cut a feature, say so and note it in the README.
+- **No demo.** Code that "should work" but was never run is graded as not working.
+
+## Practice questions
+
+<Practice>
+
+<QA q="What do evaluators look for in a machine-coding round?" level="easy">
+
+In rough priority: (1) **working code** for the must-have features, demonstrated; (2) **modularity** — models, repositories, services and strategies in separate, single-purpose classes; (3) **extensibility** — new variants are new classes, not edits to `switch` statements; (4) **readability** — domain naming, small methods; (5) **tests and edge cases** — clear exceptions for invalid input. Concurrency awareness and how you explain trade-offs are also noticed.
+
+</QA>
+
+<QA q="Why use a repository interface when everything is stored in a HashMap?" level="easy">
+
+It separates **business logic from storage**. The service reads like real code (`tickets.findById`), it's easy to fake in tests, and you can honestly say "switching to a database is a new implementation of the interface" — which is the extensibility evaluators check. It costs only a couple of minutes.
+
+</QA>
+
+<QA q="How should you spend the first 15 minutes?" level="easy">
+
+About 5–7 minutes clarifying: actors, must-have operations, input/output format, variants likely to be added, business rules, error cases, concurrency, and what's out of scope — written down as comments. Then 7–8 minutes on design: nouns → entities, relationships, verbs → services, and interfaces only at the axes of change (pricing, allocation, notification, storage). Then start coding the skeleton.
+
+</QA>
+
+<QA q="How do you decide which classes deserve an interface?" level="medium">
+
+Put interfaces where the requirements **vary or will vary**: anything with multiple types now (split types, vehicle pricing) or that the interviewer hinted may change (allocation rule, notification channel), plus storage (repositories) and external effects (clock, random dice) for testability. Plain data classes and the single service don't need interfaces. Interfacing everything adds noise and costs time.
+
+</QA>
+
+<QA q="Two entry gates call park() at the same time and both get the same spot. Why, and how do you fix it?" level="medium">
+
+It's a **check-then-act race**: both threads see the spot as free, then both mark it occupied. Fixes, from simplest: make allocation `synchronized` (one global lock, correct but serial); lock per floor or per spot type; or make the claim itself atomic — an `AtomicBoolean.compareAndSet(false, true)` per spot so only one thread wins and the loser moves on to the next spot. Also use `ConcurrentHashMap` for shared maps and `AtomicLong` for ticket IDs.
+
+</QA>
+
+<QA q="Why inject a Clock instead of calling Instant.now() directly?" level="medium">
+
+Time-based rules (hourly fees, booking holds, rate limits, expiry) can't be tested reliably against the real clock. Passing a `java.time.Clock` into the service lets tests use a fixed or manually advanced clock, so "61 minutes costs 2 hours" is a fast, deterministic unit test. In production you pass `Clock.systemUTC()`.
+
+</QA>
+
+<QA q="Design the class structure for Splitwise." level="medium">
+
+- **Models**: `User`, `Group`, `Expense(id, paidBy, amount, List of Split, type)`, `Split(user, amount)`.
+- **Split strategies**: `SplitStrategy` with `EqualSplit`, `ExactSplit`, `PercentSplit`; each validates its input (exact amounts sum to the total; percents sum to 100) and returns the shares. Chosen by a small factory from the input type.
+- **BalanceSheet**: a nested map of who owes whom, updated with `merge` so `A owes B` and `B owes A` net out.
+- **Services**: `ExpenseService.addExpense(...)`, `BalanceService.showBalances(user)`, optional `simplifyDebts()`.
+- **Details**: `BigDecimal` with explicit rounding, and give any leftover paisa from an uneven split to one deterministic participant so totals match exactly.
+
+</QA>
+
+<QA q="When is a design pattern over-engineering in a machine-coding round?" level="medium">
+
+When it doesn't serve a stated or very likely axis of change, or when it costs time you need for working code. A Strategy for split types is justified (three types given, more likely). An Abstract Factory for creating users, a Visitor over a two-class hierarchy, or an event bus for a single listener isn't. Rule of thumb: add the pattern when you have the second variant or the interviewer named one, and be able to justify it in one sentence.
+
+</QA>
+
+<QA q="How would you make the parking lot's spot allocation O(log n) instead of scanning every spot?" level="hard">
+
+Keep, per `SpotType`, a sorted concurrent set of **free** spots ordered by (floor, number), such as a `ConcurrentSkipListSet` with that comparator. Allocation = `pollFirst()`, which atomically removes and returns the nearest free spot, O(log n). Release = `add(spot)`. Because the removal is atomic, two gates can't get the same spot, so you no longer need the per-spot CAS. Availability counts can be kept with per-type `AtomicInteger`s or read from the set sizes (note `size()` on a skip-list set is O(n), so counters are better if it's called often).
+
+</QA>
+
+<QA q="How do you handle money correctly in Splitwise-style problems?" level="hard">
+
+Never use `double` — binary floating point can't represent values like 0.1 exactly, so totals drift. Use `BigDecimal` with an explicit scale and `RoundingMode`, or integer minor units (`long` paise). For equal splits, compute the base share by rounding down, then distribute the remainder one unit at a time to a deterministic set of participants (e.g. the first k by user ID) so the shares sum exactly to the total. Validate exact/percent splits against the total before saving.
+
+</QA>
+
+<QA q="Design a movie seat booking flow that prevents double booking." level="hard">
+
+Seats for a show have states AVAILABLE → LOCKED(user, expiresAt) → BOOKED. `lockSeats(showId, seatIds, user)` must lock **all or none**: under a per-show lock (or by atomically claiming each seat and rolling back on failure), check every seat is available and mark them locked with a timeout. Payment success → BOOKED; failure or expiry → AVAILABLE (a scheduled sweeper or lazy check on read, with an injected `Clock`). Seat state can be a small State/enum transition table. Use `ConcurrentHashMap` keyed by show ID to hold per-show seat maps, and make lock order consistent (sort seat IDs) if you lock per seat to avoid deadlocks.
+
+</QA>
+
+<QA q="At minute 40 you realise your design can't support a requirement you missed. What do you do?" level="scenario">
+
+Don't restart. Tell the evaluator what you missed and your plan. Check whether a **small, local change** handles it (a new strategy, a field on the model, an extra service method). If it truly needs a redesign, finish and demo the current working core first, then implement the missing piece in the smallest correct way, noting the cleaner design in comments. A working, honest subset with a clear explanation scores better than a half-finished rewrite.
+
+</QA>
+
+<QA q="The interviewer asks you to add percentage-based splits 10 minutes before the end. Your code has if/else on split type inside ExpenseService. What now?" level="scenario">
+
+Quickest safe path: extract the existing branches into a `SplitStrategy` interface with `EqualSplit` and `ExactSplit` (mostly moving code), then add `PercentSplit` as a new class with its validation (percents sum to 100) and a lookup map from type to strategy. Add one test for the new type. Explain that this is the refactor you'd have done up front, and that any future type is now a single class. If time is too short to refactor, add the branch, say so explicitly, and describe the refactor.
+
+</QA>
+
+<QA q="Your parking lot passes all your tests, but the evaluator's demo with 4 threads parking 100 cars into 50 spots issues 53 tickets. Diagnose it." level="scenario">
+
+More tickets than spots means multiple threads claimed the same spot: a **check-then-act race** in allocation (reading `isFree()` and later setting `occupied = true` as separate steps), possibly also a non-thread-safe `HashMap` or `id++` producing duplicate IDs. Fix with an atomic claim (`compareAndSet` per spot or `pollFirst` from a concurrent free-spot set), `ConcurrentHashMap` for tickets, and `AtomicLong` for IDs. Add a concurrency test: N threads with a `CountDownLatch` start gate, then assert tickets issued equals min(cars, spots) and no spot ID repeats.
+
+</QA>
+
+</Practice>
+
+## Quiz
+
+<Quiz>
+
+<MCQ q="At minute 35 of a 60-minute round, nothing runs end-to-end. Best move?" options={["Cut scope and get one core operation working from main now", "Keep adding interfaces so the design is complete", "Start writing unit tests for unwritten code", "Rewrite in a different language"]} answer={0}>
+
+Working code is the top criterion. A running subset that you can demo and extend beats an elaborate design that does not compile or run.
+
+</MCQ>
+
+<MCQ q="Which is the best signal that a class deserves an interface in a machine-coding round?" options={["It has more than 50 lines", "It is a data class", "Every class should have one", "The requirement has multiple variants or the interviewer said it may change"]} answer={3}>
+
+Interfaces belong at axes of change (pricing, allocation, split type, storage). Interfacing every class adds noise and costs time.
+
+</MCQ>
+
+<MCQ q="Two threads run: if (spot.isFree()) spot.setOccupied(true). What is the bug?" options={["Check-then-act race: both can see free and both occupy it", "Deadlock", "Starvation", "Nothing, booleans are atomic"]} answer={0}>
+
+Reading and writing are separate steps. Individual boolean reads and writes are atomic, but the combination is not; use compareAndSet or a lock.
+
+</MCQ>
+
+<MCQ q="Why inject java.time.Clock into a parking service?" options={["It is faster than Instant.now()", "Clock is required by ConcurrentHashMap", "To support time zones in tickets only", "To make time-dependent logic testable with a fixed or controllable clock"]} answer={3}>
+
+A test can pass a fixed or advancing Clock, making fee and expiry logic deterministic. Production passes Clock.systemUTC().
+
+</MCQ>
+
+<MCQ q="Which data type should hold monetary amounts in a Splitwise solution?" options={["double", "float", "BigDecimal or integer minor units", "String"]} answer={2}>
+
+Binary floating point cannot represent many decimal fractions exactly, so sums drift. BigDecimal with explicit rounding, or long paise, keeps totals exact.
+
+</MCQ>
+
+<MCQ q="Which pattern does a vending machine problem most directly test?" options={["Composite", "State", "Adapter", "Flyweight"]} answer={1}>
+
+Operations like insertCoin and select behave differently in idle, has-money and dispensing states, which is exactly what the State pattern models.
+
+</MCQ>
+
+<MCQ q="An in-memory repository shared by several request threads should use which map?" options={["HashMap", "TreeMap", "ConcurrentHashMap", "LinkedHashMap"]} answer={2}>
+
+ConcurrentHashMap is thread-safe and offers atomic computeIfAbsent, merge and remove. The others are not safe for concurrent writes without external locking.
+
+</MCQ>
+
+<MCQ q="Which order best follows the entities to interfaces method?" options={["Entities (nouns), relationships, services (verbs), interfaces at axes of change", "Interfaces, then services, then entities", "Services, then tests, then entities", "Write main, then extract classes at the end"]} answer={0}>
+
+Start from domain nouns and their relationships, group verbs into services, then add interfaces only where variation exists.
+
+</MCQ>
+
+<MCQ q="In the parking example, why does stream().filter(ParkingSpot::tryOccupy).findFirst() not claim more than one spot?" options={["filter runs in parallel", "tryOccupy always returns false after the first call", "Streams are lazy, so findFirst stops after the first element that passes, and tryOccupy is only called until then", "sorted() prevents side effects"]} answer={2}>
+
+Sequential streams process elements one at a time on demand; findFirst short-circuits after the first successful claim, so later spots are never touched.
+
+</MCQ>
+
+</Quiz>
+
+## TL;DR cheat sheet
+
+- **Graded on**: working code > modularity > extensibility > naming > tests/edge cases (+ concurrency, communication).
+- **60-minute plan**: 0–7 clarify · 7–15 design · 15–20 skeleton · 20–40 core flow end-to-end · 40–48 errors + thread safety · 48–55 tests/demo · 55–60 polish + README.
+- **Clarify**: actors, must-have ops, I/O format, variants, rules, errors, concurrency, persistence, out of scope.
+- **Method**: nouns → entities → relationships → verbs → services → interfaces at axes of change.
+- **Layers**: `model` / `repository` (interface + `ConcurrentHashMap` impl) / `strategy` / `service` / `exception` / `Main`.
+- **Concurrency**: atomic claims (`compareAndSet`, `pollFirst`), `ConcurrentHashMap` atomic methods, `AtomicLong` IDs, consistent lock order.
+- **Hygiene**: `BigDecimal` for money, injected `Clock`, domain exceptions, immutable records, no `switch` on type everywhere.
+- **Demo**: scripted `Main` or sentence-named tests; walk one request end-to-end; point at extension points.
+
+## Go deeper
+
+- **refactoring.guru**: [Design patterns catalog](https://refactoring.guru/design-patterns/catalog) — quick reminders of intent and structure.
+- **JDK API**: [java.time.Clock](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/time/Clock.html) (injectable time) and [ConcurrentHashMap](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ConcurrentHashMap.html) (atomic map operations).
+- **Book**: Brian Goetz et al. — *Java Concurrency in Practice* (check-then-act races, atomic variables, lock ordering).
+- **Book**: Freeman & Robson — *Head First Design Patterns*, 2nd ed.
+- Related notes: [SOLID Principles](/learn/notes/solid-principles/), [Creational Patterns](/learn/notes/creational-patterns/), [Structural Patterns](/learn/notes/structural-patterns/), [Behavioral Patterns](/learn/notes/behavioral-patterns/), [Testing Pyramid & Contract Tests](/learn/notes/testing-pyramid-contract-tests/).

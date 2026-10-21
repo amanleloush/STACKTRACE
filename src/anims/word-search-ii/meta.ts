@@ -3,7 +3,7 @@ import type { AnimMeta } from '~/lib/anim/types';
 const meta: AnimMeta = {
   id: 'word-search-ii',
   title: 'Word Search II — grid DFS pruned by trie',
-  caption: 'Trie of {oath, oat, eat}. DFS the grid; each step requires the cell',
+  caption: 'Trie of {oath, oat, eat}. DFS the grid, following only trie children; finds oat and oath (eat is not on the grid).',
   tags: ['tree', 'string'],
   pillar: 'dsa',
   phase: '11-trie',
