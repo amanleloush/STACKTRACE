@@ -10,5 +10,8 @@ export default defineConfig({
   test: {
     environment: 'node',
     include: ['tests/**/*.test.ts'],
+    // Several suites parse every MDX file on the site; give them room on
+    // slower CI runners instead of the 5 s default.
+    testTimeout: 60_000,
   },
 });
