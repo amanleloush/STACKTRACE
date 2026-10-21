@@ -1,0 +1,781 @@
+---
+// /mock/: timed mock rounds. Static shell; the picker lists are built here,
+// and the brief / reveal HTML is fetched from the prerendered
+// /mock/problems.json when a round starts. Everything the user does
+// (current round, scratchpad, history) lives in localStorage only.
+import BaseLayout from '~/layouts/BaseLayout.astro';
+import { loadMockProblems } from '~/components/mock/load-problems';
+import {
+  DURATION_MS,
+  MODES,
+  MODE_LABEL,
+  PHASES,
+  RUBRICS,
+} from '~/components/mock/mock-logic';
+
+const problems = await loadMockProblems();
+const byMode = Object.fromEntries(MODES.map((m) => [m, problems.filter((p) => p.mode === m)]));
+const minutes = (m: (typeof MODES)[number]) => DURATION_MS[m] / 60_000;
+---
+<BaseLayout
+  title="Timed mock rounds — StackTrace"
+  description="Practise a real HLD (45 min) or LLD / machine-coding (90 min) round on your own: countdown, phase guide, scratchpad, then the model answer and a self-score rubric."
+>
+  <header class="mk-head">
+    <h1>Timed mock rounds</h1>
+    <p class="mk-lede">
+      Practise a real round on your own. Pick a problem, read only the brief, and work it against
+      the clock with a phase guide at your side. When you finish, compare with the 60-second answer
+      and score yourself on what interviewers actually grade.
+    </p>
+  </header>
+
+  <noscript>
+    <p class="mk-note">Mock rounds need JavaScript for the timer. The problems are all in the
+      <a href="/notes/">System Design notes</a>.</p>
+  </noscript>
+
+  <!-- 1. Pick a round -->
+  <section class="mk-card mk-pick" id="mk-pick" aria-labelledby="mk-pick-h">
+    <h2 id="mk-pick-h">Pick a round</h2>
+    <fieldset class="mk-modes">
+      <legend class="mk-label">Round type</legend>
+      {MODES.map((m, i) => (
+        <label class="mk-mode">
+          <input type="radio" name="mk-mode" value={m} checked={i === 0} />
+          <span class="mk-mode__name">{MODE_LABEL[m]}</span>
+          <span class="mk-mode__meta">{minutes(m)} min · {byMode[m]!.length} problems</span>
+        </label>
+      ))}
+    </fieldset>
+    {MODES.map((m, i) => (
+      <div class="mk-field" data-mode={m} hidden={i !== 0}>
+        <label class="mk-label" for={`mk-sel-${m}`}>Problem</label>
+        <select id={`mk-sel-${m}`} class="mk-input mk-sel" data-mode={m}>
+          <option value="">Random problem</option>
+          {byMode[m]!.map((p) => <option value={p.slug} data-minutes={p.minutes}>{p.title}</option>)}
+        </select>
+      </div>
+    ))}
+    <div class="mk-actions">
+      <button type="button" class="mk-btn mk-btn--primary" id="mk-start">Start round</button>
+    </div>
+    <p class="mk-hint">You'll see only the problem brief. The answer stays hidden until you finish.</p>
+  </section>
+
+  <!-- 2 + 3. The round itself: running, paused or done -->
+  <section class="mk-round" id="mk-round" hidden aria-labelledby="mk-title">
+    <div class="mk-card mk-bar">
+      <div class="mk-bar__info">
+        <span class="mk-tag" id="mk-mode-tag"></span>
+        <h2 class="mk-title" id="mk-title" tabindex="-1"></h2>
+      </div>
+      <div class="mk-timer" id="mk-timer" data-warn="none">
+        <span class="mk-clock" id="mk-clock" role="timer" aria-label="Time left">--:--</span>
+        <span class="mk-status" id="mk-status"></span>
+      </div>
+      <div class="mk-bar__btns">
+        <button type="button" class="mk-btn" id="mk-pause">Pause</button>
+        <button type="button" class="mk-btn mk-btn--primary" id="mk-finish">Finish</button>
+        <button type="button" class="mk-btn mk-btn--ghost" id="mk-abandon">Abandon</button>
+        <button type="button" class="mk-btn mk-btn--primary" id="mk-new" hidden>Start a new round</button>
+      </div>
+      <p class="mk-sr" aria-live="polite" id="mk-live"></p>
+    </div>
+
+    <div class="mk-grid">
+      <div class="mk-main">
+        <article class="mk-card">
+          <h3 class="mk-sub" id="mk-brief-h">Problem</h3>
+          <div class="mk-prose" id="mk-brief"></div>
+        </article>
+        <div class="mk-card">
+          <label class="mk-sub" for="mk-pad">Scratchpad</label>
+          <p class="mk-hint">Your notes for this attempt. Saved in this browser only.</p>
+          <textarea id="mk-pad" class="mk-input mk-pad" rows="12" spellcheck="false"
+            placeholder="Requirements, numbers, APIs, entities, trade-offs…"></textarea>
+        </div>
+      </div>
+
+      <aside class="mk-card mk-phases" id="mk-phases" aria-labelledby="mk-phases-h">
+        <h3 class="mk-sub" id="mk-phases-h">Phase guide</h3>
+        {MODES.map((m) => (
+          <ol class="mk-phase-list" data-mode={m} hidden>
+            {PHASES[m].map((p) => (
+              <li class="mk-phase">
+                <span class="mk-phase__label">{p.label}</span>
+                <span class="mk-phase__min">{p.minutes} min</span>
+              </li>
+            ))}
+          </ol>
+        ))}
+        <p class="mk-hint">The highlighted phase is where the clock says you should be.</p>
+      </aside>
+    </div>
+
+    <div class="mk-done" id="mk-done" hidden>
+      <article class="mk-card">
+        <h3 class="mk-sub">The 60-second answer</h3>
+        <div class="mk-prose" id="mk-def"></div>
+      </article>
+      <article class="mk-card" id="mk-tldr-card">
+        <h3 class="mk-sub">TL;DR</h3>
+        <div class="mk-prose" id="mk-tldr"></div>
+      </article>
+      <p class="mk-more"><a id="mk-note-link" href="/notes/">Read the full note →</a></p>
+
+      <section class="mk-card" aria-labelledby="mk-rubric-h">
+        <h3 class="mk-sub" id="mk-rubric-h">Score yourself</h3>
+        <p class="mk-hint">
+          A self-assessment guide, not an official interview scale.
+          For each item: <strong>0</strong> missed · <strong>1</strong> partly · <strong>2</strong> solid.
+        </p>
+        {MODES.map((m) => (
+          <ol class="mk-rubric" data-mode={m} hidden>
+            {RUBRICS[m].map((item, i) => (
+              <li class="mk-rb">
+                <div class="mk-rb__set" role="radiogroup" aria-labelledby={`mk-rb-${m}-${i}-l`}>
+                  <span class="mk-rb__item" id={`mk-rb-${m}-${i}-l`}>{item}</span>
+                  <span class="mk-seg">
+                    {[0, 1, 2].map((v) => (
+                      <label class="mk-seg__opt">
+                        <input type="radio" name={`mk-rb-${m}-${i}`} value={v} data-i={i} checked={v === 0} />
+                        <span>{v}</span>
+                      </label>
+                    ))}
+                  </span>
+                </div>
+              </li>
+            ))}
+          </ol>
+        ))}
+        <p class="mk-total">
+          <span class="mk-total__n" id="mk-total">0 / 20</span>
+          <span class="mk-verdict" id="mk-verdict" data-band="practice">Needs practice</span>
+        </p>
+        <p class="mk-hint">Bands: 75%+ strong hire signal · 50–74% borderline · below 50% needs practice.
+          Your score is saved to the history below as you mark it.</p>
+      </section>
+    </div>
+  </section>
+
+  <!-- 4. History -->
+  <section class="mk-card mk-history" aria-labelledby="mk-hist-h">
+    <div class="mk-history__head">
+      <h2 id="mk-hist-h">Your attempts</h2>
+      <div class="mk-views" role="group" aria-label="History view">
+        <button type="button" class="mk-btn mk-btn--sm" data-view="recent" aria-pressed="true">Recent</button>
+        <button type="button" class="mk-btn mk-btn--sm" data-view="best" aria-pressed="false">Best per problem</button>
+      </div>
+    </div>
+    <p class="mk-hint">Last 50 attempts, kept in this browser only.</p>
+    <p class="mk-empty" id="mk-hist-empty">No attempts yet. Finish a round to see it here.</p>
+    <div class="mk-scroll" id="mk-recent" hidden>
+      <table class="mk-table">
+        <thead><tr><th scope="col">Date</th><th scope="col">Problem</th><th scope="col">Round</th><th scope="col">Time used</th><th scope="col">Score</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="mk-scroll" id="mk-best" hidden>
+      <table class="mk-table">
+        <thead><tr><th scope="col">Problem</th><th scope="col">Round</th><th scope="col">Best score</th><th scope="col">Time</th><th scope="col">Attempts</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="mk-actions">
+      <button type="button" class="mk-btn mk-btn--ghost" id="mk-clear" hidden>Clear history</button>
+    </div>
+  </section>
+</BaseLayout>
+
+<script>
+  import {
+    MODE_LABEL,
+    attemptFromRun,
+    bestPerProblem,
+    coerceHistory,
+    coerceRun,
+    elapsedMs,
+    finish,
+    formatClock,
+    formatMinutes,
+    newRun,
+    pause,
+    phaseIndex,
+    phasesFor,
+    pickRandom,
+    remainingMs,
+    resume,
+    scoreMax,
+    scoreTotal,
+    upsertAttempt,
+    verdict,
+    warnLevel,
+    type Attempt,
+    type Mode,
+    type Run,
+    type Warn,
+  } from '~/components/mock/mock-logic';
+  import type { MockProblem } from '~/components/mock/mock-problems';
+
+  const KEY_RUN = 'mock:v1:run';
+  const KEY_HIST = 'mock:v1:history';
+  const PAD_PREFIX = 'mock:v1:pad:';
+  const MAX_PAD_CHARS = 50_000;
+
+  // ---- storage (every access guarded: storage may be blocked) -------------
+  function lsGet(key: string): string | null {
+    try { return localStorage.getItem(key); } catch { return null; }
+  }
+  function lsSet(key: string, value: string): void {
+    try { localStorage.setItem(key, value); } catch { /* full or blocked */ }
+  }
+  function lsDel(key: string): void {
+    try { localStorage.removeItem(key); } catch { /* blocked */ }
+  }
+  function readJson(key: string): unknown {
+    const raw = lsGet(key);
+    if (raw == null) return null;
+    try { return JSON.parse(raw); } catch { return null; }
+  }
+  const readRun = (): Run | null => coerceRun(readJson(KEY_RUN));
+  const readHistory = (): Attempt[] => coerceHistory(readJson(KEY_HIST));
+
+  /** Drop scratchpads that don't belong to the current round. */
+  function sweepPads(keepId: string | null): void {
+    try {
+      const stale: string[] = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k?.startsWith(PAD_PREFIX) && k !== PAD_PREFIX + keepId) stale.push(k);
+      }
+      stale.forEach((k) => localStorage.removeItem(k));
+    } catch { /* blocked */ }
+  }
+
+  // ---- problems (fetched once, on demand) ----------------------------------
+  let problemsP: Promise<Record<string, MockProblem> | null> | null = null;
+  function loadProblems(): Promise<Record<string, MockProblem> | null> {
+    problemsP ??= fetch('/mock/problems.json')
+      .then((r) => (r.ok ? (r.json() as Promise<Record<string, MockProblem>>) : null))
+      .catch(() => null);
+    return problemsP;
+  }
+
+  // ---- elements --------------------------------------------------------------
+  const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
+  const pick = $('mk-pick');
+  const round = $('mk-round');
+  const startBtn = $<HTMLButtonElement>('mk-start');
+  const modeTag = $('mk-mode-tag');
+  const titleEl = $('mk-title');
+  const timerEl = $('mk-timer');
+  const clockEl = $('mk-clock');
+  const statusEl = $('mk-status');
+  const live = $('mk-live');
+  const pauseBtn = $<HTMLButtonElement>('mk-pause');
+  const finishBtn = $<HTMLButtonElement>('mk-finish');
+  const abandonBtn = $<HTMLButtonElement>('mk-abandon');
+  const newBtn = $<HTMLButtonElement>('mk-new');
+  const briefH = $('mk-brief-h');
+  const brief = $('mk-brief');
+  const pad = $<HTMLTextAreaElement>('mk-pad');
+  const phasesBox = $('mk-phases');
+  const done = $('mk-done');
+  const defEl = $('mk-def');
+  const tldrCard = $('mk-tldr-card');
+  const tldrEl = $('mk-tldr');
+  const noteLink = $<HTMLAnchorElement>('mk-note-link');
+  const totalEl = $('mk-total');
+  const verdictEl = $('mk-verdict');
+  const modeRadios = [...document.querySelectorAll<HTMLInputElement>('input[name="mk-mode"]')];
+  const selFields = [...document.querySelectorAll<HTMLElement>('.mk-field')];
+
+  const titles = new Map<string, string>();
+  const minutesBySlug = new Map<string, number>();
+  const slugsByMode: Record<Mode, string[]> = { hld: [], lld: [] };
+  for (const sel of document.querySelectorAll<HTMLSelectElement>('.mk-sel')) {
+    const mode = sel.dataset.mode as Mode;
+    for (const o of sel.options) {
+      if (!o.value) continue;
+      titles.set(o.value, o.text);
+      if (o.dataset.minutes) minutesBySlug.set(o.value, Number(o.dataset.minutes));
+      slugsByMode[mode].push(o.value);
+    }
+  }
+
+  let run: Run | null = null;
+  let tick: number | undefined;
+  let lastWarn: Warn = 'none';
+
+  const save = () => { if (run) lsSet(KEY_RUN, JSON.stringify(run)); };
+  const modeOf = (): Mode =>
+    (modeRadios.find((r) => r.checked)?.value as Mode | undefined) ?? 'hld';
+
+  // ---- picker ------------------------------------------------------------------
+  function syncPicker(): void {
+    const m = modeOf();
+    for (const f of selFields) f.hidden = f.dataset.mode !== m;
+  }
+  modeRadios.forEach((r) => r.addEventListener('change', syncPicker));
+  syncPicker();
+
+  startBtn.addEventListener('click', () => {
+    const mode = modeOf();
+    const sel = document.querySelector<HTMLSelectElement>(`.mk-sel[data-mode="${mode}"]`)!;
+    const slug = sel.value || pickRandom(slugsByMode[mode]);
+    if (!slug) return;
+    const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    sweepPads(id);
+    const own = minutesBySlug.get(slug);
+    run = newRun(id, slug, mode, Date.now(), own ? own * 60_000 : undefined);
+    save();
+    void openRound(true);
+  });
+
+  // ---- the round ---------------------------------------------------------------
+  async function openRound(focus: boolean): Promise<void> {
+    if (!run) return;
+    const r = run;
+    pick.hidden = true;
+    round.hidden = false;
+    modeTag.textContent = `${MODE_LABEL[r.mode]} · ${r.durationMs / 60_000} min`;
+    titleEl.textContent = titles.get(r.slug) ?? r.slug;
+    for (const el of round.querySelectorAll<HTMLElement>('[data-mode]')) el.hidden = el.dataset.mode !== r.mode;
+    pad.value = lsGet(PAD_PREFIX + r.id) ?? '';
+    brief.textContent = 'Loading the brief…';
+    paint();
+    if (focus) titleEl.focus({ preventScroll: false });
+
+    const all = await loadProblems();
+    // paint() may have replaced `run` (e.g. time-up on load); only bail if
+    // the user moved on to a different attempt.
+    if (run?.id !== r.id) return;
+    const p = all?.[r.slug];
+    if (!all) {
+      brief.textContent = 'Could not load the problem. Check your connection and reload.';
+      return;
+    }
+    if (!p) {
+      // The note was renamed or removed since this round started.
+      brief.textContent = 'This problem is no longer available. Abandon this round and pick another.';
+      return;
+    }
+    titleEl.textContent = p.title;
+    briefH.textContent = p.briefHeading;
+    brief.innerHTML = p.briefHtml; // our own build-time HTML
+    const noteUrl = `/learn/notes/${p.slug}/`;
+    defEl.innerHTML = p.definitionHtml ||
+      `<p>This is a premium note. <a href="${noteUrl}">Open it</a> to see the answer.</p>`;
+    tldrCard.hidden = !p.tldrHtml;
+    tldrEl.innerHTML = p.tldrHtml;
+    noteLink.href = noteUrl;
+    paint();
+  }
+
+  function closeRound(): void {
+    if (run) lsDel(PAD_PREFIX + run.id);
+    run = null;
+    lsDel(KEY_RUN);
+    stopTick();
+    round.hidden = true;
+    pick.hidden = false;
+    lastWarn = 'none';
+    startBtn.focus();
+  }
+
+  const WARN_TEXT: Record<Warn, string> = {
+    none: '',
+    ten: '10 minutes left',
+    five: '5 minutes left: start wrapping up',
+    up: 'Time is up',
+  };
+
+  /** Repaint clock, warning, phase highlight and the done view from `run`. */
+  function paint(): void {
+    if (!run) return;
+    const now = Date.now();
+    if (run.finishedAt == null && remainingMs(run, now) <= 0) {
+      run = finish(run, now);
+      save();
+      recordAttempt();
+      live.textContent = 'Time is up. The answer and the rubric are below.';
+    }
+    const r = run;
+    const isDone = r.finishedAt != null;
+    const paused = r.pausedAt != null;
+    const remaining = remainingMs(r, now);
+    const elapsed = elapsedMs(r, now);
+    const warn = isDone ? (remaining <= 0 ? 'up' : 'none') : warnLevel(remaining);
+
+    clockEl.textContent = formatClock(remaining);
+    timerEl.dataset.warn = warn;
+    timerEl.dataset.paused = String(paused);
+    statusEl.textContent = isDone
+      ? `Done · used ${formatMinutes(elapsed)}`
+      : paused ? 'Paused' : WARN_TEXT[warn] || `${formatMinutes(elapsed)} in`;
+    if (!isDone && warn !== lastWarn && warn !== 'none') live.textContent = WARN_TEXT[warn];
+    lastWarn = warn;
+
+    pauseBtn.textContent = paused ? 'Resume' : 'Pause';
+    pauseBtn.setAttribute('aria-pressed', String(paused));
+    for (const b of [pauseBtn, finishBtn, abandonBtn]) b.hidden = isDone;
+    newBtn.hidden = !isDone;
+    pad.readOnly = false;
+
+    const list = phasesBox.querySelector<HTMLOListElement>(`.mk-phase-list[data-mode="${r.mode}"]`)!;
+    // A shorter mock scales the time boxes; relabel them to match.
+    phasesFor(r.mode, r.durationMs).forEach((p, i) => {
+      const min = list.children[i]?.querySelector('.mk-phase__min');
+      if (min) min.textContent = `${p.minutes} min`;
+    });
+    const cur = isDone ? -1 : phaseIndex(r.mode, elapsed, r.durationMs);
+    [...list.children].forEach((li, i) => {
+      if (i === cur) li.setAttribute('aria-current', 'step');
+      else li.removeAttribute('aria-current');
+      li.classList.toggle('is-past', !isDone && i < cur);
+    });
+
+    done.hidden = !isDone;
+    if (isDone) paintRubric();
+
+    if (isDone || paused) stopTick();
+    else startTick();
+  }
+
+  function startTick(): void {
+    tick ??= window.setInterval(paint, 250);
+  }
+  function stopTick(): void {
+    if (tick !== undefined) window.clearInterval(tick);
+    tick = undefined;
+  }
+
+  pauseBtn.addEventListener('click', () => {
+    if (!run) return;
+    run = run.pausedAt != null ? resume(run, Date.now()) : pause(run, Date.now());
+    save();
+    paint();
+  });
+
+  finishBtn.addEventListener('click', () => {
+    if (!run) return;
+    run = finish(run, Date.now());
+    save();
+    recordAttempt();
+    paint();
+    live.textContent = 'Round finished. The answer and the rubric are below.';
+    done.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+
+  abandonBtn.addEventListener('click', () => {
+    if (!run) return;
+    if (!window.confirm('Abandon this round? It will not be saved to your history.')) return;
+    closeRound();
+  });
+
+  newBtn.addEventListener('click', closeRound);
+
+  let padTimer: number | undefined;
+  pad.addEventListener('input', () => {
+    window.clearTimeout(padTimer);
+    padTimer = window.setTimeout(() => {
+      if (run) lsSet(PAD_PREFIX + run.id, pad.value.slice(0, MAX_PAD_CHARS));
+    }, 300);
+  });
+
+  // ---- rubric -----------------------------------------------------------------
+  function paintRubric(): void {
+    if (!run) return;
+    const list = round.querySelector<HTMLOListElement>(`.mk-rubric[data-mode="${run.mode}"]`)!;
+    for (const input of list.querySelectorAll<HTMLInputElement>('input[type="radio"]')) {
+      input.checked = run.scores[Number(input.dataset.i)] === Number(input.value);
+    }
+    const total = scoreTotal(run.scores);
+    const max = scoreMax(run.mode);
+    const v = verdict(total, max);
+    totalEl.textContent = `${total} / ${max}`;
+    verdictEl.textContent = v.label;
+    verdictEl.dataset.band = v.band;
+  }
+
+  round.addEventListener('change', (e) => {
+    const input = e.target as HTMLInputElement;
+    if (!run || run.finishedAt == null || !input.matches('.mk-rubric input[type="radio"]')) return;
+    const scores = [...run.scores];
+    scores[Number(input.dataset.i)] = Number(input.value);
+    run = { ...run, scores };
+    save();
+    recordAttempt();
+    paintRubric();
+  });
+
+  // ---- history ----------------------------------------------------------------
+  function recordAttempt(): void {
+    if (!run || run.finishedAt == null) return;
+    const a = attemptFromRun(run, titles.get(run.slug) ?? run.slug, Date.now());
+    lsSet(KEY_HIST, JSON.stringify(upsertAttempt(readHistory(), a)));
+    paintHistory();
+  }
+
+  const recentBody = document.querySelector<HTMLTableSectionElement>('#mk-recent tbody')!;
+  const bestBody = document.querySelector<HTMLTableSectionElement>('#mk-best tbody')!;
+  const viewBtns = [...document.querySelectorAll<HTMLButtonElement>('.mk-views [data-view]')];
+  const clearBtn = $<HTMLButtonElement>('mk-clear');
+  const emptyEl = $('mk-hist-empty');
+  let view: 'recent' | 'best' = 'recent';
+
+  const dateFmt = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+  const SHORT_MODE: Record<Mode, string> = { hld: 'HLD', lld: 'LLD' };
+
+  function row(cells: (string | Node)[]): HTMLTableRowElement {
+    const tr = document.createElement('tr');
+    for (const c of cells) {
+      const td = document.createElement('td');
+      td.append(c);
+      tr.append(td);
+    }
+    return tr;
+  }
+  function problemLink(a: { slug: string; title: string }): HTMLAnchorElement {
+    const link = document.createElement('a');
+    link.href = `/learn/notes/${a.slug}/`;
+    link.textContent = a.title;
+    return link;
+  }
+  function scoreCell(a: Attempt): HTMLSpanElement {
+    const s = document.createElement('span');
+    s.className = 'mk-score';
+    s.dataset.band = verdict(a.score, a.max).band;
+    s.textContent = `${a.score} / ${a.max}`;
+    return s;
+  }
+
+  function paintHistory(): void {
+    const list = readHistory();
+    emptyEl.hidden = list.length > 0;
+    clearBtn.hidden = list.length === 0;
+    recentBody.replaceChildren(
+      ...list.map((a) => row([dateFmt.format(a.at), problemLink(a), SHORT_MODE[a.mode], formatMinutes(a.usedMs), scoreCell(a)])),
+    );
+    bestBody.replaceChildren(
+      ...bestPerProblem(list).map((b) =>
+        row([problemLink(b), SHORT_MODE[b.mode], scoreCell(b.best), formatMinutes(b.best.usedMs), String(b.attempts)]),
+      ),
+    );
+    $('mk-recent').hidden = list.length === 0 || view !== 'recent';
+    $('mk-best').hidden = list.length === 0 || view !== 'best';
+    for (const b of viewBtns) b.setAttribute('aria-pressed', String(b.dataset.view === view));
+  }
+
+  viewBtns.forEach((b) =>
+    b.addEventListener('click', () => {
+      view = b.dataset.view === 'best' ? 'best' : 'recent';
+      paintHistory();
+    }),
+  );
+
+  clearBtn.addEventListener('click', () => {
+    if (!window.confirm('Clear all mock-round history in this browser?')) return;
+    lsDel(KEY_HIST);
+    paintHistory();
+  });
+
+  // Another tab changed something: pick it up.
+  window.addEventListener('storage', (e) => {
+    if (e.key === KEY_HIST) paintHistory();
+    if (e.key === KEY_RUN && run) {
+      const next = readRun();
+      if (next && next.id === run.id) { run = next; paint(); }
+    }
+  });
+
+  // ---- boot -------------------------------------------------------------------
+  paintHistory();
+  run = readRun();
+  if (run && !titles.has(run.slug)) {
+    // Not in the list any more: let openRound explain, but keep the title sane.
+    titles.set(run.slug, run.slug);
+  }
+  sweepPads(run?.id ?? null);
+  if (run) void openRound(false);
+</script>
+
+<style>
+  .mk-head h1 { margin: 0 0 0.5rem; }
+  .mk-lede { color: var(--fg-muted); max-width: 72ch; line-height: 1.55; margin: 0 0 1.5rem; }
+  .mk-note { color: var(--fg-muted); }
+
+  .mk-card {
+    border: 1px solid var(--card-border);
+    border-radius: 12px;
+    background: var(--card-bg);
+    padding: 1rem 1.15rem;
+    min-width: 0;
+  }
+  .mk-card + .mk-card, .mk-round, .mk-history { margin-top: 1rem; }
+  .mk-card h2 { margin: 0 0 0.75rem; font-size: 1.15rem; }
+  .mk-sub { display: block; margin: 0 0 0.6rem; font-size: 0.95rem; font-weight: 600; color: var(--fg); }
+  .mk-label { display: block; font-size: 0.8rem; color: var(--fg-muted); margin-bottom: 0.35rem; }
+  .mk-hint { font-size: 0.8rem; color: var(--fg-faint); margin: 0.5rem 0 0; line-height: 1.45; }
+  /* Lists below set display, which would beat the [hidden] attribute. */
+  .mk-round [hidden], .mk-history [hidden] { display: none !important; }
+  .mk-sr {
+    position: absolute; width: 1px; height: 1px; overflow: hidden;
+    clip: rect(0 0 0 0); white-space: nowrap; margin: -1px; padding: 0; border: 0;
+  }
+
+  /* Picker */
+  .mk-modes { border: 0; padding: 0; margin: 0 0 1rem; display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 0.6rem; }
+  .mk-modes legend { padding: 0; }
+  .mk-mode {
+    display: grid; grid-template-columns: auto 1fr; column-gap: 0.55rem; align-items: center;
+    padding: 0.7rem 0.85rem; border: 1px solid var(--card-border); border-radius: 10px;
+    background: var(--bg-soft); cursor: pointer;
+  }
+  .mk-mode:has(input:checked) { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, var(--card-bg)); }
+  .mk-mode input { grid-row: span 2; accent-color: var(--accent); }
+  .mk-mode__name { font-weight: 600; }
+  .mk-mode__meta { font-size: 0.78rem; color: var(--fg-muted); font-family: var(--font-code); }
+  .mk-input {
+    font: inherit; font-size: 0.9rem; color: var(--fg);
+    background: var(--bg-soft); border: 1px solid var(--card-border); border-radius: 8px;
+    padding: 0.5rem 0.65rem; width: 100%; box-sizing: border-box; min-width: 0;
+  }
+  .mk-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 1rem; }
+
+  .mk-btn {
+    font: inherit; font-size: 0.88rem; font-weight: 600;
+    padding: 0.5rem 0.95rem; border-radius: 8px; cursor: pointer;
+    border: 1px solid var(--card-border); background: var(--bg-soft); color: var(--fg);
+  }
+  .mk-btn:hover { border-color: var(--accent); }
+  .mk-btn--primary { background: var(--accent); border-color: var(--accent); color: var(--bg); }
+  .mk-btn--primary:hover { filter: brightness(1.08); }
+  .mk-btn--ghost { background: transparent; color: var(--fg-muted); }
+  .mk-btn--sm { font-size: 0.78rem; padding: 0.3rem 0.65rem; }
+  .mk-btn[aria-pressed='true'] { border-color: var(--accent); color: var(--accent); }
+  .mk-btn:focus-visible, .mk-input:focus-visible, .mk-mode:has(input:focus-visible),
+  .mk-seg__opt:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  /* Round header with the big clock. Sticky so the time stays in view. */
+  .mk-bar {
+    position: sticky; top: 4.25rem; z-index: 5;
+    display: grid; grid-template-columns: 1fr auto auto; gap: 0.75rem 1.25rem; align-items: center;
+    backdrop-filter: blur(10px);
+    background: color-mix(in srgb, var(--bg) 82%, transparent);
+  }
+  .mk-tag { font-size: 0.72rem; font-family: var(--font-code); color: var(--accent); text-transform: uppercase; letter-spacing: 0.04em; }
+  .mk-title { margin: 0.15rem 0 0 !important; font-size: 1.1rem !important; outline: none; }
+  .mk-timer { display: flex; flex-direction: column; align-items: center; }
+  .mk-clock {
+    font-family: var(--font-code); font-size: clamp(2.2rem, 7vw, 3.4rem); font-weight: 700;
+    line-height: 1; font-variant-numeric: tabular-nums; color: var(--fg);
+    transition: color 0.2s ease;
+  }
+  .mk-status { font-size: 0.78rem; color: var(--fg-muted); margin-top: 0.3rem; text-align: center; }
+  .mk-timer[data-warn='ten'] .mk-clock, .mk-timer[data-warn='ten'] .mk-status { color: var(--anim-highlight); }
+  .mk-timer[data-warn='five'] .mk-clock, .mk-timer[data-warn='five'] .mk-status,
+  .mk-timer[data-warn='up'] .mk-clock { color: var(--anim-danger); }
+  .mk-timer[data-warn='five'] .mk-clock { animation: mk-pulse 1.6s ease-in-out infinite; }
+  .mk-timer[data-paused='true'] .mk-clock { opacity: 0.55; animation: none; }
+  @keyframes mk-pulse { 50% { opacity: 0.6; } }
+  @media (prefers-reduced-motion: reduce) { .mk-timer[data-warn='five'] .mk-clock { animation: none; } }
+  .mk-bar__btns { display: flex; flex-wrap: wrap; gap: 0.4rem; justify-content: flex-end; }
+
+  .mk-grid { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 1rem; margin-top: 1rem; align-items: start; }
+  .mk-main { min-width: 0; }
+  .mk-pad { font-family: var(--font-code); font-size: 0.85rem; line-height: 1.5; resize: vertical; margin-top: 0.5rem; }
+  .mk-phases { position: sticky; top: 12rem; margin-top: 0 !important; }
+  .mk-phase-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.3rem; counter-reset: ph; }
+  .mk-phase {
+    counter-increment: ph;
+    display: flex; justify-content: space-between; gap: 0.5rem;
+    padding: 0.45rem 0.6rem; border-radius: 8px; border: 1px solid transparent;
+    font-size: 0.86rem; color: var(--fg-muted);
+  }
+  .mk-phase__label::before { content: counter(ph) '. '; color: var(--fg-faint); }
+  .mk-phase__min { font-family: var(--font-code); font-size: 0.75rem; color: var(--fg-faint); white-space: nowrap; }
+  .mk-phase.is-past { opacity: 0.55; text-decoration: line-through; text-decoration-color: var(--fg-faint); }
+  .mk-phase[aria-current='step'] {
+    color: var(--fg); font-weight: 600; border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+  }
+  .mk-phase[aria-current='step'] .mk-phase__min { color: var(--accent); }
+
+  /* Reveal + rubric */
+  .mk-done { margin-top: 1rem; }
+  .mk-more { margin: 0.75rem 0 1rem; font-size: 0.92rem; }
+  .mk-rubric { list-style: none; margin: 0.75rem 0 0; padding: 0; display: grid; gap: 0.35rem; }
+  .mk-rb__set {
+    padding: 0.45rem 0;
+    display: flex; align-items: center; justify-content: space-between; gap: 0.75rem;
+    border-bottom: 1px solid var(--card-border);
+  }
+  .mk-rb__item { font-size: 0.9rem; color: var(--fg); }
+  .mk-seg { display: inline-flex; border: 1px solid var(--card-border); border-radius: 8px; overflow: hidden; flex: none; margin-left: auto; }
+  .mk-seg__opt { position: relative; cursor: pointer; }
+  .mk-seg__opt input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
+  .mk-seg__opt span {
+    display: block; min-width: 2.2rem; padding: 0.35rem 0; text-align: center;
+    font-family: var(--font-code); font-size: 0.85rem; color: var(--fg-muted);
+  }
+  .mk-seg__opt + .mk-seg__opt { border-left: 1px solid var(--card-border); }
+  .mk-seg__opt:has(input:checked) span { background: var(--accent); color: var(--bg); font-weight: 700; }
+  .mk-total { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem; margin: 1rem 0 0; }
+  .mk-total__n { font-family: var(--font-code); font-size: 1.6rem; font-weight: 700; }
+  .mk-verdict, .mk-table :global(.mk-score) {
+    font-size: 0.8rem; font-weight: 600; padding: 0.2rem 0.6rem; border-radius: 999px;
+    border: 1px solid currentColor;
+  }
+  .mk-table :global(.mk-score) { font-family: var(--font-code); font-size: 0.75rem; white-space: nowrap; }
+  .mk-verdict[data-band='strong'], .mk-table :global(.mk-score[data-band='strong']) { color: var(--anim-success); }
+  .mk-verdict[data-band='borderline'], .mk-table :global(.mk-score[data-band='borderline']) { color: var(--anim-highlight); }
+  .mk-verdict[data-band='practice'], .mk-table :global(.mk-score[data-band='practice']) { color: var(--anim-danger); }
+
+  /* Note HTML (brief, answer, TL;DR) comes in via innerHTML, so :global. */
+  .mk-prose { line-height: 1.6; font-size: 0.93rem; overflow-wrap: anywhere; }
+  .mk-prose :global(p) { margin: 0 0 0.7rem; }
+  .mk-prose :global(ul), .mk-prose :global(ol) { margin: 0 0 0.7rem; padding-left: 1.3rem; }
+  .mk-prose :global(li) { margin: 0.2rem 0; }
+  .mk-prose :global(h3), .mk-prose :global(h4) { font-size: 0.95rem; margin: 1rem 0 0.5rem; }
+  .mk-prose :global(pre) { font-size: 0.82rem; max-width: 100%; }
+  .mk-prose :global(table) {
+    display: block; max-width: 100%; overflow-x: auto;
+    border-collapse: collapse; font-size: 0.84rem; margin: 0 0 0.8rem;
+  }
+  .mk-prose :global(th), .mk-prose :global(td) {
+    border: 1px solid var(--card-border); padding: 0.4rem 0.6rem; text-align: left; vertical-align: top;
+    overflow-wrap: normal; min-width: 7rem;
+  }
+  .mk-prose :global(th) { background: var(--bg-soft); }
+  .mk-prose :global(blockquote) { margin: 0 0 0.7rem; padding-left: 0.8rem; border-left: 3px solid var(--accent); color: var(--fg-muted); }
+  .mk-prose > :global(:last-child) { margin-bottom: 0; }
+
+  /* History */
+  .mk-history__head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.5rem; }
+  .mk-history__head h2 { margin: 0; }
+  .mk-views { display: inline-flex; gap: 0.35rem; }
+  .mk-empty { color: var(--fg-muted); font-size: 0.9rem; margin: 1rem 0 0; }
+  .mk-scroll { overflow-x: auto; margin-top: 0.75rem; }
+  .mk-table { width: 100%; border-collapse: collapse; font-size: 0.86rem; }
+  /* Rows are built in JS (no scope attribute), hence :global for cells. */
+  .mk-table th, .mk-table :global(td) { text-align: left; padding: 0.5rem 0.6rem; border-bottom: 1px solid var(--card-border); white-space: nowrap; }
+  .mk-table :global(td:nth-child(2)), .mk-table th:nth-child(2) { white-space: normal; min-width: 12rem; }
+  .mk-table th { font-size: 0.75rem; color: var(--fg-muted); font-weight: 600; }
+
+  @media (max-width: 820px) {
+    .mk-grid { grid-template-columns: 1fr; }
+    .mk-phases { position: static; order: -1; }
+    /* The site header is taller here; a sticky clock would eat the screen. */
+    .mk-bar { position: static; grid-template-columns: 1fr auto; }
+    .mk-bar__btns { grid-column: 1 / -1; justify-content: flex-start; }
+  }
+  @media (max-width: 480px) {
+    .mk-card { padding: 0.85rem 0.9rem; }
+    .mk-bar { grid-template-columns: 1fr; }
+    .mk-timer { align-items: flex-start; }
+    .mk-status { text-align: left; }
+    .mk-rb__set { flex-wrap: wrap; }
+  }
+</style>

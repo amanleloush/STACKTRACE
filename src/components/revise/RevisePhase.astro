@@ -1,0 +1,574 @@
+---
+// One printable revision sheet for a notes or DSA phase: a sticky table
+// of contents, print / one-liners-only controls, and one block per topic
+// (one-liner, collapsible definition, cheat sheet or complexity +
+// pitfalls). Section HTML comes from our own MDX via content-extract, so
+// it is injected with set:html.
+import type { ReviseTopic } from './revise-data';
+
+interface PhaseRef {
+  slug: string;
+  num: string;
+  title: string;
+}
+
+interface Props {
+  kind: 'notes' | 'dsa';
+  phase: PhaseRef & { blurb: string };
+  topics: ReviseTopic[];
+  prev: PhaseRef | null;
+  next: PhaseRef | null;
+}
+
+const { kind, phase, topics, prev, next } = Astro.props;
+const kindLabel = kind === 'notes' ? 'System design' : 'DSA';
+const defLabel = kind === 'notes' ? 'Definition' : 'Interview-ready explanation';
+const fullLabel = kind === 'notes' ? 'Read the full note' : 'Read the full page';
+const subtitle =
+  kind === 'notes'
+    ? 'every one-liner, definition and cheat sheet'
+    : 'every one-liner, explanation, complexity and pitfalls';
+---
+<div class="rv" data-kind={kind}>
+  {/* Apply the remembered "one-liners only" choice before first paint. */}
+  <script is:inline>
+    try {
+      if (localStorage.getItem('stacktrace:revise:oneliners') === '1') {
+        document.currentScript.parentElement.classList.add('rv--oneliners');
+      }
+    } catch (e) {}
+  </script>
+
+  <nav class="rv-crumbs" aria-label="Breadcrumb">
+    <a href="/revise/">Revision</a> <span aria-hidden="true">/</span> <span>{kindLabel}</span>
+  </nav>
+
+  <header class="rv-head">
+    <p class="rv-head__kicker">{kindLabel} · Phase {phase.num} · revision sheet</p>
+    <h1 class="rv-head__title">{phase.title}</h1>
+    <p class="rv-head__sub">
+      {topics.length} topic{topics.length === 1 ? '' : 's'} · {subtitle}
+    </p>
+  </header>
+
+  <div class="rv-layout">
+    <aside class="rv-side" aria-label="Revision controls and contents">
+      <div class="rv-controls" hidden>
+        <button type="button" class="rv-btn rv-btn--print">Print / Save as PDF</button>
+        <button type="button" class="rv-btn rv-btn--mode" aria-pressed="false">One-liners only</button>
+      </div>
+      <details class="rv-toc" open>
+        <summary>Contents <span class="rv-toc__count">({topics.length})</span></summary>
+        <ol class="rv-toc__list">
+          {topics.map((t) => (
+            <li><a href={`#${t.anchor}`}>{t.title}</a></li>
+          ))}
+        </ol>
+      </details>
+    </aside>
+
+    {/* The same text lives on each note's own page; keep search pointing there. */}
+    <div class="rv-topics" data-pagefind-ignore="all">
+      {topics.length === 0 && (
+        <p class="rv-empty">Nothing to revise here yet. This phase is still being written.</p>
+      )}
+      {topics.map((t, i) => (
+        <article class="rv-topic" id={t.anchor} aria-labelledby={`${t.anchor}-h`}>
+          <h2 class="rv-topic__title" id={`${t.anchor}-h`}>
+            <span class="rv-topic__num" aria-hidden="true">{String(i + 1).padStart(2, '0')}</span>
+            <a class="rv-title-link" href={t.href}>{t.title}</a>
+          </h2>
+
+          {t.oneLinerHtml && (
+            <p class="rv-oneliner"><span class="rv-label">One-liner</span> <Fragment set:html={t.oneLinerHtml} /></p>
+          )}
+
+          {t.complexity && (
+            <p class="rv-complexity rv-detail">
+              <span class="rv-chip">Time <code>{t.complexity.time}</code></span>
+              <span class="rv-chip">Space <code>{t.complexity.space}</code></span>
+            </p>
+          )}
+
+          {t.definitionHtml && (
+            <details class="rv-def rv-detail">
+              <summary>{defLabel}</summary>
+              <div class="rv-prose" set:html={t.definitionHtml} />
+            </details>
+          )}
+
+          {t.cheatSheetHtml && (
+            <details class="rv-cheat rv-detail" open>
+              <summary>TL;DR cheat sheet</summary>
+              <div class="rv-prose" set:html={t.cheatSheetHtml} />
+            </details>
+          )}
+
+          {t.pitfallsHtml.length > 0 && (
+            <details class="rv-cheat rv-detail" open>
+              <summary>Common pitfalls</summary>
+              <ul class="rv-prose rv-pitfalls">
+                {t.pitfallsHtml.map((p) => <li set:html={p} />)}
+              </ul>
+            </details>
+          )}
+
+          <p class="rv-more"><a href={t.fullHref}>{fullLabel} →</a></p>
+        </article>
+      ))}
+    </div>
+  </div>
+
+  <nav class="rv-nav" aria-label="Adjacent phases">
+    {prev ? (
+      <a href={`/revise/${kind}/${prev.slug}/`} class="rv-nav__link">
+        <span class="rv-nav__dir">← Previous phase</span>
+        <span class="rv-nav__title">{prev.num} · {prev.title}</span>
+      </a>
+    ) : <span></span>}
+    {next && (
+      <a href={`/revise/${kind}/${next.slug}/`} class="rv-nav__link rv-nav__link--next">
+        <span class="rv-nav__dir">Next phase →</span>
+        <span class="rv-nav__title">{next.num} · {next.title}</span>
+      </a>
+    )}
+  </nav>
+</div>
+
+<script>
+  const KEY = 'stacktrace:revise:oneliners';
+
+  function init(): void {
+    const root = document.querySelector<HTMLElement>('.rv');
+    if (!root) return;
+    const controls = root.querySelector<HTMLElement>('.rv-controls');
+    const printBtn = root.querySelector<HTMLButtonElement>('.rv-btn--print');
+    const modeBtn = root.querySelector<HTMLButtonElement>('.rv-btn--mode');
+    if (!controls || !printBtn || !modeBtn) return;
+    // Buttons only work with JS, so they stay hidden without it.
+    controls.hidden = false;
+
+    const sync = (): void => {
+      modeBtn.setAttribute('aria-pressed', String(root.classList.contains('rv--oneliners')));
+    };
+    sync();
+
+    modeBtn.addEventListener('click', () => {
+      const on = root.classList.toggle('rv--oneliners');
+      sync();
+      try {
+        if (on) localStorage.setItem(KEY, '1');
+        else localStorage.removeItem(KEY);
+      } catch {
+        // Storage blocked: the toggle still works for this visit.
+      }
+    });
+
+    printBtn.addEventListener('click', () => window.print());
+
+    // Print every <details> expanded, then restore what the reader had.
+    let closed: HTMLDetailsElement[] = [];
+    window.addEventListener('beforeprint', () => {
+      closed = [...root.querySelectorAll<HTMLDetailsElement>('details:not([open])')];
+      closed.forEach((d) => (d.open = true));
+    });
+    window.addEventListener('afterprint', () => {
+      closed.forEach((d) => (d.open = false));
+      closed = [];
+    });
+
+    // Keep the sticky bar (mobile) / sidebar (desktop) clear of the sticky
+    // site header, whose height changes when its nav wraps.
+    const header = document.querySelector<HTMLElement>('.site-header');
+    const setTop = (): void => {
+      root.style.setProperty('--rv-top', `${header ? header.offsetHeight : 0}px`);
+    };
+    setTop();
+    window.addEventListener('resize', setTop, { passive: true });
+
+    // On narrow screens the contents list collapses; jumping to a topic
+    // closes it again so it doesn't cover the page.
+    const toc = root.querySelector<HTMLDetailsElement>('.rv-toc');
+    const narrow = window.matchMedia('(max-width: 959px)');
+    if (toc && narrow.matches) toc.open = false;
+    toc?.addEventListener('click', (e) => {
+      if (narrow.matches && (e.target as HTMLElement).closest('a')) toc.open = false;
+    });
+  }
+
+  init();
+</script>
+
+<style>
+  .rv {
+    --rv-top: 56px;
+  }
+
+  .rv-crumbs {
+    font-size: 0.85rem;
+    margin-bottom: 1.25rem;
+    color: var(--fg-muted);
+  }
+  .rv-crumbs a { color: var(--fg-muted); text-decoration: none; }
+  .rv-crumbs a:hover { color: var(--accent); }
+
+  .rv-head { margin-bottom: 1.75rem; }
+  .rv-head__kicker {
+    margin: 0;
+    font-family: var(--font-code);
+    font-size: 0.78rem;
+    color: var(--fg-muted);
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+  .rv-head__title {
+    margin: 0.3rem 0 0.5rem;
+    font-size: clamp(1.8rem, 4vw, 2.4rem);
+    font-weight: 800;
+    background: var(--grad-3);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .rv-head__sub { margin: 0; color: var(--fg-muted); font-size: 0.92rem; }
+
+  /* Layout: sidebar + topics on wide screens, sticky bar on top otherwise. */
+  .rv-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 1.25rem;
+  }
+  .rv-side {
+    position: sticky;
+    top: var(--rv-top);
+    z-index: 10;
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    padding: 0.6rem 0;
+    background: var(--bg);
+    border-bottom: 1px solid color-mix(in srgb, var(--card-border) 60%, transparent);
+  }
+  @media (min-width: 960px) {
+    .rv-layout { grid-template-columns: 15rem minmax(0, 1fr); gap: 2rem; align-items: start; }
+    .rv-side {
+      top: calc(var(--rv-top) + 1rem);
+      max-height: calc(100vh - var(--rv-top) - 2rem);
+      padding: 0;
+      background: none;
+      border-bottom: 0;
+    }
+  }
+
+  .rv-controls { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+  .rv-controls[hidden] { display: none; }
+  .rv-btn {
+    font: inherit;
+    font-size: 0.85rem;
+    font-weight: 600;
+    padding: 0.45rem 0.8rem;
+    border-radius: 999px;
+    border: 1px solid var(--card-border);
+    background: var(--card-bg);
+    color: var(--fg);
+    cursor: pointer;
+    transition: border-color 0.15s ease, background 0.15s ease;
+  }
+  .rv-btn:hover { border-color: var(--accent); }
+  .rv-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .rv-btn[aria-pressed='true'] {
+    border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 16%, var(--card-bg));
+  }
+
+  .rv-toc {
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--card-border);
+    border-radius: 12px;
+    background: var(--card-bg);
+  }
+  .rv-toc summary {
+    cursor: pointer;
+    padding: 0.55rem 0.85rem;
+    font-size: 0.85rem;
+    font-weight: 700;
+    color: var(--fg);
+  }
+  .rv-toc summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 10px; }
+  .rv-toc__count { color: var(--fg-muted); font-weight: 500; }
+  .rv-toc__list {
+    margin: 0;
+    padding: 0 0.85rem 0.7rem 2rem;
+    max-height: 50vh;
+    overflow-y: auto;
+    font-size: 0.84rem;
+    line-height: 1.35;
+  }
+  @media (min-width: 960px) {
+    .rv-toc__list { max-height: calc(100vh - var(--rv-top) - 9rem); }
+  }
+  .rv-toc__list li { margin: 0.3rem 0; color: var(--fg-faint); }
+  .rv-toc__list a { color: var(--fg-muted); text-decoration: none; }
+  .rv-toc__list a:hover, .rv-toc__list a:focus-visible { color: var(--accent); }
+
+  /* Topic blocks */
+  .rv-topics { display: grid; gap: 1rem; min-width: 0; }
+  .rv-empty {
+    color: var(--fg-faint);
+    font-style: italic;
+    padding: 1.25rem;
+    border: 1px dashed var(--card-border);
+    border-radius: 10px;
+  }
+  .rv-topic {
+    min-width: 0;
+    padding: 1.1rem 1.25rem;
+    border: 1px solid var(--card-border);
+    border-radius: 14px;
+    background: var(--card-bg);
+    scroll-margin-top: calc(var(--rv-top) + 4.5rem);
+  }
+  @media (min-width: 960px) {
+    .rv-topic { scroll-margin-top: calc(var(--rv-top) + 1rem); }
+  }
+  .rv-topic__title {
+    margin: 0 0 0.6rem;
+    font-size: 1.15rem;
+    line-height: 1.3;
+    display: flex;
+    gap: 0.6rem;
+    align-items: baseline;
+  }
+  .rv-topic__num { font-family: var(--font-code); font-size: 0.8rem; color: var(--fg-faint); }
+  .rv-title-link { color: var(--fg); text-decoration: none; }
+  .rv-title-link:hover { color: var(--accent); text-decoration: underline; }
+
+  .rv-oneliner {
+    margin: 0 0 0.75rem;
+    padding: 0.7rem 0.9rem;
+    border-left: 3px solid var(--accent);
+    border-radius: 0 10px 10px 0;
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+    font-size: 1.02rem;
+    line-height: 1.5;
+    font-weight: 500;
+  }
+  .rv-label {
+    display: inline-block;
+    margin-right: 0.35rem;
+    font-family: var(--font-code);
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent);
+    vertical-align: 0.1em;
+  }
+
+  .rv-complexity { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0 0 0.75rem; }
+  .rv-chip {
+    font-size: 0.8rem;
+    color: var(--fg-muted);
+    padding: 0.15rem 0.6rem;
+    border-radius: 999px;
+    border: 1px solid var(--card-border);
+  }
+
+  .rv-def, .rv-cheat {
+    margin: 0 0 0.6rem;
+    border-top: 1px solid color-mix(in srgb, var(--card-border) 60%, transparent);
+    padding-top: 0.5rem;
+  }
+  .rv-def summary, .rv-cheat summary {
+    cursor: pointer;
+    font-size: 0.82rem;
+    font-weight: 700;
+    color: var(--fg-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 0.2rem 0;
+  }
+  .rv-def summary:hover, .rv-cheat summary:hover { color: var(--accent); }
+  .rv-def summary:focus-visible, .rv-cheat summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .rv-more { margin: 0.4rem 0 0; font-size: 0.85rem; }
+  .rv-more a { color: var(--accent); text-decoration: none; font-weight: 600; }
+  .rv-more a:hover { text-decoration: underline; }
+
+  /* One-liners only: hide everything but the title and one-liner. */
+  .rv--oneliners .rv-detail { display: none; }
+  .rv--oneliners .rv-topic { padding-bottom: 0.8rem; }
+  .rv--oneliners .rv-oneliner { margin-bottom: 0.4rem; }
+
+  /* Injected section HTML: lists, tables, code. */
+  .rv-prose { font-size: 0.92rem; line-height: 1.55; color: var(--fg); min-width: 0; }
+  .rv-prose :global(p) { margin: 0.5rem 0; }
+  .rv-prose :global(ul), .rv-prose :global(ol), .rv-pitfalls { margin: 0.4rem 0; padding-left: 1.3rem; }
+  .rv-prose :global(li) { margin: 0.25rem 0; }
+  .rv-prose :global(h3), .rv-prose :global(h4) { font-size: 0.95rem; margin: 0.9rem 0 0.35rem; }
+  .rv-prose :global(pre) { font-size: 0.8rem; max-width: 100%; overflow-x: auto; }
+  .rv-prose :global(code) { overflow-wrap: anywhere; }
+  .rv-prose :global(pre code) { overflow-wrap: normal; }
+  .rv-prose :global(table) {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+    border-collapse: collapse;
+    font-size: 0.84rem;
+    margin: 0.6rem 0;
+  }
+  .rv-prose :global(th), .rv-prose :global(td) {
+    border: 1px solid var(--card-border);
+    padding: 0.35rem 0.6rem;
+    text-align: left;
+    vertical-align: top;
+  }
+  .rv-prose :global(th) { background: var(--bg-soft); font-weight: 700; }
+  .rv-prose :global(a) { color: var(--accent); }
+  .rv-prose :global(blockquote) {
+    margin: 0.5rem 0;
+    padding-left: 0.8rem;
+    border-left: 3px solid var(--card-border);
+    color: var(--fg-muted);
+  }
+
+  /* Prev / next phase */
+  .rv-nav {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+    margin-top: 2.5rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid color-mix(in srgb, var(--card-border) 60%, transparent);
+  }
+  .rv-nav__link {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    padding: 0.9rem 1.1rem;
+    background: var(--card-bg);
+    border: 1px solid var(--card-border);
+    border-radius: 12px;
+    text-decoration: none;
+    color: var(--fg);
+  }
+  .rv-nav__link:hover { border-color: var(--accent); text-decoration: none; }
+  .rv-nav__link--next { text-align: right; }
+  .rv-nav__dir {
+    font-family: var(--font-code);
+    font-size: 0.7rem;
+    color: var(--fg-faint);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-weight: 700;
+  }
+  .rv-nav__title { font-size: 0.95rem; font-weight: 700; }
+
+  @media (max-width: 600px) {
+    .rv-topic { padding: 0.9rem 0.95rem; }
+    .rv-nav { grid-template-columns: 1fr; }
+    .rv-nav__link--next { text-align: left; }
+  }
+
+  /* ---------- Print: black on white, compact, no chrome ---------- */
+  @media print {
+    @page { size: A4; margin: 12mm; }
+
+    :global(.site-header),
+    :global(.site-footer),
+    :global(.skip-link),
+    .rv-crumbs,
+    .rv-side,
+    .rv-nav,
+    .rv-more {
+      display: none !important;
+    }
+    :global(html), :global(body), :global(.site-main) {
+      background: #fff !important;
+      color: #000 !important;
+    }
+    :global(.site-main) { max-width: none; padding: 0; }
+    :global(body *) { box-shadow: none !important; text-shadow: none !important; }
+
+    .rv { font-size: 8.5pt; color: #000; }
+    .rv-layout { display: block; }
+    .rv-head { margin-bottom: 4mm; }
+    .rv-head__kicker, .rv-head__sub { color: #000; }
+    .rv-head__title {
+      background: none;
+      color: #000;
+      -webkit-text-fill-color: #000;
+      font-size: 16pt;
+      margin: 1mm 0;
+    }
+
+    .rv-topics { display: block; }
+    .rv-topic {
+      break-inside: avoid;
+      page-break-inside: avoid;
+      border: 0;
+      border-bottom: 0.5pt solid #999;
+      border-radius: 0;
+      background: none;
+      padding: 0 0 2.5mm;
+      margin: 0 0 2.5mm;
+    }
+    .rv-topic__title { font-size: 10.5pt; margin-bottom: 1.5mm; break-after: avoid; }
+    .rv-topic__num, .rv-title-link { color: #000; }
+    /* Only the title link prints its URL. */
+    .rv-title-link::after {
+      content: ' (' attr(href) ')';
+      font-family: var(--font-code);
+      font-size: 7.5pt;
+      font-weight: 400;
+      color: #444;
+    }
+
+    .rv-oneliner {
+      background: none;
+      border-left: 2pt solid #000;
+      padding: 0.5mm 0 0.5mm 2.5mm;
+      margin-bottom: 1.5mm;
+      font-size: 9pt;
+      line-height: 1.35;
+    }
+    .rv-label { color: #000; }
+    .rv-chip { border-color: #999; color: #000; }
+    .rv-complexity { margin-bottom: 1.5mm; }
+
+    .rv-def, .rv-cheat { border-top: 0; padding-top: 0; margin-bottom: 1.5mm; }
+    .rv-def summary, .rv-cheat summary {
+      list-style: none;
+      color: #000;
+      font-size: 7.5pt;
+      padding: 0;
+    }
+    .rv-def summary::-webkit-details-marker, .rv-cheat summary::-webkit-details-marker { display: none; }
+    /* Belt and braces with the beforeprint handler: force-open content. */
+    details::details-content { content-visibility: visible; display: block; }
+
+    .rv-prose { font-size: 7.8pt; line-height: 1.3; color: #000; }
+    .rv-prose :global(p) { margin: 1mm 0; }
+    .rv-prose :global(ul), .rv-prose :global(ol), .rv-pitfalls { margin: 1mm 0; padding-left: 4.5mm; }
+    .rv-prose :global(li) { margin: 0.4mm 0; }
+    .rv-prose :global(a) { color: #000; text-decoration: none; }
+    .rv-prose :global(code), .rv-prose :global(pre), .rv-chip :global(code), .rv-oneliner :global(code) {
+      background: none !important;
+      color: #000 !important;
+      padding: 0;
+    }
+    .rv-prose :global(pre) {
+      border: 0.5pt solid #999;
+      padding: 1.5mm;
+      white-space: pre-wrap;
+      overflow: visible;
+      font-size: 7.5pt;
+    }
+    .rv-prose :global(table) { display: table; overflow: visible; font-size: 7.5pt; }
+    .rv-prose :global(th), .rv-prose :global(td) { border-color: #999; padding: 0.6mm 1.5mm; color: #000; }
+    .rv-prose :global(th) { background: none; }
+    .rv-prose :global(blockquote) { color: #000; border-left-color: #999; }
+  }
+</style>
