@@ -58,7 +58,10 @@ export default defineConfig({
         ],
       ],
     }),
-    sitemap(),
+    sitemap({
+      // The offline fallback page is for the service worker, not search.
+      filter: (page) => !new URL(page).pathname.startsWith('/offline'),
+    }),
     // Search: no astro-pagefind integration. scripts/build-search-index.ts
     // builds dist/pagefind after `astro build` (see package.json), because
     // the Worker-rendered /learn/* pages need records the integration
