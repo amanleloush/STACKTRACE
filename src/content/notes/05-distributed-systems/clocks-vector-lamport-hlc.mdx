@@ -16,6 +16,8 @@ In a distributed system, **wall-clock time can't be trusted** because clocks dri
 - **Vector clocks**: one counter per process; comparing vectors tells you `<`, `>`, or "concurrent."
 - **Hybrid Logical Clocks (HLC)**: combine wall-clock time + logical counter for near-physical ordering with causal guarantees.
 
+**One-liner:** Logical clocks order events by causality instead of unreliable wall time: Lamport timestamps give an order consistent with happens-before, vector clocks can also detect concurrent events, and HLCs keep that causal order while staying close to physical time.
+
 ## Why it matters
 
 Wall-clock ordering breaks: replicas with skewed clocks make wrong decisions ("which write won?"). Distributed systems use logical or hybrid clocks for consistency, replication conflict resolution, version vectors, and tracing. Understanding the model determines correctness, not just performance.
@@ -31,7 +33,7 @@ Wall-clock ordering breaks: replicas with skewed clocks make wrong decisions ("w
 - **VM clock drift**: virtual machines can lag or jump.
 - **Clock skew between data centers**: easily 100ms+.
 
-Last-write-wins (LWW) using wall-clock time can incorrectly drop a later write whose clock is behind. Cassandra historically had this problem; designed around it.
+Last-write-wins (LWW) using wall-clock time can incorrectly drop a later write whose clock is behind. Cassandra resolves conflicts exactly this way (per-cell LWW on timestamps), so it relies on tightly synced clocks.
 
 ### Happens-before relation (Lamport, 1978)
 
@@ -67,7 +69,7 @@ Comparing vectors:
 - `V1 = V2` → same event (in theory, unlikely).
 - Neither dominates → **concurrent**.
 
-This is the only structure that can detect concurrency.
+Unlike Lamport timestamps, vector clocks can detect concurrency (and a vector with one entry per process is the minimum size that can do it in general).
 
 ### Version vectors (vector clocks for objects)
 
@@ -115,7 +117,7 @@ Used by: CockroachDB, YugabyteDB, MongoDB (since 3.6 for replica set ordering).
 
 ### TrueTime (Spanner)
 
-Google's atomic-clock-backed API: returns time as `[earliest, latest]` interval. Commits wait out the interval to guarantee external consistency (strict serializability). Hardware investment (atomic clocks + GPS in every DC). Practically, HLC achieves much of what TrueTime does without hardware, at the cost of needing some clock sync (NTP) and slightly weaker guarantees.
+Google's atomic-clock-backed API: returns time as `[earliest, latest]` interval. Commits wait out the interval to guarantee external consistency (strict serializability). Hardware investment (atomic clocks + GPS in every DC). Practically, HLC achieves much of what TrueTime does without special hardware, at the cost of needing ordinary clock sync (NTP) and weaker guarantees: for example, CockroachDB uses HLC and guarantees serializability, but not strict serializability for every pair of transactions.
 
 ### Practical applications
 
@@ -136,8 +138,9 @@ P1 does another local event: C=2 (independent of P2/P3)
 Order:
   Events: (P1,1), (P1,2), (P2,2), (P2,3), (P3,4)
   (P1,1) → (P2,2)  (causal: send/receive)
-  (P1,2) and (P2,2): concurrent — Lamport says 2<2 isn't helpful;
-                     ties broken by process ID for total order.
+  (P1,2) and (P2,2): concurrent — equal timestamps tell you nothing
+                     about causality; ties are broken by process ID
+                     only to get a total order.
 ```
 
 ## Real-world examples

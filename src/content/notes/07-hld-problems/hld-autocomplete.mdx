@@ -9,6 +9,16 @@ estimatedMinutes: 5
 prerequisites: []
 ---
 
+## Definition (interview-ready)
+
+**Search autocomplete (typeahead)** suggests the top few completions for whatever prefix the user has typed so far, on every keystroke, ranked mostly by how popular each query is.
+
+The design in one breath: an offline job aggregates the **query logs** into (term, score) pairs and builds a **trie** (prefix tree) where every node stores its **precomputed top K** completions, so serving is just "walk the prefix, return the list" in O(prefix length). The trie lives **in memory**, sharded and replicated across serving nodes, and is rebuilt every few minutes to hours and **swapped in atomically**. Short, popular prefixes are cached at the **CDN edge** and in a cache like Redis, because every keystroke is a request. A small streaming layer boosts trending terms, and personalization is a light per-user overlay merged at query time.
+
+The main trade-off is **freshness vs simplicity and speed**: precomputing top K makes reads trivial but means rankings lag behind real traffic until the next rebuild.
+
+**One-liner:** Aggregate query logs offline into a trie that stores the top K suggestions at every prefix node, serve it from memory with an atomic swap on each rebuild, and put edge caches in front because every keystroke is a request.
+
 ## Problem statement
 
 Design a typeahead service that suggests the most likely completions for a user's prefix in real time, ranked by popularity and relevance.
@@ -154,7 +164,7 @@ Realtime increments via streaming for trending terms (Flink keeps top K per pref
 
 ## Trade-offs
 
-- **Real-time vs batch updates**: real-time is more responsive but more complex. Most prod systems batch every few minutes.
+- **Real-time vs batch updates**: real-time is more responsive but more complex. A common choice is a batch rebuild every few minutes to hours, plus a small real-time layer for trending terms.
 - **In-memory vs distributed**: a single trie in RAM is simplest; sharded trie scales but adds routing.
 - **Spell-correction at the edge**: typeahead can suggest spell-corrections on-the-fly (Did you mean...) — useful UX but extra cost.
 
@@ -164,7 +174,7 @@ Realtime increments via streaming for trending terms (Flink keeps top K per pref
 
 <QA q="Why use a trie?" level="easy">
 
-Lookup is O(prefix length): walk the characters of the prefix and return the top K precomputed at that node. That beats `LIKE` queries on a database (a scan over N rows) by orders of magnitude, and it fits the sub-100 ms p99 budget.
+Lookup is O(prefix length): walk the characters of the prefix and return the top K precomputed at that node. A database `LIKE 'p%'` query can use a B-tree index to find matching rows, but it would still have to fetch every match and sort it by popularity on every keystroke; short prefixes match millions of rows. Precomputing the answer per prefix turns that into a constant-size read and fits the sub-100 ms p99 budget.
 
 </QA>
 
@@ -205,7 +215,7 @@ A/B test ranking functions behind flags.
 
 <QA q="How would you update suggestions for trending events?" level="medium">
 
-A real-time stream job (Flink) keeps a windowed top K per prefix from recent queries. Merge it with the baseline trie at query time, or rebuild more often for popular prefixes. Most production systems batch every few minutes; full real-time is more responsive but more complex.
+A real-time stream job (Flink) keeps a windowed top K per prefix from recent queries. Merge it with the baseline trie at query time, or rebuild more often for popular prefixes. A common choice is batch rebuilds plus this small real-time layer; full real-time is more responsive but more complex.
 
 </QA>
 
@@ -329,7 +339,6 @@ CJK text lacks spaces and users may type romanized input, so tokenization and ma
 
 - **Alex Xu Vol 1**: Chapter 13 (Search autocomplete).
 - **Gaurav Sen**: ["Designing Typeahead"](https://www.youtube.com/results?search_query=gaurav+sen+typeahead).
-- **High Scalability**: Google/Yahoo typeahead architecture posts.
-- **Elasticsearch**: completion suggester, edge n-gram tokenizer.
+- **Elasticsearch**: [suggesters](https://www.elastic.co/guide/en/elasticsearch/reference/current/search-suggesters.html) (completion suggester), edge n-gram tokenizer.
 - **Solr**: AnalyzingInfixSuggester.
 - **System Design Primer**: search section.

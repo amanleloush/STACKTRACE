@@ -13,6 +13,8 @@ prerequisites: []
 
 In dimensional modeling, **fact tables** store metrics (sales, clicks, sessions) and **dimension tables** store descriptive attributes (customer, product, store). **Slowly Changing Dimensions (SCDs)** are strategies for tracking changes to dimension attributes over time (Type 1 = overwrite, Type 2 = history with effective dates). **Star schema** denormalizes dimensions; **snowflake schema** normalizes them into sub-dimensions.
 
+**One-liner:** A star schema is a central fact table of events joined to flat dimension tables, and slowly changing dimensions decide how those dimensions record changes: Type 1 overwrites, Type 2 adds a new versioned row so past facts keep the attributes they had at the time.
+
 ## Why it matters
 
 Dimensional modeling is the backbone of every analytics warehouse — it's the language analysts use, the schema BI tools assume, and the structure that makes queries simple and fast. Understanding SCDs avoids "historical reports that change every day" type bugs.
@@ -108,7 +110,7 @@ When dimension data changes (customer moves city, product category renamed), how
 
 #### Type 0: never change
 
-Static — never update. Rarely useful.
+Keep the original value forever, even if the source changes. Used for attributes that should never change, such as date of birth or original signup date.
 
 #### Type 1: overwrite
 
@@ -150,7 +152,7 @@ Only the most recent prior value preserved. Rare.
 
 #### Type 4: history table
 
-Separate table tracks history; main dim is current.
+Separate table tracks history; main dim is current. (Naming varies: in Kimball's *Data Warehouse Toolkit*, Type 4 means a "mini-dimension" that splits out rapidly changing attributes. Many teams use "Type 4" for a separate history table, as here.)
 
 #### Type 6: hybrid (1+2+3)
 
@@ -183,13 +185,24 @@ A dimension used by multiple fact tables (same `dim_customer` in `fact_sales` an
 ## Modern lakehouse take
 
 In Iceberg / Delta tables:
-- **MERGE INTO** for Type 2:
+- **MERGE INTO** for Type 2. One `MERGE` row can either update or insert, but a changed customer needs both (close the old row and insert the new version). The standard trick stages each changed row twice, once with a `NULL` merge key so it falls into the insert branch:
   ```sql
-  MERGE INTO dim_customer t USING source s
-    ON t.customer_id = s.customer_id AND t.is_current
-    WHEN MATCHED AND s.city <> t.city THEN UPDATE SET is_current = 0, effective_to = current_date
-    WHEN NOT MATCHED THEN INSERT (...)
+  MERGE INTO dim_customer t
+  USING (
+    SELECT s.customer_id AS merge_key, s.* FROM source s
+    UNION ALL
+    SELECT NULL AS merge_key, s.* FROM source s           -- second copy: forces an INSERT
+      JOIN dim_customer d ON d.customer_id = s.customer_id
+     WHERE d.is_current AND d.city <> s.city
+  ) u
+  ON t.customer_id = u.merge_key AND t.is_current
+  WHEN MATCHED AND t.city <> u.city THEN
+    UPDATE SET is_current = false, effective_to = current_date
+  WHEN NOT MATCHED THEN
+    INSERT (customer_id, city, effective_from, effective_to, is_current)
+    VALUES (u.customer_id, u.city, current_date, DATE '9999-12-31', true);
   ```
+  Changed customers get their old row closed and a new current row; brand-new customers are inserted; unchanged ones are left alone.
 - **dbt snapshots** automate Type 2 SCDs declaratively.
 
 ### dbt snapshots

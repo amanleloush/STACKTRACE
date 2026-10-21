@@ -16,7 +16,7 @@ summary: "How the OS gives every process its own private address space using pag
 
 The **page cache** is the kernel using spare RAM to cache file contents. Reads are served from it, and writes land in it as **dirty pages** that are flushed to disk later (or when you call `fsync`).
 
-How to say it: *"Virtual memory is an indirection layer. It gives isolation (you can't name another process's memory), lets the OS overcommit and lazily allocate, lets it share pages (shared libraries, copy-on-write fork), and lets files be cached and memory-mapped through the same machinery."*
+**One-liner:** Virtual memory is an indirection layer: the MMU maps each process's virtual pages to physical frames through kernel-managed page tables (cached in the TLB), which gives isolation, lazy allocation and overcommit, page sharing such as shared libraries and copy-on-write `fork`, and lets files be cached and memory-mapped through the same machinery.
 
 ## Why it matters
 
@@ -103,7 +103,7 @@ A **page fault** is a CPU exception raised when a translation is missing or an a
 | Type | What happened | Cost |
 |---|---|---|
 | **Minor (soft)** | The data is already in RAM, just not mapped for this process. E.g., first touch of a freshly `malloc`'d page (kernel hands out a zeroed frame), a shared library page already in the page cache, a copy-on-write page | Microseconds, no disk I/O |
-| **Major (hard)** | The data must be read from disk: a file page not in the page cache, or a page that was swapped out | Disk latency: from roughly a hundred microseconds on NVMe to milliseconds on HDD |
+| **Major (hard)** | The data must be read from disk: a file page not in the page cache, or a page that was swapped out | Disk latency: from tens to around a hundred microseconds on NVMe to several milliseconds on HDD |
 | **Invalid** | Address not mapped at all, or writing to a read-only page that isn't copy-on-write | Kernel sends `SIGSEGV` → segfault |
 
 See them with `ps -o min_flt,maj_flt -p PID`, `pidstat -r 1` (minflt/s, majflt/s), or `/usr/bin/time -v cmd`. Major faults on a latency-sensitive service are a red flag.
@@ -161,7 +161,9 @@ When a process calls `fork()`, the kernel doesn't copy its memory. It copies the
 
  child writes to the page → page fault (write to read-only)
    kernel sees it's a COW page → copies frame 42 to frame 97
-   child PTE ──► frame 97 (writable)    parent PTE ──► frame 42 (writable again once refcount is 1)
+   child PTE ──► frame 97 (writable)
+   parent PTE ──► frame 42 (still read-only; refcount is now 1, so the parent's
+                            next write just flips it writable, no copy)
 ```
 
 - `fork` + `exec` stays cheap because the child replaces its memory almost immediately.
@@ -426,7 +428,7 @@ The page cache uses spare RAM and is mostly reclaimable. `available` is the esti
 
 <MCQ q="What does setting /proc/PID/oom_score_adj to -1000 do?" options={["Makes the process the first OOM victim", "Exempts the process from the OOM killer", "Limits the process to 1000 MB", "Disables swap for the process"]} answer={1}>
 
--1000 makes the adjusted score zero, so the OOM killer never selects that process. +1000 would make it the preferred victim.
+-1000 (OOM_SCORE_ADJ_MIN) is a special value: the kernel skips that process entirely when choosing a victim. +1000 would make it the preferred victim.
 
 </MCQ>
 

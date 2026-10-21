@@ -14,6 +14,8 @@ summary: "How Redis gets data from RAM onto disk with RDB snapshots and the appe
 
 **Redis persistence** is how an in-memory Redis server writes its dataset to disk so it survives a restart. There are two mechanisms. **RDB** takes point-in-time binary snapshots: the server forks, and the child writes the whole dataset to `dump.rdb`. **AOF** (append-only file) logs every write command and replays the log on startup. You can run neither (pure cache), either one, or both. Since Redis 4.0 the AOF can also start with an RDB-format snapshot (the "RDB preamble"), which gives you a compact base plus a log of recent writes. How much data you can lose is set by how often you snapshot (RDB) or how often you `fsync` the log (AOF, default once per second). Replication, `WAIT`, and `WAITAOF` lower the risk further, but Redis never becomes a strongly consistent store.
 
+**One-liner:** Redis persists its in-memory data with RDB snapshots (fork and dump the whole dataset) and/or an append-only log of writes fsynced every second by default, so you can lose minutes of data with RDB alone or about one second with AOF.
+
 ## Why it matters
 
 - "Is Redis durable?" is a classic interview trap. The honest answer is "it depends on the config, and here is the exact loss window for each config."
@@ -59,7 +61,8 @@ When both are enabled, Redis loads the **AOF** at startup and ignores `dump.rdb`
 #### Save points
 
 ```conf
-# redis.conf — the defaults when no save line is given:
+# redis.conf — the defaults (Redis 7.0+) when no save line is given:
+#   (before 7.0 the defaults were 900 1, 300 10, 60 10000)
 #   after 3600s if >= 1 change, after 300s if >= 100 changes, after 60s if >= 10000 changes
 save 3600 1 300 100 60 10000
 
@@ -148,7 +151,7 @@ The result: no big rewrite buffer in memory, and no writing every command twice.
 
 ### Hybrid: RDB preamble
 
-`aof-use-rdb-preamble yes` (added in 4.0, default `yes`) writes the AOF **base** as an RDB snapshot. Restart then loads a fast binary base and replays only the short incremental log. You get RDB's restart speed with AOF's loss window. This is what "RDB + AOF hybrid" means in practice.
+`aof-use-rdb-preamble yes` (added in 4.0, default `yes` since 5.0) writes the AOF **base** as an RDB snapshot. Restart then loads a fast binary base and replays only the short incremental log. You get RDB's restart speed with AOF's loss window. This is what "RDB + AOF hybrid" means in practice.
 
 ### RDB vs AOF
 
@@ -213,10 +216,17 @@ stop-writes-on-bgsave-error yes
 
 ```bash
 # Simple cron-style backup
-redis-cli BGSAVE
-until redis-cli INFO persistence | grep -q 'rdb_bgsave_in_progress:0'; do sleep 1; done
-cp /var/lib/redis/dump.rdb /backups/redis-$(date +%F-%H%M).rdb
-aws s3 cp /backups/redis-$(date +%F-%H%M).rdb s3://my-bucket/redis/ --sse
+set -e
+before=$(redis-cli LASTSAVE)              # unix time of the last successful save
+redis-cli BGSAVE SCHEDULE                 # queued if an AOF rewrite is running
+for i in $(seq 600); do                   # wait up to 10 min for a new successful save
+  [ "$(redis-cli LASTSAVE)" != "$before" ] && break
+  sleep 1
+done
+[ "$(redis-cli LASTSAVE)" != "$before" ] || { echo "BGSAVE did not finish" >&2; exit 1; }
+f=/backups/redis-$(date +%F-%H%M).rdb      # compute the name once
+cp /var/lib/redis/dump.rdb "$f"
+aws s3 cp "$f" s3://my-bucket/redis/ --sse
 ```
 
 ### Restore procedure (RDB)

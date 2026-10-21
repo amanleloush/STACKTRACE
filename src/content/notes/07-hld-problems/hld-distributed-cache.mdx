@@ -9,9 +9,19 @@ estimatedMinutes: 6
 prerequisites: []
 ---
 
+## Definition (interview-ready)
+
+A **distributed cache** keeps hot key-value data in memory across many machines so reads take about a millisecond instead of hitting a database, and it scales by adding nodes.
+
+The design in one breath (Redis Cluster model): the key space is split into **16,384 hash slots** (`CRC16(key) mod 16384`), and each slot is owned by one **primary**, so adding nodes means moving slots, not rehashing everything. Each primary has one or more **replicas** fed by **asynchronous replication**; nodes watch each other over a **gossip cluster bus** and promote a replica when a majority of primaries agree its primary has failed. **Smart clients** cache the slot map and go straight to the right node, following `MOVED`/`ASK` redirects during resharding. Each node caps memory with `maxmemory` and evicts with an LRU-style policy; TTLs expire keys lazily plus by sampling.
+
+The main trade-off is **speed vs durability**: async replication keeps writes fast but can lose recently acknowledged writes on failover, which is fine for a cache, not for a source of truth. Hot keys and big keys need special handling because one key always lives on one shard.
+
+**One-liner:** Shard keys into 16,384 hash slots spread across primaries, give each primary async replicas with gossip-based failover, let smart clients route directly using a cached slot map, and treat it as a cache because async replication can lose recent writes.
+
 ## Problem statement
 
-Design a distributed cache cluster (Redis-style) for sub-ms reads of hot keyed data, horizontally scalable, with replication for HA and consistent hashing for sharding.
+Design a distributed cache cluster (Redis-style) for sub-ms reads of hot keyed data, horizontally scalable, with replication for HA and hash-slot sharding (a fixed-partition cousin of consistent hashing).
 
 <Anim id="consistent-hash" />
 
@@ -40,7 +50,7 @@ Design a distributed cache cluster (Redis-style) for sub-ms reads of hot keyed d
 
 ```
                         ┌────────────┐
-   Client SDK ───────►  │ Proxy /    │ ── consistent hash → shard
+   Client SDK ───────►  │ Proxy /    │ ── CRC16(key) → slot → shard
                         │ Cluster    │
                         │ Client     │
                         └─────┬──────┘
@@ -107,7 +117,7 @@ Design a distributed cache cluster (Redis-style) for sub-ms reads of hot keyed d
 If one key (`celebrity_user`) takes 100K QPS, one shard saturates.
 
 Solutions:
-- **Read replicas** for that key: clients can hit any replica.
+- **Read replicas** for that key: clients can read from any replica (in Redis Cluster the client must send `READONLY` on replica connections, and replica reads may be slightly stale).
 - **Local hot-key cache** at the application server: short-TTL Caffeine/Guava cache.
 - **Key splitting**: store under N keys (`key:0`, `key:1`, ..., `key:N-1`), clients pick one at random.
 
@@ -117,6 +127,7 @@ A single key with 1 GB value (huge sorted set) — single-thread Redis blocks on
 
 Solutions:
 - Split into smaller keys.
+- Delete big keys with `UNLINK` (frees memory in a background thread) instead of `DEL`.
 - Use SCAN-based operations instead of full reads.
 - Move to a different store (sometimes the data shouldn't be in Redis).
 
@@ -130,7 +141,7 @@ Solutions:
 ## Trade-offs
 
 - **Cluster mode vs single-node + Sentinel**: cluster scales writes (sharding); Sentinel is HA without sharding. Pick cluster only when single-node memory/throughput insufficient.
-- **Async vs sync replication**: Redis Cluster uses async (default) — fast, but writes can be lost on primary failure within the replication window. WAIT command can force sync-like ack.
+- **Async vs sync replication**: Redis Cluster uses async (default) — fast, but writes can be lost on primary failure within the replication window. The `WAIT` command makes the client wait for replica acks, which narrows the window, but the Redis docs are clear that even `WAIT` doesn't make Redis Cluster strongly consistent.
 - **Pure cache vs durable**: pure cache loses data on full cluster failure. Acceptable for caches; not for source-of-truth.
 
 ## Practice questions
@@ -188,7 +199,7 @@ Sentinel gives HA (automatic failover) but no sharding, so all data and writes s
 
 <QA q="Can Redis Cluster lose writes that were acknowledged? How do you reduce that?" level="hard">
 
-Yes. Replication is asynchronous: the primary acks the client before replicas have the write. If the primary dies inside that replication window, the promoted replica doesn't have it. `WAIT` can force the client to wait for replica acks (sync-like), at a latency cost. For a cache this is usually acceptable; for source-of-truth data it is not.
+Yes. Replication is asynchronous: the primary acks the client before replicas have the write. If the primary dies inside that replication window, the promoted replica doesn't have it. `WAIT` makes the client wait for replica acks, at a latency cost; it narrows the window but still doesn't make the cluster strongly consistent. For a cache this is usually acceptable; for source-of-truth data it is not.
 
 </QA>
 

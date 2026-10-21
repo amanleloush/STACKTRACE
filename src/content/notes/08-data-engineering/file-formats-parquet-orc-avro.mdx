@@ -13,9 +13,11 @@ prerequisites: []
 
 **Parquet** and **ORC** are **columnar** file formats optimized for analytics: store each column separately, enabling column pruning, predicate pushdown, and efficient compression. **Avro** is a **row-based** format with strong schema evolution support, optimized for streaming and serialization (Kafka payloads, RPC).
 
+**One-liner:** Parquet and ORC store data column by column so analytics queries read only the columns and row groups they need; Avro stores data row by row with a schema, which makes it the go-to for Kafka messages and evolving record schemas.
+
 ## Why it matters
 
-The file format decision affects every downstream query's performance and cost. Storing analytics data in JSON or CSV instead of Parquet typically multiplies your S3 + query costs by 5-50× and slows queries by 10-100×.
+The file format decision affects every downstream query's performance and cost. Storing analytics data in JSON or CSV instead of Parquet can multiply storage and scan costs several times over (5-50× is common in benchmarks) and make queries an order of magnitude or more slower.
 
 ```mermaid
 flowchart TB
@@ -37,9 +39,9 @@ flowchart TB
 |---|---|---|---|
 | Layout | columnar | columnar | row |
 | Best for | analytics (Spark/Trino) | analytics (Hive) | streaming, RPC payloads |
-| Compression | strong (per-column) | strong (stripe-level) | good |
+| Compression | strong (per-column) | strong (per-column streams) | good (per block) |
 | Schema evolution | yes (loose) | yes | strongest |
-| Predicate pushdown | yes (stats per page) | yes (indexes per stripe) | no |
+| Predicate pushdown | yes (row-group stats, optional page indexes and bloom filters) | yes (file, stripe and row-index stats, optional bloom filters) | no (row format: whole records are read) |
 
 ## Core concepts
 
@@ -119,7 +121,7 @@ Parquet vs ORC: 95% similar; choose based on tooling. Spark/Athena: Parquet. Hiv
 ### Compression codecs
 
 - **Snappy**: fast compression / decompression. Default for many systems.
-- **GZIP**: ~30% smaller than Snappy, ~2x slower. Use for cold storage.
+- **GZIP**: often 20-30% smaller files than Snappy, but much slower, especially to compress. Use for cold storage.
 - **ZSTD**: best ratio, fast decompression, slightly slower compression. **Often the best choice now.**
 - **LZ4**: very fast, compression ratio roughly comparable to Snappy.
 
@@ -132,7 +134,7 @@ Parquet vs ORC: 95% similar; choose based on tooling. Spark/Athena: Parquet. Hiv
 ### Partitioning
 
 - Files organized by partition columns (e.g., `year=2026/month=05/`).
-- Helps with predicate pushdown at the directory level: query for `year=2026` skips other directories entirely.
+- Enables **partition pruning** (filtering at the directory level): a query for `year=2026` skips other directories entirely.
 - Avoid over-partitioning (many small partitions = small file problem).
 
 ## How Parquet read works
@@ -151,7 +153,7 @@ Query: SELECT col_a, col_b FROM t WHERE col_b > 100;
 ## Real-world examples
 
 - **Almost every modern data lake**: Parquet on S3.
-- **Iceberg, Delta Lake, Hudi**: lakehouse formats — all built on Parquet (and sometimes ORC).
+- **Iceberg, Delta Lake, Hudi**: lakehouse table formats that store data in Parquet by default. Delta uses Parquet only; Iceberg also supports ORC and Avro; Hudi uses Parquet (or ORC) base files plus Avro log files for merge-on-read.
 - **Kafka + Confluent Schema Registry**: Avro is the original and most common payload format (Protobuf and JSON Schema also supported since Confluent Platform 5.5).
 - **Cloudera (Hadoop-native)**: heavy ORC usage.
 
@@ -219,7 +221,7 @@ About 128 MB to 1 GB per file. Smaller files add per-file overhead (separate tas
 
 <QA q="Compression: Snappy vs ZSTD vs GZIP?" level="medium">
 
-Snappy: fast, a common default. ZSTD: high ratio with fast decompression and slightly slower compression; **often the best modern choice**. GZIP: ~30% smaller than Snappy but ~2× slower; use for cold or archive data. LZ4: very fast, ratio roughly like Snappy.
+Snappy: fast, a common default. ZSTD: high ratio with fast decompression and slightly slower compression; **often the best modern choice**. GZIP: often 20–30% smaller than Snappy but much slower, especially to compress; use for cold or archive data. LZ4: very fast, ratio roughly like Snappy.
 
 </QA>
 
@@ -249,7 +251,7 @@ Min/max stats are written into the footer at write time. If the data isn't sorte
 - Each file is a separate read task, so planning and open overhead dominate.
 - The file count balloons and S3 listing slows down.
 - Compression and encoding can't amortize over so little data.
-- Fix: buffer writes to ~128 MB–1 GB and compact periodically (`OPTIMIZE` in Delta/Iceberg, or a custom job).
+- Fix: buffer writes to ~128 MB–1 GB and compact periodically (`OPTIMIZE` in Delta, the `rewrite_data_files` procedure in Iceberg, or a custom job).
 
 </QA>
 
@@ -315,9 +317,9 @@ Dictionary encoding swaps repeated strings for small IDs. Delta suits sorted num
 - **Avro**: row-based, schema-evolution-friendly. Kafka payloads, RPC.
 - **CSV/JSON**: never for production warehouse.
 - Target file size: 128 MB - 1 GB. Compact small files.
-- ZSTD is the modern default compression.
+- ZSTD is often the best modern codec (Snappy is still the common default).
 - Partition for directory-level pruning, but not too granular.
-- Keep statistics fresh.
+- Sort or cluster on common filter columns so min/max stats can skip row groups.
 - Avoid `SELECT *` to leverage column pruning.
 
 ## Go deeper

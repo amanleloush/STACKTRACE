@@ -21,6 +21,8 @@ SQS has two queue types:
 
 **Amazon SNS** (Simple Notification Service) is managed **push-based pub/sub**. You publish once to a **topic** and SNS pushes a copy to every subscription: SQS queues, Lambda functions, HTTP endpoints, email, SMS, mobile push. **SNS → several SQS queues** is the standard AWS "fan-out" pattern: one event, many independent consumers, each with its own durable backlog.
 
+**One-liner:** SQS is AWS's managed pull queue: a received message is hidden for a visibility timeout and comes back unless the consumer deletes it, which gives at-least-once delivery (FIFO adds per-group order and 5-minute dedup). SNS is managed push pub/sub that copies one message to many subscribers, usually one SQS queue per consuming service.
+
 ## Why it matters
 
 SQS and SNS are the default messaging building blocks on AWS, so interviewers expect you to know their real behaviour, not just their names. The common production bugs are all about the details:
@@ -283,10 +285,15 @@ while running:
         VisibilityTimeout=120,
         MessageSystemAttributeNames=["ApproximateReceiveCount"],
     )
+    msgs = resp.get("Messages", [])
+    # heartbeat EVERY message in the batch right away: the 10th message waits while
+    # the first nine are processed, and its visibility timeout is already running
+    stops = {}
+    for m in msgs:
+        stops[m["MessageId"]] = threading.Event()
+        threading.Thread(target=heartbeat, args=(m["ReceiptHandle"], stops[m["MessageId"]]), daemon=True).start()
     done = []
-    for m in resp.get("Messages", []):
-        stop = threading.Event()
-        threading.Thread(target=heartbeat, args=(m["ReceiptHandle"], stop), daemon=True).start()
+    for m in msgs:
         try:
             evt = parse(m["Body"])
             if not already_processed(evt.id):      # idempotency: at-least-once delivery
@@ -295,7 +302,7 @@ while running:
         except Exception:
             pass   # don't delete: it reappears after the timeout; after maxReceiveCount → DLQ
         finally:
-            stop.set()
+            stops[m["MessageId"]].set()
     if done:
         r = sqs.delete_message_batch(QueueUrl=Q, Entries=done)
         for f in r.get("Failed", []):              # HTTP 200 can still hide failures

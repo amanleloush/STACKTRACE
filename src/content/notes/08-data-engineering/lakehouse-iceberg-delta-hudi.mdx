@@ -11,11 +11,13 @@ prerequisites: []
 
 ## Definition (interview-ready)
 
-A **lakehouse** is a data architecture that adds warehouse-grade features (ACID transactions, schema enforcement, time travel, upserts) on top of cheap object storage (S3/GCS/ADLS) with open file formats (Parquet/ORC). The three open table formats are **Apache Iceberg**, **Delta Lake**, and **Apache Hudi** — each implements lakehouse semantics via metadata layers on top of Parquet.
+A **lakehouse** is a data architecture that adds warehouse-grade features (ACID transactions, schema enforcement, time travel, upserts) on top of cheap object storage (S3/GCS/ADLS) with open file formats (Parquet/ORC). The three open table formats are **Apache Iceberg**, **Delta Lake**, and **Apache Hudi** — each implements lakehouse semantics with a metadata layer that tracks which data files (usually Parquet) make up each version of a table.
+
+**One-liner:** A lakehouse is a data lake with warehouse features: an open table format such as Iceberg, Delta or Hudi keeps metadata over Parquet files in object storage, giving you ACID commits, upserts, schema evolution and time travel without copying data into a warehouse.
 
 ## Why it matters
 
-Lakehouses replace the messy two-tier "data lake + warehouse" architecture. You get warehouse semantics at lake price and open-format flexibility. Modern data stacks at Netflix, Apple, Uber, Stripe, and most large teams are converging on lakehouse table formats.
+Lakehouses replace the messy two-tier "data lake + warehouse" architecture. You get warehouse semantics at lake price and open-format flexibility. Large data teams such as Netflix, Apple and Uber have moved to lakehouse table formats, and most modern data stacks are converging on them.
 
 ```mermaid
 flowchart TB
@@ -67,7 +69,7 @@ Key features added:
 - **Schema enforcement + evolution**: rejects bad writes; supports add/rename/drop columns.
 - **Upserts / deletes / merges**: row-level changes (not just append).
 - **Time travel**: query a table as of a past timestamp / version.
-- **Hidden partitioning**: no need to manually compute partition columns.
+- **Hidden partitioning** (Iceberg): no need to manually compute partition columns.
 - **Compaction / optimize**: rewrite small files into larger ones.
 - **Concurrency control**: multiple writers safely.
 
@@ -75,7 +77,7 @@ Key features added:
 
 - Originated at Netflix.
 - Snapshot-based: each table version is an immutable snapshot.
-- Metadata files: a manifest list pointing to manifests, each pointing to data files (Parquet).
+- Metadata tree: a table metadata file (JSON) points to the current snapshot's manifest list, which points to manifests, each listing data files (Parquet, ORC or Avro) with per-file stats.
 - **Hidden partitioning**: query layer derives partition from a function of timestamp; no manual `year=`/`month=` columns.
 - **Schema evolution**: by **field ID** (not by name) — safe rename, add, drop.
 - Catalogs: REST catalog, Hive metastore, AWS Glue, Snowflake — pluggable.
@@ -98,7 +100,7 @@ Key features added:
 - Two table types:
   - **Copy-on-write (CoW)**: rewrites Parquet files on updates. Slower writes, fast reads.
   - **Merge-on-read (MoR)**: writes delta logs, merges on read. Fast writes, slower reads (until compaction).
-- **Indexes**: HBase / bloom / hash → fast upserts.
+- **Indexes** (bloom, simple, bucket/hash, HBase, record-level) map record keys to files, so upserts don't have to scan the whole table.
 - Stronger CDC + streaming use cases (because of MoR).
 
 ### Comparison
@@ -110,11 +112,11 @@ Key features added:
 | Schema evolution | by field ID (safest) | by name (column mapping enables safe rename/drop) | by name |
 | Updates | snapshot-based | snapshot-based | CoW or MoR with indexes |
 | Time travel | yes | yes | yes |
-| CDC | recent additions | yes (CDF) | yes (built-in incremental queries) |
+| CDC | limited (incremental reads, Spark changelog views) | yes (Change Data Feed) | yes (built-in incremental queries) |
 | Streaming | growing | strong | strong |
-| Hidden partitioning | yes (excellent) | no (manual) | partition spec |
+| Hidden partitioning | yes (excellent) | no (explicit partition columns; generated columns help) | no (explicit partition path) |
 
-**Most common choice in 2024–2026**: Iceberg (broadest support, open governance). Delta Lake if you're heavily Databricks-shop.
+**Usual default for multi-engine stacks today**: Iceberg (broadest engine support, open governance). Delta Lake if you are mostly on Databricks.
 
 ### Time travel
 
@@ -130,7 +132,7 @@ Useful for: audits, reproducible ML, recovery from accidental writes.
 
 Small-file problem hits lakehouses too. Periodic compaction rewrites small files into larger ones, updating the metadata atomically.
 
-Delta: `OPTIMIZE table`. Iceberg: `RewriteDataFiles`. Hudi: clustering / compaction.
+Delta: `OPTIMIZE table`. Iceberg: the `rewrite_data_files` procedure (the `RewriteDataFiles` action). Hudi: clustering / compaction.
 
 ### Vacuum / garbage collection
 
@@ -139,7 +141,7 @@ Old snapshot files accumulate. Vacuum (Delta `VACUUM`; Iceberg `expire_snapshots
 ### Concurrency
 
 - **Optimistic concurrency control**: each write attempts to commit; conflict detection via metadata. Conflict → retry.
-- For high concurrency (streaming writes): tune for partition-level serializability.
+- For high concurrency (streaming writes): have concurrent writers touch disjoint partitions, commit in larger batches, and (in Delta) use the default `WriteSerializable` isolation level rather than `Serializable`.
 
 ### Streaming ingestion
 
@@ -152,9 +154,10 @@ Old snapshot files accumulate. Vacuum (Delta `VACUUM`; Iceberg `expire_snapshots
 Writer:
 1. Read current snapshot's manifest list.
 2. Write new Parquet files to S3.
-3. Generate a new manifest pointing to the new (and existing) files.
-4. Update manifest list with the new manifest.
-5. Atomically swap the table's current snapshot pointer (in catalog) to new snapshot.
+3. Write a new manifest listing the new files.
+4. Write a new manifest list (the new manifest + the unchanged existing manifests) = the new snapshot.
+5. Write a new table metadata file that names this snapshot as current.
+6. Atomically swap the catalog's pointer to the new metadata file (compare-and-swap; fails if someone else committed first).
 
 Reader:
 1. Resolve table → current snapshot.
@@ -180,7 +183,6 @@ Reader:
 - **Cross-engine catalog mismatch**: Spark + Trino + Flink reading the same table need consistent catalog access. Use a shared metastore (Glue, Hive, REST catalog).
 - **Concurrent writers without proper locking**: conflicts cause retries; high contention = slow.
 - **Querying without partition predicates**: scans whole table — defeats partitioning.
-- **Reusing partition columns as primary keys**: locked into bad design.
 
 ## Practice questions
 
@@ -248,7 +250,7 @@ Optimistic concurrency: each writer tries to commit a new snapshot. If the snaps
 
 <QA q="How would you handle GDPR delete on a lakehouse table?" level="scenario">
 
-Run the format's `DELETE` (Delta, Iceberg, and Hudi all support row-level deletes); it rewrites affected files or writes delete markers. Old snapshots still contain the row, so you must also run `VACUUM` (Delta), `expire_snapshots` (Iceberg), or the cleaner (Hudi) to physically remove it. Set retention to balance time travel against the compliance deadline.
+Run the format's `DELETE` (Delta, Iceberg, and Hudi all support row-level deletes); it either rewrites affected files or writes delete markers (Iceberg delete files, Delta deletion vectors, Hudi log files). With delete markers the row is still physically in the current data file, so first rewrite or compact those files (Iceberg `rewrite_data_files`, Delta `REORG TABLE ... APPLY (PURGE)`, Hudi compaction). Old snapshots also still reference files containing the row, so then run `VACUUM` (Delta), `expire_snapshots` (Iceberg), or the cleaner (Hudi) to physically delete them. Set retention to balance time travel against the compliance deadline.
 
 </QA>
 
@@ -278,7 +280,7 @@ MoR appends updates to delta logs for fast writes and merges at read time or com
 
 <MCQ q="After a GDPR DELETE on a Delta table, the row can still be read with time travel. What else is needed?" options={["Run VACUUM so old files past retention are physically removed", "Run OPTIMIZE", "Re-run the DELETE", "Nothing; time travel ignores deletes"]} answer={0}>
 
-DELETE creates a new version, but old versions still reference files with the row. VACUUM removes those files. OPTIMIZE only compacts.
+DELETE creates a new version, but old versions still reference files with the row. VACUUM removes those files once they pass retention. OPTIMIZE only compacts. (If deletion vectors are enabled, also run REORG TABLE ... APPLY (PURGE) first so the current files are rewritten without the row.)
 
 </MCQ>
 

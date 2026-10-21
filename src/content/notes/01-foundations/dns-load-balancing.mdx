@@ -11,7 +11,9 @@ prerequisites: []
 
 ## Definition (interview-ready)
 
-**DNS** is a hierarchical, distributed key-value store mapping names to records (A, AAAA, CNAME, MX, TXT, SRV). **Load balancing** distributes traffic across backends; **L4** decides based on TCP/UDP (IP+port), **L7** decides based on HTTP content (path, headers, cookies). **Consistent hashing** is a placement algorithm that minimizes key remapping when nodes are added or removed.
+**DNS** is a hierarchical, distributed key-value store mapping names to records (A, AAAA, CNAME, MX, TXT, SRV). **Load balancing** distributes traffic across backends; **L4** decides based on TCP/UDP (IP+port), **L7** decides based on HTTP content (path, headers, cookies). **Consistent hashing** is a placement algorithm that minimizes key remapping when nodes are added or removed: adding one node to N moves only about 1/N of the keys.
+
+**One-liner:** DNS turns a name into an IP address through a cached hierarchy of nameservers; a load balancer then spreads traffic across backends, by IP and port at L4 or by HTTP content at L7; and consistent hashing decides which node owns a key so that resizing the cluster moves only about 1/N of the keys.
 
 ## Why it matters
 
@@ -84,24 +86,24 @@ The recursive resolver does the hard work and caches based on **TTL**.
 
 Naive sharding: `node = hash(key) % N`. Add a node → almost every key remaps. Catastrophic for caches.
 
-**Consistent hashing**: place both keys and nodes on a ring (hash space 0 to 2^32). A key goes to the next node clockwise on the ring.
+**Consistent hashing**: place both keys and nodes on a ring (a hash space such as 0 to 2^32 − 1 that wraps around). A key goes to the next node clockwise on the ring.
 
 - Add a node: only ~1/N of keys move (the ones now closer to the new node).
 - Remove a node: only its keys move.
 
 **Virtual nodes** (vnodes): each physical node owns many points on the ring. Spreads load evenly even if you have few physical nodes, and lets you reshard without bias.
 
-**Used by**: Redis Cluster (slot map, conceptually similar), Memcached clients (ketama), Cassandra, DynamoDB, CDN cache shard selection, Discord's guild routing.
+**Used by**: Memcached clients (ketama), Cassandra, Amazon's Dynamo (the design behind DynamoDB), CDN cache shard selection, Discord's guild routing. Redis Cluster uses a related idea: 16,384 fixed hash slots assigned to nodes, so resharding moves whole slots rather than every key.
 
 ### Rendezvous hashing (HRW)
 
-Alternative: for each key, hash `(key, node)` for every node and pick the highest. Same minimal-remapping property, simpler logic, no ring data structure. Used by some CDNs and message brokers.
+Alternative: for each key, hash `(key, node)` for every node and pick the highest. Same minimal-remapping property, simpler logic, no ring data structure. Used in some CDNs, distributed caches and load balancers.
 
 ## How it works (a request's full path)
 
 1. Client resolves `api.example.com` → IP of L7 LB (via DNS).
 2. Client opens TCP to LB.
-3. LB terminates TLS, reads `:path` header, picks an upstream pool.
+3. LB terminates TLS, reads the request path and headers, picks an upstream pool.
 4. LB picks a specific backend (least-connections, round-robin, EWMA).
 5. LB opens a separate TCP connection to the backend (or reuses one from its pool).
 6. Backend responds → LB streams response back → client.
@@ -110,13 +112,13 @@ Alternative: for each key, hash `(key, node)` for every node and pick the highes
 
 - **AWS**: Route 53 (DNS), NLB (L4), ALB (L7), CloudFront (CDN with edge routing).
 - **GCP**: Cloud Load Balancing with global anycast — one IP, lowest-latency region selected automatically.
-- **Discord**: uses a consistent hash ring to find which Elixir node owns each guild (server); every session for that guild routes to the same node. Adding capacity moves ~1/N guilds.
+- **Discord**: uses a consistent hash ring to find which Elixir node owns each guild (server); all events for that guild are handled by the process on that node. Adding capacity moves ~1/N guilds.
 - **Memcached clients**: use ketama (consistent hashing) so adding a Memcached node doesn't invalidate the whole cache.
 
 ## Common pitfalls
 
-- **DNS TTL**: clients (especially JVMs!) ignore the record TTL — the JDK caches successful lookups for 30 s by default, and *forever* when a security manager is installed, unless `networkaddress.cache.ttl` is tuned. Failover can stall long after the DNS change.
-- **CNAME at apex**: you can't put a CNAME at the root `example.com` per RFC. Use `ALIAS` / `ANAME` from the DNS provider, or A records.
+- **DNS TTL**: clients (especially JVMs!) ignore the record TTL — the JDK caches successful lookups for 30 s by default, and *forever* when a security manager is installed (older setups; the security manager is deprecated), unless `networkaddress.cache.ttl` is tuned. Failover can stall long after the DNS change.
+- **CNAME at apex**: you can't put a CNAME at the root `example.com` (RFC 1034: a CNAME can't share a name with other records, and the apex must hold SOA and NS). Use `ALIAS` / `ANAME` from the DNS provider, or A records.
 - **L4 LB + sticky sessions**: L4 can do source-IP hash, but NATs (corporate networks, mobile carriers) collapse many users to one IP — unbalanced.
 - **L7 LB + WebSockets**: most support it, but configuration is finicky (upgrade headers, longer timeouts).
 - **Consistent hashing without vnodes**: skew. A 3-node ring with 3 points gives ~25% / 30% / 45% load distribution easily.

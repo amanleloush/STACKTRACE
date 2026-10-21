@@ -18,6 +18,8 @@ The **cost-based optimizer** is the brain. It enumerates possible plans (which i
 
 `EXPLAIN` shows the chosen plan with estimates; `EXPLAIN ANALYZE` actually runs the query and shows real row counts and times next to the estimates. Comparing the two is the core skill of query tuning.
 
+**One-liner:** The database parses SQL, and a cost-based optimizer uses table statistics to estimate row counts and pick the cheapest plan (which indexes, which join algorithms, which join order); most slow queries come from a bad row estimate, which you find by comparing estimated and actual rows in `EXPLAIN ANALYZE`.
+
 ## Why it matters
 
 - **Most production slowness is a bad plan**, not slow hardware: a missing index, an index the query can't use, or a join algorithm chosen from a wildly wrong row estimate.
@@ -89,7 +91,7 @@ An index lookup costs a tree descent plus, for each matching row, a fetch from t
 
 Postgres models this with `seq_page_cost = 1.0` and `random_page_cost = 4.0` (defaults). On SSDs or fully cached data, lowering `random_page_cost` (for example to about 1.1) makes index scans look cheaper, which is often closer to reality.
 
-**Composite index rule (leftmost prefix):** an index on `(a, b, c)` helps `WHERE a = ?`, `WHERE a = ? AND b = ?`, `WHERE a = ? AND b > ?`, but not `WHERE b = ?` alone. Put equality columns first and the range column last.
+**Composite index rule (leftmost prefix):** an index on `(a, b, c)` helps `WHERE a = ?`, `WHERE a = ? AND b = ?`, `WHERE a = ? AND b > ?`, but not `WHERE b = ?` alone, at least not efficiently. (MySQL 8.0.13+ and PostgreSQL 18+ can sometimes use a **skip scan** for that case, which works well only when `a` has few distinct values.) Put equality columns first and the range column last.
 
 ### Join algorithms
 
@@ -268,7 +270,7 @@ EXPLAIN ANALYZE SELECT ...;
     -> Single-row index lookup on u using PRIMARY (id=o.user_id)  (cost=0.25 rows=1) (actual time=0.002..0.002 rows=1 loops=12)
 ```
 
-Same reading rules as Postgres: compare estimated `rows` with actual `rows`, and multiply by `loops`. MySQL's `EXPLAIN ANALYZE` also runs the query and always uses tree format.
+Same reading rules as Postgres: compare estimated `rows` with actual `rows`, and multiply by `loops`. MySQL's `EXPLAIN ANALYZE` also runs the query. It prints tree format by default; MySQL 8.3+ can also print it as JSON (with `explain_json_format_version = 2`).
 
 ## Common plan problems
 
@@ -316,7 +318,7 @@ A single index can't serve both branches. Engines can combine two indexes (Postg
 ### 5. Other frequent ones
 
 - **Leading wildcard**: `LIKE '%foo'` can't use a B-tree. Use a trigram index (Postgres `pg_trgm`) or full-text search.
-- **Wrong composite column order**: index `(created_at, user_id)` won't help `WHERE user_id = ?` alone.
+- **Wrong composite column order**: index `(created_at, user_id)` won't help `WHERE user_id = ?` alone (skip scan can't help either, because `created_at` has too many distinct values).
 - **Correlated columns** → underestimates → nested loops on huge inputs.
 - **Parameter-sensitive plans**: a cached generic plan that's good for a rare value and terrible for a common one (Postgres prepared statements use custom plans for the first five executions, then may switch to a cached generic plan if it doesn't look more expensive; `plan_cache_mode` controls this).
 - **`OFFSET` pagination**: `OFFSET 100000` still reads and discards 100,000 rows. Use keyset pagination: `WHERE (created_at, id) < (?, ?) ORDER BY created_at DESC, id DESC LIMIT 20`.
@@ -430,7 +432,7 @@ Suspect a plan change caused by stale statistics. Run `EXPLAIN (ANALYZE, BUFFERS
 
 <QA q="A dashboard query uses WHERE customer_id = ? OR referrer_id = ? and does a full scan on a 200M-row table. Both columns are indexed. What do you do?" level="scenario">
 
-A single B-tree can't satisfy an OR across two columns, and the optimizer judged index merge or BitmapOr too costly (or stats were off). Rewrite as two index-friendly queries combined: `SELECT ... WHERE customer_id = ? UNION SELECT ... WHERE referrer_id = ?` (use `UNION ALL` plus a dedup condition if duplicates can't occur). Verify each branch uses its index with EXPLAIN. Also make sure stats are fresh, since a bad estimate can make the bitmap/index-merge plan look worse than it is.
+A single B-tree can't satisfy an OR across two columns, and the optimizer judged index merge or BitmapOr too costly (or stats were off). Rewrite as two index-friendly queries combined: `SELECT ... WHERE customer_id = ? UNION SELECT ... WHERE referrer_id = ?`. `UNION` removes the rows that match both branches. `UNION ALL` is cheaper because it skips that dedup step; to use it safely, make the second branch exclude rows the first already returned (for example `AND customer_id IS DISTINCT FROM ?`). Verify each branch uses its index with EXPLAIN. Also make sure stats are fresh, since a bad estimate can make the bitmap/index-merge plan look worse than it is.
 
 </QA>
 

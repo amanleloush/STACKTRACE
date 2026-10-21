@@ -9,6 +9,16 @@ estimatedMinutes: 5
 prerequisites: []
 ---
 
+## Definition (interview-ready)
+
+An **ad-click tracking system** records every ad impression and click, removes duplicates and fraud, and turns the stream into counts per ad, campaign and time bucket. Those counts feed real-time dashboards for advertisers and exact numbers for billing.
+
+The design in one breath: a thin **ingest API** at the edge enriches each event and appends it to **Kafka**, which absorbs bursts. A **stream processor** (Flink) deduplicates on a per-click ID over a time window, filters fraud, and writes pre-aggregated **1–5 minute rollups** into a columnar **OLAP store** (ClickHouse, Druid, Pinot) for sub-minute dashboards. In parallel, raw events land as **Parquet on object storage**, where a **batch job** does exact dedup and fraud subtraction and produces the numbers advertisers are billed on.
+
+The main trade-off is **freshness vs exactness**: real-time numbers are approximate and labelled preliminary; billing always uses the batch pipeline (a lambda-style split, or kappa if you reprocess by replaying the log).
+
+**One-liner:** Edge ingest into Kafka, then a Flink job that dedups by click ID and writes windowed rollups to an OLAP store for live dashboards, while raw events go to Parquet on S3 for an exact batch pipeline that drives billing.
+
 ## Problem statement
 
 Design a system that ingests billions of ad-click events per day, deduplicates, attributes, aggregates in real time and offline, and provides dashboards + APIs for advertisers and internal systems.
@@ -37,15 +47,15 @@ flowchart LR
 - Long-term storage for billing & audit.
 
 ### Non-functional
-- 100B events/day = ~1M/sec average, multi-million peak.
+- 100B events/day = ~1.2M/sec average, multi-million peak.
 - Sub-second latency for ingest.
 - Sub-minute for real-time metrics.
-- Cost-efficient (events are huge).
+- Cost-efficient (the event volume is huge).
 
 ## Scale estimation
 
 - 100B events/day, ~300 bytes each → **30 TB/day raw**, ~10 TB compressed.
-- 1M events/sec average; 5M peak.
+- ~1.2M events/sec average; ~5M peak.
 - Storage: 5 years ≈ 10 TB × 1,825 days ≈ ~18 PB compressed (~55 PB if the raw store keeps RF=3).
 
 ## High-level architecture
@@ -60,8 +70,8 @@ flowchart LR
        ┌───────────────┐       ┌────────────────┐
        │ Real-time     │       │ Batch          │
        │ aggregation   │       │ pipeline       │
-       │  (Flink /     │       │ (Spark on S3)  │
-       │   Spark Str.) │       │ Parquet)       │
+       │  (Flink /     │       │ (Spark on S3,  │
+       │   Spark Str.) │       │  Parquet)      │
        └──────┬────────┘       └────────────────┘
               ▼
      ┌────────────────┐
@@ -173,13 +183,13 @@ Ingest must be sub-second at millions of events per second, so it only does chea
 
 <QA q="How do you deduplicate clicks across Kafka and the OLAP store?" level="medium">
 
-Give each click an idempotency token (a client-generated UUID, or a signed timestamp + nonce). A stream processor (Flink) keeps keyed dedup state over a time window (about an hour) and drops duplicates inside it. At-least-once Kafka delivery plus dedup gives effectively-exactly-once visible counts.
+Give each click an idempotency token (a client-generated UUID, or a signed timestamp + nonce). A stream processor (Flink) keeps keyed dedup state over a time window (about an hour) and drops duplicates inside it. At-least-once Kafka delivery plus this dedup gives effectively-exactly-once counts for duplicates that arrive within the window; anything later is caught by the batch pipeline.
 
 </QA>
 
 <QA q="How would you handle attribution?" level="medium">
 
-Each click gets a unique click ID, stored in a cookie or passed as a URL parameter. The conversion event carries that click ID, so clicks and conversions can be joined on it — in the stream or as a nightly batch join. Multi-touch models (last-click, linear, time-decay) are computed in batch.
+Each click gets a unique click ID, stored in a cookie or passed as a URL parameter. The conversion event carries that click ID, so clicks and conversions can be joined on it — in the stream or as a nightly batch join. Attribution models, from simple last-click to multi-touch models such as linear or time-decay, are computed in batch.
 
 </QA>
 
@@ -219,7 +229,7 @@ Stop inserting per event. Pre-aggregate in the stream job (tumbling 1- or 5-minu
 
 <QA q="Design ingestion for 1M events/sec." level="scenario">
 
-An edge API behind an HTTPS load balancer appends to Kafka. Use `acks=1` for speed, or `acks=all` if these raw events feed billing — `acks=1` can lose writes on leader failover. Producers batch to cut per-request overhead. Each broker handles roughly 100K–500K events/sec, so a cluster of about 10 brokers comfortably handles 1M; scale partitions with load.
+An edge API behind an HTTPS load balancer appends to Kafka. Use `acks=all` with `min.insync.replicas=2` if these raw events feed billing (`acks=all` is the producer default since Kafka 3.0); `acks=1` is faster but can lose writes on leader failover. Producers batch and compress to cut per-request overhead. Size for the ~5M/sec peak, not the average: 5M × 300 bytes ≈ 1.5 GB/s, and replication factor 3 triples the disk writes to ~4.5 GB/s, so plan for a few tens of brokers and enough partitions to spread the load.
 
 </QA>
 
@@ -276,7 +286,7 @@ Dashboard queries touch a few columns across many rows, which is exactly what co
 
 <MCQ q="If raw click events feed billing, what producer setting should ingest use?" options={["acks=0", "acks=1", "acks=all", "No acknowledgements, with retries disabled"]} answer={2}>
 
-acks=all waits for the in-sync replicas, so a leader failover doesn't lose acknowledged writes. acks=1 can lose writes on failover, and acks=0 or no acks with no retries can drop events silently.
+acks=all waits for all in-sync replicas (with min.insync.replicas of 2 or more), so a leader failover doesn't lose acknowledged writes. acks=1 can lose writes on failover, and acks=0 or no acks with no retries can drop events silently.
 
 </MCQ>
 
@@ -315,7 +325,7 @@ Real-time numbers are preliminary by design; batch applies exact dedup and fraud
 - **ClickHouse docs**: [clickhouse.com/docs](https://clickhouse.com/docs).
 - **Apache Druid**, **Apache Pinot** — alternative OLAP engines.
 - **Apache Flink**: real-time aggregation reference.
-- **High Scalability**: Cloudflare's ClickHouse + analytics architecture.
+- **Cloudflare**: [HTTP Analytics for 6M requests per second using ClickHouse](https://blog.cloudflare.com/http-analytics-for-6m-requests-per-second-using-clickhouse/).
 - **Alex Xu Vol 2**: ad-click event aggregation chapter.
 - **ByteByteGo**: ad-click pipeline videos.
 - **Snowflake / BigQuery** patterns for ad analytics.

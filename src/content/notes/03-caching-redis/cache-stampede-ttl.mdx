@@ -13,6 +13,8 @@ prerequisites: []
 
 A **cache stampede** (a.k.a. **thundering herd**) is when many concurrent requests for the same expired or missing cache key all fall through to the origin (database / API), overwhelming it. The fix is to serialize the regeneration with **single-flight** locks, return slightly stale values during refresh, or smear TTLs with jitter and probabilistic early refresh.
 
+**One-liner:** A cache stampede is many concurrent misses on the same hot key all hitting the database at once; you stop it by letting only one caller rebuild the key (single-flight), serving stale data while it refreshes, and spreading or pre-empting expiries with TTL jitter and early refresh.
+
 ## Why it matters
 
 Stampedes are a top cause of cache-fronted service outages. The DB is sized assuming the cache absorbs 99% of reads — when a key expires and 10K requests miss simultaneously, the DB sees a 10K-instant spike and falls over. Real production incident class; every senior engineer should know the fixes.
@@ -65,11 +67,14 @@ Pattern (using Redis):
 val = redis.get(key)
 if val:
     return val
-ok = redis.set("lock:" + key, "1", NX=True, EX=10)
+token = random_id()
+ok = redis.set("lock:" + key, token, NX=True, EX=10)
 if ok:
-    val = db.fetch(...)
-    redis.set(key, val, EX=ttl)
-    redis.del("lock:" + key)
+    val = redis.get(key)          # re-check: another caller may have just filled it
+    if not val:
+        val = db.fetch(...)
+        redis.set(key, val, EX=ttl)
+    delete "lock:" + key only if its value is still token   # Lua check-and-delete
     return val
 else:
     sleep(50ms); retry
@@ -100,15 +105,15 @@ if random() < e^(-(expiry - now) / delta):
 return cache_value  # serve current value
 ```
 
-Reference: ["Optimal Probabilistic Cache Stampede Prevention"](http://cseweb.ucsd.edu/~avattani/papers/cache_stampede.pdf) (Vattani et al, VLDB '15).
+Reference: ["Optimal Probabilistic Cache Stampede Prevention"](https://www.vldb.org/pvldb/vol8/p886-vattani.pdf) (Vattani et al, VLDB '15).
 
-Effect: hot keys are refreshed before expiry, by exactly one caller. Cold keys behave normally.
+Effect: hot keys are usually refreshed before they expire, typically by a single caller (it's probabilistic, so occasionally two callers refresh). Cold keys behave normally.
 
 ### 4. Stale-while-revalidate (SWR)
 
 Standard HTTP cache pattern (`Cache-Control: stale-while-revalidate=N`). Within the staleness budget, the cache serves the old value AND triggers async refresh. Used by browsers, CDNs (Fastly, Cloudflare), and many in-process caches.
 
-Result: users never see a miss; origin sees at most one refresh per key per refresh interval.
+Result: within the staleness budget users don't wait on a miss, and with request collapsing the origin sees about one refresh per key per interval.
 
 ### 5. Negative caching (cache the "not found")
 
@@ -118,7 +123,7 @@ Watch for cache poisoning if someone can spam non-existent keys (set an LFU cap 
 
 ### 6. Bloom filter front-door
 
-For "does this key exist?" lookups (e.g., username availability), put a bloom filter in front. False positives still query origin; false negatives never reach it. Good for sparse keyspaces.
+For "does this key exist?" lookups (e.g., username availability), put a Bloom filter in front. A Bloom filter never gives false negatives, so a "definitely not present" answer can skip the origin entirely; its occasional false positives just fall through to a normal lookup. Good for sparse keyspaces.
 
 ### The four classic cache failures (name them precisely)
 
@@ -193,11 +198,10 @@ T0+300ms: DB has burned 1000× the work, possibly fell over.
 
 ## Real-world examples
 
-- **Instagram**: documented their stampede protection with single-flight + jitter.
-- **Mike Perham (Sidekiq)**: blog post on thundering herds during deploys.
-- **Cloudflare**: stale-while-revalidate at the edge for huge wins.
+- **Instagram**: wrote about caching the *promise* of an in-flight fetch ("Thundering Herds & Promises"), so concurrent requests for the same key share one backend call — single-flight at the application layer.
+- **Cloudflare / Fastly**: support `stale-while-revalidate` at the edge, so a popular object is refreshed in the background instead of every edge request waiting on origin.
 - **CDN-level**: Akamai/Fastly/Varnish all support request collapsing — multiple in-flight requests for the same URL get collapsed to one origin fetch.
-- **CDN purge storms**: a global cache purge that doesn't ramp gradually = stampede. CDNs offer "soft purge" (mark stale, async refresh).
+- **CDN purge storms**: a global cache purge that doesn't ramp gradually = stampede. Some CDNs (e.g. Fastly) offer "soft purge": mark content stale instead of deleting it, so it can still be served while it refreshes.
 
 ## Common pitfalls
 
@@ -238,8 +242,8 @@ val = GET key
 if val: return val
 got = SET lock:key <token> NX EX 10
 if got:
-    val = db.fetch()
-    SET key val EX ttl
+    val = GET key            (re-check: someone may have just filled it)
+    if not val: val = db.fetch(); SET key val EX ttl
     release lock only if it still holds <token>  (Lua check-and-delete)
     return val
 else:
@@ -279,7 +283,7 @@ Since Redis 6, a client can enable `CLIENT TRACKING`. The app keeps hot values i
 
 <QA q="Compare locking vs probabilistic early expiration." level="hard">
 
-Locking guarantees one refill per key but adds complexity (lock TTLs, tokens, retries, and waiting for the losers). Probabilistic early expiration is lock-free: a small random fraction of reads near expiry refresh the value early, so hot keys are usually refreshed by one caller before they expire, and cold keys behave normally. No waiting, but no hard guarantee either. A common combination is early expiration for hot keys plus a lock as a safety net.
+Locking gives one refill per key (as long as the lock TTL outlasts the rebuild) but adds complexity (lock TTLs, tokens, retries, and waiting for the losers). Probabilistic early expiration is lock-free: a small random fraction of reads near expiry refresh the value early, so hot keys are usually refreshed by one caller before they expire, and cold keys behave normally. No waiting, but no hard guarantee either. A common combination is early expiration for hot keys plus a lock as a safety net.
 
 </QA>
 
@@ -394,8 +398,7 @@ A local cache absorbs the hottest reads even when the shared cache layer fails, 
 
 ## Go deeper
 
-- **Vattani et al, VLDB 2015**: ["Optimal Probabilistic Cache Stampede Prevention"](http://cseweb.ucsd.edu/~avattani/papers/cache_stampede.pdf) — short, readable.
-- **Mike Perham**: ["The Thundering Herd Problem"](https://www.mikeperham.com/) blog posts.
+- **Vattani et al, VLDB 2015**: ["Optimal Probabilistic Cache Stampede Prevention"](https://www.vldb.org/pvldb/vol8/p886-vattani.pdf) — short, readable.
 - **Instagram engineering**: stampede protection writeups (search "instagram cache stampede").
 - **Fastly blog**: stale-while-revalidate at the edge.
 - **Go**: [`golang.org/x/sync/singleflight`](https://pkg.go.dev/golang.org/x/sync/singleflight) for in-process collapse.

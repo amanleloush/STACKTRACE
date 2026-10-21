@@ -10,6 +10,12 @@ prerequisites: ["behavioral-patterns", "machine-coding-strategy", "java-concurre
 summary: "A complete, tested Java 21 movie-ticket booking system: catalog of movies, theatres, screens and shows; all-or-nothing seat holds with a TTL driven by an injected Clock; payment success, failure, timeout and late-payment refunds; Observer notifications; and a multi-threaded test proving no seat is ever sold twice."
 ---
 
+## Definition (interview-ready)
+
+A movie ticket booking system lets users browse shows (a movie on a screen at a time), pick seats, hold them for a few minutes while they pay, and get a confirmation. The core entities are an immutable catalog (`Movie`, `Theatre`, `Screen`, `Seat`, `Show`), a `Booking` with a status, and a `Hold` that groups one booking's seats with an expiry time. The key decisions: seat state lives **per show** behind **one lock per show**, so a multi-seat hold is checked and written in one critical section (all or nothing, no double booking); holds have a **TTL read from an injected `Clock`**, so expiry is testable; the payment call happens **outside** the lock and `confirm()` re-checks the hold afterwards, refunding late payments; booking status moves out of `PENDING` with **compare-and-set**, so racing threads produce one outcome. Notifications use **Observer**, and payment sits behind a `PaymentGateway` interface (Strategy/dependency inversion). The trade-off: an in-memory lock only protects one JVM; with several servers the same interface is backed by Redis or a database.
+
+**One-liner:** Per-show seat state under one lock gives all-or-nothing holds with a Clock-driven TTL, payment runs outside the lock and is re-validated on confirm, and a CAS on booking status plus Observer events make every booking end in exactly one state with exactly one notification.
+
 ## Problem statement
 
 > Design a movie ticket booking system like BookMyShow.
@@ -141,6 +147,7 @@ Key rules:
 - **Never hold the seat lock during `charge()`.** A payment call can take seconds; holding the show lock would block every other user of that show.
 - **Re-check after charging.** The hold may have expired during the payment. `confirm()` re-validates under the lock. If it fails, refund. This is the "late payment" case.
 - **CAS on the booking status.** `transition(PENDING, X)` uses `AtomicReference.compareAndSet`. If the sweeper and the payment thread both try to finish the same booking, exactly one wins, so the user gets exactly one notification.
+- **One `pay()` at a time per booking.** `pay()` runs inside `synchronized (b)` for that booking. Without it, a double click or a retried payment callback could pass the `PENDING` check twice and charge the customer twice. This lock covers only one booking, so it never blocks other users.
 - **TIMED_OUT is treated like FAILED here**, which is the simple interview answer. In a real system a timeout means "unknown": the charge may have gone through, so you reconcile with the gateway's status API later and refund if needed.
 
 ### Step 5: Observer notifications
@@ -369,26 +376,28 @@ final class BookingService {
     BookingStatus pay(String bookingId) {
         Booking b = bookings.get(bookingId);
         if (b == null) throw new IllegalArgumentException("no booking " + bookingId);
-        if (b.status() != BookingStatus.PENDING) throw new IllegalStateException(b.id() + " is " + b.status());
-        if (!locks.isHeld(b.showId(), b.id())) { expireBooking(b); return b.status(); }
+        synchronized (b) {   // per-booking lock: a duplicate pay() (double click, retried callback) waits, then sees non-PENDING
+            if (b.status() != BookingStatus.PENDING) throw new IllegalStateException(b.id() + " is " + b.status());
+            if (!locks.isHeld(b.showId(), b.id())) { expireBooking(b); return b.status(); }
 
-        PaymentStatus p = gateway.charge(b.id(), b.amountPaise());
-        switch (p) {
-            case SUCCESS -> {
-                if (locks.confirm(b.showId(), b.id()) && b.transition(BookingStatus.PENDING, BookingStatus.CONFIRMED)) {
-                    listeners.forEach(l -> l.onConfirmed(b));
-                } else {                                    // paid too late: hold expired meanwhile
-                    gateway.refund(b.id(), b.amountPaise());
-                    expireBooking(b);
+            PaymentStatus p = gateway.charge(b.id(), b.amountPaise());
+            switch (p) {
+                case SUCCESS -> {
+                    if (locks.confirm(b.showId(), b.id()) && b.transition(BookingStatus.PENDING, BookingStatus.CONFIRMED)) {
+                        listeners.forEach(l -> l.onConfirmed(b));
+                    } else {                                // paid too late: hold expired meanwhile
+                        gateway.refund(b.id(), b.amountPaise());
+                        expireBooking(b);
+                    }
+                }
+                case FAILED, TIMED_OUT -> {
+                    locks.release(b.showId(), b.id());
+                    if (b.transition(BookingStatus.PENDING, BookingStatus.FAILED))
+                        listeners.forEach(l -> l.onFailed(b, "payment " + p));
                 }
             }
-            case FAILED, TIMED_OUT -> {
-                locks.release(b.showId(), b.id());
-                if (b.transition(BookingStatus.PENDING, BookingStatus.FAILED))
-                    listeners.forEach(l -> l.onFailed(b, "payment " + p));
-            }
+            return b.status();
         }
-        return b.status();
     }
 
     /** Called periodically by a scheduler. */
@@ -495,7 +504,7 @@ public class Main {
 |---|---|
 | Overlapping request (one of several seats taken) | Whole request fails; no partial hold. |
 | Duplicate seat in one request, empty list, unknown seat or show | `IllegalArgumentException`. |
-| Pay twice, or pay a FAILED/EXPIRED booking | `IllegalStateException`. |
+| Pay twice (even concurrently), or pay a FAILED/EXPIRED booking | `IllegalStateException`; the per-booking lock means only one charge is ever made. |
 | Hold expires, nobody touches the seats | Sweeper expires it, notifies the user. |
 | Hold expires, another user grabs a seat | Lazy eviction during `tryLock`; the old booking becomes EXPIRED and is notified. |
 | Payment succeeds after the hold expired | Refund, EXPIRED, seat stays available for others. |
@@ -649,7 +658,7 @@ Bob's first attempt fails because A2 is held by Alice (all or nothing, so A3 is 
 | **Extend hold while on the payment page** | `extend(bookingId)` under the show lock, if the hold is still valid, with a cap on total time. |
 | **Seat selection rules** (no single empty seat left between bookings) | A validation step (chain of validators) before `tryLock`. |
 | **Waiting list for a sold-out show** | Observer on "hold expired / payment failed" events that offers freed seats to the next user in a queue. |
-| **Idempotent payment callbacks** | Use the booking id as the idempotency key; `pay` already rejects non-PENDING bookings, and CAS prevents double transitions. |
+| **Idempotent payment callbacks** | Use the booking id as the idempotency key with the gateway; `pay` already runs one call per booking at a time and rejects non-PENDING bookings, and CAS prevents double transitions. Across several servers, the per-booking lock becomes a conditional status update in the database. |
 | **Persistence** | Repositories for catalog and bookings behind interfaces; the service code doesn't change. |
 
 ## Common mistakes

@@ -11,7 +11,9 @@ prerequisites: []
 
 ## Definition (interview-ready)
 
-**Circuit breaker**: a state machine wrapping a remote call that **opens** (fast-fails) when failures exceed a threshold, **half-opens** to test recovery, and **closes** when healthy. **Bulkhead**: isolating resources (threads, connections) per dependency so a slow downstream can't drain shared pools. **Retry with backoff**: re-attempt failed calls with **exponential delay + jitter** to avoid synchronized retry storms.
+**Circuit breaker**: a state machine wrapping a remote call that **opens** (fast-fails) when failures exceed a threshold, **half-opens** to test recovery, and **closes** when healthy. **Bulkhead**: isolating resources (threads, connections) per dependency so a slow downstream can't drain shared pools. **Retry with backoff**: re-attempt failed calls with **exponential delay + jitter** to avoid synchronized retry storms. Together with **timeouts** on every call, these patterns stop one slow or failing dependency from cascading into a full outage.
+
+**One-liner:** Timeouts bound the wait, bulkheads cap how much of my capacity one dependency can hold, retries with jittered backoff absorb transient blips, and a circuit breaker fast-fails calls to a dependency that is clearly sick.
 
 ## Why it matters
 
@@ -35,22 +37,23 @@ stateDiagram-v2
 ### Circuit breaker states
 
 ```
-       success threshold
-   closed -------> half-open -------> closed
-     |                |
-     | error %        | one bad call
-     v                v
-     open <-------- open
-        cooldown timer
+            failure threshold crossed
+   CLOSED  -------------------------->  OPEN
+     ^                                  |   ^
+     | probe(s) succeed                 |   | probe fails
+     |                     cooldown     v   |
+     +-------------------  HALF-OPEN  <-+---+
 ```
 
 - **Closed**: requests flow through normally. Count failures.
 - **Open**: fast-fail (return error / fallback immediately, no remote call).
-- **Half-open**: after cooldown, allow a probe request. Success → close; failure → open again.
+- **Half-open**: after cooldown, allow one or a few probe requests (resilience4j lets 10 through by default). Success → close; failure → open again for another cooldown.
 
 ### Triggering rules
 
-- **Error rate**: >50% errors over last 20 requests within 10s.
+Example thresholds (the first one matches Hystrix's old defaults):
+
+- **Error rate**: >50% errors over a 10s window, once at least 20 requests have been seen.
 - **Error count**: 5 consecutive failures.
 - **Latency**: p99 > 5s for 10s.
 
@@ -61,7 +64,7 @@ Pick a rule that matches the symptom you fear. Latency-based is often best — s
 When circuit is open, what do you return?
 - **Cached value** (last known good).
 - **Default value** (empty list, "service unavailable").
-- **Static** (queue for later, "try again").
+- **Deferred** (queue the work for later, tell the user "try again").
 - **Best-effort partial result** (e.g., feed without recommendations).
 
 ### Bulkheads
@@ -100,7 +103,7 @@ Each retry doubles the delay. Caps prevent absurd waits.
 #### Jitter
 
 Without jitter, all clients retry at the same moments → **thundering herd**. Add randomness:
-- **Full jitter**: `delay = random(0, base * 2^attempt)`. Simplest, very effective.
+- **Full jitter**: `delay = random(0, min(cap, base * 2^attempt))`. Simplest, very effective.
 - **Equal jitter**: `delay = base * 2^attempt / 2 + random(0, base * 2^attempt / 2)`.
 - **Decorrelated jitter** (from the AWS Architecture Blog): `delay = min(cap, random(base, prev * 3))`.
 
@@ -118,7 +121,7 @@ Retries assume the call is idempotent (or has an idempotency key). Otherwise: du
 
 The forgotten cousin. Every remote call needs a **timeout** — otherwise you wait forever for an answer that may never come, holding resources hostage.
 
-Rule of thumb: a service's timeout calling a downstream should be **less than** its own SLO from upstream. Otherwise you'll exceed your SLO waiting on the downstream.
+Rule of thumb: a service's timeout for a downstream call should be **less than** the time budget its own caller gives it (the caller's timeout), minus its own processing time. Otherwise the caller gives up while you are still waiting on the downstream.
 
 ### Health checks
 
@@ -167,7 +170,7 @@ With protection:
 ## Real-world examples
 
 - **Netflix Hystrix**: popularized the circuit breaker pattern in microservices (the pattern itself comes from Nygard's *Release It!*). In maintenance mode since 2018; its README points users to resilience4j, and Netflix moved toward adaptive concurrency limits.
-- **Envoy / Istio**: declarative outlier detection (circuit breaker), retry policies, timeouts.
+- **Envoy / Istio**: declarative outlier detection (ejects failing hosts from the pool, breaker-like), "circuit breaking" limits on connections and pending requests (bulkhead-style), retry policies, timeouts.
 - **AWS SDKs**: built-in exponential backoff with **full jitter** in the "standard" retry mode, plus a token-bucket retry quota (a retry budget).
 - **Spring Cloud**: Resilience4j integration.
 - **Kubernetes liveness/readiness probes**: control restarts and traffic eligibility.
@@ -178,7 +181,7 @@ With protection:
 - **No jitter** → synchronized retry storms.
 - **No timeout** → resource exhaustion.
 - **Cascading deep health checks**: service A's readiness depends on B's health; B depends on C → C blips → all unhealthy.
-- **Circuit breaker per-instance, not per-key**: a slow user breaks the entire downstream's circuit for everyone.
+- **One shared breaker when failures are key-specific**: requests for one bad key (say, one user whose calls always fail) push the shared error rate over the threshold and open the circuit for everyone.
 - **Bulkhead per route, not per dependency**: one slow third-party API depletes all routes' pools.
 - **Endless retries** without budget → amplify outages.
 - **Fail-open vs fail-closed**: when CB opens, you must decide if your service still works degraded. If not, opening just hides the problem.
@@ -289,7 +292,7 @@ Decide **fail-open vs fail-closed** explicitly. If the feature can degrade (serv
 
 <QA q="A team enabled retries and now their downstream is overloaded even under normal load. Why?" level="scenario">
 
-**Retry amplification.** With 3 retries, 1% failures add up to 3% extra load — but under stress, 30% failures add up to 90% extra, pushing the downstream deeper into trouble. Fixes:
+**Retry amplification.** With 3 retries, 1% failures add at most about 3% extra load — but under stress, 30% failures can add up to about 90% extra (when retries keep failing too), pushing the downstream deeper into trouble. Fixes:
 - **Retry budget** — cap retries at, say, 10% of calls.
 - **Backoff + jitter** — spread retries over time.
 - **Circuit breaker** — stop retrying when the downstream is clearly degraded.
@@ -329,7 +332,7 @@ A 400 is a client error that will fail the same way again. Network blips, 5xx, a
 
 <MCQ q="Under stress 30% of calls fail and each client retries up to 3 times. Roughly how much extra load can retries add?" options={["About 3%", "About 30%", "None, because retries are spread out", "About 90%"]} answer={3}>
 
-0.3 failures times 3 retries is about 0.9 extra calls per original call. That amplification is why retry budgets and circuit breakers matter.
+In the worst case, when retries keep failing, 0.3 failures times 3 retries is about 0.9 extra calls per original call. That amplification is why retry budgets and circuit breakers matter.
 
 </MCQ>
 
@@ -361,7 +364,7 @@ A slow downstream drains pools while calls wait, causing cascades. Fast errors r
 
 ## TL;DR cheat sheet
 
-- **Timeout**: always. Calling service's timeout < its SLO from upstream.
+- **Timeout**: always. Your downstream timeout < the budget your own caller gives you.
 - **Retry**: exponential backoff + **full jitter**. Cap attempts and total budget. Only on transient + idempotent.
 - **Circuit breaker**: closed → open (fast-fail) → half-open (probe) → closed. Threshold on error rate or latency.
 - **Bulkhead**: isolate threads/connections per dependency (or semaphores). Stops one slow downstream from draining shared pools.

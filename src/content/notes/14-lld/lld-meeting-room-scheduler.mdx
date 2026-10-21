@@ -10,6 +10,12 @@ prerequisites: ["machine-coding-strategy", "behavioral-patterns", "java-collecti
 summary: "Build a thread-safe meeting room booking system in Java 21: half-open time slots, O(log n) conflict checks with TreeMap floor/ceiling, best-fit room search, all-or-nothing recurring meetings, Observer notifications and Command-based undo."
 ---
 
+## Definition (interview-ready)
+
+A meeting room scheduler books rooms for time slots so that no two meetings in the same room overlap, even when many users book at once. The core entities are `Room`, `User`, an immutable half-open `TimeSlot` [start, end), `Booking`, and one `RoomCalendar` per room. Each calendar keeps its bookings in a `TreeMap` keyed by start time. Because stored bookings never overlap, a new slot only has to be checked against two neighbours, `floorEntry` and `ceilingEntry`, which is O(log n). The check and the insert run under that room's own `ReentrantLock`, so two threads can never both win, and different rooms never block each other. A `MeetingScheduler` facade adds best-fit room search, all-or-nothing recurring series, Observer notifications sent outside the lock, and Command objects for undo.
+
+**One-liner:** Half-open time slots stored in a per-room TreeMap, an O(log n) floor/ceiling conflict check done together with the insert under a per-room lock, plus Observer for notifications and Command for undo.
+
 ## Problem statement
 
 > "Design a meeting room booking system for an office. There are several rooms, each with a seating capacity. A user can book a room for a time slot and invite attendees. Two meetings must never overlap in the same room. Users should be able to find a free room for a given time and group size, cancel a booking, and set up simple recurring meetings (daily or weekly). Attendees get notified when they are invited or a meeting is cancelled. Many people book at once, so it must be safe under concurrency. Bonus: undo the last action."
@@ -130,7 +136,7 @@ The naive check scans every booking in the room: O(n). Instead, each `RoomCalend
 - `floorEntry(start)` — the booking with the greatest start ≤ new start. Clash if it **ends after** the new start.
 - `ceilingEntry(start)` — the booking with the smallest start ≥ new start. Clash if it **starts before** the new end.
 
-`TreeMap` is a red-black tree: its Javadoc guarantees O(log n) for `get`/`put`/`remove`, and the navigation lookups are the same O(log n) tree walk, so booking is O(log n). Why is checking two neighbours enough? Any booking further left ends before the floor booking starts; any booking further right starts after the ceiling booking. If neither neighbour overlaps, nothing does.
+`TreeMap` is a red-black tree: its Javadoc guarantees O(log n) for `get`/`put`/`remove`, and the navigation lookups are the same O(log n) tree walk, so booking is O(log n). Why is checking two neighbours enough? Any booking further left ends at or before the moment the floor booking starts; any booking further right starts after the ceiling booking. If neither neighbour overlaps, nothing does.
 
 ### Step 3 — making check-and-insert atomic
 
@@ -244,7 +250,7 @@ final class RoomCalendar {
                     throw new BookingConflictException(room.name() + " is taken " + b.slot()
                             + " by '" + clash.get().title() + "'");
             }
-            // occurrences of one series never overlap each other (step is at least 1 day, slot is shorter)
+            // occurrences of one series never overlap each other (step is at least 1 day, slot is no longer than the step)
             for (Booking b : bookings) byStart.put(b.slot().start(), b);
         } finally { lock.unlock(); }
     }
@@ -295,8 +301,10 @@ final class MeetingScheduler {
     private final AtomicLong ids = new AtomicLong();
 
     void addRoom(Room r) {
-        if (rooms.putIfAbsent(r.id(), r) != null) throw new IllegalArgumentException("duplicate room " + r.id());
-        calendars.put(r.id(), new RoomCalendar(r));
+        // calendar first: a room is never visible in 'rooms' without its calendar
+        if (calendars.putIfAbsent(r.id(), new RoomCalendar(r)) != null)
+            throw new IllegalArgumentException("duplicate room " + r.id());
+        rooms.put(r.id(), r);
     }
     void subscribe(BookingListener l) { listeners.add(l); }
 
@@ -736,9 +744,9 @@ Undo in a shared system is a new operation that must pass the same checks. Faili
 
 </MCQ>
 
-<MCQ q="Which PostgreSQL feature can enforce no overlapping bookings per room at the database level?" options={["A UNIQUE index on (room_id, start_time)", "An exclusion constraint using GiST with room WITH = and during WITH &&", "A CHECK constraint on start_time", "SERIALIZABLE isolation alone, with no constraint"]} answer={1}>
+<MCQ q="Which PostgreSQL feature declares on the table itself that no two bookings for a room may overlap, no matter how the application writes them?" options={["A UNIQUE index on (room_id, start_time)", "An exclusion constraint using GiST with room WITH = and during WITH &&", "A CHECK constraint on start_time", "SERIALIZABLE isolation alone, with no constraint"]} answer={1}>
 
-An exclusion constraint rejects any two rows with the same room and overlapping ranges. A UNIQUE index only blocks identical start times. SERIALIZABLE can also catch the race but needs retries and is not a declarative guarantee on the table.
+An exclusion constraint rejects any two rows with the same room and overlapping ranges. A UNIQUE index only blocks identical start times. SERIALIZABLE can also catch the race, but only if every writer runs the check-then-insert inside a serializable transaction and retries on failure; it is not a declarative rule on the table.
 
 </MCQ>
 

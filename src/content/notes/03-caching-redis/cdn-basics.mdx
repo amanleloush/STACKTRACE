@@ -11,7 +11,9 @@ prerequisites: []
 
 ## Definition (interview-ready)
 
-A **CDN** (Content Delivery Network) is a globally distributed cache of edge servers (PoPs — Points of Presence) that sit close to users, serving static content (and increasingly dynamic content) on behalf of an origin server. Users hit the nearest PoP via **Anycast DNS** + **BGP**; caches are invalidated/refreshed by **purge** and **TTL** semantics.
+A **CDN** (Content Delivery Network) is a globally distributed cache of edge servers (PoPs — Points of Presence) that sit close to users, serving static content (and increasingly dynamic content) on behalf of an origin server. Users reach a nearby PoP through **anycast** routing (one IP announced from many places via **BGP**) or **GeoDNS** (DNS answers that depend on location); cached copies are refreshed by **TTL** expiry and removed early by **purge**.
+
+**One-liner:** A CDN is a network of edge caches near users that serves content on the origin's behalf — anycast or GeoDNS sends each user to a nearby PoP, `Cache-Control` headers and purges control freshness, and the result is lower latency, less origin load and DDoS absorption.
 
 ## Why it matters
 
@@ -21,7 +23,7 @@ Once your app has users in more than one country, the speed of light becomes the
 sequenceDiagram
     autonumber
     participant U as User (Mumbai)
-    participant DNS as Anycast DNS
+    participant DNS as CDN DNS (GeoDNS)
     participant POP as Edge PoP (Mumbai)
     participant ORG as Origin (us-east-1)
     U->>DNS: resolve cdn.example.com
@@ -51,7 +53,7 @@ sequenceDiagram
 
 - **Anycast**: same IP advertised from many locations via BGP. Internet routing chooses the closest.
 - **DNS-based**: `cname.cdn.com` resolves to different IPs based on the resolver's location (GeoDNS).
-- **Hybrid**: most modern CDNs do Anycast for speed and DNS for fallback / routing.
+- **Hybrid**: some CDNs combine both. Cloudflare is mostly anycast; Akamai has historically relied mostly on DNS-based mapping.
 
 ### What gets cached
 
@@ -59,7 +61,7 @@ sequenceDiagram
 - **HTML pages**: cacheable if not personalized.
 - **API responses**: cacheable for GET endpoints with stable keys.
 - **Video streaming**: HLS / DASH manifest + chunks. CDNs are the only way to scale this.
-- **Dynamic**: edge compute (Cloudflare Workers, Lambda@Edge, Fastly Compute@Edge) generates responses at the edge.
+- **Dynamic**: edge compute (Cloudflare Workers, Lambda@Edge, Fastly Compute) generates responses at the edge.
 
 ### Cache key
 
@@ -78,16 +80,16 @@ Default: full URL. You can include / exclude query params and headers per route.
 
 ### Invalidation (purge)
 
-- **Purge by URL**: invalidate a specific path. Fast, instant.
+- **Purge by URL**: invalidate a specific path. Usually takes effect within seconds (some CDNs, like CloudFront, can take longer).
 - **Purge by tag / surrogate key**: tag responses on origin (`Surrogate-Key: product-42`). Purge by tag to wipe all related responses (product page, listings showing it, search results).
 - **Wipe all**: nuclear option; expect a brief origin storm — use soft purge if possible.
 - **Soft purge**: mark stale; next request triggers async refresh while serving stale.
 
 ### Edge compute
 
-- **Cloudflare Workers**: V8 isolates, serverless functions in 250+ cities.
+- **Cloudflare Workers**: V8 isolates, serverless functions in Cloudflare's 300+ edge cities.
 - **Lambda@Edge / CloudFront Functions**: AWS equivalent.
-- **Fastly Compute@Edge**: WebAssembly-based, very fast.
+- **Fastly Compute** (formerly Compute@Edge): WebAssembly-based, very fast startup.
 - Use cases: A/B routing, header rewriting, auth checks, response personalization, light JSON shaping.
 
 ### Origin shield
@@ -98,7 +100,7 @@ Default: full URL. You can include / exclude query params and headers per route.
 ### Image / video optimization at the edge
 
 - Resize, reformat (AVIF/WebP), compress on the fly based on `Accept` header.
-- Adaptive bitrate streaming: PoP picks the right HLS variant based on the user's bandwidth.
+- Adaptive bitrate streaming: the CDN caches every HLS/DASH rendition, and the client player switches between them based on its measured bandwidth.
 - Saves origin storage + bandwidth.
 
 ## How it works (a CDN request)
@@ -117,7 +119,7 @@ Default: full URL. You can include / exclude query params and headers per route.
 - **Netflix**: huge CDN strategy. Built **Open Connect Appliances** — Netflix-owned CDN boxes inside ISPs. Saves transit cost, gets closest to users.
 - **YouTube / Google**: own private CDN backbone.
 - **Cloudflare**: anycast everywhere; powers a huge chunk of the public web.
-- **Fastly**: powered news sites with fast purge; famously had a major outage in 2021 that took down half the internet for an hour.
+- **Fastly**: popular with news sites for fast purge. In June 2021 one customer's valid config change triggered a latent bug, and many major sites (Amazon, Reddit, gov.uk, news outlets) were down for about an hour.
 - **Akamai**: original CDN, heavy enterprise / financial / video presence.
 
 ## Common pitfalls
@@ -128,7 +130,7 @@ Default: full URL. You can include / exclude query params and headers per route.
 - **Long TTL on something you'll need to change**: prefer cache-busting filenames (`app.abc123.js`) for static; short TTL or tag-purge for dynamic.
 - **Origin hiding behind CDN by IP**: attackers find your origin via historical DNS / SSL transparency logs. Use origin auth (CF Tunnel, AWS WAF + signed requests) to refuse non-CDN traffic.
 - **Purge floods**: aggressive purges trigger origin stampedes — use soft purge or staggered.
-- **HTTPS misconfiguration**: CDN ↔ origin TLS can be weaker than client ↔ CDN. Set "full strict" mode.
+- **HTTPS misconfiguration**: CDN ↔ origin TLS can be weaker than client ↔ CDN. Encrypt CDN-to-origin traffic and validate the origin certificate (Cloudflare calls this "Full (strict)" mode).
 
 ## Practice questions
 
@@ -193,7 +195,7 @@ An extra cache layer between the PoPs and the origin. A PoP that misses asks the
 
 <QA q="What is edge compute used for, and why does it help caching?" level="hard">
 
-Edge compute (Cloudflare Workers on V8 isolates, Lambda@Edge / CloudFront Functions, Fastly Compute@Edge on WebAssembly) runs code at the PoP. Uses: A/B routing, header rewriting, auth checks, response personalization, light JSON shaping. It helps caching because the main response can stay public and cacheable while the small personalized piece is added at the edge.
+Edge compute (Cloudflare Workers on V8 isolates, Lambda@Edge / CloudFront Functions, Fastly Compute on WebAssembly) runs code at the PoP. Uses: A/B routing, header rewriting, auth checks, response personalization, light JSON shaping. It helps caching because the main response can stay public and cacheable while the small personalized piece is added at the edge.
 
 </QA>
 
@@ -310,5 +312,5 @@ Origin authentication (or no public origin at all) rejects anything that didn't 
 - **Fastly blog**: surrogate keys, stale-while-revalidate, varnish-derived terminology.
 - **MDN**: [HTTP caching](https://developer.mozilla.org/en-US/docs/Web/HTTP/Caching) — the canonical reference for headers.
 - **Netflix Open Connect** docs and blog posts.
-- **RFC 7234** (HTTP caching) — short and worth reading once.
+- **RFC 9111** (HTTP Caching, which replaced RFC 7234 in 2022) — short and worth reading once.
 - **Cloudflare YouTube**: "How Cloudflare works" series.

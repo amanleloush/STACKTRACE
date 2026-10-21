@@ -11,7 +11,9 @@ prerequisites: []
 
 ## Definition (interview-ready)
 
-**Stream processing** is computation over an unbounded sequence of events with low latency, typically driven by Kafka or another log. **Apache Flink** is a distributed engine with sophisticated state management, event-time semantics, watermarks, and exactly-once guarantees. **Kafka Streams** is a library (not a cluster) that runs inside your app, scaling via Kafka consumer-group rebalancing and using Kafka topics as state-store backups. **Windowing** chops the infinite stream into bounded buckets (tumbling, sliding, session); **watermarks** are the engine's mechanism for deciding "no more late events of this kind will arrive" so it can emit results.
+**Stream processing** is computation over an unbounded sequence of events with low latency, typically driven by Kafka or another log. **Apache Flink** is a distributed engine with sophisticated state management, event-time semantics, watermarks, and exactly-once guarantees. **Kafka Streams** is a library (not a cluster) that runs inside your app, scaling via Kafka consumer-group rebalancing and using Kafka topics as state-store backups. **Windowing** chops the infinite stream into bounded buckets (tumbling, sliding, session); a **watermark** is the engine's running estimate of event-time progress ("no more events older than time t are expected"), which tells it when a window is complete enough to emit.
+
+**One-liner:** Stream processing computes continuously over unbounded event streams; you group events into event-time windows, use watermarks to decide when a window is done despite out-of-order arrivals, and rely on checkpointed state plus a replayable source and transactional sink for exactly-once results. Flink is a cluster engine for this, and Kafka Streams is a library inside your app.
 
 ## Why it matters
 
@@ -38,7 +40,7 @@ flowchart LR
 
 ### Watermarks
 
-A watermark `W(t)` is a promise from the source: "no events with event time < t will arrive after this point." When watermark passes the window end, the engine closes and emits the window.
+A watermark `W(t)` is an assertion that flows with the stream: "no more events with event time earlier than t are expected." It is usually a heuristic, so some events can still arrive after it (those are *late* events). When the watermark passes a window's end, the engine fires and emits the window.
 
 ```mermaid
 sequenceDiagram
@@ -47,9 +49,9 @@ sequenceDiagram
     participant W as Window 10:00-10:01
     S->>W: event t=10:00:05
     S->>W: event t=10:00:48
-    S->>W: event t=10:00:30 (late)
+    S->>W: event t=10:00:30 (out of order, still on time)
     S->>W: watermark 10:01:05 (allowed lateness 5s)
-    W->>W: close window, emit result
+    W->>W: emit result, then drop window state (watermark is past end plus lateness)
     S->>W: event t=10:00:55 (very late)
     Note over W: routed to side-output, not the window
 ```
@@ -149,7 +151,7 @@ flowchart LR
 
 - **No cluster of its own** — it's a library you embed in your app/JVM.
 - Scales by adding instances → Kafka rebalances partitions → state migrates by replaying the changelog topic.
-- Simpler operationally if you already run Kafka + JVM apps; less powerful than Flink (no event-time guarantees as strong, simpler windowing, no real Python ecosystem).
+- Simpler operationally if you already run Kafka + JVM apps; less powerful than Flink (event-time windows driven by stream time and grace periods rather than watermarks, simpler windowing, no official Python API).
 
 ### Flink vs Kafka Streams vs Spark Structured Streaming
 
@@ -160,7 +162,7 @@ flowchart LR
 | State | RocksDB + checkpoints | RocksDB + changelog topic | versioned state store (HDFS-backed or RocksDB) |
 | Latency | tens of ms | tens of ms | ~100 ms to seconds (micro-batch); ~1 ms in experimental continuous mode |
 | Throughput | very high | high | very high |
-| Watermarks | first-class | limited | yes |
+| Watermarks | first-class | none; uses "stream time" plus a per-window grace period | yes |
 | Languages | Java, Scala, Python (PyFlink), SQL | Java, Scala | Scala, Java, Python, SQL |
 | Best for | low-latency complex pipelines | "stream processing inside my service" | unified batch+stream on existing Spark infra |
 
@@ -175,14 +177,14 @@ flowchart LR
 ## Common pitfalls
 
 - **Using processing time when you mean event time.** Replays, recoveries, backfills will silently corrupt aggregates.
-- **No allowed-lateness.** Real event streams always have stragglers; without lateness, every late event is lost.
+- **No allowed-lateness.** Real event streams almost always have stragglers; without allowed lateness (or a side output), every event that arrives after the watermark is silently dropped.
 - **Unbounded state.** A keyBy on an ever-growing key space (e.g., raw UUIDs) accumulates state forever. Add TTL or scope by window.
 - **No state size monitoring.** RocksDB grows; checkpoints get expensive; eventually slow snapshots block processing.
 - **Treating "exactly-once" as automatic.** It's a chain — break any link and you're at-least-once. Verify sink supports transactions or is idempotent.
-- **Skew on a hot key.** All events for "celebrity_user_id" land on one operator instance. Mitigate by adding a salt: `keyBy = (key, hash(event) % N)` then `union → aggregate`.
+- **Skew on a hot key.** All events for "celebrity_user_id" land on one operator instance. Mitigate by adding a salt: `keyBy((key, hash(event) % N))`, pre-aggregate per salted key, then re-key by the original key and merge the partial results.
 - **Restart from scratch instead of from savepoint.** Restoring from a savepoint preserves state; restart from offset 0 reprocesses everything (correct only if everything is idempotent).
 - **Kafka Streams with too few partitions.** Parallelism is capped at # of input partitions. Repartition early if you need more.
-- **Side-effects in operators.** Calling an external API from a `map()` adds latency and breaks exactly-once. Use **async I/O** with checkpointed deduplication.
+- **Side-effects in operators.** Calling an external API from a `map()` blocks the pipeline, and after a restart the replayed events repeat the call: exactly-once covers Flink's state and transactional sinks, not external side effects. Use **async I/O** for lookups, and make side-effecting calls idempotent (for example with an idempotency key) or move them into a transactional sink.
 
 ## Practice questions
 
@@ -246,7 +248,7 @@ Likely processing-time windows: replayed events after the restart land in differ
 
 <QA q="Explain end-to-end exactly-once between Kafka → Flink → Postgres." level="hard">
 
-Source: Kafka offsets are stored in Flink's checkpoint state (committing them back to Kafka is only for monitoring). Operators: state is snapshotted atomically with the offsets via barriers. Sink: **two-phase commit** — writes go into a Postgres transaction that is pre-committed at the checkpoint and committed only when the checkpoint completes. On failure: restore state from the checkpoint, replay from the checkpointed offsets; uncommitted transactions roll back and are redone. Every input affects Postgres exactly once.
+Source: Kafka offsets are stored in Flink's checkpoint state (committing them back to Kafka is only for monitoring). Operators: state is snapshotted atomically with the offsets via barriers. Sink: **two-phase commit** — writes go into a Postgres transaction that is pre-committed (prepared) at the checkpoint and committed only when the checkpoint completes. Flink's JDBC exactly-once sink does this with XA transactions, so Postgres needs `max_prepared_transactions` above 0. On failure: restore state from the checkpoint, replay from the checkpointed offsets; uncommitted transactions roll back and are redone. Every input affects Postgres exactly once.
 
 </QA>
 

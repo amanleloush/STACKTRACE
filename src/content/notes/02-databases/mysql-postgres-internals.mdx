@@ -11,7 +11,9 @@ prerequisites: []
 
 ## Definition (interview-ready)
 
-Relational databases like MySQL (InnoDB) and Postgres store rows in **B+ tree** indexes on disk, use a **query planner** to convert SQL into an execution plan based on table statistics, and expose that plan via **EXPLAIN**. Performance work means understanding how the planner picks plans and tuning indexes to give it good options.
+Relational databases like MySQL (InnoDB) and Postgres organize their indexes as **B+ trees** on disk (InnoDB also stores the table itself inside the primary-key B+ tree, while Postgres keeps rows in a separate heap), use a **query planner** to convert SQL into an execution plan based on table statistics, and expose that plan via **EXPLAIN**. Performance work means understanding how the planner picks plans and tuning indexes to give it good options.
+
+**One-liner:** Relational databases find rows through shallow, high-fanout B+ tree indexes and use a cost-based planner that relies on table statistics to choose between scans and joins; EXPLAIN ANALYZE shows the chosen plan, so you can spot missing indexes and bad estimates.
 
 ## Why it matters
 
@@ -25,7 +27,7 @@ Most production performance issues in OLTP systems trace back to a missing index
 
 - **B+ tree** = balanced, ordered tree where:
   - **Internal nodes** hold keys + pointers (no row data).
-  - **Leaf nodes** hold all keys (and in Postgres, pointers to the heap row; in MySQL InnoDB, the actual row data).
+  - **Leaf nodes** hold all keys plus what they point to: in Postgres, a pointer to the heap row; in InnoDB, the full row (primary-key index) or the PK value (secondary indexes).
   - Leaves form a **linked list** for fast range scans.
 - High fanout (hundreds of keys per node) → very shallow (3–4 levels deep, even for billions of rows).
 - Most reads = 3–4 page accesses → ~30–40 ms on HDD if nothing is cached (upper levels usually are), μs with cache hits.
@@ -36,7 +38,7 @@ Most production performance issues in OLTP systems trace back to a missing index
 - **MySQL InnoDB**: rows live **inside the primary key's B+ tree** (clustered index). Secondary indexes store the PK value, not a row pointer.
 
 Consequence:
-- Postgres: cheap to add secondary indexes; PK change is normal.
+- Postgres: every index, including the PK, points straight at the heap, so a secondary lookup is one index walk plus a heap fetch. The flip side: an update that can't be done as a HOT (heap-only tuple) update writes a new row version, and every index needs a new entry for it.
 - InnoDB: secondary index lookup = 2 B+ tree traversals (secondary → PK → row). Big PK = bloated secondary indexes. Choose a **small monotonic PK** (typically `BIGINT`).
 
 ### Index types
@@ -76,7 +78,7 @@ Cost-based optimizers (CBO) — the choice depends on stats. **Bad stats = bad p
 EXPLAIN ANALYZE SELECT * FROM orders WHERE user_id = 42 AND status = 'OPEN';
 ```
 
-Read top-down:
+The output is a tree: the top node returns the final result, and execution starts at the most-indented nodes and flows upward.
 ```
 Index Scan using idx_user_status on orders  (cost=0.43..8.45 rows=2 width=...)
                                             (actual time=0.012..0.014 rows=2 loops=1)
@@ -87,7 +89,7 @@ Key things to look for:
 - **`Seq Scan`** on a big table with a selective predicate → missing index.
 - **`Rows Removed by Filter`** = work done, then thrown away. Index doesn't cover the predicate.
 - **Big gap between estimated and actual rows** → stale stats, run `ANALYZE`.
-- **`Nested Loop` with high `loops=N`** = many round trips. Often want a hash join instead.
+- **`Nested Loop` with high `loops=N`** = the inner side ran N times. With a large outer side, a hash join is often better.
 
 ### MVCC (preview — full coverage in [Transactions & Isolation](/learn/notes/transactions-isolation/))
 
@@ -144,7 +146,7 @@ By the **leftmost-prefix rule**: `WHERE user_id = ?` and `WHERE user_id = ? AND 
 
 <QA q="How do Postgres and InnoDB store rows differently, and what does that mean for secondary indexes?" level="medium">
 
-**Postgres** keeps rows in an unordered **heap**, and every index (including the PK) points into the heap with a TID, so adding secondary indexes is cheap. **InnoDB** stores rows inside the **primary key B+ tree**, and secondary indexes store the PK value. A secondary lookup is therefore two traversals (secondary → PK → row), and a wide PK bloats every secondary index. Choose a small, monotonic PK (typically `BIGINT`).
+**Postgres** keeps rows in an unordered **heap**, and every index (including the PK) points into the heap with a TID, so a secondary lookup is one index walk plus a heap fetch. **InnoDB** stores rows inside the **primary key B+ tree**, and secondary indexes store the PK value. A secondary lookup is therefore two traversals (secondary → PK → row), and a wide PK bloats every secondary index. Choose a small, monotonic PK (typically `BIGINT`).
 
 </QA>
 
@@ -281,7 +283,7 @@ If the index covers all needed columns, the executor can answer from the index. 
 - InnoDB clusters rows in the PK B+ tree. Postgres uses a separate heap.
 - Cost-based planner picks plans from **stats** — keep them fresh (`ANALYZE`).
 - Joins: nested loop (tiny outer + indexed inner), hash (big equi-join), merge (sorted inputs).
-- `EXPLAIN ANALYZE` reads top-down; look for Seq Scan on big tables, big estimate-vs-actual gaps, `Rows Removed by Filter`.
+- `EXPLAIN ANALYZE` is a tree (top node = final result, most-indented nodes run first); look for Seq Scan on big tables, big estimate-vs-actual gaps, `Rows Removed by Filter`.
 - Composite index: equality columns first.
 - Index-only scan = covering all needed columns in the index. Fastest path.
 - Functions on indexed columns kill index use unless you have expression indexes.

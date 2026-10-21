@@ -9,6 +9,14 @@ estimatedMinutes: 5
 prerequisites: []
 ---
 
+## Definition (interview-ready)
+
+A **payment system** moves money between parties (charge a customer, credit a merchant, refund) without ever charging twice, losing a transfer or losing the audit trail, even when networks time out and clients retry. Every mutating API takes an **idempotency key**, which is stored with the response and forwarded to the payment provider, so retries are safe end to end. Money is recorded in an append-only **double-entry ledger**: each transfer writes a debit and a matching credit in one database transaction, so every transaction sums to zero. A **payment state machine**, driven by a saga orchestrator, walks each payment through authorize, capture and settle, with void and refund as compensations. Provider webhooks are verified and deduped, and a daily **reconciliation** job compares the ledger with provider reports. Card data stays in a PCI-scoped vault or with the provider as tokens.
+
+The main trade-off is correctness over latency and availability: money movement uses strong consistency, while read views such as balances can lag.
+
+**One-liner:** Idempotency keys on every write, an append-only double-entry ledger, a saga-driven authorize-capture-settle state machine, deduped webhooks and daily reconciliation, so retries and failures can never double-charge or lose money.
+
 ## Problem statement
 
 Design a payment system that processes money movement (debit A, credit B) with strict correctness — no double charges, no lost transfers, full auditability, even under retries and partial failures.
@@ -65,11 +73,11 @@ Design a payment system that processes money movement (debit A, credit B) with s
 ### Idempotency
 
 Every mutation API takes an `Idempotency-Key`:
-1. Lookup in idempotency store (Redis or Postgres with unique constraint).
-2. If exists: return the previous response — no new action.
-3. If not: execute, store the response keyed by the idempotency key, return.
+1. Atomically reserve the key in the idempotency store (for example `INSERT` into a Postgres table with a unique constraint, or Redis `SET NX`). This stops two concurrent retries from both executing.
+2. If the key already exists with a stored response: return that response, with no new action. If it exists but is still in progress, return a conflict (Stripe returns 409) so the client retries later. If it was reused with different request parameters, reject it.
+3. If the reservation succeeded: execute, store the response against the key, return.
 
-Window: 24h+. Forwarded to upstream providers as their idempotency key too (Stripe, Adyen support this).
+Window: 24h+ (Stripe keeps keys for at least 24 hours). Forwarded to upstream providers as their idempotency key too (Stripe and Adyen both accept an `Idempotency-Key` header).
 
 ### Ledger (double-entry bookkeeping)
 
@@ -140,7 +148,7 @@ Providers send async events: "payment_succeeded," "payment_failed," "chargeback.
 - Verify signature (HMAC, JWS).
 - Idempotency: provider event IDs deduped.
 - Apply state change in ledger / payment state.
-- Acknowledge — provider retries until acked.
+- Acknowledge with a 2xx. Until it gets one, the provider retries for a limited window (Stripe retries for up to 3 days), so processing must be idempotent.
 
 ### Reconciliation
 
@@ -151,7 +159,8 @@ Providers send async events: "payment_succeeded," "payment_failed," "chargeback.
 
 ### Compliance: PCI DSS
 
-- Card data NEVER stored in plaintext.
+- Card numbers (PAN) are never stored in plaintext; if stored at all they must be unreadable (tokenized, truncated or strongly encrypted).
+- The CVV/CVC must never be stored after authorization, not even encrypted.
 - Tokenized via provider (Stripe Token) or in our own vault (separate strict env).
 - App tier sees only tokens (`tok_xxx`).
 - Vault is isolated network, audited, encrypted.
@@ -164,7 +173,7 @@ Providers send async events: "payment_succeeded," "payment_failed," "chargeback.
 ## Bottlenecks & optimizations
 
 - **Hot account** (a popular merchant): high write concurrency on their balance row. Use:
-  - Atomic increments (not read-then-write).
+  - Atomic increments (not read-then-write). These prevent lost updates, but every update still waits for the same row lock.
   - Sharded counter (split balance into N partitions, sum on read).
 - **Synchronous provider calls**: typical 200-500 ms. Don't block user-facing requests longer than needed; capture sync, settle async.
 - **Saga orchestrator load**: Temporal/Cadence scale horizontally.
@@ -200,7 +209,7 @@ Authorize asks the provider to place a hold on the card for the amount; no money
 
 <QA q="How do you guarantee no double charges?" level="medium">
 
-Idempotency keys on every mutation. Stored in a dedupe table (Redis or Postgres with a unique constraint) along with the response, for 24h or more. Retries return the cached response. Forward the same key to the upstream provider so it dedupes too.
+Idempotency keys on every mutation. Stored in a dedupe table (Redis or Postgres with a unique constraint) along with the response, for 24h or more. Reserve the key atomically before doing the work, so two concurrent retries can't both execute. Retries return the cached response. Forward the same key to the upstream provider so it dedupes too.
 
 </QA>
 
@@ -329,7 +338,7 @@ Discrepancies go to a reconciliation queue for ops to investigate, because the c
 
 ## Go deeper
 
-- **Stripe Engineering**: [idempotency](https://stripe.com/blog/idempotency), [reconciliation](https://stripe.com/blog), payment-system architecture posts.
+- **Stripe Engineering**: ["Designing robust and predictable APIs with idempotency"](https://stripe.com/blog/idempotency), plus other payment-architecture posts on the [Stripe blog](https://stripe.com/blog).
 - **Square engineering**: payment flow + saga posts.
 - **Adyen engineering blog**: payment architecture.
 - **DDIA Chapters 11–12** — stream processing, idempotence and end-to-end correctness ("Aiming for Correctness").

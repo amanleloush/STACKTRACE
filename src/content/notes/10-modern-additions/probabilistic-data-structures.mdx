@@ -13,6 +13,8 @@ prerequisites: []
 
 **Probabilistic data structures** trade exact answers for orders-of-magnitude less memory and CPU, by accepting a bounded error rate. **Bloom filter**: set membership with no false negatives, tunable false positives. **HyperLogLog (HLL)**: cardinality (distinct count) using ~12 KB (Redis's implementation) to estimate billions of uniques with ~0.81% standard error. **Count-Min Sketch (CMS)**: frequency estimates for stream items in bounded memory. **Top-K** / **Heavy Hitters**: track the K most-frequent items in a stream without storing all of them.
 
+**One-liner:** Probabilistic data structures give approximate answers with a known, tunable error in a tiny, fixed amount of memory: a Bloom filter for 'have I seen this?' with no false negatives, HyperLogLog for distinct counts, Count-Min Sketch for frequencies, and a sketch plus heap for top-K.
+
 ## Why it matters
 
 Once your data doesn't fit in memory (and at scale, it never does), exact answers become prohibitively expensive. Probabilistic structures let you answer "is this email in our spam list?" or "how many unique visitors today?" or "what are the trending hashtags right now?" using a tiny fraction of the memory exact answers would need — at error rates so low they're indistinguishable for the use case.
@@ -57,8 +59,8 @@ How: hash each item to a uniform bit string; observe the position of the leftmos
 
 A 2D matrix of size `d × w` (d = number of hash rows, w = width). To **add** item `x` with count `c`: for each row `i`, increment `CMS[i][h_i(x) % w] += c`. To **query frequency** of `x`: return the *minimum* of those `d` cells.
 
-- Always **overestimates** (collisions add); never underestimates (you can't lose counts).
-- Error ≈ `c · count_total / w` with probability `1 - (1/2)^d`.
+- **Never underestimates**: collisions only add to a cell, so the answer is the true count or higher (assuming counts only go up).
+- Error bound: with `N` = total of all counts, the overcount is at most `2N / w` with probability at least `1 - (1/2)^d`.
 - Common sizing: `w = 2/ε`, `d = log₂(1/δ)` (the original paper uses `w = ⌈e/ε⌉`, `d = ⌈ln(1/δ)⌉`, giving error ≤ ε·N with probability 1 − δ).
 
 ### Top-K (Heavy Hitters)
@@ -130,7 +132,7 @@ Cassandra/RocksDB use this per-SSTable: a read first checks the per-file Bloom; 
 - **Forgetting to size for the eventual `n`.** A Bloom sized for 1M items used at 100M items has ~100% false positive rate (every bit set). Re-create with bigger `m` and rebuild from data.
 - **Sharing one Bloom across mutating sets** — no deletes. Either use counting-Bloom (more memory) or **rebuild periodically** from authoritative data.
 - **HLL over a tiny cardinality.** The raw HLL estimator is biased at small cardinalities. Good implementations (HLL++, Redis) correct this with linear counting / a sparse exact-ish encoding — check yours does, or count exactly below a threshold.
-- **CMS for negative counts (decays).** Standard CMS assumes monotonic counts. If you need decay (sliding-window heavy hitters), use **count-min with conservative update** + time-decay multiplier, or **DDSketch** for histograms.
+- **CMS with negative counts.** The "take the minimum" trick assumes no item's count goes below zero. Decay is fine: multiplying every cell by, say, 0.95 keeps each cell at or above the item's decayed true count. If counts can genuinely go negative (arbitrary decrements), use the **Count-Median** variant (median across rows). For sliding windows, another option is one sketch per time bucket, dropping old buckets.
 - **Hashing the same item with correlated hash functions.** `k` Bloom hashes must be *independent*. Common trick: `h_i(x) = h_a(x) + i * h_b(x)` with two strong hashes.
 - **Persisting Bloom bits but not the parameters.** Recreating needs `m`, `k`, and the exact hash functions. Encode them in the serialized payload.
 - **Confusing approximate with wrong.** A 1% false positive rate on a spam check is fine; on a "do they have permission to access this row?" check it's a security bug. Match the structure's error model to the use case.
@@ -199,13 +201,13 @@ Ingest the tweet stream → per-shard Count-Min Sketch keyed by hashtag plus a p
 
 <QA q="Reading from a cold store costs 100ms per query. How can a Bloom filter cut p99?" level="hard">
 
-Keep an in-memory Bloom of all keys known to exist in front of the cold store. Check it first (under 1 µs): 'no' → return empty immediately; 'yes' → go to the store. Sized for 10M items at 0.5% false positives it's ~14 MB (≈110 M bits, k ≈ 8), and every miss saves 100 ms — most queries in a cold-tail workload. Rebuild it daily from a snapshot. Cassandra and RocksDB use the same idea per SSTable.
+Keep an in-memory Bloom of all keys known to exist in front of the cold store. Check it first (under 1 µs): 'no' → return empty immediately; 'yes' → go to the store. Sized for 10M items at 0.5% false positives it's ~14 MB (≈110 M bits, k ≈ 8). Every query for a key that doesn't exist now skips the 100 ms read (except the 0.5% false positives), which cuts p99 when many queries are for missing keys. Rebuild it daily from a snapshot. Cassandra and RocksDB use the same idea per SSTable.
 
 </QA>
 
 <QA q="A teammate proposes HLL to count distinct IPs hitting an endpoint per hour. What edge cases do you raise?" level="scenario">
 
-(a) The raw HLL estimator is biased at very small cardinalities — confirm small-range correction (HLL++ / Redis) or count exactly below a threshold. (b) HLL gives a **count**, not the IPs — you can't list them. (c) HLLs aren't subtractable: 'new uniques today' is only approximable as HLL(today ∪ yesterday) − HLL(yesterday), biased on the tails. (d) Persist the register state, not the estimated count, so you can re-aggregate.
+(a) The raw HLL estimator is biased at very small cardinalities — confirm small-range correction (HLL++ / Redis) or count exactly below a threshold. (b) HLL gives a **count**, not the IPs — you can't list them. (c) HLLs aren't subtractable: 'new uniques today' is only approximable as HLL(today ∪ yesterday) − HLL(yesterday), and the error of that difference can be large compared with a small result. (d) Persist the register state, not the estimated count, so you can re-aggregate.
 
 </QA>
 
@@ -286,7 +288,7 @@ m is about 1.44 times log2 of 1/p bits per item; for p equal to 0.01 that's abou
 ## TL;DR cheat sheet
 
 - **Bloom** = "is x in set?" — bit array + k hashes — false positives, no false negatives.
-- **HyperLogLog** = "how many distinct?" — ~12 KB → billions of distincts at ~1% error, merges cleanly.
+- **HyperLogLog** = "how many distinct?" — ~12 KB → billions of distincts at ~0.81% standard error, merges cleanly.
 - **Count-Min Sketch** = "frequency of x?" — overestimates, never under.
 - **Top-K** = CMS + min-heap, or Misra-Gries / Space-Saving.
 - **T-Digest / DDSketch** = quantiles (p50/p99).

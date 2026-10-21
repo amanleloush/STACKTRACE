@@ -9,6 +9,16 @@ estimatedMinutes: 5
 prerequisites: []
 ---
 
+## Definition (interview-ready)
+
+A **distributed job scheduler** runs jobs at the right time (cron schedules) and in the right order (DAGs, directed acyclic graphs of dependent tasks), across a pool of machines, with retries, alerting and a history of every run. Airflow is the classic example.
+
+The design in one breath: a **metadata database** (Postgres) holds DAG definitions and the state of every run and task instance. A **scheduler** loop creates runs when schedules fire, finds task instances whose upstream tasks are done, and puts them on a **task queue**. **Workers pull** tasks from the queue, run them, write status back and ship logs to object storage. Failed tasks go through **retries with backoff**, and tasks must be **idempotent** (keyed by the run's logical date or run ID) because retries, catchup and backfills re-run them. Pools and quotas stop one team from starving others, and **deferrable sensors** stop waiting tasks from holding worker slots.
+
+The main trade-off is **a central state database (simple, easy to reason about) vs throughput**: every state change is a DB write, so the DB and scheduler loop become the bottleneck at scale.
+
+**One-liner:** A scheduler loop reads DAG and task state from a central database, enqueues tasks whose dependencies are met, and pull-based workers run them with retries, idempotent task design and pools for multi-tenant fairness.
+
 ## Problem statement
 
 Design a distributed scheduler that runs millions of jobs on time (cron-like) and dependency-driven (DAGs), with retries, failure handling, and observability.
@@ -80,7 +90,7 @@ flowchart LR
 
 - **DAG**: a workflow definition (`Python file` in Airflow, declarative YAML elsewhere).
 - **Task**: a unit of work (run bash, call API, run Spark job).
-- **Run / Execution**: a specific instantiation of a DAG with input data (e.g., DAG `daily_sales` for 2026-05-29).
+- **Run / Execution**: a specific instantiation of a DAG for a given input or date, its **logical date** (e.g., DAG `daily_sales` for 2026-05-29).
 - **Task instance**: a specific task within a run.
 
 ### Scheduler
@@ -111,7 +121,7 @@ flowchart LR
 
 ### Dependencies
 
-- A task is ready when all its upstream dependencies have succeeded (or skipped per skip_rule).
+- A task is ready when its upstream tasks satisfy its **trigger rule**. Airflow's default, `all_success`, waits for every upstream task to succeed; other rules such as `all_done` or `none_failed` allow failed or skipped upstreams.
 - Computed by scheduler on every scan cycle.
 - Stored in DB for visualization.
 
@@ -130,7 +140,7 @@ Set without running: UPSTREAM_FAILED (an upstream failed), SKIPPED (branch / sho
 ### Idempotency
 
 - Tasks should be idempotent.
-- Pass `execution_date` / `run_id` to task code; idempotent operations use it as key.
+- Pass the run's logical date / `run_id` to task code (Airflow 3 removed the old `execution_date` name in favour of `logical_date`); idempotent operations use it as the key.
 - Critical for retries.
 
 ### Cron + sensors
@@ -146,9 +156,9 @@ Set without running: UPSTREAM_FAILED (an upstream failed), SKIPPED (branch / sho
 
 ### Catchup & backfill
 
-- If scheduler is down for a day, on restart it can "catch up" missed runs.
+- If the scheduler is down for a day, on restart it can "catch up" missed runs, if catchup is enabled for that DAG.
 - Backfill: manually rerun historical DAGs (e.g., reprocess data after bug fix).
-- Controls: `catchup=False` to skip historical runs.
+- Controls: `catchup=False` to skip historical runs. Airflow 3.0 made this the default (`catchup_by_default = False`); Airflow 2 defaulted to catching up.
 
 ## Bottlenecks & optimizations
 
@@ -196,7 +206,7 @@ Mark the task as failed. Increment the retry count. If retries remain, schedule 
 
 <QA q="Why do tasks need to be idempotent?" level="medium">
 
-Retries (failure, then re-run), backfills (re-run historical periods), partial failures (a task started but its state wasn't recorded) — all mean the same task may run more than once. Idempotency ensures no duplicate side effects. Pass `execution_date` / `run_id` into the task and use it as the key, for example overwrite the partition for that date instead of appending.
+Retries (failure, then re-run), backfills (re-run historical periods), partial failures (a task started but its state wasn't recorded) — all mean the same task may run more than once. Idempotency ensures no duplicate side effects. Pass the run's logical date / `run_id` into the task and use it as the key, for example overwrite the partition for that date instead of appending.
 
 </QA>
 
@@ -208,7 +218,7 @@ Pull (worker polls queue, popular in Celery/Airflow): simple, natural backpressu
 
 <QA q="How does catchup vs backfill differ?" level="medium">
 
-Catchup = scheduler runs missed historical schedules on startup. Backfill = manually trigger a rerun of a historical period (typically after a bug fix or change). Catchup is automatic; backfill is operator-initiated. `catchup=False` skips the historical runs.
+Catchup = scheduler creates runs for missed historical schedules when it starts (or when a DAG is unpaused), if catchup is enabled. Backfill = manually trigger a rerun of a historical period (typically after a bug fix or change). Catchup is automatic; backfill is operator-initiated. `catchup=False` skips the historical runs.
 
 </QA>
 
@@ -236,7 +246,7 @@ Per-team DAG quotas, resource pools with a max parallelism (for example a `spark
 
 <QA q="How would you scale to 100K concurrent tasks?" level="scenario">
 
-- Multiple scheduler instances (sharded by DAG hash).
+- Multiple scheduler instances: shard DAGs by hash, or run several active schedulers that claim work with row locks (`SELECT ... FOR UPDATE SKIP LOCKED`), which is how Airflow 2+ runs schedulers in HA.
 - Many worker pools across machines.
 - Autoscaling based on queue depth.
 - Deferrable / async sensors instead of polling.
@@ -247,7 +257,7 @@ Per-team DAG quotas, resource pools with a max parallelism (for example a `spark
 
 <QA q="The scheduler was down for a day. What happens when it comes back, and what could go wrong?" level="scenario">
 
-With catchup on, it creates runs for every missed schedule, which can flood the queue and workers with a day of runs at once. Control it with `catchup=False` for DAGs where only the latest run matters, concurrency limits per DAG and pools, and idempotent tasks so any overlapping or repeated runs are safe.
+With catchup on (opt-in per DAG since Airflow 3.0), it creates runs for every missed schedule, which can flood the queue and workers with a day of runs at once. Control it with `catchup=False` for DAGs where only the latest run matters, concurrency limits per DAG and pools, and idempotent tasks so any overlapping or repeated runs are safe.
 
 </QA>
 
@@ -268,7 +278,7 @@ With catchup on, it creates runs for every missed schedule, which can flood the 
 
 <Quiz>
 
-<MCQ q="When is a task instance ready to be queued?" options={["As soon as its DAG run is created", "When all its upstream dependencies have succeeded (or been skipped per its rule)", "When a worker becomes idle", "When its retry delay expires, regardless of upstream state"]} answer={1}>
+<MCQ q="When is a task instance ready to be queued?" options={["As soon as its DAG run is created", "When its upstream tasks satisfy its trigger rule, by default when all of them have succeeded", "When a worker becomes idle", "When its retry delay expires, regardless of upstream state"]} answer={1}>
 
 The scheduler marks a task ready only once its upstream dependencies are satisfied. Run creation, idle workers or a retry timer alone don't satisfy dependencies.
 
@@ -276,7 +286,7 @@ The scheduler marks a task ready only once its upstream dependencies are satisfi
 
 <MCQ q="A task that appends rows to a table is retried after a timeout and the table now has duplicates. What is the best fix?" options={["Set retries to 0", "Add more workers", "Make the task overwrite the partition keyed by its run date", "Switch from pull to push workers"]} answer={2}>
 
-Keying the write on execution_date or run_id makes reruns idempotent. Disabling retries loses reliability, and worker count or dispatch model don't stop duplicate side effects.
+Keying the write on the logical date or run_id makes reruns idempotent. Disabling retries loses reliability, and worker count or dispatch model don't stop duplicate side effects.
 
 </MCQ>
 
