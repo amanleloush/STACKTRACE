@@ -1,0 +1,820 @@
+---
+import { getCollection } from 'astro:content';
+import BaseLayout from '~/layouts/BaseLayout.astro';
+import { NOTES_PHASES } from '~/lib/notes-phases';
+import { PHASES as DSA_PHASES } from '~/lib/dsa-phases';
+import { DEFAULT_DAILY_CAP, MAX_DAILY_CAP } from '~/lib/review-schedule';
+
+// Daily review queue. Static shell; the queue, the cards and the session are
+// built in the browser from /review/cards.json, the mistakes notebook and
+// the review store (localStorage + KV sync for signed-in users).
+export const prerender = true;
+
+const [notes, dsa] = await Promise.all([
+  getCollection('notes', (e) => !e.data.draft),
+  getCollection('dsa', (e) => !e.data.draft),
+]);
+const countBy = (items: { data: { phase: string } }[]): Map<string, number> => {
+  const m = new Map<string, number>();
+  for (const it of items) m.set(it.data.phase, (m.get(it.data.phase) ?? 0) + 1);
+  return m;
+};
+const noteCounts = countBy(notes);
+const dsaCounts = countBy(dsa);
+
+const groups = [
+  {
+    id: 'rv-ph-notes',
+    label: 'System design',
+    pillar: 'notes',
+    phases: NOTES_PHASES.filter((p) => (noteCounts.get(p.slug) ?? 0) > 0).map((p) => ({
+      ...p,
+      count: noteCounts.get(p.slug) ?? 0,
+    })),
+  },
+  {
+    id: 'rv-ph-dsa',
+    label: 'DSA patterns',
+    pillar: 'dsa',
+    phases: DSA_PHASES.filter((p) => (dsaCounts.get(p.slug) ?? 0) > 0).map((p) => ({
+      ...p,
+      count: dsaCounts.get(p.slug) ?? 0,
+    })),
+  },
+];
+---
+<BaseLayout
+  title="Daily review — StackTrace"
+  description="A few minutes a day: spaced-repetition flash cards for every one-liner, plus the quiz questions you got wrong."
+>
+  <nav class="crumbs" aria-label="Breadcrumb">
+    <a href="/revise/">Revise</a> <span aria-hidden="true">/</span>
+    <span aria-current="page">Daily review</span>
+  </nav>
+
+  <header class="rv-head">
+    <h1>Daily review</h1>
+    <p class="rv-lede">
+      Spaced repetition for every one-liner on the site, plus the quiz questions you got wrong. Rate how
+      well you remembered each card and it comes back right before you’d forget it.
+    </p>
+    <p class="rv-hint">
+      Mistakes from quizzes come from your <a href="/review/mistakes/">mistakes notebook</a>; answer one
+      right a few times, spaced out, and it’s resolved there too.
+    </p>
+    <p class="rv-sync" aria-live="polite"></p>
+  </header>
+
+  <noscript>
+    <p class="rv-msg">The daily review needs JavaScript: your schedule lives in this browser.</p>
+  </noscript>
+
+  <div class="rv-app" hidden>
+    <!-- Overview -->
+    <section class="rv-over" aria-labelledby="rv-today">
+      <h2 class="rv-today" id="rv-today">
+        Today: <span class="rv-n" data-stat="due">–</span> due,
+        <span class="rv-n" data-stat="new">–</span> new
+      </h2>
+      <p class="rv-sub" data-stat="detail">Loading your cards…</p>
+      <div class="rv-actions">
+        <button type="button" class="rv-btn rv-btn--primary" data-action="start" disabled>Start review</button>
+        <a class="rv-link" href="/review/mistakes/">Mistakes notebook →</a>
+      </div>
+
+      <details class="rv-settings">
+        <summary>Settings</summary>
+        <div class="rv-settings__body">
+          <label class="rv-cap">
+            <span>New cards per day</span>
+            <input type="number" name="cap" min="0" max={MAX_DAILY_CAP} step="1" value={DEFAULT_DAILY_CAP} inputmode="numeric" />
+          </label>
+          <fieldset class="rv-phases">
+            <legend>Phases to study</legend>
+            <p class="rv-phases__hint">Leave everything unticked (or ticked) to study all phases.</p>
+            <div class="rv-phases__bulk">
+              <button type="button" class="rv-btn rv-btn--small" data-action="all">All</button>
+              <button type="button" class="rv-btn rv-btn--small" data-action="none">None</button>
+            </div>
+            {groups.map((g) => (
+              <div class="rv-phases__group" role="group" aria-labelledby={g.id}>
+                <p class="rv-phases__label" id={g.id}>{g.label}</p>
+                <div class="rv-phases__list">
+                  {g.phases.map((p) => (
+                    <label class="rv-check">
+                      <input type="checkbox" name="phase" value={`${g.pillar}/${p.slug}`} />
+                      <span>{p.num} · {p.title}</span>
+                      <span class="rv-check__n">{p.count}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </fieldset>
+          <p class="rv-saved" aria-live="polite"></p>
+        </div>
+      </details>
+    </section>
+
+    <!-- Session -->
+    <section class="rv-session" aria-label="Review session" hidden>
+      <div class="rv-progress">
+        <p class="rv-progress__text" aria-live="polite"></p>
+        <div class="rv-bar" aria-hidden="true"><span class="rv-bar__fill"></span></div>
+      </div>
+      <article class="rv-card" tabindex="-1" aria-live="polite"></article>
+      <div class="rv-rate" role="group" aria-label="How well did you remember it?" hidden>
+        <button type="button" class="rv-rate__btn" data-rating="again"><kbd>1</kbd> Again <span class="rv-rate__ivl"></span></button>
+        <button type="button" class="rv-rate__btn" data-rating="hard"><kbd>2</kbd> Hard <span class="rv-rate__ivl"></span></button>
+        <button type="button" class="rv-rate__btn" data-rating="good"><kbd>3</kbd> Good <span class="rv-rate__ivl"></span></button>
+        <button type="button" class="rv-rate__btn" data-rating="easy"><kbd>4</kbd> Easy <span class="rv-rate__ivl"></span></button>
+      </div>
+      <div class="rv-session__foot">
+        <p class="rv-keys">
+          <kbd>Space</kbd> show answer · <kbd>1</kbd>–<kbd>4</kbd> rate · <kbd>A</kbd>–<kbd>H</kbd> pick an option
+        </p>
+        <button type="button" class="rv-btn rv-btn--small" data-action="end">End session</button>
+      </div>
+    </section>
+
+    <!-- Summary -->
+    <section class="rv-summary" aria-labelledby="rv-sum-title" tabindex="-1" hidden>
+      <h2 id="rv-sum-title">Session done</h2>
+      <ul class="rv-summary__list"></ul>
+      <div class="rv-actions">
+        <button type="button" class="rv-btn rv-btn--primary" data-action="back">Back to today</button>
+        <a class="rv-link" href="/review/mistakes/">Mistakes notebook →</a>
+      </div>
+    </section>
+  </div>
+</BaseLayout>
+
+<script>
+  import {
+    initReviewStore,
+    onReviewChange,
+    onReviewSync,
+    rateCard,
+    readAllReview,
+    readSettings,
+    saveSettings,
+    type SyncState,
+  } from '~/lib/review-store';
+  import {
+    buildQueue,
+    DAY_MS,
+    intervalLabel,
+    isMistakeCard,
+    MAX_DAILY_CAP,
+    mcqIdOfCard,
+    mistakeCardId,
+    mistakeState,
+    nextInterval,
+    newCardState,
+    RATINGS,
+    type CardState,
+    type OneLinerCard,
+    type OpenMistake,
+    type Rating,
+  } from '~/lib/review-schedule';
+  import { initMistakesStore, onMistakesChange, readAllMistakes, recordAnswer } from '~/lib/mistakes-store';
+  import { inlineParts, type McqRecord } from '~/lib/mistakes';
+
+  const $ = <T extends HTMLElement>(sel: string): T => document.querySelector<T>(sel)!;
+  const app = $<HTMLElement>('.rv-app');
+  const over = $<HTMLElement>('.rv-over');
+  const sessionEl = $<HTMLElement>('.rv-session');
+  const summaryEl = $<HTMLElement>('.rv-summary');
+  const cardEl = $<HTMLElement>('.rv-card');
+  const rateRow = $<HTMLElement>('.rv-rate');
+  const rateBtns = Array.from(document.querySelectorAll<HTMLButtonElement>('.rv-rate__btn'));
+  const startBtn = $<HTMLButtonElement>('[data-action="start"]');
+  const capInput = $<HTMLInputElement>('input[name="cap"]');
+  const phaseBoxes = Array.from(document.querySelectorAll<HTMLInputElement>('input[name="phase"]'));
+  const savedLine = $<HTMLElement>('.rv-saved');
+  const syncLine = $<HTMLElement>('.rv-sync');
+  const LETTERS = 'ABCDEFGH';
+
+  let cards: OneLinerCard[] | null = null;
+  let cardById = new Map<string, OneLinerCard>();
+  let mcqIndex: Record<string, McqRecord> = {};
+  let mcqsLoaded = false;
+
+  app.hidden = false;
+  initReviewStore();
+  initMistakesStore();
+
+  function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls?: string, text?: string): HTMLElementTagNameMap[K] {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = text;
+    return n;
+  }
+
+  /** MCQ text: backticks become <code>, everything else is text. */
+  function inline(s: string): Node[] {
+    return inlineParts(s).map((p) => (p.code ? el('code', undefined, p.text) : document.createTextNode(p.text)));
+  }
+
+  /** Open mistakes that still have a question to ask. */
+  function openMistakes(): OpenMistake[] {
+    const out: OpenMistake[] = [];
+    for (const [id, e] of Object.entries(readAllMistakes())) {
+      const rec = mcqIndex[id];
+      if (e.status !== 'open' || !rec) continue;
+      out.push({ id: mistakeCardId(id), phase: `notes/${rec.phase}`, updatedAt: e.updatedAt });
+    }
+    return out;
+  }
+
+  function currentQueue(now = Date.now()) {
+    return buildQueue({
+      cards: cards ?? [],
+      mistakes: openMistakes(),
+      states: readAllReview(),
+      settings: readSettings(),
+      now,
+    });
+  }
+
+  // ── Overview ───────────────────────────────────────────────────────────────
+
+  function renderOverview(): void {
+    if (!cards) return;
+    const q = currentQueue();
+    const mistakes = q.due.filter(isMistakeCard).length;
+    const s = readSettings();
+    $('[data-stat="due"]').textContent = String(q.due.length);
+    $('[data-stat="new"]').textContent = String(q.fresh.length);
+    const parts: string[] = [];
+    if (mistakes) parts.push(`${mistakes} of the due cards ${mistakes === 1 ? 'is a quiz mistake' : 'are quiz mistakes'}.`);
+    parts.push(`New cards today: ${q.introducedToday} of ${s.dailyCap} introduced.`);
+    if (s.phases.length) parts.push(`Studying ${s.phases.length} selected ${s.phases.length === 1 ? 'phase' : 'phases'}.`);
+    if (!mcqsLoaded) parts.push('Loading your quiz mistakes…');
+    const total = q.due.length + q.fresh.length;
+    if (total === 0) parts.unshift('All caught up for today. Come back tomorrow.');
+    $('[data-stat="detail"]').textContent = parts.join(' ');
+    startBtn.disabled = total === 0;
+    startBtn.textContent = total > 0 ? `Start review (${total})` : 'Start review';
+  }
+
+  function renderSettings(): void {
+    const s = readSettings();
+    if (document.activeElement !== capInput) capInput.value = String(s.dailyCap);
+    const on = new Set(s.phases);
+    for (const b of phaseBoxes) b.checked = on.has(b.value);
+  }
+
+  function flashSaved(): void {
+    savedLine.textContent = 'Saved.';
+    window.setTimeout(() => {
+      if (savedLine.textContent === 'Saved.') savedLine.textContent = '';
+    }, 1500);
+  }
+
+  function savePhases(): void {
+    const picked = phaseBoxes.filter((b) => b.checked).map((b) => b.value);
+    // Everything ticked is the same as nothing ticked: study it all.
+    saveSettings({ phases: picked.length === phaseBoxes.length ? [] : picked });
+    renderOverview();
+    flashSaved();
+  }
+
+  capInput.addEventListener('change', () => {
+    const n = Math.trunc(Number(capInput.value));
+    const cap = Number.isFinite(n) ? Math.min(MAX_DAILY_CAP, Math.max(0, n)) : 15;
+    capInput.value = String(cap);
+    saveSettings({ dailyCap: cap });
+    renderOverview();
+    flashSaved();
+  });
+  for (const b of phaseBoxes) b.addEventListener('change', savePhases);
+  $('[data-action="all"]').addEventListener('click', () => {
+    for (const b of phaseBoxes) b.checked = true;
+    savePhases();
+  });
+  $('[data-action="none"]').addEventListener('click', () => {
+    for (const b of phaseBoxes) b.checked = false;
+    savePhases();
+  });
+
+  // ── Session ────────────────────────────────────────────────────────────────
+
+  interface Session {
+    queue: string[];
+    pos: number;
+    /** Distinct cards in the session (repeats after Again don't count). */
+    distinct: number;
+    counts: Record<Rating, number>;
+    graduated: number;
+    started: number;
+  }
+  let session: Session | null = null;
+  /** The card on screen. */
+  let cur: {
+    id: string;
+    from: CardState | null;
+    revealed: boolean;
+    /** MCQ only: whether the pick was right (null before answering). */
+    right: boolean | null;
+    picked: number;
+    options: HTMLButtonElement[];
+    showAnswer?: () => void;
+  } | null = null;
+
+  function show(which: 'over' | 'session' | 'summary'): void {
+    over.hidden = which !== 'over';
+    sessionEl.hidden = which !== 'session';
+    summaryEl.hidden = which !== 'summary';
+  }
+
+  function startSession(): void {
+    const q = currentQueue();
+    const queue = [...q.due, ...q.fresh];
+    if (!queue.length) return;
+    session = {
+      queue,
+      pos: 0,
+      distinct: queue.length,
+      counts: { again: 0, hard: 0, good: 0, easy: 0 },
+      graduated: 0,
+      started: Date.now(),
+    };
+    show('session');
+    renderCard();
+  }
+
+  function stateFor(id: string): CardState | null {
+    const states = readAllReview();
+    if (isMistakeCard(id)) {
+      const m = readAllMistakes()[mcqIdOfCard(id)];
+      return mistakeState(states, { id, phase: '', updatedAt: m?.updatedAt ?? 0 });
+    }
+    const s = states[id];
+    return s?.kind === 'card' ? s : null;
+  }
+
+  function setRatings(enabled: Rating[] | null): void {
+    rateRow.hidden = enabled === null;
+    if (!cur || enabled === null) return;
+    const from = cur.from ?? { ...newCardState(), updatedAt: 0 };
+    rateBtns.forEach((b, i) => {
+      const r = RATINGS[i]!;
+      b.disabled = !enabled.includes(r);
+      b.querySelector('.rv-rate__ivl')!.textContent = intervalLabel(nextInterval(from, r).interval);
+    });
+  }
+
+  function renderProgress(): void {
+    if (!session) return;
+    const n = session.queue.length;
+    const i = Math.min(session.pos + 1, n);
+    $('.rv-progress__text').textContent = `Card ${i} of ${n}`;
+    $<HTMLElement>('.rv-bar__fill').style.width = `${Math.round((session.pos / Math.max(1, n)) * 100)}%`;
+  }
+
+  function renderCard(): void {
+    if (!session) return;
+    // Skip cards that went away mid-session (resolved in another tab, etc.).
+    while (session.pos < session.queue.length) {
+      const id = session.queue[session.pos]!;
+      if (isMistakeCard(id) ? mcqIndex[mcqIdOfCard(id)] : cardById.get(id)) break;
+      session.pos++;
+    }
+    if (session.pos >= session.queue.length) {
+      finishSession();
+      return;
+    }
+    renderProgress();
+    const id = session.queue[session.pos]!;
+    cur = { id, from: stateFor(id), revealed: false, right: null, picked: -1, options: [] };
+    if (isMistakeCard(id)) renderMcq(id, mcqIndex[mcqIdOfCard(id)]!);
+    else renderOneLiner(cardById.get(id)!);
+    cardEl.focus({ preventScroll: true });
+  }
+
+  function badge(text: string, kind: string): HTMLElement {
+    const b = el('p', 'rv-card__tag', text);
+    b.dataset.kind = kind;
+    return b;
+  }
+
+  function renderOneLiner(c: OneLinerCard): void {
+    const isNew = !cur?.from;
+    const front = el('h3', 'rv-card__front', c.front);
+    const back = el('div', 'rv-card__back');
+    back.hidden = true;
+    const body = el('div', 'rv-card__html');
+    // Our own build output (MDX → HTML in cards.json), never user input.
+    body.innerHTML = c.backHtml;
+    const link = el('a', 'rv-link', `Open “${c.title}” →`);
+    link.href = c.href;
+    back.append(body, link);
+    const showBtn = el('button', 'rv-btn rv-btn--primary rv-card__show', 'Show answer');
+    showBtn.type = 'button';
+    const reveal = (): void => {
+      if (!cur || cur.revealed) return;
+      cur.revealed = true;
+      back.hidden = false;
+      showBtn.hidden = true;
+      setRatings(RATINGS);
+      rateBtns[2]?.focus({ preventScroll: true });
+    };
+    showBtn.addEventListener('click', reveal);
+    cur!.showAnswer = reveal;
+    cardEl.replaceChildren(
+      badge(`${isNew ? 'New · ' : ''}${c.id.startsWith('d:') ? 'DSA' : 'Concept'}`, isNew ? 'new' : 'card'),
+      front,
+      showBtn,
+      back,
+    );
+    setRatings(null);
+  }
+
+  function renderMcq(id: string, rec: McqRecord): void {
+    const head = badge(`Quiz mistake · ${rec.noteTitle}`, 'mistake');
+    const q = el('h3', 'rv-card__front');
+    q.append(...inline(rec.q));
+    const opts = el('div', 'rv-mcq__opts');
+    const why = el('div', 'rv-mcq__why');
+    why.hidden = true;
+    const verdict = el('p', 'rv-mcq__verdict');
+    const expl = el('div', 'rv-card__html');
+    // Our own build output (MDX → HTML in mcqs.json), never user input.
+    expl.innerHTML = rec.explanationHtml;
+    const link = el('a', 'rv-link', `Open “${rec.noteTitle}” →`);
+    link.href = `/learn/notes/${encodeURIComponent(rec.noteSlug)}/#quiz`;
+    why.append(verdict, expl, link);
+
+    const pick = (picked: number): void => {
+      if (!cur || cur.right !== null) return;
+      const right = picked === rec.answer;
+      cur.right = right;
+      cur.picked = picked;
+      cur.revealed = true;
+      cur.options.forEach((o, i) => {
+        o.disabled = true;
+        o.dataset.state = i === rec.answer ? 'correct' : i === picked ? 'wrong' : 'dim';
+      });
+      verdict.dataset.ok = String(right);
+      verdict.textContent = right
+        ? '✓ Correct! How easy was it?'
+        : `✗ Not quite — the answer is ${LETTERS[rec.answer]}. It comes back in 10 minutes.`;
+      // A wrong answer counts as another miss in the notebook right away.
+      if (!right) recordAnswer(mcqIdOfCard(id), rec.noteSlug, picked, false);
+      why.hidden = false;
+      setRatings(right ? ['hard', 'good', 'easy'] : ['again']);
+      rateBtns[right ? 2 : 0]?.focus({ preventScroll: true });
+    };
+    cur!.options = rec.options.map((opt, i) => {
+      const b = el('button', 'rv-mcq__opt');
+      b.type = 'button';
+      b.append(el('span', 'rv-mcq__letter', LETTERS[i] ?? '?'));
+      const t = el('span');
+      t.append(...inline(opt));
+      b.append(t);
+      b.addEventListener('click', () => pick(i));
+      return b;
+    });
+    opts.append(...cur!.options);
+    cardEl.replaceChildren(head, q, opts, why);
+    setRatings(null);
+  }
+
+  function rate(rating: Rating): void {
+    if (!session || !cur || !cur.revealed) return;
+    const btn = rateBtns[RATINGS.indexOf(rating)];
+    if (!btn || btn.disabled) return;
+    const { id, from } = cur;
+    const mistake = isMistakeCard(id);
+    const next = rateCard(id, from, rating, mistake);
+    session.counts[rating]++;
+    if (next && mistake && next.graduated) {
+      const rec = mcqIndex[mcqIdOfCard(id)];
+      // Graduated: resolve it in the mistakes notebook too.
+      if (rec) recordAnswer(mcqIdOfCard(id), rec.noteSlug, cur.picked, true);
+      session.graduated++;
+    }
+    // Again: see it once more at the end of this session.
+    if (rating === 'again') session.queue.push(id);
+    session.pos++;
+    cur = null;
+    renderCard();
+  }
+
+  rateBtns.forEach((b, i) => b.addEventListener('click', () => rate(RATINGS[i]!)));
+
+  function finishSession(): void {
+    if (!session) return;
+    const s = session;
+    session = null;
+    cur = null;
+    const reviewed = s.counts.again + s.counts.hard + s.counts.good + s.counts.easy;
+    const mins = Math.max(1, Math.round((Date.now() - s.started) / 60000));
+    const tomorrow = currentQueue(Date.now() + DAY_MS);
+    const left = Math.max(0, s.queue.length - s.pos);
+    const items = [
+      `${reviewed} ${reviewed === 1 ? 'review' : 'reviews'} in about ${mins} min.` +
+        (left ? ` ${left} ${left === 1 ? 'card' : 'cards'} left for later.` : ` All ${s.distinct} queued cards done.`),
+      `Again ${s.counts.again} · Hard ${s.counts.hard} · Good ${s.counts.good} · Easy ${s.counts.easy}`,
+      `About ${tomorrow.due.length} ${tomorrow.due.length === 1 ? 'card' : 'cards'} due tomorrow, plus up to ${tomorrow.fresh.length} new.`,
+    ];
+    if (s.graduated) {
+      items.splice(2, 0, `${s.graduated} quiz ${s.graduated === 1 ? 'mistake' : 'mistakes'} graduated and resolved in your notebook.`);
+    }
+    $('.rv-summary__list').replaceChildren(...items.map((t) => el('li', undefined, t)));
+    show('summary');
+    summaryEl.focus();
+  }
+
+  startBtn.addEventListener('click', startSession);
+  $('[data-action="end"]').addEventListener('click', finishSession);
+  $('[data-action="back"]').addEventListener('click', () => {
+    show('over');
+    renderOverview();
+    startBtn.focus();
+  });
+
+  // Keyboard: Space shows the answer, 1–4 rate, A–H pick an MCQ option.
+  document.addEventListener('keydown', (e) => {
+    if (!session || !cur || sessionEl.hidden) return;
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    const t = e.target as HTMLElement | null;
+    if (t && /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) return;
+    if (e.key === ' ' || e.key === 'Spacebar') {
+      if (cur.showAnswer && !cur.revealed) {
+        e.preventDefault();
+        cur.showAnswer();
+      } else if (t?.tagName !== 'BUTTON' && t?.tagName !== 'A') {
+        e.preventDefault();
+      }
+      return;
+    }
+    if (/^[1-4]$/.test(e.key)) {
+      e.preventDefault();
+      rate(RATINGS[Number(e.key) - 1]!);
+      return;
+    }
+    const letter = LETTERS.indexOf(e.key.toUpperCase());
+    if (e.key.length === 1 && letter >= 0 && cur.options[letter] && cur.right === null) {
+      e.preventDefault();
+      cur.options[letter]!.click();
+    }
+  });
+
+  // ── Data + live updates ────────────────────────────────────────────────────
+
+  let pending = false;
+  const refresh = (): void => {
+    if (pending) return;
+    pending = true;
+    requestAnimationFrame(() => {
+      pending = false;
+      renderSettings();
+      if (!over.hidden) renderOverview();
+    });
+  };
+  onReviewChange(refresh);
+  onMistakesChange(refresh);
+
+  const SYNC_TEXT: Record<SyncState, string> = {
+    local: 'Saved in this browser. Sign in to keep your schedule in sync across devices.',
+    syncing: 'Syncing…',
+    synced: 'Synced across your devices.',
+    error: 'Saved in this browser; sync will retry.',
+  };
+  onReviewSync((s) => {
+    syncLine.textContent = SYNC_TEXT[s];
+  });
+
+  renderSettings();
+
+  fetch('/review/cards.json')
+    .then((r) => {
+      if (!r.ok) throw new Error(String(r.status));
+      return r.json() as Promise<OneLinerCard[]>;
+    })
+    .then((data) => {
+      cards = Array.isArray(data) ? data : [];
+      cardById = new Map(cards.map((c) => [c.id, c]));
+      renderOverview();
+    })
+    .catch(() => {
+      $('[data-stat="detail"]').textContent = 'Couldn’t load the cards. Check your connection and reload the page.';
+    });
+
+  // The MCQ index is only needed when there are open mistakes.
+  const hasOpen = Object.values(readAllMistakes()).some((e) => e.status === 'open');
+  if (!hasOpen) {
+    mcqsLoaded = true;
+  } else {
+    fetch('/review/mcqs.json')
+      .then((r) => {
+        if (!r.ok) throw new Error(String(r.status));
+        return r.json() as Promise<Record<string, McqRecord>>;
+      })
+      .then((data) => {
+        mcqIndex = data && typeof data === 'object' ? data : {};
+      })
+      .catch(() => {
+        /* one-liner cards still work; mistakes just aren't offered */
+      })
+      .finally(() => {
+        mcqsLoaded = true;
+        renderOverview();
+      });
+  }
+</script>
+
+<style>
+  .crumbs { font-size: 0.82rem; color: var(--fg-faint); margin-bottom: 1rem; }
+  .crumbs a { color: var(--fg-muted); }
+  .rv-head h1 { margin: 0 0 0.5rem; }
+  .rv-lede { color: var(--fg-muted); max-width: 72ch; line-height: 1.55; margin: 0; }
+  .rv-hint { color: var(--fg-muted); font-size: 0.88rem; max-width: 72ch; margin: 0.5rem 0 0; }
+  .rv-hint a, .rv-link { color: var(--primary-light); }
+  .rv-sync { margin: 0.5rem 0 0; font-family: var(--font-code); font-size: 0.78rem; color: var(--fg-muted); min-height: 1em; }
+  .rv-msg { color: var(--fg-muted); padding: 1.5rem 0; }
+  .rv-app { margin-top: 1.75rem; }
+
+  .rv-over, .rv-summary, .rv-card {
+    border: 1px solid var(--card-border);
+    border-radius: 12px;
+    background: var(--card-bg);
+    padding: 1.1rem 1.2rem;
+    min-width: 0;
+  }
+  .rv-summary:focus-visible, .rv-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .rv-card:focus { outline: none; }
+  .rv-today { margin: 0; font-size: clamp(1.2rem, 3.5vw, 1.5rem); }
+  .rv-n { font-family: var(--font-code); color: var(--primary-light); }
+  .rv-sub { color: var(--fg-muted); margin: 0.4rem 0 0; font-size: 0.9rem; line-height: 1.5; }
+  .rv-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem 1rem; margin-top: 1rem; }
+
+  .rv-btn {
+    font: inherit;
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: var(--primary-light);
+    background: transparent;
+    border: 1px solid var(--card-border);
+    border-radius: 999px;
+    padding: 0.45rem 1.1rem;
+    cursor: pointer;
+  }
+  .rv-btn:hover:not(:disabled) { border-color: var(--accent); }
+  .rv-btn:disabled { opacity: 0.55; cursor: default; }
+  .rv-btn--primary {
+    color: var(--fg);
+    border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+  }
+  .rv-btn--small { font-size: 0.8rem; padding: 0.25rem 0.8rem; }
+  .rv-btn:focus-visible, .rv-link:focus-visible, .rv-settings summary:focus-visible,
+  .rv-check input:focus-visible, .rv-cap input:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  .rv-settings { margin-top: 1.25rem; border-top: 1px dashed var(--card-border); padding-top: 0.8rem; }
+  .rv-settings summary { cursor: pointer; font-weight: 600; color: var(--fg-muted); width: fit-content; }
+  .rv-settings__body { margin-top: 0.8rem; display: grid; gap: 1rem; }
+  .rv-cap { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem; font-size: 0.9rem; }
+  .rv-cap input {
+    width: 5.5rem;
+    font: inherit;
+    color: var(--fg);
+    background: var(--bg-soft);
+    border: 1px solid var(--card-border);
+    border-radius: 8px;
+    padding: 0.3rem 0.5rem;
+  }
+  .rv-phases { border: 0; margin: 0; padding: 0; min-width: 0; }
+  .rv-phases legend { font-weight: 600; font-size: 0.9rem; padding: 0; }
+  .rv-phases__hint { margin: 0.2rem 0 0.5rem; font-size: 0.8rem; color: var(--fg-faint); }
+  .rv-phases__bulk { display: flex; gap: 0.4rem; margin-bottom: 0.6rem; }
+  .rv-phases__label {
+    font-size: 0.75rem;
+    font-family: var(--font-code);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--fg-muted);
+    margin: 0.6rem 0 0.35rem;
+  }
+  .rv-phases__list {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(230px, 100%), 1fr));
+    gap: 0.3rem 1rem;
+  }
+  .rv-check { display: flex; align-items: baseline; gap: 0.45rem; font-size: 0.86rem; min-width: 0; cursor: pointer; }
+  .rv-check span:first-of-type { overflow-wrap: anywhere; }
+  .rv-check__n { margin-left: auto; font-family: var(--font-code); font-size: 0.72rem; color: var(--fg-faint); }
+  .rv-saved { margin: 0; font-size: 0.8rem; color: var(--anim-success); min-height: 1em; }
+
+  .rv-progress { display: grid; gap: 0.35rem; margin-bottom: 0.9rem; }
+  .rv-progress__text { margin: 0; font-family: var(--font-code); font-size: 0.8rem; color: var(--fg-muted); }
+  .rv-bar { height: 6px; border-radius: 999px; background: var(--bg-soft); overflow: hidden; }
+  .rv-bar__fill { display: block; height: 100%; width: 0; background: var(--accent); transition: width 0.2s ease; }
+
+  .rv-card { overflow-wrap: anywhere; }
+  .rv-card :global(.rv-card__tag) {
+    margin: 0 0 0.5rem;
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--fg-faint);
+  }
+  .rv-card :global(.rv-card__tag[data-kind='new']) { color: var(--accent); }
+  .rv-card :global(.rv-card__tag[data-kind='mistake']) { color: var(--anim-danger); }
+  .rv-card :global(.rv-card__front) { margin: 0 0 1rem; font-size: 1.15rem; line-height: 1.45; }
+  .rv-card :global(.rv-card__back) { border-top: 1px dashed var(--card-border); padding-top: 0.8rem; }
+  .rv-card :global(.rv-card__html) { line-height: 1.6; margin-bottom: 0.7rem; }
+  .rv-card :global(.rv-card__html > :first-child) { margin-top: 0; }
+  .rv-card :global(.rv-card__html pre) { overflow-x: auto; max-width: 100%; }
+  .rv-card :global(code) { font-family: var(--font-code); font-size: 0.9em; }
+  .rv-card :global(.rv-link) { color: var(--primary-light); }
+
+  .rv-card :global(.rv-mcq__opts) { display: grid; gap: 0.45rem; }
+  .rv-card :global(.rv-mcq__opt) {
+    display: flex;
+    gap: 0.6rem;
+    align-items: baseline;
+    text-align: left;
+    font: inherit;
+    color: var(--fg);
+    background: transparent;
+    border: 1px solid var(--card-border);
+    border-radius: 8px;
+    padding: 0.55rem 0.75rem;
+    cursor: pointer;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+  .rv-card :global(.rv-mcq__opt:hover:not(:disabled)) { border-color: var(--accent); }
+  .rv-card :global(.rv-mcq__opt:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .rv-card :global(.rv-mcq__opt:disabled) { cursor: default; }
+  .rv-card :global(.rv-mcq__letter) { font-family: var(--font-code); font-size: 0.8rem; color: var(--fg-muted); flex-shrink: 0; }
+  .rv-card :global(.rv-mcq__opt[data-state='correct']) {
+    border-color: var(--anim-success);
+    background: color-mix(in srgb, var(--anim-success) 14%, transparent);
+  }
+  .rv-card :global(.rv-mcq__opt[data-state='wrong']) {
+    border-color: var(--anim-danger);
+    background: color-mix(in srgb, var(--anim-danger) 14%, transparent);
+  }
+  .rv-card :global(.rv-mcq__opt[data-state='dim']) { opacity: 0.6; }
+  .rv-card :global(.rv-mcq__why) { margin-top: 0.8rem; padding-top: 0.6rem; border-top: 1px dashed var(--card-border); }
+  .rv-card :global(.rv-mcq__verdict) { font-weight: 700; margin-top: 0; }
+  .rv-card :global(.rv-mcq__verdict[data-ok='true']) { color: var(--anim-success); }
+  .rv-card :global(.rv-mcq__verdict[data-ok='false']) { color: var(--anim-danger); }
+
+  .rv-rate { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0.5rem; margin-top: 0.9rem; }
+  .rv-rate__btn {
+    font: inherit;
+    font-size: 0.88rem;
+    font-weight: 600;
+    color: var(--fg);
+    background: var(--card-bg);
+    border: 1px solid var(--card-border);
+    border-radius: 10px;
+    padding: 0.55rem 0.3rem;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.15rem;
+    min-width: 0;
+  }
+  .rv-rate__btn:hover:not(:disabled) { border-color: var(--accent); }
+  .rv-rate__btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .rv-rate__btn:disabled { opacity: 0.4; cursor: default; }
+  .rv-rate__btn[data-rating='again'] { border-color: color-mix(in srgb, var(--anim-danger) 55%, var(--card-border)); }
+  .rv-rate__btn[data-rating='good'] { border-color: color-mix(in srgb, var(--anim-success) 55%, var(--card-border)); }
+  .rv-rate__ivl { font-family: var(--font-code); font-size: 0.72rem; font-weight: 400; color: var(--fg-muted); }
+  kbd {
+    font-family: var(--font-code);
+    font-size: 0.7rem;
+    color: var(--fg-muted);
+    border: 1px solid var(--card-border);
+    border-radius: 4px;
+    padding: 0 0.3rem;
+    background: var(--bg-soft);
+  }
+  .rv-session__foot {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.6rem;
+    margin-top: 1rem;
+  }
+  .rv-keys { margin: 0; font-size: 0.78rem; color: var(--fg-faint); }
+  @media (hover: none) {
+    .rv-keys { display: none; }
+  }
+
+  .rv-summary h2 { margin: 0 0 0.6rem; }
+  .rv-summary__list { margin: 0; padding-left: 1.2rem; display: grid; gap: 0.35rem; color: var(--fg-muted); }
+  .rv-summary:focus { outline: none; }
+</style>
